@@ -101,11 +101,15 @@ class OpenCodeAdapter(BaseCLIAdapter):
         )
 
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
-        """Build the ``opencode run`` argv as a list, with the prompt as the last element.
+        """Build the ``opencode run`` invocation, feeding the prompt via stdin.
 
         The role preamble is prepended and in-scope files appended to the prompt (OpenCode has no
-        system-prompt or file-attach flag). Safety env is overlaid on the spec env; safety args
-        are appended before the positional prompt.
+        system-prompt or file-attach flag). The composed prompt is passed on STDIN rather than as a
+        positional argument: OpenCode installs as a Windows npm shim, so it launches via
+        ``cmd.exe /c``, and a newline in a ``cmd.exe`` argument truncates the command at the first
+        newline -- which would silently drop everything after the first line of a multi-line prompt
+        (for example a stance directive joined to a claim with a blank line). stdin carries the full
+        multi-line prompt intact. Safety env is overlaid on the spec env.
         """
         prompt = self._with_files(
             self._compose_prompt(req.prompt, ctx.role_preamble),
@@ -123,10 +127,9 @@ class OpenCodeAdapter(BaseCLIAdapter):
         safety = self.map_safety(ctx.safety_mode)
         argv += safety.args
 
-        # Prompt is positional and must be the last argv element.
-        argv.append(prompt)
-
-        return InvocationSpec(argv=argv, env=dict(safety.env), cwd=req.working_dir)
+        # The prompt rides on stdin (not a positional argv element) so a multi-line prompt
+        # survives the cmd.exe shim launch. OpenCode reads the prompt from stdin.
+        return InvocationSpec(argv=argv, env=dict(safety.env), cwd=req.working_dir, stdin=prompt)
 
     def available_models(self) -> list[str]:
         """List models via ``opencode models``; fall back to the static set on any failure."""

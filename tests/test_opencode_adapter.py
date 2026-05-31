@@ -9,13 +9,14 @@ from pathlib import Path
 import pytest
 
 from rutherford.adapters.opencode import OpenCodeAdapter
-from rutherford.domain.enums import AuthState, SafetyMode
+from rutherford.domain.enums import AuthState, SafetyMode, Stance
 from rutherford.domain.models import (
     DelegationRequest,
     InvocationContext,
     ProcessResult,
     Target,
 )
+from rutherford.services.consensus import _apply_stance
 from tests.fakes import FakeProbe
 
 SAMPLES = Path(__file__).parent / "parsers" / "opencode"
@@ -46,12 +47,15 @@ def _req(**kwargs: object) -> DelegationRequest:
 # --- build_invocation --------------------------------------------------------
 
 
-def test_build_invocation_basic_argv_is_a_list() -> None:
+def test_build_invocation_prompt_goes_on_stdin() -> None:
     spec = OpenCodeAdapter().build_invocation(_req(), _ctx())
     assert isinstance(spec.argv, list)
     assert spec.argv[:4] == ["opencode", "run", "--format", "json"]
-    # The prompt is the last positional argv element.
-    assert spec.argv[-1] == "say hi"
+    # The prompt rides on stdin, not as a positional argv element. OpenCode launches via a
+    # cmd.exe shim on Windows, where a newline in an argv element truncates the command; stdin
+    # carries the full prompt intact.
+    assert spec.stdin == "say hi"
+    assert "say hi" not in spec.argv
     assert "-m" in spec.argv
     assert spec.argv[spec.argv.index("-m") + 1] == "anthropic/claude-sonnet-4-6"
 
@@ -65,32 +69,50 @@ def test_build_invocation_includes_working_dir_and_resume() -> None:
     assert spec.argv[spec.argv.index("--dir") + 1] == "/work"
     assert spec.cwd == "/work"
     assert spec.argv[spec.argv.index("--session") + 1] == "ses_1"
-    # Prompt stays last even with extra flags.
-    assert spec.argv[-1] == "say hi"
+    assert spec.stdin == "say hi"
 
 
 def test_build_invocation_prepends_role_preamble_to_prompt() -> None:
     spec = OpenCodeAdapter().build_invocation(_req(), _ctx(preamble="You are a reviewer."))
-    # No system-prompt flag exists; the preamble is folded into the positional prompt.
+    # No system-prompt flag exists; the preamble is folded into the stdin prompt.
     assert "--system-prompt" not in spec.argv
     assert "--append-system-prompt" not in spec.argv
-    prompt = spec.argv[-1]
-    assert prompt.startswith("You are a reviewer.")
-    assert "say hi" in prompt
+    assert spec.stdin is not None
+    assert spec.stdin.startswith("You are a reviewer.")
+    assert "say hi" in spec.stdin
 
 
 def test_build_invocation_appends_files_to_prompt() -> None:
     spec = OpenCodeAdapter().build_invocation(_req(files=["a.py", "b.py"]), _ctx())
-    prompt = spec.argv[-1]
-    assert "Files in scope:" in prompt
-    assert "- a.py" in prompt
+    assert spec.stdin is not None
+    assert "Files in scope:" in spec.stdin
+    assert "- a.py" in spec.stdin
 
 
 def test_build_invocation_never_builds_a_shell_string() -> None:
     spec = OpenCodeAdapter().build_invocation(_req(prompt="rm -rf / ; echo pwned"), _ctx())
-    # The dangerous text is a single argv element, never concatenated into a command line.
-    assert spec.argv[-1] == "rm -rf / ; echo pwned"
-    assert all(";" not in arg or arg == "rm -rf / ; echo pwned" for arg in spec.argv)
+    # The dangerous text rides on stdin, never an argv element / command line.
+    assert spec.stdin == "rm -rf / ; echo pwned"
+    assert all(";" not in arg for arg in spec.argv)
+
+
+def test_multiline_stance_prompt_survives_intact_on_stdin() -> None:
+    # Regression: a consensus stance directive joined to the claim with a blank line must reach
+    # OpenCode as one coherent stdin message. Passing it as a positional argv element silently
+    # dropped everything after the first newline through the Windows cmd.exe shim, so OpenCode
+    # saw only the stance directive and asked for the proposition.
+    claim = 'CLAIM TO DEBATE: "A message queue is overkill for a single-server app."'
+    steered = _apply_stance(claim, Stance.AGAINST)
+    assert "\n" in steered  # the directive and claim are separated by a blank line
+
+    spec = OpenCodeAdapter().build_invocation(_req(prompt=steered), _ctx())
+
+    assert spec.stdin == steered  # the full steered prompt, intact
+    assert "Argue against" in spec.stdin  # the stance directive
+    assert claim in spec.stdin  # AND the full claim body
+    # The claim must not be sitting in an argv element where the shim would truncate it.
+    assert all(claim not in arg for arg in spec.argv)
+    assert all("\n" not in arg for arg in spec.argv)
 
 
 # --- map_safety --------------------------------------------------------------
@@ -118,8 +140,8 @@ def test_build_invocation_overlays_safety_env() -> None:
 def test_build_invocation_yolo_adds_skip_permissions_flag() -> None:
     spec = OpenCodeAdapter().build_invocation(_req(), _ctx(safety=SafetyMode.YOLO))
     assert "--dangerously-skip-permissions" in spec.argv
-    # The flag precedes the positional prompt.
-    assert spec.argv.index("--dangerously-skip-permissions") < len(spec.argv) - 1
+    # The prompt is on stdin, not in argv.
+    assert spec.stdin == "say hi"
 
 
 def test_build_invocation_read_only_denies_in_env() -> None:
