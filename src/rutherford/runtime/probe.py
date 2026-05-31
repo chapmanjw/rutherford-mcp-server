@@ -68,6 +68,10 @@ class SystemProbe:
             completed = subprocess.run(
                 launch,
                 capture_output=True,
+                # Detach the child's stdin from ours. When Rutherford runs as a stdio MCP server
+                # its stdin is the client's pipe; a probed CLI that reads stdin would otherwise
+                # block on it (or steal protocol bytes).
+                stdin=subprocess.DEVNULL,
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout_s,

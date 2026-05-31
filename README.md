@@ -11,18 +11,14 @@ returns each one's answer in a single normalized envelope. It is CLI-only: it or
 coding agents and never calls a model provider API directly.
 
 ```
-                 ______________
-                /              \
-               |   ___    ___   |
-               |  / o \  / o \  |#####
-               |  \___/  \___/  |#####]===   cranial implant
-               |       __       |  |||
-               |      |  |      |
-               |       \/       |
-                \    ______    /
-                 \__/      \__/
-            -- Ensign Sam Rutherford --
-              USS Cerritos . Engineering
+.---------.
+|  \/\/\/ |
+|  O  [==]|
+|    <    |
+|  \___/  |
+'---------'
+-- Ensign Sam Rutherford --
+USS Cerritos . Engineering
 ```
 
 ## Why Rutherford?

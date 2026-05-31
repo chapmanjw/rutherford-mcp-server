@@ -55,9 +55,12 @@ class AsyncProcessRunner:
     ) -> ProcessResult:
         launch = prepare_argv(spec.argv)
         start = time.monotonic()
+        # When stdin is not supplied, detach the child from our stdin (DEVNULL) rather than
+        # inheriting it. Under a stdio MCP client our stdin is the client's pipe, and a spawned
+        # CLI that reads stdin would block on it or consume protocol bytes.
         process = await asyncio.create_subprocess_exec(
             *launch,
-            stdin=asyncio.subprocess.PIPE if spec.stdin is not None else None,
+            stdin=asyncio.subprocess.PIPE if spec.stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=spec.cwd,
