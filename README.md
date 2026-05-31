@@ -90,7 +90,7 @@ Antigravity's print-mode model is fixed (no model selector). Cursor on a free pl
 `auto` model; named models need a paid plan. Both Cursor and Qwen install as Windows shims, which
 Rutherford launches via `cmd.exe` while feeding the prompt on stdin. Codex on Windows installs as an npm
 shim, which Rutherford launches via `cmd.exe` automatically while still passing arguments as a list.
-A seventh, well-behaved CLI can be added without code -- see [docs/adding-a-cli.md](docs/adding-a-cli.md).
+A seventh, well-behaved CLI can be added without code -- see [docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md).
 
 ## Using Rutherford
 
@@ -178,7 +178,7 @@ more targets.
 
 `plan` -- one target, the `planner` role, read-only. The bundled roles are `planner`, `codereviewer`,
 `security`, and `debugger`; ask "what roles does Rutherford have?" to list them, and you can add your
-own (see [docs/configuration.md](docs/configuration.md)).
+own (see [docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md)).
 
 ### Let an agent actually make the change
 
@@ -237,7 +237,7 @@ uv run rutherford-mcp-server --smoke   # prints a readiness line and exits
 ```
 
 Rutherford does not install or authenticate the target CLIs. Install and log in to whichever CLIs
-you want to orchestrate (see [docs/integration-testing.md](docs/integration-testing.md)), then run
+you want to orchestrate (see [docs/integration-testing.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/integration-testing.md)), then run
 the `doctor` tool to confirm each one is reachable.
 
 ## MCP client registration
@@ -300,7 +300,7 @@ tool with `cli="claude_code"`. Rutherford spawns a fresh, isolated `claude -p` s
 from your session, and returns its result. The same works for Codex calling `codex`. The depth
 guard (`max_depth`, default 3) bounds any self-referential chain.
 
-See [docs/mcp-client-integration.md](docs/mcp-client-integration.md) for more clients and detail.
+See [docs/mcp-client-integration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/mcp-client-integration.md) for more clients and detail.
 
 ## Safety model
 
@@ -316,23 +316,23 @@ Every delegation runs in one of four safety modes, defaulting to the most restri
 `write` and `yolo` require an explicit argument and a trusted-workspace check -- the target
 directory must be on the configured `trusted_workspaces` allowlist, or the call must pass
 `trust_workspace=true`. No adapter ever defaults to its permission-bypass flag. Invocations are
-always built as an argv list, never a shell string. See [docs/security.md](docs/security.md).
+always built as an argv list, never a shell string. See [docs/security.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/security.md).
 
 ## Documentation
 
-- [docs/architecture.md](docs/architecture.md) -- the layered design and the two core interfaces.
-- [docs/configuration.md](docs/configuration.md) -- config file, env overrides, generic adapters.
-- [docs/adding-a-cli.md](docs/adding-a-cli.md) -- the contract and checklist for adding a CLI.
-- [docs/integration-testing.md](docs/integration-testing.md) -- installing and authenticating each CLI, and running the suite.
-- [docs/mcp-client-integration.md](docs/mcp-client-integration.md) -- registration for many clients.
-- [docs/troubleshooting.md](docs/troubleshooting.md) -- common problems and fixes.
-- [docs/security.md](docs/security.md) -- the security model in depth.
+- [docs/architecture.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/architecture.md) -- the layered design and the two core interfaces.
+- [docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md) -- config file, env overrides, generic adapters.
+- [docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md) -- the contract and checklist for adding a CLI.
+- [docs/integration-testing.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/integration-testing.md) -- installing and authenticating each CLI, and running the suite.
+- [docs/mcp-client-integration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/mcp-client-integration.md) -- registration for many clients.
+- [docs/troubleshooting.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/troubleshooting.md) -- common problems and fixes.
+- [docs/security.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/security.md) -- the security model in depth.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The whole core is testable without a real CLI; run
+See [CONTRIBUTING.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/CONTRIBUTING.md). The whole core is testable without a real CLI; run
 `just check` before pushing, then `just test-integration` for whatever CLIs your machine has.
 
 ## License
 
-MIT (c) John Chapman. See [LICENSE](LICENSE).
+MIT (c) John Chapman. See [LICENSE](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/LICENSE).
