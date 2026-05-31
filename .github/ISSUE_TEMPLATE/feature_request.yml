@@ -1,0 +1,25 @@
+name: Feature request
+description: A new adapter, a tool surface improvement, a configuration option.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: What problem are you trying to solve? What can't you do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: |
+        Sketch the change. If you are proposing a new CLI target, name its headless
+        invocation, its non-interactive auth method, and whether it can be a config-only
+        generic adapter or needs a code adapter (see docs/adding-a-cli.md).
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

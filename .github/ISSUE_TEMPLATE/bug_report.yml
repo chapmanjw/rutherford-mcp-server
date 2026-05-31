@@ -1,0 +1,51 @@
+name: Bug report
+description: A defect in Rutherford's behavior - a wrong result envelope, a misparsed CLI output, a crash, etc.
+labels: [bug]
+body:
+  - type: input
+    id: rutherford_version
+    attributes:
+      label: Rutherford version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / platform
+      placeholder: "Windows 11 / macOS 15 / Ubuntu 24.04 / Ubuntu on WSL2"
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      placeholder: "Claude Code / Claude Desktop 1.4 / Cursor / ..."
+  - type: input
+    id: target_cli
+    attributes:
+      label: Target CLI and version
+      description: Which adapter, and the CLI version from its `--version`.
+      placeholder: "claude_code (claude 2.1.158) / codex 0.133.0 / agy 1.0.2 / kiro-cli 2.5.0"
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Be precise - the tool called, its arguments, expected vs actual.
+      placeholder: |
+        1. Call `delegate` with target `{cli: "...", model: "..."}` and prompt `...`
+        2. Expected `Y`
+        3. Got `Z`
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: doctor output
+      description: Paste the output of the `doctor` tool (or `capabilities`). Strip any tokens or keys.
+      render: shell
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Logs, config, other context. Redact secrets.

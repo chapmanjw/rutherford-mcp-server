@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+.env
+.env.local
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local research receipts (kept out of commits)
+.research/
+
+# Per-user Claude Code settings
+.claude/settings.local.json
+
+# Logs and OS cruft
+*.log
+.DS_Store
+Thumbs.db

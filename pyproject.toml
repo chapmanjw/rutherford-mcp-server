@@ -1,0 +1,155 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rutherford-mcp-server"
+version = "0.1.0"
+description = "An MCP server that delegates work to, and builds consensus across, a crew of agentic coding CLIs."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "John Chapman" }]
+requires-python = ">=3.11"
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "cli",
+    "orchestration",
+    "consensus",
+    "claude-code",
+    "codex",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Typing :: Typed",
+]
+dependencies = [
+    "fastmcp>=3.3",
+    "pydantic>=2.13",
+    "psutil>=7",
+    "python-toon>=0.1.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/chapmanjw/rutherford-mcp-server#readme"
+Repository = "https://github.com/chapmanjw/rutherford-mcp-server.git"
+Issues = "https://github.com/chapmanjw/rutherford-mcp-server/issues"
+Changelog = "https://github.com/chapmanjw/rutherford-mcp-server/blob/main/CHANGELOG.md"
+
+[project.scripts]
+rutherford-mcp-server = "rutherford.server:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=1.4",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "types-psutil>=7",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rutherford"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/rutherford", "roles", "README.md", "CHANGELOG.md", "LICENSE"]
+
+# --- Lint and format (ruff is the single Python equivalent of the siblings'
+# ESLint/Prettier and Spotless/Checkstyle; 120-char lines match the Java
+# Checkstyle setting). ----------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+    "PTH",  # flake8-use-pathlib
+    "RUF",  # ruff-specific
+    "ASYNC",# flake8-async
+]
+ignore = [
+    "N818", # exception names need not end in "Error" (RutherfordError already does)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B011"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["rutherford"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# --- Type checking (mypy strict; matches the siblings' strict tsc). ------------
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_any_generics = true
+plugins = ["pydantic.mypy"]
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["toon", "toon.*"]
+ignore_missing_imports = true
+
+# Tests are type-checked, but do not require full annotations on every test function.
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_decorators = false
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# --- Tests (pytest with the integration marker deselected by default;
+# pytest-cov enforces a coverage floor that fails the build). -------------------
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-m 'not integration' --cov=rutherford --cov-report=term-missing --cov-fail-under=90"
+markers = [
+    "integration: real-CLI tests, local only, skipped by default (run with -m integration)",
+]
+
+[tool.coverage.run]
+source = ["rutherford"]
+branch = true
+omit = ["*/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "@(abc\\.)?abstractmethod",
+    "\\.\\.\\.",
+]

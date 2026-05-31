@@ -1,0 +1,31 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{json,yml,yaml,toml}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+# Windows scripts: keep batch as CRLF (cmd.exe insists), PowerShell as LF.
+# IMPORTANT: PowerShell 5.1 reads .ps1 as Windows-1252 without a BOM, so any
+# multi-byte UTF-8 char (em-dash, arrow, smart quote, etc.) silently breaks the
+# parser. Keep .ps1 files ASCII-only.
+[*.bat]
+end_of_line = crlf
+[*.ps1]
+end_of_line = lf
+
+[Makefile]
+indent_style = tab
+
+[justfile]
+indent_style = space
+indent_size = 4

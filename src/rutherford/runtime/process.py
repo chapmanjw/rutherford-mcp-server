@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Chapman
+"""The ``ProcessRunner`` interface and its real asyncio implementation.
+
+``ProcessRunner`` abstracts subprocess execution so the orchestration core can be driven by a
+``FakeProcessRunner`` in tests, and so every cross-platform concern -- argv resolution, the
+no-shell rule, the timeout, and process-tree termination -- lives in exactly one place.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Callable
+from typing import Protocol, runtime_checkable
+
+from ..domain.models import InvocationSpec, ProcessResult
+from .launch import merged_env, prepare_argv
+
+
+@runtime_checkable
+class ProcessRunner(Protocol):
+    """Runs a resolved :class:`InvocationSpec` to completion under a timeout."""
+
+    async def run(
+        self,
+        spec: InvocationSpec,
+        timeout_s: float,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> ProcessResult:
+        """Execute ``spec``, enforce ``timeout_s``, and return the raw outcome.
+
+        A timeout, a non-zero exit, or a missing binary are normal outcomes returned as a
+        :class:`ProcessResult` -- not raised. On timeout or cancellation the whole process tree
+        is killed.
+        """
+        ...
+
+
+class AsyncProcessRunner:
+    """The real :class:`ProcessRunner`: asyncio subprocess, argv list, process-tree kill.
+
+    Uses :func:`~rutherford.runtime.launch.prepare_argv` so Windows ``.cmd``/``.ps1`` shims run
+    correctly, never assembles a shell string, streams stderr lines to ``on_progress`` as they
+    arrive, enforces the timeout, and on timeout or cancellation terminates the entire process
+    tree with :mod:`psutil` (these agents spawn children, so killing only the direct child would
+    orphan them).
+    """
+
+    async def run(
+        self,
+        spec: InvocationSpec,
+        timeout_s: float,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> ProcessResult:
+        launch = prepare_argv(spec.argv)
+        start = time.monotonic()
+        process = await asyncio.create_subprocess_exec(
+            *launch,
+            stdin=asyncio.subprocess.PIPE if spec.stdin is not None else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=spec.cwd,
+            env=merged_env(spec.env),
+        )
+        stdin_bytes = spec.stdin.encode("utf-8") if spec.stdin is not None else None
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                self._communicate(process, stdin_bytes, on_progress),
+                timeout=timeout_s,
+            )
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            await asyncio.to_thread(_kill_process_tree, process.pid)
+            duration = time.monotonic() - start
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return ProcessResult(
+                exit_code=None,
+                stdout="",
+                stderr=f"timed out after {timeout_s:.0f}s",
+                duration_s=duration,
+                timed_out=True,
+            )
+        return ProcessResult(
+            exit_code=process.returncode,
+            stdout=stdout_b.decode("utf-8", errors="replace"),
+            stderr=stderr_b.decode("utf-8", errors="replace"),
+            duration_s=time.monotonic() - start,
+        )
+
+    @staticmethod
+    async def _communicate(
+        process: asyncio.subprocess.Process,
+        stdin_bytes: bytes | None,
+        on_progress: Callable[[str], None] | None,
+    ) -> tuple[bytes, bytes]:
+        """Feed stdin, drain stdout, and tee stderr lines to ``on_progress``."""
+        assert process.stdout is not None
+        assert process.stderr is not None
+
+        async def drain_stdout() -> bytes:
+            return await process.stdout.read()  # type: ignore[union-attr]
+
+        async def drain_stderr() -> bytes:
+            chunks: list[bytes] = []
+            while True:
+                line = await process.stderr.readline()  # type: ignore[union-attr]
+                if not line:
+                    break
+                chunks.append(line)
+                if on_progress is not None:
+                    on_progress(line.decode("utf-8", errors="replace").rstrip("\n"))
+            return b"".join(chunks)
+
+        if stdin_bytes is not None and process.stdin is not None:
+            process.stdin.write(stdin_bytes)
+            await process.stdin.drain()
+            process.stdin.close()
+
+        stdout_b, stderr_b = await asyncio.gather(drain_stdout(), drain_stderr())
+        await process.wait()
+        return stdout_b, stderr_b
+
+
+def _kill_process_tree(pid: int, timeout_s: float = 3.0) -> None:
+    """Terminate ``pid`` and all descendants. Best-effort; never raises.
+
+    Uses ``terminate()`` then ``kill()`` (not raw signals) so it works identically on POSIX and
+    Windows. The official psutil recipe.
+    """
+    import contextlib
+
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - psutil is a hard dependency
+        return
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+    procs = parent.children(recursive=True)
+    procs.append(parent)
+    for proc in procs:
+        with contextlib.suppress(psutil.NoSuchProcess):
+            proc.terminate()
+    _, alive = psutil.wait_procs(procs, timeout=timeout_s)
+    for proc in alive:
+        with contextlib.suppress(psutil.NoSuchProcess):
+            proc.kill()
