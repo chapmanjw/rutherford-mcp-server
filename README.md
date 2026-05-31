@@ -77,7 +77,7 @@ rather than a local install.
 | --- | --- | --- | --- | --- |
 | Claude Code | `claude_code` | `claude -p "<prompt>" --output-format json` | subscription/OAuth login or `ANTHROPIC_API_KEY` | 2026-05-30 |
 | Codex | `codex` | `codex exec --json --skip-git-repo-check` (prompt on stdin) | ChatGPT login or `OPENAI_API_KEY` | 2026-05-30 |
-| Antigravity | `antigravity` | `agy -p "<prompt>"` (answer read from the transcript file) | Google account login (token at `~/.gemini/oauth_creds.json`) | 2026-05-30 |
+| Antigravity | `antigravity` | `agy -p "<prompt>"` (answer read from the transcript file) | Google account login (no `whoami`; `doctor` verifies it with a live check) | 2026-05-30 |
 | Kiro | `kiro` | `kiro-cli chat --no-interactive "<prompt>"` | `KIRO_API_KEY` (Pro/Pro+/Power) or `kiro-cli login` | 2026-05-30 |
 | OpenCode | `opencode` | `opencode run --format json -q "<prompt>"` | provider key or `opencode auth login` | 2026-05-30 (docs) |
 | Goose | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key | 2026-05-30 (docs) |
@@ -227,12 +227,17 @@ or files for the agents to read:
 
 ### Inspect the crew
 
-`capabilities` (no arguments) lists every CLI -- installed, auth state, and available models.
-`doctor` (no arguments) adds diagnostics for anything unavailable; pass `{ "live": true }` to
-actively verify a credential-store CLI such as Antigravity with a minimal real round trip.
+`capabilities` (no arguments) is the cheap snapshot -- every CLI, installed state, auth, and models,
+with no model calls. A CLI with no non-interactive auth check (Antigravity) shows auth `unknown`
+here.
+
+`doctor` (no arguments) is the thorough health check: it confirms each CLI is installed and, by
+default, verifies any adapter that is still `unknown` with a minimal real round trip -- so
+Antigravity comes back `authenticated` rather than `unknown`. Pass `{ "live": false }` for a
+metadata-only run with no model calls.
 
 ```json
-{ "live": true }
+{ "live": false }
 ```
 
 ### Background jobs

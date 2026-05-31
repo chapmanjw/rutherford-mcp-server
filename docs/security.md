@@ -200,11 +200,12 @@ then run a non-interactive status command if one exists. If neither is available
 `unknown` rather than hang. The `doctor` tool surfaces these states to the operator; it does not
 attempt a login on an unauthenticated target.
 
-Antigravity is the special case: `agy` authenticates with a Google OAuth flow and exposes no
-`whoami`, but it persists the token on disk at `~/.gemini/oauth_creds.json`. Its `check_auth`
-detects that credential file (checking only for the presence of a `refresh_token`/`access_token`
-key -- never reading the token value) and reports `authenticated` or `needs_login` accordingly.
-`doctor live=true` can additionally confirm a still-unknown adapter with a real round trip.
+Antigravity is the special case: `agy` authenticates with a Google OAuth flow, exposes no
+`whoami`, and stores its token in a location that varies by platform and install (keyring vs an
+on-disk file, and a different path under WSL), so no cheap probe is trustworthy. Its `check_auth`
+returns `AuthState.UNKNOWN`. The `doctor` tool resolves that by default (`live=true`) with a
+minimal read-only round trip -- the only reliable signal absent a status command -- reclassifying
+it to `authenticated` or `needs_login`.
 
 ---
 

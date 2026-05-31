@@ -26,14 +26,15 @@ async def capabilities_tool(app: AppContext) -> str:
     return tool_success(list(statuses))
 
 
-async def doctor_tool(app: AppContext, *, live: bool = False) -> str:
-    """Health-probe every adapter and report diagnostic notes for unavailable targets.
+async def doctor_tool(app: AppContext, *, live: bool = True) -> str:
+    """Health-probe every adapter, verifying auth that cannot be checked cheaply.
 
-    With ``live=True``, any installed adapter whose auth state is ``unknown`` (an adapter that
-    cannot be probed non-interactively, such as Antigravity, which stores its credential in the OS
-    keyring) is verified with a minimal read-only round trip and reclassified by the outcome. This
-    spends a real (cheap) model call per such adapter, so it is off by default to keep ``doctor``
-    fast and free.
+    `doctor` confirms each CLI is installed and reads its auth state. Some CLIs (Antigravity) have
+    no non-interactive auth check, so their cheap state is ``unknown``. With ``live=True`` (the
+    default), any installed adapter that is still ``unknown`` is verified with a minimal read-only
+    round trip and reclassified by the outcome -- the only trustworthy signal when there is no
+    ``whoami``. That spends a small model call for each such adapter; pass ``live=False`` for a
+    metadata-only check with no model calls (``capabilities`` is the always-cheap snapshot).
     """
     adapters = app.registry.all()
     statuses = await asyncio.gather(

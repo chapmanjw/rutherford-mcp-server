@@ -106,22 +106,7 @@ def test_no_models() -> None:
     assert AntigravityAdapter().available_models() == []
 
 
-def test_check_auth_authenticated_when_creds_present(tmp_path: Path) -> None:
-    # agy stores its token at ~/.gemini/oauth_creds.json -- the parent of the agy data root.
-    (tmp_path / "oauth_creds.json").write_text(
-        json.dumps({"access_token": "x", "refresh_token": "y", "expiry_date": 0}),
-        encoding="utf-8",
-    )
-    adapter = AntigravityAdapter(data_root=tmp_path / "antigravity-cli")
-    assert adapter.check_auth().state is AuthState.AUTHENTICATED
-
-
-def test_check_auth_needs_login_when_creds_absent(tmp_path: Path) -> None:
-    adapter = AntigravityAdapter(data_root=tmp_path / "antigravity-cli")
-    assert adapter.check_auth().state is AuthState.NEEDS_LOGIN
-
-
-def test_check_auth_needs_login_on_empty_creds(tmp_path: Path) -> None:
-    (tmp_path / "oauth_creds.json").write_text("{}", encoding="utf-8")
-    adapter = AntigravityAdapter(data_root=tmp_path / "antigravity-cli")
-    assert adapter.check_auth().state is AuthState.NEEDS_LOGIN
+def test_check_auth_is_unknown() -> None:
+    # agy has no non-interactive whoami and no reliable cross-platform on-disk marker, so a cheap
+    # probe cannot determine auth state. doctor resolves this with a live round trip.
+    assert AntigravityAdapter().check_auth().state is AuthState.UNKNOWN

@@ -32,13 +32,13 @@ The auth mechanism differs per CLI:
 | `opencode` | Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, or run `opencode auth login` |
 | `goose` | Set `GOOSE_PROVIDER` plus a provider key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.), or run `goose configure` |
 | `kiro` | Set `KIRO_API_KEY`, or run `kiro-cli login` |
-| `antigravity` | Run `agy` once interactively to complete the Google OAuth flow; the token is persisted at `~/.gemini/oauth_creds.json` |
+| `antigravity` | Run `agy` once interactively to complete the Google OAuth flow |
 
-`agy` exposes no `whoami`, but it persists its Google OAuth token on disk at
-`~/.gemini/oauth_creds.json` (shared by the Gemini CLI family), so plain `doctor` detects auth from
-that file without a model call. The file proves a credential exists, not that the token is still
-valid; for a definitive check, call `doctor` with `live=true` to verify any still-unknown adapter
-with a minimal real round trip. That spends a small model call, so it is off by default.
+`agy` exposes no `whoami`, and where it stores its token varies by platform and install, so a cheap
+probe cannot determine its auth state -- `capabilities` reports it as `unknown`. `doctor` resolves
+that by default (`live=true`): for any installed adapter still `unknown`, it runs a minimal
+read-only round trip and reports `authenticated` or `needs_login` from the outcome. That spends a
+small model call; pass `live=false` for a metadata-only `doctor` with no model calls.
 
 Put API keys in a `.env` file (confirmed gitignored -- see `SECURITY.md`) and load them into the server process environment. Rutherford inherits the parent process environment unchanged.
 

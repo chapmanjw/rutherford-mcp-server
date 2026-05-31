@@ -29,25 +29,33 @@ async def test_doctor_diagnoses_uninstalled_adapter() -> None:
     assert "max_depth" in out
 
 
-async def test_doctor_live_verifies_unknown_auth() -> None:
+async def test_doctor_verifies_unknown_auth_by_default() -> None:
     app = make_app(
         adapters=[FakeAdapter("a", auth_state=AuthState.UNKNOWN)],
         runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
     )
-    # Default doctor leaves an unprobeable adapter as unknown.
-    assert "unknown" in await doctor_tool(app)
-    # live=True reclassifies it via a real round trip.
-    out = await doctor_tool(app, live=True)
+    # Default doctor verifies an unprobeable adapter with a real round trip and reclassifies it.
+    out = await doctor_tool(app)
     assert "authenticated" in out
     assert "verified by a live round trip" in out
 
 
-async def test_doctor_live_marks_failed_unknown_as_needs_login() -> None:
+async def test_doctor_live_false_skips_verification() -> None:
+    app = make_app(
+        adapters=[FakeAdapter("a", auth_state=AuthState.UNKNOWN)],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+    )
+    # live=False is the metadata-only path: no model call, so the state stays unknown.
+    out = await doctor_tool(app, live=False)
+    assert "unknown" in out
+
+
+async def test_doctor_marks_failed_unknown_as_needs_login() -> None:
     app = make_app(
         adapters=[FakeAdapter("a", auth_state=AuthState.UNKNOWN)],
         runner=FakeProcessRunner(ProcessResult(exit_code=1, stderr="no credentials")),
     )
-    out = await doctor_tool(app, live=True)
+    out = await doctor_tool(app)
     assert "needs_login" in out
 
 

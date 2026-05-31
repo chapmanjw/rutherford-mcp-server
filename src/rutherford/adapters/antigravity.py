@@ -13,10 +13,10 @@ Two quirks are handled entirely inside this adapter so nothing leaks upward:
   The final answer is the last line with ``source=MODEL``, ``status=DONE``,
   ``type=PLANNER_RESPONSE``, and non-empty content.
 
-Auth is a Google account flow whose token agy persists on disk at ``~/.gemini/oauth_creds.json``
-(shared by the Gemini CLI family). ``check_auth`` detects that credential file cheaply and
-non-interactively -- without reading the token value -- so it reports a real ``authenticated`` /
-``needs_login`` state rather than ``unknown``.
+Auth is a Google account flow with no non-interactive ``whoami`` and no reliable, cross-platform
+on-disk marker (the token location varies by OS and install -- native vs WSL, keyring vs file). A
+cheap probe therefore cannot determine auth state, so ``check_auth`` returns ``unknown``; the
+``doctor`` tool resolves that with a live round trip (the only trustworthy signal).
 
 Flags and transcript layout verified 2026-05-30 (agy 1.0.2). The transcript schema is community
 reverse-engineered; pin the agy version and treat a schema change as a parse failure.
@@ -57,21 +57,13 @@ class AntigravityAdapter(BaseCLIAdapter):
         self._data_root = data_root if data_root is not None else Path.home() / ".gemini" / "antigravity-cli"
 
     def check_auth(self) -> AuthStatus:
-        # agy signs in through a Google OAuth flow and persists the token on disk at
-        # ~/.gemini/oauth_creds.json (shared by the Gemini CLI family), alongside the credential
-        # store. Detecting that file -- which carries a refresh_token, so it survives access-token
-        # expiry -- is a cheap, non-interactive auth signal. The token value is never read or
-        # logged; only the presence of a credential is checked.
-        if _has_oauth_token(self._oauth_creds_path()):
-            return AuthStatus(state=AuthState.AUTHENTICATED, detail="Google OAuth credentials present in ~/.gemini")
+        # agy has no non-interactive whoami, and where it stores its token varies by platform and
+        # install (keyring vs an on-disk file whose path differs native vs WSL), so no cheap probe
+        # is trustworthy. Report unknown; doctor resolves it with a live round trip.
         return AuthStatus(
-            state=AuthState.NEEDS_LOGIN,
-            detail="no Google OAuth credentials in ~/.gemini; run `agy` once to sign in",
+            state=AuthState.UNKNOWN,
+            detail="agy has no non-interactive auth check; doctor verifies it with a live round trip",
         )
-
-    def _oauth_creds_path(self) -> Path:
-        """Return the path to the shared Gemini OAuth credentials (parent of the agy data root)."""
-        return self._data_root.parent / "oauth_creds.json"
 
     def available_models(self) -> list[str]:
         # The print-mode model is fixed; do not pretend a selector exists.
@@ -204,18 +196,3 @@ class AntigravityAdapter(BaseCLIAdapter):
             ):
                 final = event["content"]
         return final
-
-
-def _has_oauth_token(path: Path) -> bool:
-    """Return whether ``path`` holds a usable Google OAuth credential.
-
-    Checks only for the presence of a ``refresh_token`` or ``access_token`` key; the token value
-    is never read out, logged, or returned.
-    """
-    if not path.is_file():
-        return False
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return isinstance(data, dict) and bool(data.get("refresh_token") or data.get("access_token"))
