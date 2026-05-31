@@ -94,187 +94,117 @@ A seventh, well-behaved CLI can be added without code -- see [docs/adding-a-cli.
 
 ## Using Rutherford
 
-Rutherford's tools are called by your MCP client. From an agent you phrase a request in plain
-language ("ask Codex and Claude the same question and compare them") and the agent fills in the
-arguments; the examples below show those arguments as JSON, plus the TOON envelope Rutherford
-returns. Every delegating tool defaults to `read_only` and to each adapter's default model.
+You drive Rutherford from your MCP client in plain language. You describe what you want, and your
+agent translates it into Rutherford's tools (`delegate`, `consensus`, `review`, `plan`,
+`capabilities`, `doctor`, `job_status`, `job_result`, `list_roles`) -- you rarely name the tools or
+their arguments yourself. You name a CLI (`claude_code`, `codex`, `cursor`, `qwen`, `kiro`,
+`opencode`, `goose`, `antigravity`), optionally a model, and what you want done. Everything defaults
+to read-only.
 
-### Delegate one task to one CLI
+The examples below are prompts you can paste, grouped by what you are trying to do. Each is followed
+by a note on what Rutherford does under the hood.
 
-`delegate` is the foundational primitive: one `(cli, model)`, one prompt, one normalized result.
+### See which agents are available
 
-```json
-{ "cli": "claude_code", "prompt": "In one sentence, what is the capital of France?" }
-```
+> Which coding CLIs can Rutherford reach right now, and which ones am I signed in to?
 
-Returns the normalized envelope (TOON):
+> Run Rutherford's doctor and tell me if anything's misconfigured before I start delegating.
 
-```
-target:
-  cli: claude_code
-ok: true
-exit_code: 0
-text: The capital of France is Paris.
-duration_s: 6.1
-session_id: 5f3b9c1a-2e7d-4a8b-9c6e-1d2f3a4b5c6d
-```
+The first runs `capabilities` (an instant, free snapshot of installed state, auth, and models). The
+second runs `doctor`, which also live-checks any CLI that has no status command -- like Antigravity,
+whose auth only shows up once a real round trip confirms it.
 
-Pick a specific model (see `capabilities` for each CLI's list):
+### Hand one task to a specific agent
 
-```json
-{ "cli": "kiro", "model": "claude-haiku-4.5", "prompt": "Explain this regex: ^\\d{3}-\\d{4}$" }
-```
+> Use Rutherford to have Codex read `src/auth/session.py` and explain how token refresh works.
+> Read-only -- don't change anything.
 
-Give it a workspace and files, and steer it with a role:
+> Ask Kiro with the cheap `claude-haiku-4.5` model to summarize what changed in this 1,500-line log
+> and list the three most likely root causes.
 
-```json
-{ "cli": "claude_code", "role": "security", "working_dir": "/abs/path/to/repo",
-  "files": ["src/auth.py"], "prompt": "Audit this file for auth and injection issues." }
-```
+A single `delegate` to one CLI (and model), read-only. You get back one normalized result -- the
+answer text, timing, token cost, and a session id you can resume.
 
-Continue a prior conversation by passing back the `session_id` from an earlier result (on CLIs
-that support resume):
+### Get a second and third opinion
 
-```json
-{ "cli": "claude_code", "session_id": "5f3b9c1a-2e7d-4a8b-9c6e-1d2f3a4b5c6d",
-  "prompt": "Now add error handling to that function." }
-```
+> I think the deadlock is in `queue.py`. Ask Claude Code, Codex, and Qwen the same question --
+> "where is the deadlock and how would you fix it?" -- and show me their answers side by side.
 
-Let it modify the workspace -- `write`/`yolo` require both the explicit mode and a trusted
-workspace (an allowlisted path or this per-call confirmation):
+A `consensus` across three targets, one independent voice each. A CLI that errors or isn't installed
+comes back as a single failed voice without sinking the rest of the panel.
 
-```json
-{ "cli": "codex", "working_dir": "/abs/path/to/repo", "safety_mode": "write",
-  "trust_workspace": true, "prompt": "Add a docstring to every public function in utils.py." }
-```
+### Run a structured debate with assigned stances
 
-Run a long task in the background -- `mode: "async"` returns a job id immediately:
+> Use Rutherford to debate this claim: "We should replace our internal REST APIs with gRPC." Have
+> Cursor (model `auto`) argue for it and Claude Code argue against, then give me the strongest point
+> on each side.
 
-```json
-{ "cli": "opencode", "mode": "async", "working_dir": "/abs/path/to/repo",
-  "prompt": "Refactor the data layer to use the repository pattern." }
-```
+A `consensus` with per-target stances (for / against / neutral), so each agent argues its assigned
+position instead of all converging on the same answer.
 
-```
-job_id: 95eab04a69254959956e26fc6a1b154c
-status: pending
-kind: delegate
-```
+### Build one combined recommendation
 
-### Build consensus across several CLIs
+> Ask claude_code, codex, and opencode (`openai/gpt-5.4`) for the best caching strategy for an
+> append-heavy event log, then have Rutherford merge their answers into a single recommendation that
+> flags where they disagree.
 
-`consensus` asks the same prompt of every target in parallel and returns one voice per target. One
-failing voice never aborts the panel.
+A `consensus` with server-side synthesis enabled: you get every voice plus one merged answer.
+(Synthesis is off by default -- usually you let your own agent compare the voices.)
 
-```json
-{ "targets": [ { "cli": "claude_code" }, { "cli": "codex" },
-               { "cli": "opencode", "model": "anthropic/claude-sonnet-4-6" } ],
-  "prompt": "Is a message queue overkill for a single-server app? Answer in one paragraph." }
-```
+### Review code across several reviewers
 
-```
-voices[3]:
-  - target:
-      cli: claude_code
-    ok: true
-    text: For a single server, a queue is usually overkill ...
-  - target:
-      cli: codex
-    ok: true
-    text: It depends on durability needs; an in-process ...
-  - target:
-      cli: opencode
-      model: anthropic/claude-sonnet-4-6
-    ok: true
-    text: A queue adds operational overhead ...
-```
+> Review my staged diff with Rutherford using Claude Code and Codex as reviewers. Findings by file
+> and line, must-fix separated from nits, and call out anything only one of them flagged.
 
-Steer each voice with a stance (the list is parallel to `targets`):
+> Have Codex and Qwen review everything under `src/payments/` for security and injection bugs.
 
-```json
-{ "targets": [ { "cli": "claude_code" }, { "cli": "codex" } ],
-  "prompt": "Should we migrate this service to async I/O?", "stances": ["for", "against"] }
-```
+`review` -- read-only, using the `codereviewer` role -- over a diff or a set of paths, across one or
+more targets.
 
-Ask Rutherford to synthesize the voices server-side (off by default, so you usually synthesize them
-in your own agent):
+### Get an implementation plan
 
-```json
-{ "targets": [ { "cli": "claude_code" }, { "cli": "kiro" } ],
-  "prompt": "Best database for an append-heavy event log?", "synthesize": true }
-```
+> Use Rutherford's planner on Claude Code to turn "add OAuth2 device-code login to the CLI" into an
+> ordered, step-by-step plan, with the files each step touches and the risky parts flagged.
 
-The result adds a `synthesis` field alongside `voices`.
+`plan` -- one target, the `planner` role, read-only. The bundled roles are `planner`, `codereviewer`,
+`security`, and `debugger`; ask "what roles does Rutherford have?" to list them, and you can add your
+own (see [docs/configuration.md](docs/configuration.md)).
 
-### Review code
+### Let an agent actually make the change
 
-`review` is read-only and uses the `codereviewer` role. Give it a diff:
+> Let Codex apply the fix in `C:\work\myrepo` -- write mode, you have my permission to edit files in
+> that folder. Add the missing null check and a test that covers it.
 
-```json
-{ "targets": [ { "cli": "claude_code" }, { "cli": "codex" } ],
-  "diff": "--- a/parser.py\n+++ b/parser.py\n@@\n-    return data\n+    return data or {}\n" }
-```
+A `delegate` in `write` mode. Write and yolo are never the default: they require both an explicit
+mode and a trusted workspace (an allowlisted path or your per-call go-ahead), so an agent can't
+modify a directory by accident. See the safety model below.
 
-or files for the agents to read:
+### Kick off a long job and keep working
 
-```json
-{ "targets": [ { "cli": "claude_code" } ], "working_dir": "/abs/path/to/repo",
-  "paths": ["src/server.py", "src/runtime/process.py"] }
-```
+> Start a big refactor on OpenCode in the background -- "convert the data layer to the repository
+> pattern" in `C:\work\myrepo` -- and just give me the job id so I can keep working.
 
-### Plan
+> Is that Rutherford job done yet? Show me the result if it finished.
 
-`plan` asks one target for an ordered implementation plan, using the `planner` role:
+The first runs `delegate` in async mode and returns a job id immediately; the second polls
+`job_status` / `job_result`.
 
-```json
-{ "cli": "claude_code", "working_dir": "/abs/path/to/repo",
-  "goal": "Add OAuth2 device-code login to the CLI." }
-```
+### Continue where an agent left off
 
-### Inspect the crew
+> Pick the review session Claude Code just ran back up, and tell it to also check the error handling
+> now.
 
-`capabilities` (no arguments) is the cheap snapshot -- every CLI, installed state, auth, and models,
-with no model calls. A CLI with no non-interactive auth check (Antigravity) shows auth `unknown`
-here.
+A `delegate` that passes the `session_id` from the earlier result back in, resuming that CLI's own
+conversation (on the CLIs that support resume).
 
-`doctor` (no arguments) is the thorough health check: it confirms each CLI is installed and, by
-default, verifies any adapter that is still `unknown` with a minimal real round trip -- so
-Antigravity comes back `authenticated` rather than `unknown`. Pass `{ "live": false }` for a
-metadata-only run with no model calls.
+### Get a fresh, unbiased take (self-invocation)
 
-```json
-{ "live": false }
-```
+> Spin up a separate Claude Code instance through Rutherford -- one with no memory of this
+> conversation -- to critique the design we just wrote, so I get an outside opinion.
 
-### Background jobs
-
-After an async call returns a `job_id`, poll it:
-
-```json
-{ "job_id": "95eab04a69254959956e26fc6a1b154c" }
-```
-
-`job_status` returns the status and any progress; `job_result` returns the finished
-`DelegationResult` / `ConsensusResult` (or a still-running notice).
-
-### Roles
-
-`list_roles` (no arguments) returns the bundled personas -- `planner`, `codereviewer`, `security`,
-`debugger`. Pass `"role": "<name>"` to `delegate`, `consensus`, or `review` to prepend that persona,
-or add your own markdown files via the `role_dirs` config (see
-[docs/configuration.md](docs/configuration.md)).
-
-### Self-invocation
-
-Any CLI can target its own adapter. From Claude Code, delegating to `claude_code` spawns a fresh,
-isolated `claude -p` subprocess distinct from your session:
-
-```json
-{ "cli": "claude_code", "prompt": "You are a separate reviewer. Critique this approach: ..." }
-```
-
-The depth guard (`max_depth`, default 3) and the per-call target cap keep any self-referential chain
-bounded.
+Rutherford can target the very CLI you're talking to: it spawns a fresh, isolated subprocess that is
+distinct from your session and can't reach back into it. A depth guard (`max_depth`, default 3) and a
+per-call target cap keep a CLI-calls-itself chain bounded.
 
 ## Install
 
