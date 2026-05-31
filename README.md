@@ -6,9 +6,9 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that lets one AI coding
 CLI delegate work to, and build consensus across, a crew of others. Rutherford runs other agentic
-coding CLIs (Claude Code, Codex, Antigravity, Kiro, OpenCode, Goose) as headless subprocesses and
-returns each one's answer in a single normalized envelope. It is CLI-only: it orchestrates terminal
-coding agents and never calls a model provider API directly.
+coding CLIs (Claude Code, Codex, Cursor, Qwen Code, Antigravity, Kiro, OpenCode, Goose) as headless
+subprocesses and returns each one's answer in a single normalized envelope. It is CLI-only: it
+orchestrates terminal coding agents and never calls a model provider API directly.
 
 ```
 .---------.
@@ -60,6 +60,8 @@ MCP, and it spawns the target CLIs as fresh, isolated headless subprocesses.
         +--> kiro-cli chat --no-interactive "..."
         +--> opencode run --format json "..."
         +--> goose run -t "..." --no-session
+        +--> cursor-agent -p --output-format json   (prompt on stdin)
+        +--> qwen -o json                           (prompt on stdin)
 ```
 
 A self-invocation is supported and explicit: when the calling CLI targets its own adapter (Claude
@@ -81,8 +83,12 @@ rather than a local install.
 | Kiro | `kiro` | `kiro-cli chat --no-interactive "<prompt>"` | `KIRO_API_KEY` (Pro/Pro+/Power) or `kiro-cli login` | 2026-05-30 |
 | OpenCode | `opencode` | `opencode run --format json -q "<prompt>"` | provider key or `opencode auth login` | 2026-05-30 (docs) |
 | Goose | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key | 2026-05-30 (docs) |
+| Cursor | `cursor` | `cursor-agent -p --output-format json --trust` (prompt on stdin) | `cursor-agent login` or `CURSOR_API_KEY` | 2026-05-30 |
+| Qwen Code | `qwen` | `qwen -o json` (prompt on stdin) | `qwen` OAuth login or `OPENAI_API_KEY` | 2026-05-30 |
 
-Antigravity's print-mode model is fixed (no model selector). Codex on Windows installs as an npm
+Antigravity's print-mode model is fixed (no model selector). Cursor on a free plan can only use the
+`auto` model; named models need a paid plan. Both Cursor and Qwen install as Windows shims, which
+Rutherford launches via `cmd.exe` while feeding the prompt on stdin. Codex on Windows installs as an npm
 shim, which Rutherford launches via `cmd.exe` automatically while still passing arguments as a list.
 A seventh, well-behaved CLI can be added without code -- see [docs/adding-a-cli.md](docs/adding-a-cli.md).
 

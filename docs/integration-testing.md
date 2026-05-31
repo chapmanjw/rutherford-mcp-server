@@ -18,6 +18,8 @@ not installed, or not authenticated is skipped with a clear reason rather than f
 | Kiro | `RUTHERFORD_IT_KIRO` |
 | OpenCode | `RUTHERFORD_IT_OPENCODE` |
 | Goose | `RUTHERFORD_IT_GOOSE` |
+| Cursor | `RUTHERFORD_IT_CURSOR` |
+| Qwen Code | `RUTHERFORD_IT_QWEN` |
 
 A contributor with only Codex and Claude Code installed sets `RUTHERFORD_IT_CLAUDE=1` and
 `RUTHERFORD_IT_CODEX=1`; the rest skip.
@@ -74,6 +76,23 @@ set the API key) yourself, so the headless runner can reuse the session.
   `ANTHROPIC_API_KEY`), or run `goose configure`. In headless/CI environments without a keyring set
   `GOOSE_DISABLE_KEYRING=true`. Check configured state with `goose info -v`.
 - Smoke: `goose run -t "say ok" --no-session`
+
+### Cursor (`cursor-agent`)
+
+- Install: per [Cursor's CLI docs](https://docs.cursor.com/en/cli/overview). Native on Windows,
+  macOS, Linux/WSL (installs as a `cursor-agent` shim).
+- Authenticate: run `cursor-agent login`, or set `CURSOR_API_KEY`. Check with `cursor-agent status`.
+  On a free plan only the `auto` model is usable; named models need a paid plan.
+- Smoke: `cursor-agent -p --output-format json --trust --model auto "say ok"`
+
+### Qwen Code (`qwen`)
+
+- Install: per [Qwen Code's docs](https://github.com/QwenLM/qwen-code) (`npm i -g @qwen-code/qwen-code`).
+  Native on Windows, macOS, Linux/WSL.
+- Authenticate: run `qwen` once for the Qwen OAuth flow, or use an OpenAI-compatible key
+  (`OPENAI_API_KEY` with `--auth-type openai`, or `DASHSCOPE_API_KEY`). Qwen OAuth has no
+  non-interactive check, so `capabilities` shows `unknown` and `doctor` verifies it live.
+- Smoke: `qwen -o json "say ok"`
 
 ## What the suite covers
 

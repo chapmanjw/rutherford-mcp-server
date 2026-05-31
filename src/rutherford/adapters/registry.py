@@ -32,6 +32,8 @@ BUILTIN_ADAPTERS: tuple[tuple[str, str, str], ...] = (
     ("opencode", "rutherford.adapters.opencode", "OpenCodeAdapter"),
     ("goose", "rutherford.adapters.goose", "GooseAdapter"),
     ("kiro", "rutherford.adapters.kiro", "KiroAdapter"),
+    ("cursor", "rutherford.adapters.cursor", "CursorAdapter"),
+    ("qwen", "rutherford.adapters.qwen", "QwenAdapter"),
     ("antigravity", "rutherford.adapters.antigravity", "AntigravityAdapter"),
 )
 

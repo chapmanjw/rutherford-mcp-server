@@ -102,5 +102,14 @@ def test_parse_output_timeout_is_timeout_error(adapter: CLIAdapter) -> None:
     assert result.error.code == "TIMEOUT"
 
 
-def test_registry_has_all_six_builtins() -> None:
-    assert _IDS == ["antigravity", "claude_code", "codex", "goose", "kiro", "opencode"]
+def test_registry_has_all_builtins() -> None:
+    assert _IDS == [
+        "antigravity",
+        "claude_code",
+        "codex",
+        "cursor",
+        "goose",
+        "kiro",
+        "opencode",
+        "qwen",
+    ]

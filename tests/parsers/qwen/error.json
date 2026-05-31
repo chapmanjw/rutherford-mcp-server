@@ -1,0 +1,1 @@
+[{"type":"system","subtype":"init","session_id":"abc"},{"type":"result","subtype":"error","session_id":"abc","is_error":true,"result":"model request failed"}]

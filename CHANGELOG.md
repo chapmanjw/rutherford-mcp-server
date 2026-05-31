@@ -15,8 +15,9 @@ Initial release.
 - Interface-driven orchestration core. The services depend only on the abstract
   `CLIAdapter` and `ProcessRunner` interfaces; every CLI-specific detail lives behind an
   adapter, so adding or removing a CLI is additive.
-- Six CLI adapters: `claude_code`, `codex`, `antigravity`, `kiro`, `opencode`, `goose`,
-  plus a config-driven generic adapter so a well-behaved seventh CLI is a config entry.
+- Eight CLI adapters: `claude_code`, `codex`, `cursor`, `qwen`, `antigravity`, `kiro`,
+  `opencode`, `goose`, plus a config-driven generic adapter so a well-behaved further CLI is a
+  config entry.
 - The MCP tool surface: `delegate`, `consensus`, `review`, `plan`, `capabilities`,
   `doctor`, `job_status`, `job_result`, and `list_roles`, exposed over stdio via FastMCP.
 - A universal `SafetyMode` (`read_only` | `propose` | `write` | `yolo`), defaulting to

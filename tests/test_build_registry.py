@@ -10,7 +10,7 @@ from rutherford.adapters.registry import build_registry
 from rutherford.config.schema import AdapterConfig, GenericAdapterConfig, RutherfordConfig
 from rutherford.domain.errors import RegistryError
 
-ALL_BUILTINS = ["antigravity", "claude_code", "codex", "goose", "kiro", "opencode"]
+ALL_BUILTINS = ["antigravity", "claude_code", "codex", "cursor", "goose", "kiro", "opencode", "qwen"]
 
 
 def test_loads_all_builtins() -> None:

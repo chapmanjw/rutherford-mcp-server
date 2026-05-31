@@ -110,3 +110,5 @@ Run `just check` (lint, format, license header, mypy strict, unit tests with the
 | Kiro | `kiro` | `kiro-cli chat --no-interactive "<prompt>"` | `KIRO_API_KEY` or `kiro-cli login` | 2026-05-30 |
 | OpenCode | `opencode` | `opencode run --format json -q "<prompt>"` | provider key or `opencode auth login` | 2026-05-30 (docs) |
 | Goose | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key | 2026-05-30 (docs) |
+| Cursor | `cursor` | `cursor-agent -p --output-format json --trust` (prompt on stdin) | `cursor-agent login` or `CURSOR_API_KEY` | 2026-05-30 |
+| Qwen Code | `qwen` | `qwen -o json` (prompt on stdin) | `qwen` OAuth or `OPENAI_API_KEY` | 2026-05-30 |

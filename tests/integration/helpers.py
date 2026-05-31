@@ -20,6 +20,8 @@ CLI_ENV: dict[str, str] = {
     "kiro": "RUTHERFORD_IT_KIRO",
     "opencode": "RUTHERFORD_IT_OPENCODE",
     "goose": "RUTHERFORD_IT_GOOSE",
+    "cursor": "RUTHERFORD_IT_CURSOR",
+    "qwen": "RUTHERFORD_IT_QWEN",
 }
 
 _TRUTHY = {"1", "true", "yes", "on"}
