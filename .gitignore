@@ -24,6 +24,9 @@ htmlcov/
 # Local research receipts (kept out of commits)
 .research/
 
+# Working dirs a delegated CLI drops in the repo when run here (e.g. Antigravity/agy)
+.antigravitycli/
+
 # Per-user Claude Code settings
 .claude/settings.local.json
 
