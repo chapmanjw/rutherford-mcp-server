@@ -33,7 +33,7 @@ from ..domain.models import (
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
-from .results import nonzero_result, success_result, timeout_result
+from .results import nonzero_result, strip_ansi, success_result, timeout_result
 
 
 class KiroAdapter(BaseCLIAdapter):
@@ -101,8 +101,9 @@ class KiroAdapter(BaseCLIAdapter):
     def available_models(self) -> list[str]:
         """List models via ``kiro-cli chat --list-models --format json``; fall back to the static set.
 
-        The JSON may be a list of strings or a list of objects carrying a ``name``/``id``/
-        ``modelId`` field; both shapes are handled. Any failure (non-zero exit, bad JSON, an
+        Kiro emits ``{"models": [{"model_id": ..., "model_name": ...}], "default_model": ...}``.
+        The parser unwraps that ``models`` wrapper and reads each entry's ``model_id``; it also
+        tolerates a bare list or a list of strings. Any failure (non-zero exit, bad JSON, an
         unexpected shape) yields the static model set rather than raising.
         """
         result = self._probe.run([self.binary, "chat", "--list-models", "--format", "json"], timeout_s=15.0)
@@ -118,19 +119,34 @@ class KiroAdapter(BaseCLIAdapter):
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         """Map the raw process result to the normalized envelope. Never raises.
 
-        The chat answer is plain Markdown on stdout, so success returns the trimmed stdout as the
-        final text with no session id. A timeout maps to ``TIMEOUT`` and a non-zero exit to
-        ``NONZERO_EXIT``.
+        The chat answer is Markdown on stdout with ANSI color codes and a ``> `` response marker
+        in ``--no-interactive`` mode; ANSI sequences are stripped so the text is clean. Success
+        returns the trimmed text with no session id. A timeout maps to ``TIMEOUT`` and a non-zero
+        exit to ``NONZERO_EXIT``.
         """
         if raw.timed_out:
             return timeout_result(ctx, raw)
+        text = strip_ansi(raw.stdout).strip()
         if raw.exit_code != 0:
-            return nonzero_result(ctx, raw, text=raw.stdout.strip())
-        return success_result(ctx, raw, raw.stdout.strip(), session_id=None)
+            return nonzero_result(ctx, raw, text=text)
+        return success_result(ctx, raw, text, session_id=None)
 
 
 def _model_names(payload: Any) -> list[str]:
-    """Extract model names from a ``--list-models`` payload (list of strings or of objects)."""
+    """Extract model ids from a ``--list-models`` payload.
+
+    Handles Kiro's ``{"models": [...]}`` wrapper (and similar ``data``/``items`` wrappers), a bare
+    list of objects, or a list of strings. For object entries, the first present of
+    ``model_id``/``model_name``/``id``/``name``/``modelId`` is used.
+    """
+    if isinstance(payload, dict):
+        for key in ("models", "data", "items"):
+            wrapped = payload.get(key)
+            if isinstance(wrapped, list):
+                payload = wrapped
+                break
+        else:
+            return []
     if not isinstance(payload, list):
         return []
     names: list[str] = []
@@ -140,7 +156,7 @@ def _model_names(payload: Any) -> list[str]:
                 names.append(item)
             continue
         if isinstance(item, dict):
-            for key in ("name", "id", "modelId"):
+            for key in ("model_id", "model_name", "id", "name", "modelId"):
                 value = item.get(key)
                 if isinstance(value, str) and value:
                     names.append(value)

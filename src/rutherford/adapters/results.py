@@ -10,6 +10,8 @@ identical across adapters.
 
 from __future__ import annotations
 
+import re
+
 from ..domain.error_codes import ErrorCode
 from ..domain.models import (
     Artifact,
@@ -19,6 +21,15 @@ from ..domain.models import (
     InvocationContext,
     ProcessResult,
 )
+
+# CSI (colors, cursor moves) and OSC (window-title) escape sequences emitted by CLIs that print
+# to a terminal. Stripped from text-mode answers so the normalized text is clean.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from terminal output."""
+    return _ANSI_RE.sub("", text)
 
 
 def success_result(

@@ -131,6 +131,15 @@ def test_parse_success_golden() -> None:
     assert result.session_id is None
 
 
+def test_parse_strips_ansi_color_codes() -> None:
+    # kiro --no-interactive prints the answer with ANSI color codes and a "> " marker.
+    raw = ProcessResult(exit_code=0, stdout="\x1b[38;5;141m> \x1b[0mok\n", duration_s=0.5)
+    result = KiroAdapter().parse_output(raw, _ctx())
+    assert result.ok
+    assert "\x1b[" not in result.text
+    assert result.text == "> ok"
+
+
 def test_parse_nonzero_exit() -> None:
     raw = ProcessResult(
         exit_code=1,
@@ -195,7 +204,8 @@ def test_available_models_parses_list_models_json() -> None:
         run_fn=lambda argv: ProcessResult(exit_code=0, stdout=_sample("list_models.json")),
     )
     models = KiroAdapter(probe=probe).available_models()
-    assert models == ["kiro-sonnet", "kiro-opus", "kiro-haiku"]
+    # Kiro wraps the list under "models" and identifies each by model_id.
+    assert models == ["auto", "claude-sonnet-4.5", "claude-sonnet-4", "claude-haiku-4.5", "glm-5"]
     # The list comes from the documented list-models subcommand.
     assert probe.calls[-1] == ["kiro-cli", "chat", "--list-models", "--format", "json"]
 

@@ -30,7 +30,7 @@ from ..domain.models import (
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
-from .results import nonzero_result, success_result, timeout_result
+from .results import nonzero_result, strip_ansi, success_result, timeout_result
 
 
 class GooseAdapter(BaseCLIAdapter):
@@ -127,4 +127,4 @@ class GooseAdapter(BaseCLIAdapter):
             return timeout_result(ctx, raw)
         if raw.exit_code != 0:
             return nonzero_result(ctx, raw)
-        return success_result(ctx, raw, raw.stdout.strip(), session_id=None)
+        return success_result(ctx, raw, strip_ansi(raw.stdout).strip(), session_id=None)
