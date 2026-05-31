@@ -248,7 +248,8 @@ def main() -> None:
     except ConfigError as exc:
         print(f"rutherford: configuration error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
-    mcp.run()
+    # Suppress the FastMCP startup banner so a stdio client's stderr log stays clean.
+    mcp.run(show_banner=False)
 
 
 if __name__ == "__main__":
