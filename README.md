@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/logo.png" width="200" alt="Rutherford logo">
+  <img src="https://raw.githubusercontent.com/chapmanjw/rutherford-mcp-server/main/docs/images/logo.png" width="200" alt="Rutherford logo">
 </p>
 
 # Rutherford MCP Server - Multi-Agent Consensus, Debates, Reviews, and Delegation
