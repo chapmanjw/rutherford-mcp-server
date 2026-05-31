@@ -6,6 +6,25 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-31
+
+### Fixed
+
+- The README logo image and the links to `docs/`, `CONTRIBUTING.md`, and `LICENSE` now use
+  absolute GitHub URLs, so they render and resolve on the PyPI project page. Relative paths only
+  work on the GitHub repository view.
+
+### Changed
+
+- The GitHub Release attaches only the built wheel and sdist; a `.gitignore` byproduct that
+  `uv build` writes into `dist/` is no longer uploaded as an asset.
+
+### Removed
+
+- A stray `.antigravitycli/` working directory the Antigravity CLI left in the repo during local
+  verification and that was committed by accident. It is now gitignored. Only a symlink path was
+  ever tracked -- no credential or file contents.
+
 ## [0.1.0] - 2026-05-30
 
 Initial release.
