@@ -2,18 +2,30 @@
 # Copyright (c) 2026 John Chapman
 """The Codex CLI adapter (OpenAI's ``codex``).
 
-Invocation: ``codex exec --json --skip-git-repo-check`` with the prompt read from **stdin**
-(not argv), because on Windows ``codex`` is an npm shim and passing the prompt as an argument
-invites shell-quoting trouble. ``-m`` selects a model, ``-C`` sets the working root,
-``-s`` / ``-a`` set the sandbox and approval policy, and ``codex exec resume <id>`` resumes a
-prior session. Codex has no system-prompt flag, so the role preamble is folded into the prompt.
+Fresh invocation: ``codex exec --json --skip-git-repo-check`` with the prompt read from **stdin**
+(not argv). On Windows ``codex`` is an npm ``.cmd`` shim launched through ``cmd.exe /c``, which
+truncates an argv element at the first newline -- so a multi-line prompt (role preamble + task +
+files) must ride on stdin, never as a positional. ``-m`` selects a model, ``-C`` sets the working
+root, and ``-s`` selects the sandbox policy. Codex has no system-prompt flag, so the role preamble
+is folded into the prompt.
+
+Resume invocation: ``codex exec resume [OPTIONS] -- <SESSION_ID> -`` with the prompt on stdin. The
+``resume`` subcommand has a *different, smaller* option set than ``exec``: it rejects ``-s/--sandbox``
+and ``-C/--cd`` (verified against ``codex exec resume --help``). So resume omits those, expresses the
+sandbox via the accepted ``-c sandbox_mode=<mode>`` config override instead, relies on the process
+cwd for the working directory, and passes ``SESSION_ID`` and the prompt as positionals after a ``--``
+separator. The prompt positional is ``-`` (Codex's stdin sentinel), keeping the multi-line prompt on
+stdin and away from the cmd.exe-shim newline hazard; ``--`` keeps a dash-bearing session id or prompt
+from being parsed as a flag.
 
 The ``--json`` flag emits JSONL events; the final answer is the text of the last
 ``item.completed`` agent message, the session id is the ``thread.started`` ``thread_id``, and
-token usage comes from ``turn.completed``. Auth is ``OPENAI_API_KEY`` / ``CODEX_API_KEY`` or a
-persisted ``~/.codex/auth.json`` session.
+token usage comes from ``turn.completed``. A resume whose arguments the CLI rejects surfaces as a
+distinct ``RESUME_FAILED`` (not an opaque ``NONZERO_EXIT``), so a lost resume is never silent. Auth
+is ``OPENAI_API_KEY`` / ``CODEX_API_KEY`` or a persisted ``~/.codex/auth.json`` session.
 
-Flags verified 2026-05-30 against ``codex exec --help`` (codex-cli 0.135.0).
+Flags verified 2026-05-30 against ``codex exec --help`` and ``codex exec resume --help``
+(codex-cli 0.135.0).
 """
 
 from __future__ import annotations
@@ -23,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from ..domain.enums import AuthState, OutputMode, SafetyMode
+from ..domain.error_codes import ErrorCode
 from ..domain.models import (
     AdapterCapabilities,
     AuthStatus,
@@ -89,32 +102,46 @@ class CodexAdapter(BaseCLIAdapter):
         return SafetyFlags(args=["-s", "read-only"], note="read-only sandbox")
 
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
-        """Build the ``codex exec`` invocation, with the composed prompt fed via stdin.
+        """Build the ``codex exec`` (or ``codex exec resume``) invocation.
 
         Pure: returns an argv list and an stdin string, never a shell command line. The prompt
-        carries the role preamble (Codex has no system-prompt flag) and any in-scope files.
+        carries the role preamble (Codex has no system-prompt flag) and any in-scope files, and
+        always rides on stdin. ``resume`` takes a different option set than ``exec``, so it is
+        built separately rather than threading a flag through the shared path.
         """
         prompt = self._with_files(self._compose_prompt(req.prompt, ctx.role_preamble), req.files)
-
-        argv = [self.binary, "exec"]
         if req.session_id:
-            argv += ["resume", req.session_id]
-        argv += ["--json", "--skip-git-repo-check"]
+            return self._build_resume(req, ctx, prompt, req.session_id)
+        return self._build_fresh(req, ctx, prompt)
 
+    def _build_fresh(self, req: DelegationRequest, ctx: InvocationContext, prompt: str) -> InvocationSpec:
+        """Build a fresh (non-resumed) ``codex exec`` invocation: prompt on stdin, no positional."""
+        argv = [self.binary, "exec", "--json", "--skip-git-repo-check"]
         if req.working_dir:
             argv += ["-C", req.working_dir]
         if req.target.model:
             argv += ["-m", req.target.model]
-
         safety = self.map_safety(ctx.safety_mode)
         argv += safety.args
+        return InvocationSpec(argv=argv, env=dict(safety.env), cwd=req.working_dir, stdin=prompt)
 
-        return InvocationSpec(
-            argv=argv,
-            env=dict(safety.env),
-            cwd=req.working_dir,
-            stdin=prompt,
-        )
+    def _build_resume(
+        self, req: DelegationRequest, ctx: InvocationContext, prompt: str, session_id: str
+    ) -> InvocationSpec:
+        """Build a ``codex exec resume`` invocation.
+
+        ``resume`` rejects ``-s/--sandbox`` and ``-C/--cd``; the session id and prompt are
+        positionals. So: sandbox via ``-c sandbox_mode=`` (or the bypass flag for yolo), working
+        directory via the process cwd (not ``-C``), and ``-- <session_id> -`` for the positionals
+        with the prompt on stdin (the ``-`` sentinel). The ``--`` guards a dash-bearing id/prompt.
+        """
+        safety = self.map_safety(ctx.safety_mode)
+        argv = [self.binary, "exec", "resume", "--json", "--skip-git-repo-check"]
+        if req.target.model:
+            argv += ["-m", req.target.model]
+        argv += _resume_safety_args(safety.args)
+        argv += ["--", session_id, "-"]
+        return InvocationSpec(argv=argv, env=dict(safety.env), cwd=req.working_dir, stdin=prompt)
 
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         """Parse the JSONL event stream into the normalized envelope, defensively.
@@ -157,21 +184,80 @@ class CodexAdapter(BaseCLIAdapter):
         if raw.exit_code != 0:
             if answer is not None:
                 return success_result(ctx, raw, answer, session_id=session_id, cost=cost)
+            parse_error = _argument_parse_error(raw.stderr)
+            if parse_error is not None and _is_resume_error(raw.stderr):
+                return error_result(
+                    ctx,
+                    raw,
+                    ErrorCode.RESUME_FAILED,
+                    f"`codex exec resume` rejected its arguments: {parse_error}. "
+                    "This is a Rutherford/codex CLI mismatch, not a model error -- "
+                    "retry without a session_id to start a fresh session.",
+                    text="",
+                )
             return nonzero_result(ctx, raw, text=failure or "")
 
         if failure is not None:
-            return error_result(ctx, raw, "NONZERO_EXIT", failure, text=answer or "")
+            return error_result(ctx, raw, ErrorCode.NONZERO_EXIT, failure, text=answer or "")
 
         if answer is None:
             return error_result(
                 ctx,
                 raw,
-                "PARSE_ERROR",
+                ErrorCode.PARSE_ERROR,
                 "codex --json produced no agent message",
                 text=raw.stdout.strip(),
             )
 
         return success_result(ctx, raw, answer, session_id=session_id, cost=cost)
+
+
+def _resume_safety_args(exec_safety_args: list[str]) -> list[str]:
+    """Translate the fresh-``exec`` sandbox flags into the form ``codex exec resume`` accepts.
+
+    ``resume`` rejects ``-s/--sandbox`` but accepts ``-c <key=value>`` config overrides and the
+    ``--dangerously-bypass-approvals-and-sandbox`` flag. So a ``["-s", "<mode>"]`` pair becomes
+    ``["-c", "sandbox_mode=<mode>"]`` (the unquoted value parses as the literal mode string), and
+    the yolo bypass flag passes through unchanged. Deriving from ``map_safety`` keeps the resume
+    posture in lockstep with the fresh posture -- no second source of truth to drift.
+    """
+    if "-s" in exec_safety_args:
+        index = exec_safety_args.index("-s")
+        sandbox_mode = exec_safety_args[index + 1]
+        return ["-c", f"sandbox_mode={sandbox_mode}"]
+    return list(exec_safety_args)
+
+
+def _is_resume_error(stderr: str) -> bool:
+    """Return whether a CLI error came from the ``resume`` subcommand (vs. a fresh ``exec``)."""
+    return "exec resume" in stderr.lower()
+
+
+def _argument_parse_error(stderr: str) -> str | None:
+    """Return the first line of a clap argument-parse error, or ``None`` if stderr is not one.
+
+    A malformed invocation (an option the subcommand does not accept, a bad value) makes Codex
+    exit non-zero with a clap usage error and no JSONL on stdout -- categorically different from a
+    model/runtime failure, and worth surfacing distinctly instead of as an opaque non-zero exit.
+    """
+    text = stderr.strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    looks_like_parse_error = (
+        "unexpected argument" in lowered
+        or "invalid value" in lowered
+        or "unrecognized subcommand" in lowered
+        or "required arguments were not provided" in lowered
+        or "cannot be used with" in lowered  # clap's conflicting-arguments wording
+        # Any other clap usage error: an "error:" line followed by a "Usage:" block. Deliberately
+        # not keyed on the "--help" hint -- a future CLI build could drop or reword that line, and
+        # we must not silently demote a rejected resume to an opaque NONZERO_EXIT when it does.
+        or (lowered.startswith("error:") and "usage:" in lowered)
+    )
+    if not looks_like_parse_error:
+        return None
+    return text.splitlines()[0].strip()
 
 
 def _parse_events(stdout: str) -> list[dict[str, Any]]:

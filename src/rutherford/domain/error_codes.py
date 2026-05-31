@@ -30,6 +30,9 @@ class ErrorCode(StrEnum):
     NONZERO_EXIT = "NONZERO_EXIT"
     #: The CLI's output could not be parsed into a normalized result.
     PARSE_ERROR = "PARSE_ERROR"
+    #: A session-resume invocation was rejected by the CLI's argument parser (a Rutherford/CLI
+    #: mismatch), distinct from a normal non-zero exit so a lost resume is not silently swallowed.
+    RESUME_FAILED = "RESUME_FAILED"
     #: The Antigravity transcript file could not be found or read.
     TRANSCRIPT_NOT_FOUND = "TRANSCRIPT_NOT_FOUND"
     #: A request or argument failed validation.
