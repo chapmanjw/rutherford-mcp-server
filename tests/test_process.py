@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
+
+import pytest
 
 from rutherford.domain.models import InvocationSpec
 from rutherford.runtime.process import AsyncProcessRunner
@@ -59,3 +62,31 @@ async def test_env_overlay_passed_to_child() -> None:
     code = "import os; print(os.environ.get('RUTHERFORD_DEPTH', 'unset'))"
     result = await runner.run(_spec(code, env={"RUTHERFORD_DEPTH": "2"}), timeout_s=30)
     assert result.stdout.strip() == "2"
+
+
+async def test_child_stdin_detached_when_not_supplied(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression: under a stdio MCP client the server's stdin is the client's pipe; a spawned CLI
+    # must not inherit it (it would block reading the pipe). DEVNULL detaches it.
+    captured: dict[str, object] = {}
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    await AsyncProcessRunner().run(_spec("pass"), timeout_s=30)
+    assert captured["stdin"] is asyncio.subprocess.DEVNULL
+
+
+async def test_child_stdin_is_pipe_when_supplied(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    await AsyncProcessRunner().run(_spec("import sys; sys.stdin.read()", stdin="hi"), timeout_s=30)
+    assert captured["stdin"] is asyncio.subprocess.PIPE

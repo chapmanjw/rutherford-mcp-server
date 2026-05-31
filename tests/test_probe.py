@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
+
+import pytest
 
 from rutherford.runtime.probe import SystemProbe
 
@@ -42,3 +45,18 @@ def test_probe_timeout() -> None:
 def test_probe_which_known_and_unknown() -> None:
     probe = SystemProbe()
     assert probe.which("this-binary-does-not-exist-rutherford") is None
+
+
+def test_probe_detaches_child_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression: a metadata probe must not inherit the server's stdin (the MCP pipe under a
+    # stdio client), or a CLI that reads stdin would hang.
+    captured: dict[str, object] = {}
+    real = subprocess.run
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr("rutherford.runtime.probe.subprocess.run", spy)
+    SystemProbe().run([sys.executable, "-c", "pass"])
+    assert captured["stdin"] is subprocess.DEVNULL
