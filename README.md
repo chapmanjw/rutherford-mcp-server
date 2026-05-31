@@ -86,6 +86,185 @@ Antigravity's print-mode model is fixed (no model selector). Codex on Windows in
 shim, which Rutherford launches via `cmd.exe` automatically while still passing arguments as a list.
 A seventh, well-behaved CLI can be added without code -- see [docs/adding-a-cli.md](docs/adding-a-cli.md).
 
+## Using Rutherford
+
+Rutherford's tools are called by your MCP client. From an agent you phrase a request in plain
+language ("ask Codex and Claude the same question and compare them") and the agent fills in the
+arguments; the examples below show those arguments as JSON, plus the TOON envelope Rutherford
+returns. Every delegating tool defaults to `read_only` and to each adapter's default model.
+
+### Delegate one task to one CLI
+
+`delegate` is the foundational primitive: one `(cli, model)`, one prompt, one normalized result.
+
+```json
+{ "cli": "claude_code", "prompt": "In one sentence, what is the capital of France?" }
+```
+
+Returns the normalized envelope (TOON):
+
+```
+target:
+  cli: claude_code
+ok: true
+exit_code: 0
+text: The capital of France is Paris.
+duration_s: 6.1
+session_id: 5f3b9c1a-2e7d-4a8b-9c6e-1d2f3a4b5c6d
+```
+
+Pick a specific model (see `capabilities` for each CLI's list):
+
+```json
+{ "cli": "kiro", "model": "claude-haiku-4.5", "prompt": "Explain this regex: ^\\d{3}-\\d{4}$" }
+```
+
+Give it a workspace and files, and steer it with a role:
+
+```json
+{ "cli": "claude_code", "role": "security", "working_dir": "/abs/path/to/repo",
+  "files": ["src/auth.py"], "prompt": "Audit this file for auth and injection issues." }
+```
+
+Continue a prior conversation by passing back the `session_id` from an earlier result (on CLIs
+that support resume):
+
+```json
+{ "cli": "claude_code", "session_id": "5f3b9c1a-2e7d-4a8b-9c6e-1d2f3a4b5c6d",
+  "prompt": "Now add error handling to that function." }
+```
+
+Let it modify the workspace -- `write`/`yolo` require both the explicit mode and a trusted
+workspace (an allowlisted path or this per-call confirmation):
+
+```json
+{ "cli": "codex", "working_dir": "/abs/path/to/repo", "safety_mode": "write",
+  "trust_workspace": true, "prompt": "Add a docstring to every public function in utils.py." }
+```
+
+Run a long task in the background -- `mode: "async"` returns a job id immediately:
+
+```json
+{ "cli": "opencode", "mode": "async", "working_dir": "/abs/path/to/repo",
+  "prompt": "Refactor the data layer to use the repository pattern." }
+```
+
+```
+job_id: 95eab04a69254959956e26fc6a1b154c
+status: pending
+kind: delegate
+```
+
+### Build consensus across several CLIs
+
+`consensus` asks the same prompt of every target in parallel and returns one voice per target. One
+failing voice never aborts the panel.
+
+```json
+{ "targets": [ { "cli": "claude_code" }, { "cli": "codex" },
+               { "cli": "opencode", "model": "anthropic/claude-sonnet-4-6" } ],
+  "prompt": "Is a message queue overkill for a single-server app? Answer in one paragraph." }
+```
+
+```
+voices[3]:
+  - target:
+      cli: claude_code
+    ok: true
+    text: For a single server, a queue is usually overkill ...
+  - target:
+      cli: codex
+    ok: true
+    text: It depends on durability needs; an in-process ...
+  - target:
+      cli: opencode
+      model: anthropic/claude-sonnet-4-6
+    ok: true
+    text: A queue adds operational overhead ...
+```
+
+Steer each voice with a stance (the list is parallel to `targets`):
+
+```json
+{ "targets": [ { "cli": "claude_code" }, { "cli": "codex" } ],
+  "prompt": "Should we migrate this service to async I/O?", "stances": ["for", "against"] }
+```
+
+Ask Rutherford to synthesize the voices server-side (off by default, so you usually synthesize them
+in your own agent):
+
+```json
+{ "targets": [ { "cli": "claude_code" }, { "cli": "kiro" } ],
+  "prompt": "Best database for an append-heavy event log?", "synthesize": true }
+```
+
+The result adds a `synthesis` field alongside `voices`.
+
+### Review code
+
+`review` is read-only and uses the `codereviewer` role. Give it a diff:
+
+```json
+{ "targets": [ { "cli": "claude_code" }, { "cli": "codex" } ],
+  "diff": "--- a/parser.py\n+++ b/parser.py\n@@\n-    return data\n+    return data or {}\n" }
+```
+
+or files for the agents to read:
+
+```json
+{ "targets": [ { "cli": "claude_code" } ], "working_dir": "/abs/path/to/repo",
+  "paths": ["src/server.py", "src/runtime/process.py"] }
+```
+
+### Plan
+
+`plan` asks one target for an ordered implementation plan, using the `planner` role:
+
+```json
+{ "cli": "claude_code", "working_dir": "/abs/path/to/repo",
+  "goal": "Add OAuth2 device-code login to the CLI." }
+```
+
+### Inspect the crew
+
+`capabilities` (no arguments) lists every CLI -- installed, auth state, and available models.
+`doctor` (no arguments) adds diagnostics for anything unavailable; pass `{ "live": true }` to
+actively verify a credential-store CLI such as Antigravity with a minimal real round trip.
+
+```json
+{ "live": true }
+```
+
+### Background jobs
+
+After an async call returns a `job_id`, poll it:
+
+```json
+{ "job_id": "95eab04a69254959956e26fc6a1b154c" }
+```
+
+`job_status` returns the status and any progress; `job_result` returns the finished
+`DelegationResult` / `ConsensusResult` (or a still-running notice).
+
+### Roles
+
+`list_roles` (no arguments) returns the bundled personas -- `planner`, `codereviewer`, `security`,
+`debugger`. Pass `"role": "<name>"` to `delegate`, `consensus`, or `review` to prepend that persona,
+or add your own markdown files via the `role_dirs` config (see
+[docs/configuration.md](docs/configuration.md)).
+
+### Self-invocation
+
+Any CLI can target its own adapter. From Claude Code, delegating to `claude_code` spawns a fresh,
+isolated `claude -p` subprocess distinct from your session:
+
+```json
+{ "cli": "claude_code", "prompt": "You are a separate reviewer. Critique this approach: ..." }
+```
+
+The depth guard (`max_depth`, default 3) and the per-call target cap keep any self-referential chain
+bounded.
+
 ## Install
 
 Rutherford is a Python 3.11+ package. Install it as a tool so the `rutherford-mcp-server` command
@@ -109,18 +288,6 @@ uv run rutherford-mcp-server --smoke   # prints a readiness line and exits
 Rutherford does not install or authenticate the target CLIs. Install and log in to whichever CLIs
 you want to orchestrate (see [docs/integration-testing.md](docs/integration-testing.md)), then run
 the `doctor` tool to confirm each one is reachable.
-
-## Quick start
-
-After registering Rutherford with an MCP client (below), call its tools:
-
-- `capabilities` -- list every CLI, whether it is installed, its auth status, and its models.
-- `doctor` -- health-probe each adapter and diagnose anything unavailable.
-- `delegate(cli, prompt, ...)` -- hand a task to one CLI. Defaults to `read_only`.
-- `consensus(targets, prompt, ...)` -- ask several CLIs the same thing in parallel.
-- `review(targets, paths|diff, ...)` and `plan(cli, goal, ...)` -- built on the two primitives.
-- `job_status` / `job_result` -- poll a background job started with `mode="async"`.
-- `list_roles` -- the persona presets (`planner`, `codereviewer`, `security`, `debugger`).
 
 ## MCP client registration
 
