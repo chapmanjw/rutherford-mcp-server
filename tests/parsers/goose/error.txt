@@ -1,0 +1,1 @@
+Error: No provider configured. Run `goose configure` or set GOOSE_PROVIDER and a provider API key.

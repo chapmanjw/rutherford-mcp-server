@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"th_01HZX9Q2K3M4N5P6R7S8T9V0W1"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"reasoning"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","details":{"type":"agent_message","text":"The capital of France is Paris."}}}
+{"type":"turn.completed","usage":{"input_tokens":1200,"output_tokens":45}}

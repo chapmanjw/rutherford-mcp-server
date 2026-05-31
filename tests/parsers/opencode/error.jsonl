@@ -1,0 +1,2 @@
+{"type":"step_start","sessionID":"ses_3f2e1d0c9b8a7654","messageID":"msg_01","part":{"id":"prt_step_01"}}
+{"type":"error","sessionID":"ses_3f2e1d0c9b8a7654","error":{"name":"ProviderAuthError","message":"no API key configured for provider anthropic"}}

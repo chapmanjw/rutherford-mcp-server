@@ -1,0 +1,5 @@
+[
+  {"modelId": "kiro-sonnet", "name": "kiro-sonnet", "default": true},
+  {"modelId": "kiro-opus", "name": "kiro-opus", "default": false},
+  {"modelId": "kiro-haiku", "name": "kiro-haiku", "default": false}
+]

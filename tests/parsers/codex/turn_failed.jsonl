@@ -1,0 +1,3 @@
+{"type":"thread.started","thread_id":"th_01HZX9Q2K3M4N5P6R7S8T9V0W2"}
+{"type":"turn.started"}
+{"type":"turn.failed","error":{"message":"model returned an error: rate limit exceeded"}}

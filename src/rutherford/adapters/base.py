@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 from abc import ABC, abstractmethod
-from typing import ClassVar, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from ..domain.enums import AuthState, SafetyMode
 from ..domain.models import (
@@ -76,17 +76,19 @@ class CLIAdapter(Protocol):
 class BaseCLIAdapter(ABC):
     """Shared scaffolding for concrete adapters.
 
-    Subclasses set the class attributes (``id``, ``display_name``, ``binary``, and optionally
-    ``static_models`` / ``version_args``) and implement the genuinely CLI-specific methods
-    (``check_auth``, ``capabilities``, ``build_invocation``, ``map_safety``, ``parse_output``).
-    A :class:`~rutherford.runtime.probe.CommandProbe` is injected for testability.
+    Concrete adapters set these as class attributes (``id``, ``display_name``, ``binary``, and
+    optionally ``static_models`` / ``version_args``) and implement the genuinely CLI-specific
+    methods (``check_auth``, ``capabilities``, ``build_invocation``, ``map_safety``,
+    ``parse_output``). The config-driven generic adapter sets them per instance instead, which is
+    why they are plain attributes rather than ``ClassVar``. A
+    :class:`~rutherford.runtime.probe.CommandProbe` is injected for testability.
     """
 
-    id: ClassVar[str]
-    display_name: ClassVar[str]
-    binary: ClassVar[str]
-    static_models: ClassVar[tuple[str, ...]] = ()
-    version_args: ClassVar[tuple[str, ...]] = ("--version",)
+    id: str
+    display_name: str
+    binary: str
+    static_models: tuple[str, ...] = ()
+    version_args: tuple[str, ...] = ("--version",)
 
     def __init__(self, probe: CommandProbe | None = None) -> None:
         self._probe: CommandProbe = probe if probe is not None else SystemProbe()

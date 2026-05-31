@@ -1,0 +1,242 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Chapman
+"""Unit and golden tests for the OpenCode adapter."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from rutherford.adapters.opencode import OpenCodeAdapter
+from rutherford.domain.enums import AuthState, SafetyMode
+from rutherford.domain.models import (
+    DelegationRequest,
+    InvocationContext,
+    ProcessResult,
+    Target,
+)
+from tests.fakes import FakeProbe
+
+SAMPLES = Path(__file__).parent / "parsers" / "opencode"
+
+
+def _sample(name: str) -> str:
+    return (SAMPLES / name).read_text(encoding="utf-8")
+
+
+def _ctx(*, safety: SafetyMode = SafetyMode.READ_ONLY, preamble: str | None = None) -> InvocationContext:
+    return InvocationContext(
+        target=Target(cli="opencode", model="anthropic/claude-sonnet-4-6"),
+        safety_mode=safety,
+        correlation_id="test",
+        role_preamble=preamble,
+    )
+
+
+def _req(**kwargs: object) -> DelegationRequest:
+    base: dict[str, object] = {
+        "target": Target(cli="opencode", model="anthropic/claude-sonnet-4-6"),
+        "prompt": "say hi",
+    }
+    base.update(kwargs)
+    return DelegationRequest(**base)  # type: ignore[arg-type]
+
+
+# --- build_invocation --------------------------------------------------------
+
+
+def test_build_invocation_basic_argv_is_a_list() -> None:
+    spec = OpenCodeAdapter().build_invocation(_req(), _ctx())
+    assert isinstance(spec.argv, list)
+    assert spec.argv[:5] == ["opencode", "run", "--format", "json", "-q"]
+    # The prompt is the last positional argv element.
+    assert spec.argv[-1] == "say hi"
+    assert "-m" in spec.argv
+    assert spec.argv[spec.argv.index("-m") + 1] == "anthropic/claude-sonnet-4-6"
+
+
+def test_build_invocation_includes_working_dir_and_resume() -> None:
+    spec = OpenCodeAdapter().build_invocation(
+        _req(working_dir="/work", session_id="ses_1"),
+        _ctx(),
+    )
+    assert "--dir" in spec.argv
+    assert spec.argv[spec.argv.index("--dir") + 1] == "/work"
+    assert spec.cwd == "/work"
+    assert spec.argv[spec.argv.index("--session") + 1] == "ses_1"
+    # Prompt stays last even with extra flags.
+    assert spec.argv[-1] == "say hi"
+
+
+def test_build_invocation_prepends_role_preamble_to_prompt() -> None:
+    spec = OpenCodeAdapter().build_invocation(_req(), _ctx(preamble="You are a reviewer."))
+    # No system-prompt flag exists; the preamble is folded into the positional prompt.
+    assert "--system-prompt" not in spec.argv
+    assert "--append-system-prompt" not in spec.argv
+    prompt = spec.argv[-1]
+    assert prompt.startswith("You are a reviewer.")
+    assert "say hi" in prompt
+
+
+def test_build_invocation_appends_files_to_prompt() -> None:
+    spec = OpenCodeAdapter().build_invocation(_req(files=["a.py", "b.py"]), _ctx())
+    prompt = spec.argv[-1]
+    assert "Files in scope:" in prompt
+    assert "- a.py" in prompt
+
+
+def test_build_invocation_never_builds_a_shell_string() -> None:
+    spec = OpenCodeAdapter().build_invocation(_req(prompt="rm -rf / ; echo pwned"), _ctx())
+    # The dangerous text is a single argv element, never concatenated into a command line.
+    assert spec.argv[-1] == "rm -rf / ; echo pwned"
+    assert all(";" not in arg or arg == "rm -rf / ; echo pwned" for arg in spec.argv)
+
+
+# --- map_safety --------------------------------------------------------------
+
+
+def test_map_safety_covers_every_mode() -> None:
+    adapter = OpenCodeAdapter()
+    flags = {mode: adapter.map_safety(mode) for mode in SafetyMode}
+    deny = '{"edit":"deny","bash":"deny"}'
+    allow = '{"edit":"allow","bash":"allow"}'
+    assert flags[SafetyMode.READ_ONLY].env == {"OPENCODE_PERMISSION": deny}
+    assert flags[SafetyMode.READ_ONLY].args == []
+    assert flags[SafetyMode.PROPOSE].env == {"OPENCODE_PERMISSION": deny}
+    assert flags[SafetyMode.PROPOSE].args == []
+    assert flags[SafetyMode.WRITE].env == {"OPENCODE_PERMISSION": allow}
+    assert flags[SafetyMode.WRITE].args == []
+    assert flags[SafetyMode.YOLO].args == ["--dangerously-skip-permissions"]
+
+
+def test_build_invocation_overlays_safety_env() -> None:
+    spec = OpenCodeAdapter().build_invocation(_req(), _ctx(safety=SafetyMode.WRITE))
+    assert spec.env.get("OPENCODE_PERMISSION") == '{"edit":"allow","bash":"allow"}'
+
+
+def test_build_invocation_yolo_adds_skip_permissions_flag() -> None:
+    spec = OpenCodeAdapter().build_invocation(_req(), _ctx(safety=SafetyMode.YOLO))
+    assert "--dangerously-skip-permissions" in spec.argv
+    # The flag precedes the positional prompt.
+    assert spec.argv.index("--dangerously-skip-permissions") < len(spec.argv) - 1
+
+
+def test_build_invocation_read_only_denies_in_env() -> None:
+    spec = OpenCodeAdapter().build_invocation(_req(), _ctx(safety=SafetyMode.READ_ONLY))
+    assert spec.env.get("OPENCODE_PERMISSION") == '{"edit":"deny","bash":"deny"}'
+    assert "--dangerously-skip-permissions" not in spec.argv
+
+
+# --- parse_output (golden) ---------------------------------------------------
+
+
+def test_parse_success_golden() -> None:
+    raw = ProcessResult(exit_code=0, stdout=_sample("success.jsonl"), duration_s=1.9)
+    result = OpenCodeAdapter().parse_output(raw, _ctx())
+    assert result.ok
+    assert result.text == "The capital of France is Paris."
+    assert result.session_id == "ses_7c1a9b3e2d4f5a6b"
+    assert result.cost is not None
+    assert result.cost.usd == 0.0098
+    assert result.cost.input_tokens == 1180
+    assert result.cost.output_tokens == 12
+
+
+def test_parse_error_stream_with_nonzero_exit_golden() -> None:
+    raw = ProcessResult(exit_code=1, stdout=_sample("error.jsonl"), stderr="auth error", duration_s=0.6)
+    result = OpenCodeAdapter().parse_output(raw, _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "NONZERO_EXIT"
+
+
+def test_parse_nonzero_exit_with_no_text() -> None:
+    raw = ProcessResult(exit_code=1, stdout="", stderr="opencode: command failed", duration_s=0.4)
+    result = OpenCodeAdapter().parse_output(raw, _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "NONZERO_EXIT"
+    assert "command failed" in result.error.message
+
+
+def test_parse_timeout() -> None:
+    raw = ProcessResult(exit_code=None, timed_out=True, duration_s=300.0)
+    result = OpenCodeAdapter().parse_output(raw, _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "TIMEOUT"
+
+
+def test_parse_garbage_stdout_is_parse_error() -> None:
+    raw = ProcessResult(exit_code=0, stdout="not json at all", duration_s=0.1)
+    result = OpenCodeAdapter().parse_output(raw, _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "PARSE_ERROR"
+
+
+# --- detect / check_auth / available_models ----------------------------------
+
+
+def test_detect_when_installed() -> None:
+    probe = FakeProbe(
+        which_map={"opencode": "/usr/bin/opencode"},
+        run_fn=lambda argv: ProcessResult(exit_code=0, stdout="opencode 0.4.2"),
+    )
+    result = OpenCodeAdapter(probe=probe).detect()
+    assert result.installed
+    assert result.path == "/usr/bin/opencode"
+    assert result.version == "opencode 0.4.2"
+
+
+def test_detect_when_absent() -> None:
+    adapter = OpenCodeAdapter(probe=FakeProbe(which_map={}))
+    assert not adapter.detect().installed
+
+
+def test_check_auth_with_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    status = OpenCodeAdapter(probe=FakeProbe()).check_auth()
+    assert status.state is AuthState.AUTHENTICATED
+
+
+def test_check_auth_with_openai_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    status = OpenCodeAdapter(probe=FakeProbe()).check_auth()
+    assert status.state is AuthState.AUTHENTICATED
+
+
+def test_check_auth_with_persisted_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    probe = FakeProbe(default_result=ProcessResult(exit_code=0, stdout="anthropic\nopenai"))
+    assert OpenCodeAdapter(probe=probe).check_auth().state is AuthState.AUTHENTICATED
+
+
+def test_check_auth_needs_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    probe = FakeProbe(default_result=ProcessResult(exit_code=1, stderr="no credentials"))
+    assert OpenCodeAdapter(probe=probe).check_auth().state is AuthState.NEEDS_LOGIN
+
+
+def test_available_models_queries_cli() -> None:
+    probe = FakeProbe(
+        run_fn=lambda argv: ProcessResult(
+            exit_code=0,
+            stdout="anthropic/claude-sonnet-4-6\nanthropic/claude-opus-4-6\nopenai/gpt-5\n",
+        )
+    )
+    models = OpenCodeAdapter(probe=probe).available_models()
+    assert models == [
+        "anthropic/claude-sonnet-4-6",
+        "anthropic/claude-opus-4-6",
+        "openai/gpt-5",
+    ]
+
+
+def test_available_models_falls_back_on_failure() -> None:
+    probe = FakeProbe(default_result=ProcessResult(exit_code=1, stderr="boom"))
+    assert OpenCodeAdapter(probe=probe).available_models() == []

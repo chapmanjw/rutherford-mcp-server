@@ -21,9 +21,11 @@ from .context import AppContext, build_app_context, error_payload_from, tool_err
 from .domain.error_codes import ErrorCode
 from .domain.errors import ConfigError, RutherfordError
 from .domain.models import Target
+from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
 from .tools.delegate import delegate_tool
 from .tools.jobs import job_result_tool, job_status_tool
+from .tools.roles import list_roles_tool
 
 mcp: FastMCP = FastMCP(
     "rutherford",
@@ -148,6 +150,24 @@ async def job_status(job_id: str) -> str:
 async def job_result(job_id: str) -> str:
     """Return the result of a finished background job (or a still-running notice)."""
     return await _guarded(job_result_tool(get_app(), job_id=job_id))
+
+
+@mcp.tool
+async def capabilities() -> str:
+    """List every known CLI: whether it is installed, its auth status, and its available models."""
+    return await _guarded(capabilities_tool(get_app()))
+
+
+@mcp.tool
+async def doctor() -> str:
+    """Health-probe each adapter (binary, version, auth, runtime) and diagnose unavailable targets."""
+    return await _guarded(doctor_tool(get_app()))
+
+
+@mcp.tool
+async def list_roles() -> str:
+    """List the available role personas that can steer a delegation."""
+    return await _guarded(list_roles_tool(get_app()))
 
 
 def _smoke() -> None:
