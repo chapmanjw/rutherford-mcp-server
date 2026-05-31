@@ -34,6 +34,8 @@ The auth mechanism differs per CLI:
 | `kiro` | Set `KIRO_API_KEY`, or run `kiro-cli login` |
 | `antigravity` | Run `agy` once interactively to complete the Google OAuth flow; the token is stored in the OS credential store and cannot be verified non-interactively |
 
+Because `agy` exposes no `whoami`, plain `doctor` reports its auth as `unknown` -- that does not mean it is broken. Call `doctor` with `live=true` to actively verify it (and any other unprobeable adapter) with a minimal real round trip; a successful call reclassifies it to `authenticated`. This spends a small model call, so it is off by default.
+
 Put API keys in a `.env` file (confirmed gitignored -- see `SECURITY.md`) and load them into the server process environment. Rutherford inherits the parent process environment unchanged.
 
 ---

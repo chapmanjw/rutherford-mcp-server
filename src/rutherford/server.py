@@ -215,9 +215,14 @@ async def capabilities() -> str:
 
 
 @mcp.tool
-async def doctor() -> str:
-    """Health-probe each adapter (binary, version, auth, runtime) and diagnose unavailable targets."""
-    return await _guarded(doctor_tool(get_app()))
+async def doctor(live: bool = False) -> str:
+    """Health-probe each adapter (binary, version, auth, runtime) and diagnose unavailable targets.
+
+    `live=true` additionally verifies any adapter whose auth is `unknown` (e.g. Antigravity, which
+    keeps its credential in the OS keyring) with a minimal real round trip. That spends a small
+    model call, so it is off by default.
+    """
+    return await _guarded(doctor_tool(get_app(), live=live))
 
 
 @mcp.tool
