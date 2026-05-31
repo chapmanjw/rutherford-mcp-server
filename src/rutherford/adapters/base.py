@@ -117,6 +117,21 @@ class BaseCLIAdapter(ABC):
         return text.splitlines()[0].strip()
 
     @staticmethod
+    def _with_files(prompt: str, files: list[str]) -> str:
+        """Append an in-scope file list to the prompt, for CLIs without a file-attach flag."""
+        if not files:
+            return prompt
+        listing = "\n".join(f"- {path}" for path in files)
+        return f"{prompt}\n\nFiles in scope:\n{listing}"
+
+    @staticmethod
+    def _compose_prompt(prompt: str, preamble: str | None) -> str:
+        """Prepend a role preamble to the prompt, for CLIs without a system-prompt flag."""
+        if not preamble:
+            return prompt
+        return f"{preamble}\n\n---\n\n{prompt}"
+
+    @staticmethod
     def _env_present(*names: str) -> str | None:
         """Return the first of ``names`` set to a non-empty value in the environment."""
         for name in names:

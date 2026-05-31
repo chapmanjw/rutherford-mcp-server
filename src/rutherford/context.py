@@ -14,11 +14,22 @@ which keeps this module independent of the transport.
 
 from __future__ import annotations
 
+import uuid
+from dataclasses import dataclass
 from typing import Any
 
+from .adapters.registry import AdapterRegistry, build_registry
+from .config.loader import load_config
+from .config.schema import RutherfordConfig
 from .domain.error_codes import ErrorCode
 from .domain.errors import RutherfordError
 from .io.serialize import encode
+from .runtime.depth import current_depth
+from .runtime.process import AsyncProcessRunner, ProcessRunner
+from .services.consensus import ConsensusService
+from .services.delegation import DelegationService
+from .services.jobs import JobService
+from .services.roles import RoleStore, load_roles
 
 
 def tool_success(data: Any) -> str:
@@ -37,3 +48,55 @@ def tool_error(code: ErrorCode | str, message: str, details: dict[str, Any] | No
 def error_payload_from(exc: RutherfordError) -> str:
     """Build an error payload from a :class:`RutherfordError`."""
     return tool_error(exc.code, exc.message, exc.details)
+
+
+@dataclass(slots=True)
+class AppContext:
+    """The long-lived services and state, built once at startup and shared across tool calls."""
+
+    config: RutherfordConfig
+    registry: AdapterRegistry
+    roles: RoleStore
+    delegation: DelegationService
+    consensus: ConsensusService
+    jobs: JobService
+    #: The depth this server runs at, read from ``RUTHERFORD_DEPTH`` when it was spawned.
+    base_depth: int = 0
+
+    def new_correlation_id(self) -> str:
+        """Mint a short correlation id for a tool call."""
+        return uuid.uuid4().hex[:12]
+
+
+def build_app_context(
+    *,
+    config: RutherfordConfig | None = None,
+    runner: ProcessRunner | None = None,
+    registry: AdapterRegistry | None = None,
+    roles: RoleStore | None = None,
+    base_depth: int | None = None,
+) -> AppContext:
+    """Assemble the application context: load config, build the registry and services.
+
+    Arguments are injectable for tests; in production all default to the real implementations
+    (config discovered from disk and environment, the asyncio process runner, the depth read from
+    ``RUTHERFORD_DEPTH``).
+    """
+    resolved_config = config if config is not None else load_config()
+    resolved_runner = runner if runner is not None else AsyncProcessRunner()
+    resolved_depth = current_depth() if base_depth is None else base_depth
+
+    resolved_registry = registry if registry is not None else build_registry(resolved_config)
+    resolved_roles = roles if roles is not None else load_roles(resolved_config.role_dirs)
+    delegation = DelegationService(resolved_registry, resolved_runner, resolved_config, resolved_roles)
+    consensus = ConsensusService(delegation, resolved_config)
+    jobs = JobService()
+    return AppContext(
+        config=resolved_config,
+        registry=resolved_registry,
+        roles=resolved_roles,
+        delegation=delegation,
+        consensus=consensus,
+        jobs=jobs,
+        base_depth=resolved_depth,
+    )

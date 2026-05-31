@@ -175,6 +175,9 @@ class DelegationRequest(BaseModel):
     session_id: str | None = None
     depth: int = 0
     include_raw: bool = False
+    #: Per-call confirmation that a write/yolo delegation may mutate ``working_dir`` even when
+    #: it is not on the configured trusted-workspace allowlist.
+    trust_workspace: bool = False
 
 
 class DelegationResult(BaseModel):

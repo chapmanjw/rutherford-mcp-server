@@ -28,6 +28,14 @@ class SafetyMode(StrEnum):
     YOLO = "yolo"
 
 
+def is_mutating(mode: SafetyMode) -> bool:
+    """Return whether a safety mode can modify the workspace (``write`` or ``yolo``).
+
+    Read-only and propose are non-mutating, so they need no trusted-workspace check.
+    """
+    return mode in (SafetyMode.WRITE, SafetyMode.YOLO)
+
+
 class AuthState(StrEnum):
     """The result of a non-destructive auth probe. A probe never triggers a login."""
 

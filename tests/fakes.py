@@ -11,6 +11,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
+from rutherford.adapters.registry import AdapterRegistry
+from rutherford.config.schema import RutherfordConfig
+from rutherford.context import AppContext, build_app_context
 from rutherford.domain.enums import AuthState, OutputMode, SafetyMode
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.models import (
@@ -132,11 +135,18 @@ class FakeAdapter:
         )
 
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
-        argv = [self.id, "-p", req.prompt]
+        prompt = self._compose_prompt(req.prompt, ctx.role_preamble)
+        argv = [self.id, "-p", prompt]
         if req.target.model:
             argv += ["--model", req.target.model]
-        env = {"RUTHERFORD_DEPTH": str(ctx.depth + 1)}
-        return InvocationSpec(argv=argv, env=env, cwd=req.working_dir)
+        safety = self.map_safety(ctx.safety_mode)
+        argv += safety.args
+        # Note: RUTHERFORD_DEPTH is overlaid by the delegation service, not by the adapter.
+        return InvocationSpec(argv=argv, env=dict(safety.env), cwd=req.working_dir)
+
+    @staticmethod
+    def _compose_prompt(prompt: str, preamble: str | None) -> str:
+        return prompt if not preamble else f"{preamble}\n\n---\n\n{prompt}"
 
     def map_safety(self, mode: SafetyMode) -> SafetyFlags:
         return SafetyFlags(args=[f"--safety={mode.value}"], note=mode.value)
@@ -157,3 +167,20 @@ class FakeAdapter:
             error=error,
             safety_mode=ctx.safety_mode,
         )
+
+
+def make_app(
+    *,
+    adapters: Sequence[FakeAdapter] | None = None,
+    runner: FakeProcessRunner | None = None,
+    config: RutherfordConfig | None = None,
+    base_depth: int = 0,
+) -> AppContext:
+    """Build an :class:`AppContext` wired to fakes, with no disk or subprocess access."""
+    registry = AdapterRegistry(list(adapters) if adapters is not None else [FakeAdapter()])
+    return build_app_context(
+        config=config or RutherfordConfig(),
+        runner=runner or FakeProcessRunner(),
+        registry=registry,
+        base_depth=base_depth,
+    )
