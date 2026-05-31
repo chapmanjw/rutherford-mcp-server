@@ -135,7 +135,7 @@ class FakeAdapter:
         )
 
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
-        prompt = self._compose_prompt(req.prompt, ctx.role_preamble)
+        prompt = self._with_files(self._compose_prompt(req.prompt, ctx.role_preamble), req.files)
         argv = [self.id, "-p", prompt]
         if req.target.model:
             argv += ["--model", req.target.model]
@@ -143,6 +143,13 @@ class FakeAdapter:
         argv += safety.args
         # Note: RUTHERFORD_DEPTH is overlaid by the delegation service, not by the adapter.
         return InvocationSpec(argv=argv, env=dict(safety.env), cwd=req.working_dir)
+
+    @staticmethod
+    def _with_files(prompt: str, files: list[str]) -> str:
+        if not files:
+            return prompt
+        listing = "\n".join(f"- {path}" for path in files)
+        return f"{prompt}\n\nFiles in scope:\n{listing}"
 
     @staticmethod
     def _compose_prompt(prompt: str, preamble: str | None) -> str:

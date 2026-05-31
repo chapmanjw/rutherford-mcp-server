@@ -25,6 +25,8 @@ from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
 from .tools.delegate import delegate_tool
 from .tools.jobs import job_result_tool, job_status_tool
+from .tools.plan import plan_tool
+from .tools.review import review_tool
 from .tools.roles import list_roles_tool
 
 mcp: FastMCP = FastMCP(
@@ -150,6 +152,60 @@ async def job_status(job_id: str) -> str:
 async def job_result(job_id: str) -> str:
     """Return the result of a finished background job (or a still-running notice)."""
     return await _guarded(job_result_tool(get_app(), job_id=job_id))
+
+
+@mcp.tool
+async def review(
+    targets: list[Target],
+    paths: list[str] | None = None,
+    diff: str | None = None,
+    role: str = "codereviewer",
+    working_dir: str | None = None,
+    safety_mode: str = "read_only",
+    synthesize: bool = False,
+    timeout_s: float | None = None,
+) -> str:
+    """Review a diff or a set of files across one or more targets (read-only). Provide diff or paths."""
+    return await _guarded(
+        review_tool(
+            get_app(),
+            targets=list(targets),
+            paths=paths,
+            diff=diff,
+            role=role,
+            working_dir=working_dir,
+            safety_mode=safety_mode,
+            synthesize=synthesize,
+            timeout_s=timeout_s,
+        )
+    )
+
+
+@mcp.tool
+async def plan(
+    cli: str,
+    goal: str,
+    model: str | None = None,
+    role: str = "planner",
+    working_dir: str | None = None,
+    files: list[str] | None = None,
+    safety_mode: str = "read_only",
+    timeout_s: float | None = None,
+) -> str:
+    """Ask one target to produce an ordered implementation plan for a goal (read-only)."""
+    return await _guarded(
+        plan_tool(
+            get_app(),
+            cli=cli,
+            goal=goal,
+            model=model,
+            role=role,
+            working_dir=working_dir,
+            files=files,
+            safety_mode=safety_mode,
+            timeout_s=timeout_s,
+        )
+    )
 
 
 @mcp.tool
