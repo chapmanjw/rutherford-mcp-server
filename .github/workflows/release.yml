@@ -14,6 +14,9 @@ concurrency:
 jobs:
   publish-pypi:
     runs-on: ubuntu-latest
+    environment:
+      name: pypi # must match the PyPI trusted-publisher environment for the OIDC claim to match
+      url: https://pypi.org/p/rutherford-mcp-server
     permissions:
       contents: read # checkout
       id-token: write # PyPI trusted publishing (OIDC) - no API token needed
