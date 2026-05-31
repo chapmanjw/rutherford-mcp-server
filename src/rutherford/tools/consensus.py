@@ -8,14 +8,14 @@ from typing import Any
 
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode
-from ..domain.models import ConsensusRequest
+from ..domain.models import ConsensusRequest, Target
 from .common import as_target, parse_mode, parse_safety_mode, parse_stances
 
 
 async def consensus_tool(
     app: AppContext,
     *,
-    targets: list[Any],
+    targets: list[Any] | str | None = None,
     prompt: str,
     stances: list[str] | None = None,
     working_dir: str | None = None,
@@ -27,14 +27,24 @@ async def consensus_tool(
     mode: str = "sync",
     include_raw: bool = False,
 ) -> str:
-    """Run ``prompt`` across ``targets`` in parallel and return every voice.
+    """Run ``prompt`` across several CLIs in parallel and return every voice.
 
-    ``targets`` is a list of ``{cli, model}`` objects (or ``cli`` / ``cli:model`` strings).
-    Optional ``stances`` (parallel to ``targets``) steer each voice for/against/neutral. Optional
-    ``synthesize`` adds a server-side combined answer; it is off by default.
+    ``targets`` is a list of ``{cli, model}`` objects (or ``cli`` / ``cli:model`` strings). Omit it,
+    pass an empty list, or pass the sentinel ``"all"`` to fan out to every installed + authenticated
+    adapter (each at its default model, capped at ``max_targets``); the result's ``skipped`` field
+    explains any adapter left out. Optional ``stances`` (parallel to ``targets``) steer each voice
+    for/against/neutral and cannot be combined with the auto-expanded panel. Optional ``synthesize``
+    adds a server-side combined answer; it is off by default.
     """
+    expand_all = _wants_all(targets)
+    if expand_all:
+        target_objs: list[Target] = []
+    elif isinstance(targets, str):
+        target_objs = [as_target(targets)]  # a bare "cli" / "cli:model" string
+    else:
+        target_objs = [as_target(target) for target in targets or []]
     request = ConsensusRequest(
-        targets=[as_target(target) for target in targets],
+        targets=target_objs,
         prompt=prompt,
         stances=parse_stances(stances),
         working_dir=working_dir,
@@ -45,6 +55,7 @@ async def consensus_tool(
         timeout_s=timeout_s,
         include_raw=include_raw,
         depth=app.base_depth,
+        expand_all=expand_all,
     )
     correlation_id = app.new_correlation_id()
 
@@ -62,3 +73,14 @@ async def consensus_tool(
 
     result = await app.consensus.consensus(request, correlation_id=correlation_id, base_depth=app.base_depth)
     return tool_success(result)
+
+
+def _wants_all(targets: list[Any] | str | None) -> bool:
+    """Whether the caller asked for the full panel: targets omitted, empty, or the ``"all"`` sentinel."""
+    if targets is None:
+        return True
+    if isinstance(targets, str):
+        return targets.strip().lower() == "all"
+    if not targets:
+        return True
+    return len(targets) == 1 and isinstance(targets[0], str) and targets[0].strip().lower() == "all"

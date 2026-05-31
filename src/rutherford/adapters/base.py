@@ -56,6 +56,10 @@ class CLIAdapter(Protocol):
         """List selectable models, querying the CLI where possible, else a static set."""
         ...
 
+    def fallback_model(self) -> str | None:
+        """The model to retry with when a requested model is unavailable (``None`` = default)."""
+        ...
+
     def capabilities(self) -> AdapterCapabilities:
         """Advertise feature flags so the core can adapt behavior generically."""
         ...
@@ -105,6 +109,14 @@ class BaseCLIAdapter(ABC):
     def available_models(self) -> list[str]:
         """Return the static model set. Adapters with a list-models command override this."""
         return list(self.static_models)
+
+    def fallback_model(self) -> str | None:
+        """No distinct fallback by default; the delegation service retries with the default model.
+
+        An adapter whose default model can be unavailable (for example Cursor, where a free plan
+        rejects named models) overrides this to return an always-available model id (``"auto"``).
+        """
+        return None
 
     # --- helpers for subclasses ---------------------------------------------
 

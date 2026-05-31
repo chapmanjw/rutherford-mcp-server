@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+from ..adapters.base import CLIAdapter
 from ..adapters.registry import AdapterRegistry
 from ..config.schema import RutherfordConfig
 from ..domain.enums import is_mutating
@@ -97,13 +98,32 @@ class DelegationService:
             except RutherfordError as exc:
                 return self._error(ctx, exc)
 
+        result, raw = await self._execute(adapter, req, ctx, base_depth, on_progress)
+
+        if self._should_fallback(adapter, req, result):
+            result, raw = await self._fallback(adapter, req, ctx, base_depth, on_progress)
+
+        result.raw = _combine_raw(raw) if (req.include_raw and raw is not None) else None
+        return result
+
+    async def _execute(
+        self,
+        adapter: CLIAdapter,
+        req: DelegationRequest,
+        ctx: InvocationContext,
+        base_depth: int,
+        on_progress: ProgressCallback | None,
+    ) -> tuple[DelegationResult, ProcessResult | None]:
+        """Build, run, and parse one invocation. Returns the result and its raw process output.
+
+        Raw is ``None`` only when ``build_invocation`` itself failed (nothing ran).
+        """
         try:
             spec = adapter.build_invocation(req, ctx)
         except Exception as exc:  # an adapter bug becomes a structured result, not a server crash
-            return self._fail(ctx, ErrorCode.INTERNAL, f"build_invocation failed: {exc}")
+            return self._fail(ctx, ErrorCode.INTERNAL, f"build_invocation failed: {exc}"), None
 
         spec = spec.model_copy(update={"env": {**spec.env, **child_depth_env(base_depth)}})
-
         timeout = req.timeout_s or self._config.default_timeout_s
         raw = await self._runner.run(spec, timeout, on_progress)
 
@@ -111,9 +131,37 @@ class DelegationService:
             result = adapter.parse_output(raw, ctx)
         except Exception as exc:  # a quirky parse must not crash the server
             result = self._fail(ctx, ErrorCode.PARSE_ERROR, f"parse_output failed: {exc}", raw=raw)
+        return result, raw
 
-        result.raw = _combine_raw(raw) if req.include_raw else None
-        return result
+    def _should_fallback(self, adapter: CLIAdapter, req: DelegationRequest, result: DelegationResult) -> bool:
+        """Whether to retry once with the adapter's fallback model.
+
+        Only when the caller allowed it, the run failed on a model-availability error, and the
+        adapter offers a fallback that differs from what was already requested.
+        """
+        if not req.allow_model_fallback or result.ok or result.error is None:
+            return False
+        if not _is_model_unavailable_error(result.error.message):
+            return False
+        fallback = adapter.fallback_model()
+        return fallback is not None and fallback != req.target.model
+
+    async def _fallback(
+        self,
+        adapter: CLIAdapter,
+        req: DelegationRequest,
+        ctx: InvocationContext,
+        base_depth: int,
+        on_progress: ProgressCallback | None,
+    ) -> tuple[DelegationResult, ProcessResult | None]:
+        """Re-run the request once with the adapter's fallback model, recording the fallback."""
+        original_model = req.target.model
+        fb_target = req.target.model_copy(update={"model": adapter.fallback_model()})
+        fb_req = req.model_copy(update={"target": fb_target, "allow_model_fallback": False})
+        fb_ctx = ctx.model_copy(update={"target": fb_target})
+        result, raw = await self._execute(adapter, fb_req, fb_ctx, base_depth, on_progress)
+        result.fallback_from = original_model or "(default)"
+        return result, raw
 
     def _workspace_trusted(self, req: DelegationRequest) -> bool:
         """Return whether a mutating delegation is permitted for ``req``'s working directory."""
@@ -167,3 +215,29 @@ def _combine_raw(raw: ProcessResult) -> str:
     if raw.stderr.strip():
         return f"{raw.stdout}\n--- stderr ---\n{raw.stderr}"
     return raw.stdout
+
+
+#: Substrings that mark a failure as "this model is not available to you" rather than a real
+#: error. Matched case-insensitively against the error message. Kept broad on purpose: the cost
+#: of a false positive is one extra retry on the adapter's default model, which is cheap and safe.
+_MODEL_UNAVAILABLE_MARKERS: tuple[str, ...] = (
+    "named models unavailable",
+    "switch to auto",
+    "only use auto",
+    "model is not available",
+    "model not available",
+    "model unavailable",
+    "model_unavailable",
+    "no access to model",
+    "not available on your plan",
+    "upgrade your plan",
+    "upgrade plans to continue",
+    "unknown model",
+    "invalid model",
+)
+
+
+def _is_model_unavailable_error(message: str) -> bool:
+    """Heuristic: does ``message`` look like a model-availability rejection (vs. a real failure)?"""
+    lowered = message.lower()
+    return any(marker in lowered for marker in _MODEL_UNAVAILABLE_MARKERS)

@@ -72,9 +72,11 @@ class FakeProcessRunner:
         self,
         result: ProcessResult | None = None,
         results: Sequence[ProcessResult] | None = None,
+        run_fn: Callable[[InvocationSpec], ProcessResult] | None = None,
     ) -> None:
         self._result = result
         self._results = list(results) if results is not None else None
+        self._run_fn = run_fn
         self._index = 0
         self.calls: list[tuple[InvocationSpec, float]] = []
         self.progress: list[str] = []
@@ -89,6 +91,10 @@ class FakeProcessRunner:
         if on_progress is not None:
             on_progress("working")
             self.progress.append("working")
+        if self._run_fn is not None:
+            # argv-aware: lets a test decide the outcome from the model/cli in the spec, which is
+            # how the per-target model-fallback path is exercised.
+            return self._run_fn(spec)
         if self._results is not None:
             result = self._results[self._index % len(self._results)]
             self._index += 1
@@ -107,6 +113,7 @@ class FakeAdapter:
         installed: bool = True,
         auth_state: AuthState = AuthState.AUTHENTICATED,
         supports_resume: bool = True,
+        fallback_model: str | None = None,
     ) -> None:
         self.id = adapter_id
         self.display_name = adapter_id.replace("_", " ").title()
@@ -114,6 +121,7 @@ class FakeAdapter:
         self._installed = installed
         self._auth_state = auth_state
         self._supports_resume = supports_resume
+        self._fallback_model = fallback_model
 
     def detect(self) -> DetectResult:
         if not self._installed:
@@ -125,6 +133,9 @@ class FakeAdapter:
 
     def available_models(self) -> list[str]:
         return list(self._models)
+
+    def fallback_model(self) -> str | None:
+        return self._fallback_model
 
     def capabilities(self) -> AdapterCapabilities:
         return AdapterCapabilities(

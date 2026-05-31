@@ -105,8 +105,8 @@ async def delegate(
 
 @mcp.tool
 async def consensus(
-    targets: list[Target],
     prompt: str,
+    targets: list[Target | str] | str | None = None,
     stances: list[str] | None = None,
     working_dir: str | None = None,
     files: list[str] | None = None,
@@ -119,15 +119,18 @@ async def consensus(
 ) -> str:
     """Ask the same prompt of several targets in parallel and return every voice.
 
-    `targets` is a list of `{cli, model}` objects. Optional `stances` (parallel to `targets`) steer
-    each voice: for | against | neutral. `synthesize=true` adds a server-side combined answer (off
-    by default, so the orchestrator can synthesize the voices itself). With `mode="async"` a job id
-    is returned.
+    `targets` is a list of `{cli, model}` objects (or `cli` / `cli:model` strings). Omit it, pass an
+    empty list, or pass `"all"` to fan out to every installed + authenticated CLI at its default
+    model (capped at `max_targets`); the result's `skipped` list explains any adapter left out.
+    Optional `stances` (parallel to `targets`) steer each voice: for | against | neutral, and cannot
+    be combined with the auto-expanded panel. `synthesize=true` adds a server-side combined answer
+    (off by default, so the orchestrator can synthesize the voices itself). With `mode="async"` a
+    job id is returned.
     """
     return await _guarded(
         consensus_tool(
             get_app(),
-            targets=list(targets),
+            targets=targets,
             prompt=prompt,
             stances=stances,
             working_dir=working_dir,

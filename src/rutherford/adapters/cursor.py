@@ -136,6 +136,11 @@ class CursorAdapter(BaseCLIAdapter):
                 models.append(model_id)
         return models or list(self.static_models)
 
+    def fallback_model(self) -> str | None:
+        """``auto`` is available on every Cursor plan, so it is the safe retry when a named model
+        is rejected (for example on a free plan)."""
+        return "auto"
+
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         """Parse the single JSON object into the normalized envelope, defensively.
 

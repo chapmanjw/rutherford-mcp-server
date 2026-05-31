@@ -2,7 +2,7 @@
   <img src="docs/images/logo.png" width="200" alt="Rutherford logo">
 </p>
 
-# Rutherford
+# Rutherford MCP Server - Multi-Agent Consensus, Debates, Reviews, and Delegation
 
 A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that lets one AI coding
 CLI delegate work to, and build consensus across, a crew of others. Rutherford runs other agentic
@@ -132,6 +132,16 @@ answer text, timing, token cost, and a session id you can resume.
 
 A `consensus` across three targets, one independent voice each. A CLI that errors or isn't installed
 comes back as a single failed voice without sinking the rest of the panel.
+
+### Poll every CLI you have authenticated
+
+> Ask every coding agent I'm logged into the same question -- "is a UUID or a ULID a better primary
+> key for a high-write table?" -- and show me all their answers.
+
+A `consensus` with no targets named (or `targets: "all"`): Rutherford builds the panel from every
+adapter it finds installed and authenticated, each at its default model, and tells you in `skipped`
+which it left out and why (not installed, needs login). If one voice asked for a model its plan
+doesn't allow, that voice retries once on the CLI's default model rather than dropping out.
 
 ### Run a structured debate with assigned stances
 

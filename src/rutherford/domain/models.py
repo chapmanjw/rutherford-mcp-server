@@ -178,6 +178,8 @@ class DelegationRequest(BaseModel):
     #: Per-call confirmation that a write/yolo delegation may mutate ``working_dir`` even when
     #: it is not on the configured trusted-workspace allowlist.
     trust_workspace: bool = False
+    #: When the requested model is unavailable, retry once with the adapter's fallback model.
+    allow_model_fallback: bool = True
 
 
 class DelegationResult(BaseModel):
@@ -199,6 +201,10 @@ class DelegationResult(BaseModel):
     cost: Cost | None = None
     error: ErrorInfo | None = None
     safety_mode: SafetyMode = SafetyMode.READ_ONLY
+    #: When the originally requested model was unavailable and the delegation fell back to the
+    #: adapter's fallback model, this records the model that was requested. ``target.model`` then
+    #: holds the model that actually answered. ``None`` means no fallback happened.
+    fallback_from: str | None = None
 
 
 # --- Consensus ---------------------------------------------------------------
@@ -209,10 +215,12 @@ class ConsensusRequest(BaseModel):
 
     ``stances``, when given, is parallel to ``targets`` and steers each voice. ``synthesize``
     requests an optional server-side synthesis; it is off by default, so every voice is
-    returned for the orchestrator to synthesize.
+    returned for the orchestrator to synthesize. When ``expand_all`` is set, ``targets`` is
+    ignored and the panel is every installed + authenticated adapter (capped at ``max_targets``),
+    each at its default model.
     """
 
-    targets: list[Target]
+    targets: list[Target] = Field(default_factory=list)
     prompt: str
     stances: list[Stance] | None = None
     working_dir: str | None = None
@@ -223,13 +231,28 @@ class ConsensusRequest(BaseModel):
     timeout_s: float | None = None
     depth: int = 0
     include_raw: bool = False
+    #: Build the panel from every installed + authenticated adapter instead of ``targets``.
+    expand_all: bool = False
+
+
+class SkippedTarget(BaseModel):
+    """An adapter left out of an auto-expanded panel, with the reason."""
+
+    cli: str
+    reason: str
 
 
 class ConsensusResult(BaseModel):
-    """Every voice from a consensus panel, plus an optional synthesis."""
+    """Every voice from a consensus panel, plus an optional synthesis.
+
+    ``skipped`` lists adapters that were considered for an auto-expanded (``expand_all``) panel but
+    left out -- not installed, not authenticated, or over the per-call target cap -- so the caller
+    can see the full panel that was attempted.
+    """
 
     voices: list[DelegationResult]
     synthesis: str | None = None
+    skipped: list[SkippedTarget] = Field(default_factory=list)
 
 
 # --- Jobs --------------------------------------------------------------------

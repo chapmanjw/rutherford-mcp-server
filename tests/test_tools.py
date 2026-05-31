@@ -11,6 +11,7 @@ import pytest
 from toon import decode
 
 from rutherford.config.schema import RutherfordConfig
+from rutherford.domain.enums import AuthState
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import ProcessResult
 from rutherford.tools.consensus import consensus_tool
@@ -89,6 +90,46 @@ async def test_consensus_tool_target_cap_raises() -> None:
     )
     with pytest.raises(RutherfordError, match="cap"):
         await consensus_tool(app, targets=[{"cli": "a"}, {"cli": "a"}], prompt="q")
+
+
+async def test_consensus_tool_expands_when_targets_omitted() -> None:
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+    )
+    out = await consensus_tool(app, prompt="best editor?")  # no targets -> full authenticated panel
+    assert "voices[2]" in out
+    assert "cli: a" in out and "cli: b" in out
+
+
+async def test_consensus_tool_all_sentinel_expands_and_reports_skips() -> None:
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b", auth_state=AuthState.NEEDS_LOGIN)],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+    )
+    out = await consensus_tool(app, targets="all", prompt="q")
+    assert "voices[1]" in out  # only the authenticated adapter answers
+    assert "skipped" in out and "b" in out  # the skipped adapter is reported
+
+
+async def test_consensus_tool_empty_list_expands() -> None:
+    app = make_app(
+        adapters=[FakeAdapter("a")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+    )
+    out = await consensus_tool(app, targets=[], prompt="q")  # [] also means the full panel
+    assert "voices[1]" in out
+    assert "cli: a" in out
+
+
+async def test_consensus_tool_accepts_a_single_target_string() -> None:
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+    )
+    out = await consensus_tool(app, targets="a", prompt="q")  # an explicit single CLI, not "all"
+    assert "voices[1]" in out
+    assert "cli: a" in out
 
 
 async def test_job_status_unknown_raises() -> None:

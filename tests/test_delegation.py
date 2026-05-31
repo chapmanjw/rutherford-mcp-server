@@ -157,3 +157,57 @@ async def test_safety_flags_reach_the_invocation() -> None:
     )
     spec, _timeout = runner.calls[0]
     assert "--safety=yolo" in spec.argv
+
+
+# --- per-target model fallback ------------------------------------------------------------------
+
+
+def _model_unavailable_run_fn() -> object:
+    """A runner fn that rejects the ``named-only`` model and answers on anything else."""
+
+    def run_fn(spec: object) -> ProcessResult:
+        if "named-only" in spec.argv:  # type: ignore[attr-defined]
+            return ProcessResult(exit_code=1, stderr="Named models unavailable on your plan. Switch to Auto.")
+        return ProcessResult(exit_code=0, stdout="answered on auto")
+
+    return run_fn
+
+
+async def test_model_fallback_retries_with_fallback_model() -> None:
+    runner = FakeProcessRunner(run_fn=_model_unavailable_run_fn())  # type: ignore[arg-type]
+    adapter = FakeAdapter("cursorish", fallback_model="auto")
+    result = await _service([adapter], runner).delegate(_req(target=Target(cli="cursorish", model="named-only")))
+    assert result.ok
+    assert result.text == "answered on auto"
+    assert result.fallback_from == "named-only"  # the originally requested model that was rejected
+    assert result.target.model == "auto"  # the model that actually answered
+    assert len(runner.calls) == 2  # one original attempt + one fallback retry
+
+
+async def test_no_fallback_without_a_fallback_model() -> None:
+    runner = FakeProcessRunner(run_fn=_model_unavailable_run_fn())  # type: ignore[arg-type]
+    adapter = FakeAdapter("plain")  # fallback_model defaults to None
+    result = await _service([adapter], runner).delegate(_req(target=Target(cli="plain", model="named-only")))
+    assert not result.ok
+    assert result.fallback_from is None
+    assert len(runner.calls) == 1  # nothing to retry with
+
+
+async def test_no_fallback_when_disabled() -> None:
+    runner = FakeProcessRunner(run_fn=_model_unavailable_run_fn())  # type: ignore[arg-type]
+    adapter = FakeAdapter("cursorish", fallback_model="auto")
+    result = await _service([adapter], runner).delegate(
+        _req(target=Target(cli="cursorish", model="named-only"), allow_model_fallback=False),
+    )
+    assert not result.ok
+    assert result.fallback_from is None
+    assert len(runner.calls) == 1
+
+
+async def test_no_fallback_for_a_non_model_failure() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=2, stderr="syntax error in prompt"))
+    adapter = FakeAdapter("cursorish", fallback_model="auto")
+    result = await _service([adapter], runner).delegate(_req(target=Target(cli="cursorish", model="named-only")))
+    assert not result.ok
+    assert result.fallback_from is None  # a real failure is not retried
+    assert len(runner.calls) == 1

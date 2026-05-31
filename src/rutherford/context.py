@@ -89,7 +89,7 @@ def build_app_context(
     resolved_registry = registry if registry is not None else build_registry(resolved_config)
     resolved_roles = roles if roles is not None else load_roles(resolved_config.role_dirs)
     delegation = DelegationService(resolved_registry, resolved_runner, resolved_config, resolved_roles)
-    consensus = ConsensusService(delegation, resolved_config)
+    consensus = ConsensusService(delegation, resolved_config, resolved_registry)
     jobs = JobService()
     return AppContext(
         config=resolved_config,
