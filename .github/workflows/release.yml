@@ -100,4 +100,8 @@ jobs:
           name: ${{ github.ref_name }}
           body_path: notes.md
           prerelease: ${{ steps.prerelease.outputs.value }}
-          files: dist/*
+          # Only the real distributions -- `uv build` also drops a dist/.gitignore that a bare
+          # `dist/*` would attach (uploaded as "default.gitignore").
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
