@@ -32,9 +32,13 @@ The auth mechanism differs per CLI:
 | `opencode` | Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, or run `opencode auth login` |
 | `goose` | Set `GOOSE_PROVIDER` plus a provider key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.), or run `goose configure` |
 | `kiro` | Set `KIRO_API_KEY`, or run `kiro-cli login` |
-| `antigravity` | Run `agy` once interactively to complete the Google OAuth flow; the token is stored in the OS credential store and cannot be verified non-interactively |
+| `antigravity` | Run `agy` once interactively to complete the Google OAuth flow; the token is persisted at `~/.gemini/oauth_creds.json` |
 
-Because `agy` exposes no `whoami`, plain `doctor` reports its auth as `unknown` -- that does not mean it is broken. Call `doctor` with `live=true` to actively verify it (and any other unprobeable adapter) with a minimal real round trip; a successful call reclassifies it to `authenticated`. This spends a small model call, so it is off by default.
+`agy` exposes no `whoami`, but it persists its Google OAuth token on disk at
+`~/.gemini/oauth_creds.json` (shared by the Gemini CLI family), so plain `doctor` detects auth from
+that file without a model call. The file proves a credential exists, not that the token is still
+valid; for a definitive check, call `doctor` with `live=true` to verify any still-unknown adapter
+with a minimal real round trip. That spends a small model call, so it is off by default.
 
 Put API keys in a `.env` file (confirmed gitignored -- see `SECURITY.md`) and load them into the server process environment. Rutherford inherits the parent process environment unchanged.
 

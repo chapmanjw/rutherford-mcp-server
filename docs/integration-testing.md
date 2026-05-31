@@ -46,9 +46,10 @@ set the API key) yourself, so the headless runner can reuse the session.
 ### Antigravity (`agy`)
 
 - Install: the Antigravity CLI (Go binary, native on Windows). See the project's install docs.
-- Authenticate: run `agy` once interactively to complete the Google account flow; the token is
-  stored in the OS credential store (Windows Credential Manager, macOS Keychain, libsecret on
-  Linux). There is no API-key variable and no `whoami`, so `doctor` reports auth as `unknown`.
+- Authenticate: run `agy` once interactively to complete the Google account flow. There is no
+  API-key variable and no `whoami`, but `agy` persists the OAuth token on disk at
+  `~/.gemini/oauth_creds.json` (shared by the Gemini CLI family), so `doctor` detects auth from
+  that file. `doctor` with `live=true` additionally confirms it with a real round trip.
 - Smoke: `agy -p "say ok"` -- note the print-mode model is fixed and the answer is read from the
   transcript file, not stdout.
 

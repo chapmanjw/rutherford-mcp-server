@@ -106,7 +106,7 @@ Run `just check` (lint, format, license header, mypy strict, unit tests with the
 | --- | --- | --- | --- | --- |
 | Claude Code | `claude_code` | `claude -p "<prompt>" --output-format json` | subscription/OAuth or `ANTHROPIC_API_KEY` | 2026-05-30 |
 | Codex | `codex` | `codex exec --json --skip-git-repo-check` (prompt on stdin) | ChatGPT login or `OPENAI_API_KEY` | 2026-05-30 |
-| Antigravity | `antigravity` | `agy -p "<prompt>"` (transcript file) | OS credential store (Google) | 2026-05-30 |
+| Antigravity | `antigravity` | `agy -p "<prompt>"` (transcript file) | Google login (`~/.gemini/oauth_creds.json`) | 2026-05-30 |
 | Kiro | `kiro` | `kiro-cli chat --no-interactive "<prompt>"` | `KIRO_API_KEY` or `kiro-cli login` | 2026-05-30 |
 | OpenCode | `opencode` | `opencode run --format json -q "<prompt>"` | provider key or `opencode auth login` | 2026-05-30 (docs) |
 | Goose | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key | 2026-05-30 (docs) |

@@ -77,7 +77,7 @@ rather than a local install.
 | --- | --- | --- | --- | --- |
 | Claude Code | `claude_code` | `claude -p "<prompt>" --output-format json` | subscription/OAuth login or `ANTHROPIC_API_KEY` | 2026-05-30 |
 | Codex | `codex` | `codex exec --json --skip-git-repo-check` (prompt on stdin) | ChatGPT login or `OPENAI_API_KEY` | 2026-05-30 |
-| Antigravity | `antigravity` | `agy -p "<prompt>"` (answer read from the transcript file) | OS credential store (Google account) | 2026-05-30 |
+| Antigravity | `antigravity` | `agy -p "<prompt>"` (answer read from the transcript file) | Google account login (token at `~/.gemini/oauth_creds.json`) | 2026-05-30 |
 | Kiro | `kiro` | `kiro-cli chat --no-interactive "<prompt>"` | `KIRO_API_KEY` (Pro/Pro+/Power) or `kiro-cli login` | 2026-05-30 |
 | OpenCode | `opencode` | `opencode run --format json -q "<prompt>"` | provider key or `opencode auth login` | 2026-05-30 (docs) |
 | Goose | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key | 2026-05-30 (docs) |

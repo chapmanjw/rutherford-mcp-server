@@ -102,7 +102,26 @@ def test_map_safety() -> None:
     assert "--dangerously-skip-permissions" in adapter.map_safety(SafetyMode.YOLO).args
 
 
-def test_no_models_and_unknown_auth() -> None:
-    adapter = AntigravityAdapter()
-    assert adapter.available_models() == []
-    assert adapter.check_auth().state is AuthState.UNKNOWN
+def test_no_models() -> None:
+    assert AntigravityAdapter().available_models() == []
+
+
+def test_check_auth_authenticated_when_creds_present(tmp_path: Path) -> None:
+    # agy stores its token at ~/.gemini/oauth_creds.json -- the parent of the agy data root.
+    (tmp_path / "oauth_creds.json").write_text(
+        json.dumps({"access_token": "x", "refresh_token": "y", "expiry_date": 0}),
+        encoding="utf-8",
+    )
+    adapter = AntigravityAdapter(data_root=tmp_path / "antigravity-cli")
+    assert adapter.check_auth().state is AuthState.AUTHENTICATED
+
+
+def test_check_auth_needs_login_when_creds_absent(tmp_path: Path) -> None:
+    adapter = AntigravityAdapter(data_root=tmp_path / "antigravity-cli")
+    assert adapter.check_auth().state is AuthState.NEEDS_LOGIN
+
+
+def test_check_auth_needs_login_on_empty_creds(tmp_path: Path) -> None:
+    (tmp_path / "oauth_creds.json").write_text("{}", encoding="utf-8")
+    adapter = AntigravityAdapter(data_root=tmp_path / "antigravity-cli")
+    assert adapter.check_auth().state is AuthState.NEEDS_LOGIN
