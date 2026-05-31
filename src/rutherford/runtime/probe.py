@@ -63,10 +63,13 @@ class SystemProbe:
         launch = prepare_argv(argv)
         start = time.monotonic()
         try:
+            # Decode as UTF-8 with replacement rather than the platform locale (cp1252 on
+            # Windows), which raises UnicodeDecodeError on a CLI that emits UTF-8 bytes.
             completed = subprocess.run(
                 launch,
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout_s,
                 env=merged_env(env),
                 check=False,

@@ -99,9 +99,9 @@ def test_build_invocation_never_builds_a_shell_string() -> None:
 def test_map_safety_covers_every_mode() -> None:
     adapter = CodexAdapter()
     flags = {mode: adapter.map_safety(mode) for mode in SafetyMode}
-    assert flags[SafetyMode.READ_ONLY].args == ["-s", "read-only", "-a", "never"]
-    assert flags[SafetyMode.PROPOSE].args == ["-s", "read-only", "-a", "never"]
-    assert flags[SafetyMode.WRITE].args == ["-s", "workspace-write", "-a", "never"]
+    assert flags[SafetyMode.READ_ONLY].args == ["-s", "read-only"]
+    assert flags[SafetyMode.PROPOSE].args == ["-s", "read-only"]
+    assert flags[SafetyMode.WRITE].args == ["-s", "workspace-write"]
     assert flags[SafetyMode.YOLO].args == ["--dangerously-bypass-approvals-and-sandbox"]
 
 

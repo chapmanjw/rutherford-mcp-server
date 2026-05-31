@@ -2,19 +2,20 @@
 # Copyright (c) 2026 John Chapman
 """The OpenCode adapter.
 
-Invocation: ``opencode run --format json -q [flags] "<prompt>"`` with the prompt as the last
-positional argument. ``-q`` quiets the spinner so stdout is clean newline-delimited JSON. Flags:
-``--dir`` (working directory), ``-m`` (a ``provider/model`` string such as
-``anthropic/claude-sonnet-4-6``), and ``--session`` (resume). OpenCode is bring-your-own-model:
-there is no system-prompt flag, so the role preamble is prepended to the prompt and in-scope
-files are appended to it. Auth is an ``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` env key or a
-persisted ``opencode auth login`` session.
+Invocation: ``opencode run --format json [flags] "<prompt>"`` with the prompt as the last
+positional argument. ``--format json`` emits raw JSON events on stdout (logs go to a file unless
+``--print-logs`` is set, so stdout stays clean). Flags: ``--dir`` (working directory), ``-m`` (a
+``provider/model`` string such as ``anthropic/claude-sonnet-4-6``), and ``--session`` (resume).
+OpenCode is bring-your-own-model: there is no system-prompt flag, so the role preamble is prepended
+to the prompt and in-scope files are appended to it. Auth is an ``ANTHROPIC_API_KEY`` /
+``OPENAI_API_KEY`` env key or a persisted ``opencode auth login`` session.
 
 The ``--format json`` stream emits one JSON event per line: text parts carry the assistant's
 answer, a ``step_finish`` event carries token usage and cost, and events carry a ``sessionID``
 for resume.
 
-Flags verified 2026-05-30 against ``opencode run --help`` and ``opencode --help``.
+Flags verified 2026-05-30 against ``opencode run --help`` (opencode 1.15.13). Note: this version
+has no ``-q``/``--quiet`` flag; ``--format json`` is what keeps stdout machine-readable.
 """
 
 from __future__ import annotations
@@ -110,7 +111,7 @@ class OpenCodeAdapter(BaseCLIAdapter):
             self._compose_prompt(req.prompt, ctx.role_preamble),
             req.files,
         )
-        argv = [self.binary, "run", "--format", "json", "-q"]
+        argv = [self.binary, "run", "--format", "json"]
 
         if req.working_dir:
             argv += ["--dir", req.working_dir]

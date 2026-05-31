@@ -49,7 +49,7 @@ def _req(**kwargs: object) -> DelegationRequest:
 def test_build_invocation_basic_argv_is_a_list() -> None:
     spec = OpenCodeAdapter().build_invocation(_req(), _ctx())
     assert isinstance(spec.argv, list)
-    assert spec.argv[:5] == ["opencode", "run", "--format", "json", "-q"]
+    assert spec.argv[:4] == ["opencode", "run", "--format", "json"]
     # The prompt is the last positional argv element.
     assert spec.argv[-1] == "say hi"
     assert "-m" in spec.argv

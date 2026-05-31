@@ -106,14 +106,15 @@ class AntigravityAdapter(BaseCLIAdapter):
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         if raw.timed_out:
             return timeout_result(ctx, raw)
+        # Check the exit code before reading the transcript: on a failed run the newest transcript
+        # on disk may be stale (from a previous conversation), so it must not be reported as this
+        # run's answer.
+        if raw.exit_code not in (0, None):
+            return nonzero_result(ctx, raw)
 
         conv_id, text = self._read_transcript(ctx.working_dir)
         if text:
             return success_result(ctx, raw, text, session_id=conv_id)
-
-        # No transcript text: fall back to stdout, then to a structured failure.
-        if raw.exit_code not in (0, None):
-            return nonzero_result(ctx, raw)
         if raw.stdout.strip():
             return success_result(ctx, raw, raw.stdout.strip(), session_id=conv_id)
         return error_result(

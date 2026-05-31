@@ -72,26 +72,21 @@ class CodexAdapter(BaseCLIAdapter):
         )
 
     def map_safety(self, mode: SafetyMode) -> SafetyFlags:
-        """Map every SafetyMode to Codex sandbox/approval flags, defaulting to read-only.
+        """Map every SafetyMode to a Codex sandbox policy, defaulting to read-only.
 
-        ``-a never`` keeps Codex headless (it never pauses for approval). read_only and propose
-        both run in the read-only sandbox; write uses the workspace-write sandbox; yolo bypasses
+        ``codex exec`` is already non-interactive and takes no approval-policy flag (``-a`` exists
+        only on the interactive ``codex``); the sandbox policy alone controls write access.
+        read_only and propose use the read-only sandbox; write uses workspace-write; yolo bypasses
         the sandbox and approvals entirely.
         """
         if mode is SafetyMode.WRITE:
-            return SafetyFlags(
-                args=["-s", "workspace-write", "-a", "never"],
-                note="workspace-write sandbox; never prompt for approval",
-            )
+            return SafetyFlags(args=["-s", "workspace-write"], note="workspace-write sandbox")
         if mode is SafetyMode.YOLO:
             return SafetyFlags(
                 args=["--dangerously-bypass-approvals-and-sandbox"],
                 note="bypass all approvals and sandboxing",
             )
-        return SafetyFlags(
-            args=["-s", "read-only", "-a", "never"],
-            note="read-only sandbox; never prompt for approval",
-        )
+        return SafetyFlags(args=["-s", "read-only"], note="read-only sandbox")
 
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
         """Build the ``codex exec`` invocation, with the composed prompt fed via stdin.
