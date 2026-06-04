@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-06-03
+
+### Fixed
+
+- `doctor` and `capabilities` no longer report a Bedrock-configured Claude Code or Codex as
+  `needs_login`. When a CLI is pointed at a third-party cloud backend (AWS Bedrock, Google Vertex,
+  Bedrock Mantle), its credential is an AWS/GCP chain rather than an `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` or a native login session, so the old API-key/session probe gave a false
+  negative.
+  - The `claude_code` adapter now reads the JSON body of `claude auth status`. A third-party
+    `apiProvider` / `authMethod` (or a `CLAUDE_CODE_USE_*` switch) reports `unknown`, so `doctor`'s
+    live round trip confirms real reachability instead of trusting a "configured" flag.
+  - The `codex` adapter now consults `codex doctor --json` and trusts its `auth.credentials` check,
+    which validates the effective credential -- including the built-in `amazon-bedrock` provider.
+  Both adapters fall back to the previous env-key / persisted-session markers when those commands
+  are unavailable on an older CLI.
+
 ## [0.1.1] - 2026-05-31
 
 ### Fixed
