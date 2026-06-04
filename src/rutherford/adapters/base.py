@@ -153,6 +153,22 @@ class BaseCLIAdapter(ABC):
                 return name
         return None
 
+    @staticmethod
+    def _env_truthy(*names: str) -> bool:
+        """Return whether any of ``names`` is set to a truthy toggle value.
+
+        Flag-style env vars (``CLAUDE_CODE_USE_BEDROCK=1``) are opt-in switches: an explicit
+        ``0`` / ``false`` / ``no`` / ``off`` (or an empty value) means off; any other non-empty
+        value means on. Used to detect a third-party model backend (Bedrock/Vertex) that the
+        cheap auth probe cannot verify on its own.
+        """
+        falsy = {"", "0", "false", "no", "off"}
+        for name in names:
+            value = os.environ.get(name)
+            if value is not None and value.strip().lower() not in falsy:
+                return True
+        return False
+
     def _auth_from_env_or_command(
         self,
         env_vars: tuple[str, ...],

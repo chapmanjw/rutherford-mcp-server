@@ -40,6 +40,18 @@ def _req(**kwargs: object) -> DelegationRequest:
     return DelegationRequest(**base)  # type: ignore[arg-type]
 
 
+@pytest.fixture(autouse=True)
+def _clear_backend_switches(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep check_auth tests hermetic regardless of the dev's shell: clear the provider switches."""
+    for var in (
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_MANTLE",
+        "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 # --- build_invocation --------------------------------------------------------
 
 
@@ -184,3 +196,78 @@ def test_check_auth_needs_login(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_available_models_static() -> None:
     assert ClaudeCodeAdapter().available_models() == ["opus", "sonnet", "haiku"]
+
+
+# --- check_auth: third-party cloud backends (Bedrock / Vertex / Mantle) -------
+
+#: The exact `claude auth status` JSON observed on a Bedrock-configured machine.
+_BEDROCK_STATUS = '{"loggedIn": true, "authMethod": "third_party", "apiProvider": "bedrock"}'
+
+
+def _auth_status_probe(stdout: str = "", *, exit_code: int = 0) -> FakeProbe:
+    """A probe whose `claude auth status` returns the given output; other calls are inert."""
+
+    def run_fn(argv: list[str]) -> ProcessResult:
+        if "auth" in argv:  # ["claude", "auth", "status"]
+            return ProcessResult(exit_code=exit_code, stdout=stdout)
+        return ProcessResult(exit_code=0, stdout="")
+
+    return FakeProbe(which_map={"claude": "/usr/bin/claude"}, run_fn=run_fn)
+
+
+def test_check_auth_bedrock_provider_defers_to_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    # apiProvider=bedrock (authMethod third_party): `loggedIn` only means *configured*, so the cheap
+    # probe must report UNKNOWN and let doctor's live check confirm the AWS creds actually reach a model.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    status = ClaudeCodeAdapter(probe=_auth_status_probe(_BEDROCK_STATUS)).check_auth()
+    assert status.state is AuthState.UNKNOWN
+    assert "bedrock" in (status.detail or "").lower()
+
+
+def test_check_auth_vertex_provider_defers_to_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    status = ClaudeCodeAdapter(probe=_auth_status_probe('{"loggedIn": true, "apiProvider": "vertex"}')).check_auth()
+    assert status.state is AuthState.UNKNOWN
+
+
+def test_check_auth_third_party_auth_method_defers_to_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Even with an apiProvider we don't enumerate, authMethod=third_party is enough to defer.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    probe = _auth_status_probe('{"loggedIn": true, "authMethod": "third_party", "apiProvider": "acme-gateway"}')
+    assert ClaudeCodeAdapter(probe=probe).check_auth().state is AuthState.UNKNOWN
+
+
+def test_check_auth_bedrock_env_var_defers_even_without_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An older CLI whose `auth status` emits no JSON: the CLAUDE_CODE_USE_BEDROCK switch alone is
+    # enough to know the Anthropic-login probe is the wrong signal.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    status = ClaudeCodeAdapter(probe=_auth_status_probe("", exit_code=1)).check_auth()
+    assert status.state is AuthState.UNKNOWN
+
+
+def test_check_auth_bedrock_env_wins_over_stray_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    # With a backend switch set, Claude Code ignores ANTHROPIC_API_KEY, so a stray key must not
+    # produce a false AUTHENTICATED -- the backend still defers to the live check.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-stray")
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "true")
+    status = ClaudeCodeAdapter(probe=_auth_status_probe("", exit_code=1)).check_auth()
+    assert status.state is AuthState.UNKNOWN
+
+
+def test_check_auth_first_party_logged_in_is_authenticated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    probe = _auth_status_probe('{"loggedIn": true, "authMethod": "claudeai", "apiProvider": "anthropic"}')
+    assert ClaudeCodeAdapter(probe=probe).check_auth().state is AuthState.AUTHENTICATED
+
+
+def test_check_auth_json_not_logged_in_needs_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    status = ClaudeCodeAdapter(probe=_auth_status_probe('{"loggedIn": false}')).check_auth()
+    assert status.state is AuthState.NEEDS_LOGIN
+
+
+def test_check_auth_parses_pretty_printed_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    pretty = '{\n  "loggedIn": true,\n  "authMethod": "third_party",\n  "apiProvider": "bedrock"\n}'
+    assert ClaudeCodeAdapter(probe=_auth_status_probe(pretty)).check_auth().state is AuthState.UNKNOWN

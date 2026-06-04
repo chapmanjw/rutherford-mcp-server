@@ -396,3 +396,70 @@ def test_check_auth_needs_login(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 
 def test_available_models_static() -> None:
     assert CodexAdapter().available_models() == []
+
+
+# --- check_auth via `codex doctor --json` (covers the Bedrock provider) -------
+
+#: A `codex doctor --json` report whose auth.credentials check is healthy.
+_DOCTOR_OK = '{"overallStatus": "ok", "checks": {"auth.credentials": {"status": "ok"}}}'
+#: The same report shape signalling an auth problem.
+_DOCTOR_BAD = '{"overallStatus": "error", "checks": {"auth.credentials": {"status": "error"}}}'
+
+
+def _doctor_probe(stdout: str = "", *, exit_code: int = 0) -> FakeProbe:
+    """A probe whose `codex doctor --json` returns the given output; other calls are inert."""
+
+    def run_fn(argv: list[str]) -> ProcessResult:
+        if "doctor" in argv:  # ["codex", "doctor", "--json"]
+            return ProcessResult(exit_code=exit_code, stdout=stdout)
+        return ProcessResult(exit_code=0, stdout="")
+
+    return FakeProbe(which_map={"codex": "/usr/bin/codex"}, run_fn=run_fn)
+
+
+def _isolate_codex(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Strip the cheap markers (env keys + ~/.codex/auth.json) so only `codex doctor` can answer."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_API_KEY", raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    return home
+
+
+def test_check_auth_bedrock_via_doctor_ok(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # The Bedrock case: no OPENAI_API_KEY, no ~/.codex/auth.json -- yet codex doctor reports auth ok
+    # (its credential is an AWS bearer token / SDK chain). The pre-fix env+file check missed this.
+    _isolate_codex(monkeypatch, tmp_path)
+    status = CodexAdapter(probe=_doctor_probe(_DOCTOR_OK)).check_auth()
+    assert status.state is AuthState.AUTHENTICATED
+    assert "doctor" in (status.detail or "").lower()
+
+
+def test_check_auth_doctor_reports_problem_needs_login(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _isolate_codex(monkeypatch, tmp_path)
+    assert CodexAdapter(probe=_doctor_probe(_DOCTOR_BAD)).check_auth().state is AuthState.NEEDS_LOGIN
+
+
+def test_check_auth_doctor_unavailable_falls_back_to_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # An older codex without `doctor --json` (nothing parseable on stdout): fall back to the env key.
+    _isolate_codex(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    status = CodexAdapter(probe=_doctor_probe("", exit_code=2)).check_auth()
+    assert status.state is AuthState.AUTHENTICATED
+    assert status.detail == "OPENAI_API_KEY is set"
+
+
+def test_check_auth_doctor_unavailable_falls_back_to_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    home = _isolate_codex(monkeypatch, tmp_path)
+    (home / ".codex").mkdir()
+    (home / ".codex" / "auth.json").write_text("{}", encoding="utf-8")
+    status = CodexAdapter(probe=_doctor_probe("")).check_auth()
+    assert status.state is AuthState.AUTHENTICATED
+    assert status.detail == "persisted session"
+
+
+def test_check_auth_doctor_json_with_noise_is_parsed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _isolate_codex(monkeypatch, tmp_path)
+    noisy = f"checking environment...\n{_DOCTOR_OK}\n"
+    assert CodexAdapter(probe=_doctor_probe(noisy)).check_auth().state is AuthState.AUTHENTICATED

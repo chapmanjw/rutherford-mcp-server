@@ -40,6 +40,29 @@ that by default (`live=true`): for any installed adapter still `unknown`, it run
 read-only round trip and reports `authenticated` or `needs_login` from the outcome. That spends a
 small model call; pass `live=false` for a metadata-only `doctor` with no model calls.
 
+#### Third-party model backends (AWS Bedrock, Google Vertex)
+
+`claude_code` and `codex` can be pointed at a cloud backend instead of their native API: Claude
+Code via `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX` / `CLAUDE_CODE_USE_MANTLE`
+(authenticated by the AWS/GCP credential chain), and Codex via a `model_provider = "amazon-bedrock"`
+config or any custom provider. In that mode there is **no** `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`
+and **no** native login session -- so the old "is the API key or login present" probe wrongly
+reported `needs_login` even though the CLI works.
+
+The adapters now read the CLI's own effective-auth signal instead:
+
+- `claude_code` parses the JSON body of `claude auth status`. When it names a third-party backend
+  (`apiProvider` like `bedrock`, `authMethod: "third_party"`, or a `CLAUDE_CODE_USE_*` switch),
+  `loggedIn: true` only proves the backend is *configured*, not that the AWS/GCP credentials can
+  reach a model -- so the cheap probe returns `unknown` and `doctor`'s live round trip confirms it.
+- `codex` reads `codex doctor --json` and trusts its `checks["auth.credentials"].status`, which
+  already validates the effective credential (including a Bedrock provider). No live call is needed.
+
+So a Bedrock/Vertex CLI shows as `unknown` under `capabilities` (and `doctor live=false`) and
+resolves to `authenticated` / `needs_login` under the default `doctor`. If it resolves to
+`needs_login`, the live call actually failed: check `AWS_REGION` is set, the AWS profile/SSO session
+is current (`aws sts get-caller-identity`), and the account has Bedrock model access.
+
 Put API keys in a `.env` file (confirmed gitignored -- see `SECURITY.md`) and load them into the server process environment. Rutherford inherits the parent process environment unchanged.
 
 ---

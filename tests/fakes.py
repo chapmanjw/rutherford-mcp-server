@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
+from rutherford.adapters.base import CLIAdapter
 from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import AppContext, build_app_context
@@ -189,12 +190,16 @@ class FakeAdapter:
 
 def make_app(
     *,
-    adapters: Sequence[FakeAdapter] | None = None,
+    adapters: Sequence[CLIAdapter] | None = None,
     runner: FakeProcessRunner | None = None,
     config: RutherfordConfig | None = None,
     base_depth: int = 0,
 ) -> AppContext:
-    """Build an :class:`AppContext` wired to fakes, with no disk or subprocess access."""
+    """Build an :class:`AppContext` wired to fakes, with no disk or subprocess access.
+
+    ``adapters`` accepts any :class:`CLIAdapter`, so a test can mix a real adapter (driven by a
+    :class:`FakeProbe` / :class:`FakeProcessRunner`) in with the :class:`FakeAdapter` doubles.
+    """
     registry = AdapterRegistry(list(adapters) if adapters is not None else [FakeAdapter()])
     return build_app_context(
         config=config or RutherfordConfig(),

@@ -22,7 +22,9 @@ The ``--json`` flag emits JSONL events; the final answer is the text of the last
 ``item.completed`` agent message, the session id is the ``thread.started`` ``thread_id``, and
 token usage comes from ``turn.completed``. A resume whose arguments the CLI rejects surfaces as a
 distinct ``RESUME_FAILED`` (not an opaque ``NONZERO_EXIT``), so a lost resume is never silent. Auth
-is ``OPENAI_API_KEY`` / ``CODEX_API_KEY`` or a persisted ``~/.codex/auth.json`` session.
+is read from ``codex doctor --json`` -- its ``auth.credentials`` check covers a custom/Bedrock model
+provider too -- falling back to ``OPENAI_API_KEY`` / ``CODEX_API_KEY`` or a persisted
+``~/.codex/auth.json`` session when that command is unavailable.
 
 Flags verified 2026-05-30 against ``codex exec --help`` and ``codex exec resume --help``
 (codex-cli 0.135.0).
@@ -61,7 +63,25 @@ class CodexAdapter(BaseCLIAdapter):
     version_args = ("--version",)
 
     def check_auth(self) -> AuthStatus:
-        """Report auth from an API-key env var, then a persisted login, without logging in."""
+        """Resolve auth from ``codex doctor --json``, falling back to the env key / persisted session.
+
+        ``codex doctor --json`` emits a health report whose ``checks["auth.credentials"].status``
+        reflects the *effective* credential state -- including a custom or built-in ``amazon-bedrock``
+        model provider, whose credential lives outside ``OPENAI_API_KEY`` / ``~/.codex/auth.json``
+        (an AWS bearer token or the AWS SDK chain). That makes ``doctor`` the trustworthy signal: a
+        Bedrock-configured Codex has neither cheap marker yet is fully authenticated, and
+        ``codex doctor`` reports ``ok`` for it. Only when that command is unavailable (an older CLI)
+        or carries no auth check do we fall back to the env key / persisted-session markers.
+        """
+        report = self._probe.run([self.binary, "doctor", "--json"], timeout_s=20.0)
+        verdict = _doctor_auth_ok(report.stdout)
+        if verdict is True:
+            return AuthStatus(state=AuthState.AUTHENTICATED, detail="codex doctor reports auth.credentials ok")
+        if verdict is False:
+            return AuthStatus(
+                state=AuthState.NEEDS_LOGIN,
+                detail="codex doctor reports an auth problem; run codex login or set OPENAI_API_KEY",
+            )
         present = self._env_present("OPENAI_API_KEY", "CODEX_API_KEY")
         if present is not None:
             return AuthStatus(state=AuthState.AUTHENTICATED, detail=f"{present} is set")
@@ -210,6 +230,48 @@ class CodexAdapter(BaseCLIAdapter):
             )
 
         return success_result(ctx, raw, answer, session_id=session_id, cost=cost)
+
+
+def _doctor_auth_ok(stdout: str) -> bool | None:
+    """Return the auth verdict from ``codex doctor --json``: ``True`` ok, ``False`` a problem, ``None`` absent.
+
+    The report nests an ``auth.credentials`` check under ``checks``; its ``status`` is ``ok`` when the
+    effective credential -- an OpenAI key, a persisted login, or a custom/``amazon-bedrock`` provider
+    credential -- is usable. ``None`` means no parseable report or no such check, so the caller falls
+    back to the cheap env-key / persisted-session markers.
+    """
+    data = _parse_doctor_json(stdout)
+    if data is None:
+        return None
+    checks = data.get("checks")
+    if not isinstance(checks, dict):
+        return None
+    auth_check = checks.get("auth.credentials")
+    if not isinstance(auth_check, dict) or "status" not in auth_check:
+        return None
+    return str(auth_check.get("status")).strip().lower() == "ok"
+
+
+def _parse_doctor_json(stdout: str) -> dict[str, Any] | None:
+    """Return the JSON object from ``codex doctor --json``, tolerating pretty-print or surrounding noise."""
+    text = stdout.strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def _resume_safety_args(exec_safety_args: list[str]) -> list[str]:
