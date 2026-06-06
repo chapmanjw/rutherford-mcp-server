@@ -47,6 +47,10 @@ class ErrorCode(StrEnum):
     JOB_NOT_FOUND = "JOB_NOT_FOUND"
     #: A named role could not be found in any configured role directory.
     ROLE_NOT_FOUND = "ROLE_NOT_FOUND"
+    #: A named panel could not be found in any discovered panels file.
+    PANEL_NOT_FOUND = "PANEL_NOT_FOUND"
+    #: A panels file failed to parse or validate (bad TOON, unknown CLI, malformed target).
+    PANEL_INVALID = "PANEL_INVALID"
     #: An unexpected internal error.
     INTERNAL = "INTERNAL"
 

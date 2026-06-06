@@ -24,6 +24,7 @@ EXPECTED_TOOLS = {
     "job_status",
     "job_result",
     "list_roles",
+    "reload_panels",
 }
 
 

@@ -18,6 +18,10 @@ from typing import Any
 from pydantic import BaseModel
 
 
+class DecodeError(Exception):
+    """A TOON document could not be parsed. The seam-level error, so callers never import the encoder."""
+
+
 def to_plain(data: Any) -> Any:
     """Recursively convert pydantic models to JSON-compatible Python data.
 
@@ -45,3 +49,18 @@ def encode(data: Any) -> str:
 
     text = _toon_encode(to_plain(data))
     return text if text else "(no content)"
+
+
+def decode(text: str) -> Any:
+    """Decode a TOON string into plain Python data: the read counterpart to :func:`encode`.
+
+    Raises :class:`DecodeError` (not the encoder's own exception) on malformed input, so the rest
+    of the project depends on this seam rather than on the TOON library directly.
+    """
+    from toon import ToonDecodeError
+    from toon import decode as _toon_decode
+
+    try:
+        return _toon_decode(text)
+    except ToonDecodeError as exc:
+        raise DecodeError(str(exc)) from exc

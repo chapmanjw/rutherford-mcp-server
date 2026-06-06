@@ -20,6 +20,7 @@ from typing import Any
 
 from .adapters.registry import AdapterRegistry, build_registry
 from .config.loader import load_config
+from .config.panels import PanelCache, load_panels
 from .config.schema import RutherfordConfig
 from .domain.error_codes import ErrorCode
 from .domain.errors import RutherfordError
@@ -58,6 +59,7 @@ class AppContext:
     config: RutherfordConfig
     registry: AdapterRegistry
     roles: RoleStore
+    panels: PanelCache
     delegation: DelegationService
     consensus: ConsensusService
     debate: DebateService
@@ -76,6 +78,7 @@ def build_app_context(
     runner: ProcessRunner | None = None,
     registry: AdapterRegistry | None = None,
     roles: RoleStore | None = None,
+    panels: PanelCache | None = None,
     base_depth: int | None = None,
 ) -> AppContext:
     """Assemble the application context: load config, build the registry and services.
@@ -90,6 +93,7 @@ def build_app_context(
 
     resolved_registry = registry if registry is not None else build_registry(resolved_config)
     resolved_roles = roles if roles is not None else load_roles(resolved_config.role_dirs)
+    resolved_panels = panels if panels is not None else PanelCache(lambda: load_panels(resolved_registry.ids()))
     delegation = DelegationService(resolved_registry, resolved_runner, resolved_config, resolved_roles)
     consensus = ConsensusService(delegation, resolved_config, resolved_registry)
     debate = DebateService(delegation, resolved_config)
@@ -98,6 +102,7 @@ def build_app_context(
         config=resolved_config,
         registry=resolved_registry,
         roles=resolved_roles,
+        panels=resolved_panels,
         delegation=delegation,
         consensus=consensus,
         debate=debate,

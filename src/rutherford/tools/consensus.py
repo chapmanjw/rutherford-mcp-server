@@ -10,6 +10,7 @@ from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode
 from ..domain.models import ConsensusRequest, Target
 from .common import as_target, parse_mode, parse_safety_mode, parse_stances
+from .panels import panel_targets_and_stances
 
 
 async def consensus_tool(
@@ -17,6 +18,8 @@ async def consensus_tool(
     *,
     targets: list[Any] | str | None = None,
     prompt: str,
+    panel: str | None = None,
+    panel_overrides: dict[str, Any] | None = None,
     stances: list[str] | None = None,
     working_dir: str | None = None,
     files: list[str] | None = None,
@@ -32,21 +35,29 @@ async def consensus_tool(
     ``targets`` is a list of ``{cli, model}`` objects (or ``cli`` / ``cli:model`` strings). Omit it,
     pass an empty list, or pass the sentinel ``"all"`` to fan out to every installed + authenticated
     adapter (each at its default model, capped at ``max_targets``); the result's ``skipped`` field
-    explains any adapter left out. Optional ``stances`` (parallel to ``targets``) steer each voice
-    for/against/neutral and cannot be combined with the auto-expanded panel. Optional ``synthesize``
-    adds a server-side combined answer; it is off by default.
+    explains any adapter left out. Alternatively name a saved ``panel`` (with optional one-off
+    ``panel_overrides``) instead of ``targets``; the two are mutually exclusive. Optional ``stances``
+    (parallel to ``targets``) steer each voice for/against/neutral and cannot be combined with the
+    auto-expanded panel. Optional ``synthesize`` adds a server-side combined answer; it is off by
+    default.
     """
-    expand_all = _wants_all(targets)
-    if expand_all:
-        target_objs: list[Target] = []
-    elif isinstance(targets, str):
-        target_objs = [as_target(targets)]  # a bare "cli" / "cli:model" string
+    target_objs: list[Target]
+    if panel is not None:
+        target_objs, panel_stances = panel_targets_and_stances(app, panel, panel_overrides, targets, stances)
+        expand_all = False
     else:
-        target_objs = [as_target(target) for target in targets or []]
+        panel_stances = parse_stances(stances)
+        expand_all = _wants_all(targets)
+        if expand_all:
+            target_objs = []
+        elif isinstance(targets, str):
+            target_objs = [as_target(targets)]  # a bare "cli" / "cli:model" string
+        else:
+            target_objs = [as_target(target) for target in targets or []]
     request = ConsensusRequest(
         targets=target_objs,
         prompt=prompt,
-        stances=parse_stances(stances),
+        stances=panel_stances,
         working_dir=working_dir,
         files=files or [],
         role=role,

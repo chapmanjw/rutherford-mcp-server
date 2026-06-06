@@ -60,6 +60,9 @@ All fields are optional. Unset fields take the listed default.
 | `max_depth` | `int` | `3` | Maximum delegation depth. Delegations at this depth are refused. |
 | `max_targets` | `int` | `8` | Maximum targets per consensus or debate call. |
 | `max_debate_rounds` | `int` | `4` | Maximum rounds a single `debate` call may run. Each round is a full panel pass. |
+
+Saved panels and custom roles are not fields of this file; they live in their own files (see
+Saved panels below) so the main config stays small.
 | `trusted_workspaces` | `list[str]` | `[]` | Absolute paths under which `write` and `yolo` delegations are permitted. |
 | `synthesize_default` | `bool` | `false` | Whether consensus synthesizes server-side by default. |
 
@@ -80,6 +83,7 @@ entire config.
 | Variable | Type | Overrides |
 |----------|------|-----------|
 | `RUTHERFORD_CONFIG` | path | Replaces file discovery; must point to an existing file. |
+| `RUTHERFORD_CONFIG_DIR` | path | A panels/roles config directory searched ahead of the project and home locations (see Saved panels). |
 | `RUTHERFORD_MAX_DEPTH` | integer | `max_depth` |
 | `RUTHERFORD_MAX_TARGETS` | integer | `max_targets` |
 | `RUTHERFORD_DEFAULT_TIMEOUT_S` | float | `default_timeout_s` |
@@ -191,6 +195,64 @@ propose   = ["--propose"]
 write     = []
 yolo      = ["--skip-approvals"]
 ```
+
+---
+
+## Saved panels (`panels.toon`)
+
+A panel is a named, reusable set of targets -- the crew you keep reaching for. Define one in a
+`panels.toon` file and reference it by name (`consensus(panel="design-roundtable")`,
+`debate(panel=...)`, `review(panel=...)`) instead of listing the targets every call. Panels use
+TOON, not TOML; the main `config.toml` is unchanged.
+
+### Discovery and precedence
+
+Three locations are searched and their panels merged by name. On a name collision the closest
+scope wins, the same way a project `rutherford.toml` overrides the global `config.toml`:
+
+```
+~/.rutherford/panels.toon          (home / global; lowest priority)
+        +
+<cwd>/.rutherford/panels.toon      (project; overrides home for a same-named panel)
+        +
+$RUTHERFORD_CONFIG_DIR/panels.toon (explicit; overrides both)
+```
+
+Distinct panel names from every location are unioned, so global panels stay available even when a
+project defines its own. Edits are picked up by the `reload_panels` tool without a server restart.
+
+### File format
+
+```toon
+panels:
+  design-roundtable:
+    description: Lineage-diverse design review
+    strategy: all-voices
+    targets[3]:
+      - cli: claude_code
+        model: opus
+        label: proposer
+      - cli: codex
+        label: implementer
+      - cli: kiro
+        model: deepseek-3.2
+        label: dissenter
+        stance: against
+```
+
+A panel record has `description` (optional), `strategy` (optional, default `all-voices`), and a
+non-empty `targets` list. A target has `cli` (required, must be a known adapter id), `model`,
+`role`, `label`, `weight` (default `1.0`), `parity` (default `false`), and `stance`
+(`for` | `against` | `neutral`). Today `consensus`/`debate`/`review` consume a panel's `cli`,
+`model`, and `stance`; `role`, `label`, `weight`, `parity`, and `strategy` are accepted and stored
+so the file is stable, and take effect with the per-target-metadata and strategy changes that
+follow.
+
+Panel files are validated when first loaded. A bad file reports every problem at once -- malformed
+TOON, an unknown `cli`, a bad `stance` -- pointing at the file and the offending target index,
+rather than failing on the first error. A panel naming an unknown CLI is an error; a panel whose
+CLI is installed but unauthenticated still loads, and that voice is skipped at run time with the
+usual reason.
 
 ---
 

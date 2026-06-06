@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+import pytest
+
 from rutherford.context import error_payload_from, tool_error, tool_success
 from rutherford.domain.enums import SafetyMode
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import DelegationResult, Target
-from rutherford.io.serialize import encode, to_plain
+from rutherford.io.serialize import DecodeError, decode, encode, to_plain
 
 
 def test_encode_dict_is_toon() -> None:
@@ -27,6 +29,16 @@ def test_encode_uniform_list_is_tabular() -> None:
 
 def test_encode_none_is_null() -> None:
     assert encode(None) == "null"
+
+
+def test_decode_round_trips_encode() -> None:
+    data = {"panels": {"duo": {"strategy": "majority", "targets": [{"cli": "codex"}, {"cli": "kiro"}]}}}
+    assert decode(encode(data)) == data
+
+
+def test_decode_raises_decode_error_on_bad_toon() -> None:
+    with pytest.raises(DecodeError):
+        decode("items[3]: 1,2")  # declares three values but supplies two
 
 
 def test_encode_empty_is_placeholder() -> None:

@@ -8,6 +8,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Saved panels: a named, reusable set of targets defined in a `panels.toon` file, referenced by
+  `panel="..."` on `consensus`, `debate`, and `review` instead of spelling out the targets each
+  call (with optional one-off `panel_overrides`). Panels are discovered across
+  `$RUTHERFORD_CONFIG_DIR`, `<cwd>/.rutherford/`, and `~/.rutherford/` and merged by name, the
+  closest scope winning a name collision -- the same precedence the TOML config uses for a project
+  `rutherford.toml` over the global `config.toml`. Files are TOON, read through the serialization
+  seam (which gained a `decode` counterpart to `encode`). Loading is lazy and cached; a new
+  `reload_panels` tool re-reads edits without a restart. Panel files are validated at load, with
+  every problem (bad TOON, unknown CLI, malformed target) reported in one pass rather than failing
+  on the first. New error codes `PANEL_NOT_FOUND` and `PANEL_INVALID`.
 - A `debate` tool: several targets argue a question across multiple rounds and return the full
   transcript. Round one is each voice's independent answer; every later round shows a voice the
   other voices' latest positions and asks it to rebut and revise, so the panel actually argues

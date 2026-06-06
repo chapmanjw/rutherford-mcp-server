@@ -13,6 +13,7 @@ from collections.abc import Callable, Sequence
 
 from rutherford.adapters.base import CLIAdapter
 from rutherford.adapters.registry import AdapterRegistry
+from rutherford.config.panels import PanelCache
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import AppContext, build_app_context
 from rutherford.domain.enums import AuthState, OutputMode, SafetyMode
@@ -193,17 +194,20 @@ def make_app(
     adapters: Sequence[CLIAdapter] | None = None,
     runner: FakeProcessRunner | None = None,
     config: RutherfordConfig | None = None,
+    panels: PanelCache | None = None,
     base_depth: int = 0,
 ) -> AppContext:
     """Build an :class:`AppContext` wired to fakes, with no disk or subprocess access.
 
     ``adapters`` accepts any :class:`CLIAdapter`, so a test can mix a real adapter (driven by a
     :class:`FakeProbe` / :class:`FakeProcessRunner`) in with the :class:`FakeAdapter` doubles.
+    ``panels`` seeds a :class:`PanelCache` so a test can drive the ``panel=`` paths without disk.
     """
     registry = AdapterRegistry(list(adapters) if adapters is not None else [FakeAdapter()])
     return build_app_context(
         config=config or RutherfordConfig(),
         runner=runner or FakeProcessRunner(),
         registry=registry,
+        panels=panels,
         base_depth=base_depth,
     )

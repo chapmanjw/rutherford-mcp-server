@@ -96,7 +96,7 @@ A seventh, well-behaved CLI can be added without code -- see [docs/adding-a-cli.
 
 You drive Rutherford from your MCP client in plain language. You describe what you want, and your
 agent translates it into Rutherford's tools (`delegate`, `consensus`, `debate`, `review`, `plan`,
-`capabilities`, `doctor`, `job_status`, `job_result`, `list_roles`) -- you rarely name the tools or
+`capabilities`, `doctor`, `job_status`, `job_result`, `list_roles`, `reload_panels`) -- you rarely name the tools or
 their arguments yourself. You name a CLI (`claude_code`, `codex`, `cursor`, `qwen`, `kiro`,
 `opencode`, `goose`, `antigravity`), optionally a model, and what you want done. Everything defaults
 to read-only.
@@ -156,6 +156,17 @@ transcript -- you can retrace exactly how each voice moved -- and an optional cl
 where they converged and where they still split. Optional stances (for / against / neutral) keep a
 voice on its assigned side the whole way through. For a single-shot version where each agent
 answers once with an assigned stance and nobody rebuts, use `consensus` with `stances` instead.
+
+### Save a panel and reuse it
+
+> Run my `design-roundtable` panel on this question: "should this API return a stream or a page?"
+
+Once you have a crew you keep reaching for, save it as a named panel in `~/.rutherford/panels.toon`
+(or `<project>/.rutherford/panels.toon` for a project-specific one) and name it with `panel=`
+instead of listing the targets every time. A project's panel of the same name overrides your global
+one, and `consensus`, `debate`, and `review` all accept `panel`. After editing the file, "reload
+Rutherford's panels" picks up the change without restarting. See
+[docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md) for the file format.
 
 ### Build one combined recommendation
 

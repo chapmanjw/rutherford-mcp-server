@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Awaitable
+from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -26,6 +27,7 @@ from .tools.consensus import consensus_tool
 from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
 from .tools.jobs import job_result_tool, job_status_tool
+from .tools.panels import reload_panels_tool
 from .tools.plan import plan_tool
 from .tools.review import review_tool
 from .tools.roles import list_roles_tool
@@ -108,6 +110,8 @@ async def delegate(
 async def consensus(
     prompt: str,
     targets: list[Target | str] | str | None = None,
+    panel: str | None = None,
+    panel_overrides: dict[str, Any] | None = None,
     stances: list[str] | None = None,
     working_dir: str | None = None,
     files: list[str] | None = None,
@@ -122,17 +126,20 @@ async def consensus(
 
     `targets` is a list of `{cli, model}` objects (or `cli` / `cli:model` strings). Omit it, pass an
     empty list, or pass `"all"` to fan out to every installed + authenticated CLI at its default
-    model (capped at `max_targets`); the result's `skipped` list explains any adapter left out.
-    Optional `stances` (parallel to `targets`) steer each voice: for | against | neutral, and cannot
-    be combined with the auto-expanded panel. `synthesize=true` adds a server-side combined answer
-    (off by default, so the orchestrator can synthesize the voices itself). With `mode="async"` a
-    job id is returned.
+    model (capped at `max_targets`); the result's `skipped` list explains any adapter left out. Or name
+    a saved `panel` (with optional `panel_overrides`) instead of `targets`; the two are mutually
+    exclusive. Optional `stances` (parallel to `targets`) steer each voice: for | against | neutral,
+    and cannot be combined with the auto-expanded panel. `synthesize=true` adds a server-side combined
+    answer (off by default, so the orchestrator can synthesize the voices itself). With `mode="async"`
+    a job id is returned.
     """
     return await _guarded(
         consensus_tool(
             get_app(),
             targets=targets,
             prompt=prompt,
+            panel=panel,
+            panel_overrides=panel_overrides,
             stances=stances,
             working_dir=working_dir,
             files=files,
@@ -149,7 +156,9 @@ async def consensus(
 @mcp.tool
 async def debate(
     prompt: str,
-    targets: list[Target | str],
+    targets: list[Target | str] | None = None,
+    panel: str | None = None,
+    panel_overrides: dict[str, Any] | None = None,
     rounds: int = 2,
     stances: list[str] | None = None,
     working_dir: str | None = None,
@@ -164,18 +173,21 @@ async def debate(
     """Have several targets argue a question across rounds and return the full transcript.
 
     `targets` is a list of `{cli, model}` objects (or `cli` / `cli:model` strings); a debate needs at
-    least two. `rounds` (default 2) is how many passes the panel makes: round one is each voice's
-    independent answer, and each later round shows a voice the others' latest positions and asks it to
-    rebut and revise. Optional `stances` (parallel to `targets`) keep a voice arguing for | against |
-    neutral throughout. `synthesize=true` (default) adds a closing summary. The result's `rounds` hold
-    every voice's answer at every round, so the discussion is fully retraceable. With `mode="async"` a
-    job id is returned.
+    least two. Or name a saved `panel` (with optional `panel_overrides`) instead of `targets`; the two
+    are mutually exclusive. `rounds` (default 2) is how many passes the panel makes: round one is each
+    voice's independent answer, and each later round shows a voice the others' latest positions and
+    asks it to rebut and revise. Optional `stances` (parallel to `targets`) keep a voice arguing for |
+    against | neutral throughout. `synthesize=true` (default) adds a closing summary. The result's
+    `rounds` hold every voice's answer at every round, so the discussion is fully retraceable. With
+    `mode="async"` a job id is returned.
     """
     return await _guarded(
         debate_tool(
             get_app(),
             prompt=prompt,
-            targets=list(targets),
+            targets=list(targets) if targets is not None else None,
+            panel=panel,
+            panel_overrides=panel_overrides,
             rounds=rounds,
             stances=stances,
             working_dir=working_dir,
@@ -204,7 +216,9 @@ async def job_result(job_id: str) -> str:
 
 @mcp.tool
 async def review(
-    targets: list[Target],
+    targets: list[Target] | None = None,
+    panel: str | None = None,
+    panel_overrides: dict[str, Any] | None = None,
     paths: list[str] | None = None,
     diff: str | None = None,
     role: str = "codereviewer",
@@ -213,11 +227,17 @@ async def review(
     synthesize: bool = False,
     timeout_s: float | None = None,
 ) -> str:
-    """Review a diff or a set of files across one or more targets (read-only). Provide diff or paths."""
+    """Review a diff or a set of files across one or more targets (read-only). Provide diff or paths.
+
+    Name a list of `targets` or a saved `panel` (with optional `panel_overrides`); they are mutually
+    exclusive.
+    """
     return await _guarded(
         review_tool(
             get_app(),
-            targets=list(targets),
+            targets=list(targets) if targets is not None else None,
+            panel=panel,
+            panel_overrides=panel_overrides,
             paths=paths,
             diff=diff,
             role=role,
@@ -278,6 +298,12 @@ async def doctor(live: bool = True) -> str:
 async def list_roles() -> str:
     """List the available role personas that can steer a delegation."""
     return await _guarded(list_roles_tool(get_app()))
+
+
+@mcp.tool
+async def reload_panels() -> str:
+    """Re-read saved panels from disk (after editing a `panels.toon`) and list those now available."""
+    return await _guarded(reload_panels_tool(get_app()))
 
 
 def _smoke() -> None:
