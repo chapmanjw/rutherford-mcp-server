@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Chapman
+"""The ``debate`` tool: several CLIs argue a question across multiple rounds."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ..context import AppContext, tool_success
+from ..domain.enums import DelegationMode
+from ..domain.models import DebateRequest
+from .common import as_target, parse_mode, parse_safety_mode, parse_stances
+
+
+async def debate_tool(
+    app: AppContext,
+    *,
+    prompt: str,
+    targets: list[Any],
+    rounds: int = 2,
+    stances: list[str] | None = None,
+    working_dir: str | None = None,
+    files: list[str] | None = None,
+    role: str | None = None,
+    safety_mode: str = "read_only",
+    synthesize: bool = True,
+    timeout_s: float | None = None,
+    mode: str = "sync",
+    include_raw: bool = False,
+) -> str:
+    """Run a multi-round debate across several CLIs and return the full transcript.
+
+    ``targets`` is a list of ``{cli, model}`` objects (or ``cli`` / ``cli:model`` strings); a debate
+    needs at least two. ``rounds`` (default 2) is how many passes the panel makes: round one is each
+    voice's independent answer, and every later round shows a voice the others' latest positions and
+    asks it to rebut and revise. Optional ``stances`` (parallel to ``targets``) keep a voice arguing
+    for/against/neutral the whole way through. ``synthesize`` (on by default) adds a closing summary
+    of where the panel landed. The result's ``rounds`` hold every voice's answer at every round, so
+    the discussion is fully retraceable. With ``mode="async"`` a job id is returned.
+    """
+    target_objs = [as_target(target) for target in targets or []]
+    request = DebateRequest(
+        targets=target_objs,
+        prompt=prompt,
+        rounds=rounds,
+        stances=parse_stances(stances),
+        working_dir=working_dir,
+        files=files or [],
+        role=role,
+        safety_mode=parse_safety_mode(safety_mode),
+        synthesize=synthesize,
+        timeout_s=timeout_s,
+        include_raw=include_raw,
+        depth=app.base_depth,
+    )
+    correlation_id = app.new_correlation_id()
+
+    if parse_mode(mode) is DelegationMode.ASYNC:
+        job = app.jobs.submit(
+            "debate",
+            lambda progress: app.debate.debate(
+                request,
+                correlation_id=correlation_id,
+                base_depth=app.base_depth,
+                on_progress=progress,
+            ),
+        )
+        return tool_success({"job_id": job.id, "status": job.status, "kind": job.kind})
+
+    result = await app.debate.debate(request, correlation_id=correlation_id, base_depth=app.base_depth)
+    return tool_success(result)

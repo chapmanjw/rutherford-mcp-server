@@ -16,6 +16,7 @@ from tests.fakes import FakeAdapter, FakeProcessRunner, make_app
 EXPECTED_TOOLS = {
     "delegate",
     "consensus",
+    "debate",
     "review",
     "plan",
     "capabilities",
@@ -50,6 +51,14 @@ async def test_mcp_delegate_round_trip(wired_server: None) -> None:
         result = await client.call_tool("delegate", {"cli": "a", "prompt": "hi"})
         text = result.content[0].text
         assert "ok: true" in text
+        assert "hello there" in text
+
+
+async def test_mcp_debate_round_trip(wired_server: None) -> None:
+    async with Client(server.mcp) as client:
+        result = await client.call_tool("debate", {"prompt": "q", "targets": ["a", "b"], "rounds": 1})
+        text = result.content[0].text
+        assert "rounds[1]" in text
         assert "hello there" in text
 
 

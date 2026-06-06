@@ -27,6 +27,7 @@ from .io.serialize import encode
 from .runtime.depth import current_depth
 from .runtime.process import AsyncProcessRunner, ProcessRunner
 from .services.consensus import ConsensusService
+from .services.debate import DebateService
 from .services.delegation import DelegationService
 from .services.jobs import JobService
 from .services.roles import RoleStore, load_roles
@@ -59,6 +60,7 @@ class AppContext:
     roles: RoleStore
     delegation: DelegationService
     consensus: ConsensusService
+    debate: DebateService
     jobs: JobService
     #: The depth this server runs at, read from ``RUTHERFORD_DEPTH`` when it was spawned.
     base_depth: int = 0
@@ -90,6 +92,7 @@ def build_app_context(
     resolved_roles = roles if roles is not None else load_roles(resolved_config.role_dirs)
     delegation = DelegationService(resolved_registry, resolved_runner, resolved_config, resolved_roles)
     consensus = ConsensusService(delegation, resolved_config, resolved_registry)
+    debate = DebateService(delegation, resolved_config)
     jobs = JobService()
     return AppContext(
         config=resolved_config,
@@ -97,6 +100,7 @@ def build_app_context(
         roles=resolved_roles,
         delegation=delegation,
         consensus=consensus,
+        debate=debate,
         jobs=jobs,
         base_depth=resolved_depth,
     )

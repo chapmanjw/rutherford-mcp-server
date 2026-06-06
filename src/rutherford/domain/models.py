@@ -255,6 +255,80 @@ class ConsensusResult(BaseModel):
     skipped: list[SkippedTarget] = Field(default_factory=list)
 
 
+# --- Debate ------------------------------------------------------------------
+
+
+class DebateRequest(BaseModel):
+    """A multi-round debate across several targets, with a retraceable transcript.
+
+    Round 1 collects each voice's independent answer. Each later round shows a voice the other
+    voices' latest positions and asks it to critique and revise its own, so the panel actually
+    argues instead of answering in isolation. ``rounds`` is the number of rounds to run (at least
+    one, capped by ``max_debate_rounds``); the debate stops early if fewer than two voices remain.
+    ``synthesize`` (on by default here) adds a closing pass that states where the panel converged
+    and where it still disagrees. ``stances``, when given, is parallel to ``targets`` and a voice
+    keeps its assigned stance through every round.
+    """
+
+    targets: list[Target] = Field(default_factory=list)
+    prompt: str
+    rounds: int = 2
+    stances: list[Stance] | None = None
+    working_dir: str | None = None
+    files: list[str] = Field(default_factory=list)
+    role: str | None = None
+    safety_mode: SafetyMode = SafetyMode.READ_ONLY
+    synthesize: bool = True
+    timeout_s: float | None = None
+    depth: int = 0
+    include_raw: bool = False
+
+
+class DebateContribution(BaseModel):
+    """One voice's turn in a single debate round.
+
+    Carries the answer plus the metadata needed to retrace who said what and under which steering:
+    the voice ``label``, its resolved ``target`` (with any model fallback already applied), the
+    ``round_index`` it belongs to, and the optional ``stance`` / ``role`` it argued under. A failed
+    turn is recorded with ``ok=false`` and an ``error`` rather than dropped, so the transcript shows
+    where a voice fell out.
+    """
+
+    label: str
+    target: Target
+    round_index: int
+    stance: Stance | None = None
+    role: str | None = None
+    ok: bool
+    text: str = ""
+    raw: str | None = None
+    duration_s: float = 0.0
+    error: ErrorInfo | None = None
+    fallback_from: str | None = None
+
+
+class DebateRound(BaseModel):
+    """Every participating voice's contribution for one round of a debate, in panel order."""
+
+    index: int
+    contributions: list[DebateContribution] = Field(default_factory=list)
+
+
+class DebateResult(BaseModel):
+    """The full, retraceable transcript of a multi-round debate, plus an optional closing pass.
+
+    ``rounds`` holds every voice's answer at every round it took part in, so a reader can follow how
+    the positions shifted and where they converged or split -- this is the "thinking out loud" the
+    transcript exists to preserve. ``final`` is the closing synthesis when ``synthesize`` was set.
+    ``skipped`` mirrors the consensus field for any target left out before the debate began.
+    """
+
+    prompt: str
+    rounds: list[DebateRound] = Field(default_factory=list)
+    final: str | None = None
+    skipped: list[SkippedTarget] = Field(default_factory=list)
+
+
 # --- Jobs --------------------------------------------------------------------
 
 
@@ -264,7 +338,7 @@ class Job(BaseModel):
     id: str
     kind: str
     status: JobStatus = JobStatus.PENDING
-    result: DelegationResult | ConsensusResult | None = None
+    result: DelegationResult | ConsensusResult | DebateResult | None = None
     error: ErrorInfo | None = None
     created_at: float = 0.0
     updated_at: float = 0.0

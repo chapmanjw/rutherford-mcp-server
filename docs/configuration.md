@@ -58,7 +58,8 @@ All fields are optional. Unset fields take the listed default.
 | `default_timeout_s` | `float` | `300.0` | Per-run timeout in seconds. |
 | `role_dirs` | `list[str]` | `[]` | Extra directories to search for role markdown files. Built-in roles always load. |
 | `max_depth` | `int` | `3` | Maximum delegation depth. Delegations at this depth are refused. |
-| `max_targets` | `int` | `8` | Maximum targets per consensus call. |
+| `max_targets` | `int` | `8` | Maximum targets per consensus or debate call. |
+| `max_debate_rounds` | `int` | `4` | Maximum rounds a single `debate` call may run. Each round is a full panel pass. |
 | `trusted_workspaces` | `list[str]` | `[]` | Absolute paths under which `write` and `yolo` delegations are permitted. |
 | `synthesize_default` | `bool` | `false` | Whether consensus synthesizes server-side by default. |
 

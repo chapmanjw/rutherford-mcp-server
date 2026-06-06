@@ -23,6 +23,7 @@ from .domain.errors import ConfigError, RutherfordError
 from .domain.models import Target
 from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
+from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
 from .tools.jobs import job_result_tool, job_status_tool
 from .tools.plan import plan_tool
@@ -33,10 +34,10 @@ mcp: FastMCP = FastMCP(
     "rutherford",
     instructions=(
         "Rutherford orchestrates other agentic coding CLIs. Use `delegate` to hand a task to one "
-        "CLI, `consensus` to ask several in parallel, and `capabilities`/`doctor` to see which are "
-        "installed and authenticated. Delegations default to read_only; write and yolo are explicit "
-        "opt-in. Long tasks can run as background jobs (mode=async), polled with job_status / "
-        "job_result."
+        "CLI, `consensus` to ask several in parallel, `debate` to have several argue across rounds "
+        "(returning the full transcript), and `capabilities`/`doctor` to see which are installed and "
+        "authenticated. Delegations default to read_only; write and yolo are explicit opt-in. Long "
+        "tasks can run as background jobs (mode=async), polled with job_status / job_result."
     ),
 )
 
@@ -132,6 +133,50 @@ async def consensus(
             get_app(),
             targets=targets,
             prompt=prompt,
+            stances=stances,
+            working_dir=working_dir,
+            files=files,
+            role=role,
+            safety_mode=safety_mode,
+            synthesize=synthesize,
+            timeout_s=timeout_s,
+            mode=mode,
+            include_raw=include_raw,
+        )
+    )
+
+
+@mcp.tool
+async def debate(
+    prompt: str,
+    targets: list[Target | str],
+    rounds: int = 2,
+    stances: list[str] | None = None,
+    working_dir: str | None = None,
+    files: list[str] | None = None,
+    role: str | None = None,
+    safety_mode: str = "read_only",
+    synthesize: bool = True,
+    timeout_s: float | None = None,
+    mode: str = "sync",
+    include_raw: bool = False,
+) -> str:
+    """Have several targets argue a question across rounds and return the full transcript.
+
+    `targets` is a list of `{cli, model}` objects (or `cli` / `cli:model` strings); a debate needs at
+    least two. `rounds` (default 2) is how many passes the panel makes: round one is each voice's
+    independent answer, and each later round shows a voice the others' latest positions and asks it to
+    rebut and revise. Optional `stances` (parallel to `targets`) keep a voice arguing for | against |
+    neutral throughout. `synthesize=true` (default) adds a closing summary. The result's `rounds` hold
+    every voice's answer at every round, so the discussion is fully retraceable. With `mode="async"` a
+    job id is returned.
+    """
+    return await _guarded(
+        debate_tool(
+            get_app(),
+            prompt=prompt,
+            targets=list(targets),
+            rounds=rounds,
             stances=stances,
             working_dir=working_dir,
             files=files,

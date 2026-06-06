@@ -52,6 +52,17 @@ async def test_consensus_wrapper_returns_voices(wired_server: None) -> None:
     assert "voices[2]" in out
 
 
+async def test_debate_wrapper_returns_transcript(wired_server: None) -> None:
+    out = await server.debate(prompt="q", targets=[Target(cli="fake"), Target(cli="other")], rounds=2)
+    assert "rounds[2]" in out  # both rounds run when both voices survive
+    assert "answer" in out
+
+
+async def test_debate_wrapper_rejects_single_target(wired_server: None) -> None:
+    with pytest.raises(ToolError, match="at least two targets"):
+        await server.debate(prompt="q", targets=[Target(cli="fake")])
+
+
 async def test_job_status_wrapper_unknown_raises_tool_error(wired_server: None) -> None:
     with pytest.raises(ToolError) as info:
         await server.job_status(job_id="missing")

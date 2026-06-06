@@ -6,6 +6,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- A `debate` tool: several targets argue a question across multiple rounds and return the full
+  transcript. Round one is each voice's independent answer; every later round shows a voice the
+  other voices' latest positions and asks it to rebut and revise, so the panel actually argues
+  instead of answering in isolation. The result's `rounds` hold every voice's answer at every
+  round, so the discussion is fully retraceable -- the verbose record that a one-shot `consensus`
+  drops. A voice that fails a round is recorded and falls out; the debate stops early once fewer
+  than two voices remain. Optional `stances` keep a voice arguing for/against throughout, and an
+  optional closing `synthesize` pass (on by default) states where the panel converged. The new
+  `max_debate_rounds` config field (default 4) caps the rounds; the per-call `max_targets` cap
+  bounds the panel.
+
 ## [0.1.2] - 2026-06-03
 
 ### Fixed

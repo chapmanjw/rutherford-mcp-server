@@ -95,7 +95,7 @@ A seventh, well-behaved CLI can be added without code -- see [docs/adding-a-cli.
 ## Using Rutherford
 
 You drive Rutherford from your MCP client in plain language. You describe what you want, and your
-agent translates it into Rutherford's tools (`delegate`, `consensus`, `review`, `plan`,
+agent translates it into Rutherford's tools (`delegate`, `consensus`, `debate`, `review`, `plan`,
 `capabilities`, `doctor`, `job_status`, `job_result`, `list_roles`) -- you rarely name the tools or
 their arguments yourself. You name a CLI (`claude_code`, `codex`, `cursor`, `qwen`, `kiro`,
 `opencode`, `goose`, `antigravity`), optionally a model, and what you want done. Everything defaults
@@ -143,14 +143,19 @@ adapter it finds installed and authenticated, each at its default model, and tel
 which it left out and why (not installed, needs login). If one voice asked for a model its plan
 doesn't allow, that voice retries once on the CLI's default model rather than dropping out.
 
-### Run a structured debate with assigned stances
+### Run a multi-round debate
 
-> Use Rutherford to debate this claim: "We should replace our internal REST APIs with gRPC." Have
-> Cursor (model `auto`) argue for it and Claude Code argue against, then give me the strongest point
-> on each side.
+> Use Rutherford to run a 3-round debate on this claim: "We should replace our internal REST APIs
+> with gRPC." Put Cursor (model `auto`), Claude Code, and Codex on the panel, have Cursor argue for
+> it and Claude Code argue against, and show me how the positions shifted plus a closing summary.
 
-A `consensus` with per-target stances (for / against / neutral), so each agent argues its assigned
-position instead of all converging on the same answer.
+A `debate` across the named targets. Round one is each voice's independent answer; in every later
+round each voice sees the others' latest positions and rebuts or revises its own, so the panel
+actually argues rather than answering in isolation. The result carries the full per-round
+transcript -- you can retrace exactly how each voice moved -- and an optional closing summary of
+where they converged and where they still split. Optional stances (for / against / neutral) keep a
+voice on its assigned side the whole way through. For a single-shot version where each agent
+answers once with an assigned stance and nobody rebuts, use `consensus` with `stances` instead.
 
 ### Build one combined recommendation
 

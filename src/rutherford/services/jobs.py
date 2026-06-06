@@ -18,10 +18,11 @@ from collections.abc import Awaitable, Callable
 from ..domain.enums import JobStatus
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
-from ..domain.models import ConsensusResult, DelegationResult, ErrorInfo, Job
+from ..domain.models import ConsensusResult, DebateResult, DelegationResult, ErrorInfo, Job
 
-#: A job body: given a progress callback, produces a delegation or consensus result.
-JobBody = Callable[[Callable[[str], None]], Awaitable[DelegationResult | ConsensusResult]]
+#: A job body: given a progress callback, produces a delegation, consensus, or debate result.
+JobResult = DelegationResult | ConsensusResult | DebateResult
+JobBody = Callable[[Callable[[str], None]], Awaitable[JobResult]]
 
 
 class JobStore:
@@ -56,7 +57,7 @@ class JobStore:
             job.progress.append(line)
             job.updated_at = self._clock()
 
-    def complete(self, job_id: str, result: DelegationResult | ConsensusResult) -> None:
+    def complete(self, job_id: str, result: JobResult) -> None:
         """Record a finished job. The job succeeded even if its delegation result is ``ok=false``."""
         job = self._jobs.get(job_id)
         if job is not None:

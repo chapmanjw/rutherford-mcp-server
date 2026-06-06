@@ -84,6 +84,8 @@ class RutherfordConfig(BaseModel):
     max_depth: int = 3
     #: Maximum number of targets a single consensus call may fan out to.
     max_targets: int = 8
+    #: Maximum number of rounds a single debate call may run (each round is a full panel pass).
+    max_debate_rounds: int = 4
     #: Absolute paths under which write/yolo delegations are permitted.
     trusted_workspaces: list[str] = Field(default_factory=list)
     #: Whether consensus synthesizes server-side by default (off by default per the spec).
