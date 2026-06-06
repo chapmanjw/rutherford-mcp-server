@@ -2,12 +2,12 @@
   <img src="https://raw.githubusercontent.com/chapmanjw/rutherford-mcp-server/main/docs/images/logo.png" width="200" alt="Rutherford logo">
 </p>
 
-# Rutherford MCP Server - Multi-Agent Consensus, Debates, Reviews, and Delegation
+# Rutherford MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that lets one AI coding
-CLI delegate work to, and build consensus across, a crew of others. Rutherford runs other agentic
-coding CLIs (Claude Code, Codex, Cursor, Qwen Code, Antigravity, Kiro, OpenCode, Goose) as headless
-subprocesses and returns each one's answer in a single normalized envelope. It is CLI-only: it
+Give your AI coding agent a crew. Rutherford is a [Model Context Protocol](https://modelcontextprotocol.io)
+server that lets one coding CLI delegate work to, debate with, and build consensus across a group of
+others — Claude Code, Codex, Cursor, Qwen Code, Antigravity, Kiro, OpenCode, and Goose. It runs them
+as headless subprocesses and brings their answers back in one normalized shape. It is CLI-only: it
 orchestrates terminal coding agents and never calls a model provider API directly.
 
 ```
@@ -21,234 +21,77 @@ orchestrates terminal coding agents and never calls a model provider API directl
 USS Cerritos . Engineering
 ```
 
-## Why Rutherford?
+> Named for the irrepressibly cheerful engineer aboard the USS Cerritos in *Star Trek: Lower Decks*,
+> who has a gift for getting heterogeneous systems to cooperate. That is the job here: one agent hands
+> work to a crew of others and brings the results back. *Star Trek* and *Lower Decks* are trademarks of
+> their respective owners; this is an unaffiliated, fan-named open-source project.
 
-> Rutherford is named for Ensign Sam Rutherford, the irrepressibly cheerful engineer aboard the
-> USS Cerritos in Star Trek: Lower Decks. Rutherford has a cybernetic implant and a gift for
-> getting heterogeneous systems to cooperate, which is exactly what this server does: it lets one
-> AI coding agent hand work to a crew of others and bring their results back. Like the show's
-> lower-deckers, Rutherford does the unglamorous coordination so the bridge, your primary agent,
-> gets the win.
->
-> Star Trek and Lower Decks are trademarks of their respective owners. This is an unaffiliated,
-> fan-named open-source project and implies no endorsement.
+## Why you'd want this
 
-## Experimental status
+You are deep in a session with one coding agent. Then you hit a moment where one opinion isn't enough:
 
-Rutherford drives independent third-party CLIs. Their headless flags, output formats, and auth
-mechanisms change between releases, and a CLI update can change or remove something an adapter
-relies on. Every flag in this repo was verified against the CLI's own `--help` and docs on the
-date in the table below; pin your CLI versions, re-verify after upgrades, and treat the integration
-as evolving. Each adapter keeps all of its CLI-specific details in one file, so a change is a
-one-file edit.
+- You're about to commit to a design and want a **second and third opinion** before you do.
+- Two models disagree and you want to watch them actually **argue it out**, not just answer in parallel.
+- A diff is risky and you want **several reviewers** on it, with the must-fix issues separated from nits.
+- You want to **hand off a long refactor** to a different agent and keep working while it runs.
+- You want a **fresh, unbiased critique** of the code you just wrote, from an instance with no memory of
+  the conversation that produced it.
+
+Rutherford does all of that from inside the agent you're already talking to. You describe what you want
+in plain language; your agent translates it into Rutherford's tools. You rarely name the tools yourself.
 
 ## How it works
 
-Rutherford is a stdio MCP server. Any MCP client -- a coding CLI or a desktop app -- calls it over
-MCP, and it spawns the target CLIs as fresh, isolated headless subprocesses.
+Rutherford is a stdio MCP server. Your MCP client (a coding CLI or a desktop app) calls it, and it
+spawns the target CLIs as fresh, isolated headless subprocesses — argv arrays, never shell strings,
+read-only by default, and depth-bounded so a CLI that calls itself can't recurse forever.
 
 ```
-   any MCP client (Claude Code, Claude Desktop, Cursor, Codex, ...)
-        |
+   your MCP client (Claude Code, Cursor, Codex, Claude Desktop, ...)
         |  MCP over stdio
         v
    rutherford-mcp-server
-        |  argv list, no shell   (read_only by default; depth-bounded)
+        |  fresh subprocess per call (read_only by default)
         +--> claude -p "..." --output-format json
-        +--> codex exec --json            (prompt on stdin)
-        +--> agy -p "..."                 (answer read from the transcript file)
+        +--> codex exec --json
         +--> kiro-cli chat --no-interactive "..."
         +--> opencode run --format json "..."
         +--> goose run -t "..." --no-session
-        +--> cursor-agent -p --output-format json   (prompt on stdin)
-        +--> qwen -o json                           (prompt on stdin)
+        +--> cursor-agent -p --output-format json
+        +--> qwen -o json
+        +--> agy -p "..."   (answer read from the transcript file)
 ```
 
-A self-invocation is supported and explicit: when the calling CLI targets its own adapter (Claude
-Code asking Rutherford to delegate to `claude_code`), Rutherford spawns a separate headless process
-that is independent of the caller's session. A delegation depth is tracked and propagated through
-`RUTHERFORD_DEPTH`, so a CLI-calls-itself chain stops at a configured maximum rather than recursing
-without bound.
+Every answer comes back in the same envelope regardless of the CLI's native output format, so your agent
+compares apples to apples. A CLI that errors or isn't installed comes back as one failed voice without
+sinking the rest of a panel.
 
 ## Supported CLIs
 
-Invocation flags verified 2026-05-30. "(docs)" means verified against the CLI's documentation
-rather than a local install.
+Invocation flags verified 2026-05-30. Pin your CLI versions and re-verify after upgrades; each adapter
+keeps all of its CLI-specific details in one file, so a change is a one-file edit.
 
-| CLI | Adapter id | How Rutherford invokes it headlessly | Auth | Verified |
-| --- | --- | --- | --- | --- |
-| Claude Code | `claude_code` | `claude -p "<prompt>" --output-format json` | subscription/OAuth login or `ANTHROPIC_API_KEY` | 2026-05-30 |
-| Codex | `codex` | `codex exec --json --skip-git-repo-check` (prompt on stdin) | ChatGPT login or `OPENAI_API_KEY` | 2026-05-30 |
-| Antigravity | `antigravity` | `agy -p "<prompt>"` (answer read from the transcript file) | Google account login (no `whoami`; `doctor` verifies it with a live check) | 2026-05-30 |
-| Kiro | `kiro` | `kiro-cli chat --no-interactive "<prompt>"` | `KIRO_API_KEY` (Pro/Pro+/Power) or `kiro-cli login` | 2026-05-30 |
-| OpenCode | `opencode` | `opencode run --format json -q "<prompt>"` | provider key or `opencode auth login` | 2026-05-30 (docs) |
-| Goose | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key | 2026-05-30 (docs) |
-| Cursor | `cursor` | `cursor-agent -p --output-format json --trust` (prompt on stdin) | `cursor-agent login` or `CURSOR_API_KEY` | 2026-05-30 |
-| Qwen Code | `qwen` | `qwen -o json` (prompt on stdin) | `qwen` OAuth login or `OPENAI_API_KEY` | 2026-05-30 |
+| CLI | Adapter id | How Rutherford runs it | Auth |
+| --- | --- | --- | --- |
+| Claude Code | `claude_code` | `claude -p "<prompt>" --output-format json` | subscription/OAuth login or `ANTHROPIC_API_KEY` |
+| Codex | `codex` | `codex exec --json` (prompt on stdin) | ChatGPT login or `OPENAI_API_KEY` |
+| Cursor | `cursor` | `cursor-agent -p --output-format json` (prompt on stdin) | `cursor-agent login` or `CURSOR_API_KEY` |
+| Qwen Code | `qwen` | `qwen -o json` (prompt on stdin) | `qwen` OAuth login or `OPENAI_API_KEY` |
+| Kiro | `kiro` | `kiro-cli chat --no-interactive "<prompt>"` | `KIRO_API_KEY` or `kiro-cli login` |
+| OpenCode | `opencode` | `opencode run --format json -q "<prompt>"` | provider key or `opencode auth login` |
+| Goose | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key |
+| Antigravity | `antigravity` | `agy -p "<prompt>"` (answer from the transcript file) | Google account login |
 
-Antigravity's print-mode model is fixed (no model selector). Cursor on a free plan can only use the
-`auto` model; named models need a paid plan. Both Cursor and Qwen install as Windows shims, which
-Rutherford launches via `cmd.exe` while feeding the prompt on stdin. Codex on Windows installs as an npm
-shim, which Rutherford launches via `cmd.exe` automatically while still passing arguments as a list.
-A seventh, well-behaved CLI can be added without code -- see [docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md).
+A ninth, well-behaved CLI can be added without code — see
+[docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md).
 
-## Using Rutherford
+---
 
-You drive Rutherford from your MCP client in plain language. You describe what you want, and your
-agent translates it into Rutherford's tools (`delegate`, `consensus`, `debate`, `review`, `plan`,
-`capabilities`, `doctor`, `job_status`, `job_result`, `list_roles`, `reload_panels`, `setup`) -- you rarely name the tools or
-their arguments yourself. You name a CLI (`claude_code`, `codex`, `cursor`, `qwen`, `kiro`,
-`opencode`, `goose`, `antigravity`), optionally a model, and what you want done. Everything defaults
-to read-only.
+## Setup
 
-The examples below are prompts you can paste, grouped by what you are trying to do. Each is followed
-by a note on what Rutherford does under the hood.
+### 1. Install Rutherford
 
-### See which agents are available
-
-> Which coding CLIs can Rutherford reach right now, and which ones am I signed in to?
-
-> Run Rutherford's doctor and tell me if anything's misconfigured before I start delegating.
-
-The first runs `capabilities` (an instant, free snapshot of installed state, auth, and models). The
-second runs `doctor`, which also live-checks any CLI that has no status command -- like Antigravity,
-whose auth only shows up once a real round trip confirms it.
-
-### Hand one task to a specific agent
-
-> Use Rutherford to have Codex read `src/auth/session.py` and explain how token refresh works.
-> Read-only -- don't change anything.
-
-> Ask Kiro with the cheap `claude-haiku-4.5` model to summarize what changed in this 1,500-line log
-> and list the three most likely root causes.
-
-A single `delegate` to one CLI (and model), read-only. You get back one normalized result -- the
-answer text, timing, token cost, and a session id you can resume.
-
-### Get a second and third opinion
-
-> I think the deadlock is in `queue.py`. Ask Claude Code, Codex, and Qwen the same question --
-> "where is the deadlock and how would you fix it?" -- and show me their answers side by side.
-
-A `consensus` across three targets, one independent voice each. A CLI that errors or isn't installed
-comes back as a single failed voice without sinking the rest of the panel.
-
-### Poll every CLI you have authenticated
-
-> Ask every coding agent I'm logged into the same question -- "is a UUID or a ULID a better primary
-> key for a high-write table?" -- and show me all their answers.
-
-A `consensus` with no targets named (or `targets: "all"`): Rutherford builds the panel from every
-adapter it finds installed and authenticated, each at its default model, and tells you in `skipped`
-which it left out and why (not installed, needs login). If one voice asked for a model its plan
-doesn't allow, that voice retries once on the CLI's default model rather than dropping out.
-
-### Run a multi-round debate
-
-> Use Rutherford to run a 3-round debate on this claim: "We should replace our internal REST APIs
-> with gRPC." Put Cursor (model `auto`), Claude Code, and Codex on the panel, have Cursor argue for
-> it and Claude Code argue against, and show me how the positions shifted plus a closing summary.
-
-A `debate` across the named targets. Round one is each voice's independent answer; in every later
-round each voice sees the others' latest positions and rebuts or revises its own, so the panel
-actually argues rather than answering in isolation. The result carries the full per-round
-transcript -- you can retrace exactly how each voice moved -- and an optional closing summary of
-where they converged and where they still split. Optional stances (for / against / neutral) keep a
-voice on its assigned side the whole way through. For a single-shot version where each agent
-answers once with an assigned stance and nobody rebuts, use `consensus` with `stances` instead.
-
-### Save a panel and reuse it
-
-> Run my `design-roundtable` panel on this question: "should this API return a stream or a page?"
-
-Once you have a crew you keep reaching for, save it as a named panel in `~/.rutherford/panels.toon`
-(or `<project>/.rutherford/panels.toon` for a project-specific one) and name it with `panel=`
-instead of listing the targets every time. A project's panel of the same name overrides your global
-one, and `consensus`, `debate`, and `review` all accept `panel`. After editing the file, "reload
-Rutherford's panels" picks up the change without restarting. See
-[docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md) for the file format.
-
-### Build one combined recommendation
-
-> Ask claude_code, codex, and opencode (`openai/gpt-5.4`) for the best caching strategy for an
-> append-heavy event log, then have Rutherford merge their answers into a single recommendation that
-> flags where they disagree.
-
-A `consensus` with server-side synthesis enabled: you get every voice plus one merged answer.
-(Synthesis is off by default -- usually you let your own agent compare the voices.)
-
-### Reduce a panel to a decision
-
-> Ask claude_code, codex, and qwen "is this migration safe to ship?" and take the majority verdict,
-> with each one ending in a one-word VERDICT line.
-
-A `consensus` with a `strategy` (`unanimous`, `majority`, `weighted`, or `parity-pair`). Each voice
-is asked for a verdict and Rutherford returns the `outcome` and the winning `decision` alongside
-every voice's verdict and full reasoning, instead of leaving you to tally them. `weighted` honors
-per-target weights; `parity-pair` flags a proposer-versus-dissenter disagreement as `escalate`. Pass
-a `verdict_schema` to collect the verdict as JSON instead of a `VERDICT:` line.
-
-### Review code across several reviewers
-
-> Review my staged diff with Rutherford using Claude Code and Codex as reviewers. Findings by file
-> and line, must-fix separated from nits, and call out anything only one of them flagged.
-
-> Have Codex and Qwen review everything under `src/payments/` for security and injection bugs.
-
-`review` -- read-only, using the `codereviewer` role -- over a diff or a set of paths, across one or
-more targets.
-
-### Get an implementation plan
-
-> Use Rutherford's planner on Claude Code to turn "add OAuth2 device-code login to the CLI" into an
-> ordered, step-by-step plan, with the files each step touches and the risky parts flagged.
-
-`plan` -- one target, the `planner` role, read-only. The bundled roles are `planner`, `codereviewer`,
-`security`, and `debugger`; ask "what roles does Rutherford have?" to list them (each shows its
-source). Add your own as markdown or TOON files under `~/.rutherford/roles/` or a project's
-`.rutherford/roles/`, with a project role overriding a same-named global one (see
-[docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md)).
-
-### Let an agent actually make the change
-
-> Let Codex apply the fix in `C:\work\myrepo` -- write mode, you have my permission to edit files in
-> that folder. Add the missing null check and a test that covers it.
-
-A `delegate` in `write` mode. Write and yolo are never the default: they require both an explicit
-mode and a trusted workspace (an allowlisted path or your per-call go-ahead), so an agent can't
-modify a directory by accident. See the safety model below.
-
-### Kick off a long job and keep working
-
-> Start a big refactor on OpenCode in the background -- "convert the data layer to the repository
-> pattern" in `C:\work\myrepo` -- and just give me the job id so I can keep working.
-
-> Is that Rutherford job done yet? Show me the result if it finished.
-
-The first runs `delegate` in async mode and returns a job id immediately; the second polls
-`job_status` / `job_result`.
-
-### Continue where an agent left off
-
-> Pick the review session Claude Code just ran back up, and tell it to also check the error handling
-> now.
-
-A `delegate` that passes the `session_id` from the earlier result back in, resuming that CLI's own
-conversation (on the CLIs that support resume).
-
-### Get a fresh, unbiased take (self-invocation)
-
-> Spin up a separate Claude Code instance through Rutherford -- one with no memory of this
-> conversation -- to critique the design we just wrote, so I get an outside opinion.
-
-Rutherford can target the very CLI you're talking to: it spawns a fresh, isolated subprocess that is
-distinct from your session and can't reach back into it. A depth guard (`max_depth`, default 3) and a
-per-call target cap keep a CLI-calls-itself chain bounded.
-
-## Install
-
-Rutherford is a Python 3.11+ package. Install it as a tool so the `rutherford-mcp-server` command
-is on your PATH:
+It's a Python 3.11+ package. Install it as a tool so the `rutherford-mcp-server` command is on your PATH:
 
 ```sh
 uv tool install rutherford-mcp-server
@@ -256,40 +99,32 @@ uv tool install rutherford-mcp-server
 # or: pip install rutherford-mcp-server
 ```
 
-From source (for development):
+### 2. Install and sign in to the CLIs you want to orchestrate
 
-```sh
-git clone https://github.com/chapmanjw/rutherford-mcp-server
-cd rutherford-mcp-server
-uv sync
-uv run rutherford-mcp-server --smoke   # prints a readiness line and exits
-```
+Rutherford does not install or authenticate the target CLIs — it drives the ones you already have. Install
+whichever you want a crew of, and log in to each (subscription login or the relevant API key; see
+[docs/integration-testing.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/integration-testing.md)).
+You don't need all eight; two is enough for a consensus or a debate.
 
-Rutherford does not install or authenticate the target CLIs. Install and log in to whichever CLIs
-you want to orchestrate (see [docs/integration-testing.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/integration-testing.md)), then run
-the `doctor` tool to confirm each one is reachable.
+### 3. Register Rutherford with your MCP client
 
-To scaffold a starter config and a panel of the CLIs you are signed in to, run
-`rutherford-mcp-server init` (a terminal wizard that shows the plan and writes it on confirmation),
-or once Rutherford is registered, ask your agent to "set up Rutherford" -- the `setup` tool proposes
-the same files for review and writes them when you approve. Neither overwrites an existing file.
+The command to run is `rutherford-mcp-server` (equivalently `python -m rutherford`). Same command on
+Windows, macOS, and Linux.
 
-## MCP client registration
-
-Rutherford is client-agnostic: every tool behaves identically from any MCP client. The command to
-run is `rutherford-mcp-server` (equivalently `python -m rutherford`). Configuration uses the same
-command on Windows, macOS, and Linux.
-
-### Claude Code
+**Claude Code**
 
 ```sh
 claude mcp add rutherford -- rutherford-mcp-server
 ```
 
-### Claude Desktop / Cursor / other JSON-config clients
+**Codex**
 
-Add to the client's MCP servers config (Claude Desktop: `claude_desktop_config.json`; Cursor:
-`.cursor/mcp.json`):
+```sh
+codex mcp add rutherford -- rutherford-mcp-server
+```
+
+**Claude Desktop / Cursor / other JSON-config clients** (Claude Desktop: `claude_desktop_config.json`;
+Cursor: `.cursor/mcp.json`):
 
 ```json
 {
@@ -301,40 +136,171 @@ Add to the client's MCP servers config (Claude Desktop: `claude_desktop_config.j
 }
 ```
 
-If the command is not on PATH, use an absolute path (or `python -m rutherford` with the interpreter
-from the environment where Rutherford is installed).
+If the command isn't on PATH, use an absolute path, or `python -m rutherford` with the interpreter from the
+environment where Rutherford is installed. For WSL and more clients, see
+[docs/mcp-client-integration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/mcp-client-integration.md).
 
-### Codex
+### 4. Scaffold your config, then confirm the crew is reachable
+
+Run the setup wizard to detect which CLIs you're signed in to and write a starter config plus a panel of
+them:
 
 ```sh
-codex mcp add rutherford -- rutherford-mcp-server
+rutherford-mcp-server init
 ```
 
-### Linux under WSL
+It prints the plan and writes the files only after you confirm (it never overwrites an existing file).
+Once Rutherford is registered, you can do the same conversationally — ask your agent to "set up
+Rutherford" and the `setup` tool proposes the same files for you to approve. Then have your agent run
+`doctor` to confirm each CLI is installed, authenticated, and reachable.
 
-Install and run Rutherford inside the same WSL distribution as the CLIs it will orchestrate, and
-register it from a client running in that distribution. When a client on the Windows host must
-reach a server in WSL, invoke it through `wsl.exe`:
+---
 
-```json
-{
-  "mcpServers": {
-    "rutherford": {
-      "command": "wsl.exe",
-      "args": ["-e", "rutherford-mcp-server"]
-    }
-  }
-}
+## Tutorials
+
+You drive Rutherford in plain language from your MCP client. Each tutorial below is a prompt you can paste,
+with a note on what Rutherford does under the hood. Everything defaults to read-only.
+
+### See who's on the crew
+
+> Which coding CLIs can Rutherford reach right now, and which am I signed in to? Then run doctor and tell
+> me if anything's misconfigured.
+
+`capabilities` is an instant, free snapshot of installed state, auth, and models. `doctor` goes further and
+live-checks any CLI that has no status command (like Antigravity, whose auth only shows up once a real
+round trip confirms it).
+
+### Hand one task to one agent
+
+> Use Rutherford to have Codex read `src/auth/session.py` and explain how token refresh works. Read-only.
+
+A `delegate` to one CLI. You get back one normalized result: the answer, timing, token cost, and a session
+id you can resume later. Add a model if you want a specific one ("ask Kiro with the cheap
+`claude-haiku-4.5` model to ...").
+
+### Get a second and third opinion
+
+> I think the deadlock is in `queue.py`. Ask Claude Code, Codex, and Qwen the same question — where is it
+> and how would you fix it? — and show me their answers side by side.
+
+A `consensus` across three targets, one independent voice each, run in parallel. To poll *everyone* you're
+signed in to, just don't name targets: "ask every coding agent I'm logged into whether a UUID or a ULID is
+a better primary key." Rutherford builds the panel from every installed, authenticated CLI and tells you in
+`skipped` which it left out and why.
+
+### Run a real debate
+
+This is the one that isn't just parallel answers. In a debate, round one is each voice's independent take;
+in every later round, each voice sees the others' latest positions and is asked to rebut and revise.
+
+> Run a 3-round debate between Claude Code, Codex, and Kiro: "is UUIDv7 or ULID the better primary key for a
+> high-write event table?" Show me how each position shifted, plus a closing summary.
+
+A `debate`. The result carries the full per-round transcript, so you can retrace exactly who said what and
+where someone changed their mind, followed by a closing synthesis of where the panel converged and where it
+still splits. In a real run of that exact prompt, all three opened with "UUIDv7" for different reasons,
+then in round two Claude Code and Codex corrected a factual error in Kiro's argument — and Kiro revised its
+position in response. Optional stances ("have Cursor argue for it and Claude Code argue against") keep a
+voice on an assigned side the whole way through.
+
+### Turn a panel into a decision
+
+When you want an answer, not a transcript, give consensus a strategy. Each voice is asked for a verdict and
+Rutherford aggregates them.
+
+> Ask claude_code, codex, and qwen "is this migration safe to ship?" and take the majority verdict, with
+> each ending in a one-word VERDICT line.
+
+A `consensus` with `strategy: majority`. You get back the `outcome`, the winning `decision`, and every
+voice's verdict alongside its full reasoning. The strategies:
+
+| Strategy | What it does |
+| --- | --- |
+| `all-voices` | Every voice, no aggregation (the default). |
+| `unanimous` | Agrees only if every voice matches, otherwise reports a split. |
+| `majority` | One voice, one vote; the most-voted verdict wins. |
+| `weighted` | The verdict with the greatest summed target weight wins. |
+| `parity-pair` | Compares a proposer against parity counterweights; disagreement escalates. |
+
+Verdicts are read from a final `VERDICT: <token>` line, or as JSON if you pass a `verdict_schema`.
+
+### Save a crew as a panel and reuse it
+
+Once you have a group you keep reaching for, save it as a named panel instead of listing the targets every
+time.
+
+```toon
+# ~/.rutherford/panels.toon
+panels:
+  design-roundtable:
+    description: Lineage-diverse design review
+    strategy: parity-pair
+    targets[3]:
+      - cli: claude_code
+        model: opus
+        label: proposer
+      - cli: codex
+        label: implementer
+      - cli: kiro
+        model: deepseek-3.2
+        label: dissenter
+        parity: true
 ```
 
-### Self-invocation example
+> Run my `design-roundtable` panel on this: "should this API return a stream or a page?"
 
-Register Rutherford in Claude Code as above, then ask Claude Code to use Rutherford's `delegate`
-tool with `cli="claude_code"`. Rutherford spawns a fresh, isolated `claude -p` subprocess, distinct
-from your session, and returns its result. The same works for Codex calling `codex`. The depth
-guard (`max_depth`, default 3) bounds any self-referential chain.
+`consensus`, `debate`, and `review` all accept `panel="design-roundtable"`. Panels live in
+`~/.rutherford/panels.toon` (global) or `<project>/.rutherford/panels.toon` (project-specific, which
+overrides a global panel of the same name). After editing the file, ask your agent to "reload Rutherford's
+panels" and it picks up the change without a restart.
 
-See [docs/mcp-client-integration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/mcp-client-integration.md) for more clients and detail.
+### Review a diff across several reviewers
+
+> Review my staged diff with Claude Code and Codex as reviewers. Findings by file and line, must-fix
+> separated from nits, and call out anything only one of them flagged.
+
+A `review` — read-only, using the `codereviewer` role — over a diff or a set of paths, across one or more
+targets. Point it at paths instead ("review everything under `src/payments/` for injection bugs") and the
+reviewers read the files themselves.
+
+### Get an implementation plan
+
+> Use Rutherford's planner on Claude Code to turn "add OAuth2 device-code login to the CLI" into an ordered,
+> step-by-step plan, with the files each step touches and the risky parts flagged.
+
+A `plan` — one target, the `planner` role, read-only. The bundled roles are `planner`, `codereviewer`,
+`security`, and `debugger`; ask "what roles does Rutherford have?" to list them (each shows its source). Add
+your own as markdown or TOON files under `~/.rutherford/roles/` (or a project's `.rutherford/roles/`); a
+project role overrides a same-named global one. See
+[docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md).
+
+### Let an agent actually make the change
+
+> Let Codex apply the fix in `C:\work\myrepo` — write mode, you have my permission to edit files there. Add
+> the missing null check and a test that covers it.
+
+A `delegate` in `write` mode. Write and yolo are never the default: they require both an explicit mode and a
+trusted workspace (an allowlisted path or your per-call go-ahead), so an agent can't modify a directory by
+accident. See the safety model below.
+
+### Kick off a long job and keep working
+
+> Start a big refactor on OpenCode in the background — "convert the data layer to the repository pattern" in
+> `C:\work\myrepo` — and just give me the job id.
+
+`delegate` (or `consensus` / `debate`) in async mode returns a job id immediately. "Is that Rutherford job
+done yet? Show me the result if it finished" polls `job_status` / `job_result`.
+
+### Get a fresh, unbiased take on your own work
+
+> Spin up a separate Claude Code instance through Rutherford — one with no memory of this conversation — to
+> critique the design we just wrote.
+
+Rutherford can target the very CLI you're talking to. It spawns a fresh, isolated subprocess that is
+distinct from your session and can't reach back into it. A depth guard (`max_depth`, default 3) keeps a
+CLI-calls-itself chain bounded.
+
+---
 
 ## Safety model
 
@@ -342,30 +308,46 @@ Every delegation runs in one of four safety modes, defaulting to the most restri
 
 | Mode | Meaning |
 | --- | --- |
-| `read_only` (default) | Inspect only. Review and consensus are read-only by nature. |
+| `read_only` (default) | Inspect only. Review, consensus, debate, and plan are read-only by nature. |
 | `propose` | The agent may propose changes (e.g. a diff) but not apply them. |
-| `write` | The agent may modify the workspace, subject to the CLI's approvals. |
+| `write` | The agent may modify the workspace, subject to the CLI's own approvals. |
 | `yolo` | The agent may act without approval prompts (the CLI's bypass mode). |
 
-`write` and `yolo` require an explicit argument and a trusted-workspace check -- the target
-directory must be on the configured `trusted_workspaces` allowlist, or the call must pass
-`trust_workspace=true`. No adapter ever defaults to its permission-bypass flag. Invocations are
-always built as an argv list, never a shell string. See [docs/security.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/security.md).
+`write` and `yolo` require an explicit argument and a trusted-workspace check: the target directory must be
+on the configured `trusted_workspaces` allowlist, or the call must pass `trust_workspace=true`. No adapter
+ever defaults to its permission-bypass flag, and invocations are always built as an argv list, never a
+shell string. See [docs/security.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/security.md).
+
+## Configuration
+
+The main config is a small TOML file (`config.toml` in your platform config dir, or a project-local
+`rutherford.toml`); panels and custom roles live in their own files under `~/.rutherford/` and a project's
+`.rutherford/`. The full reference — every field, the discovery and precedence rules, the panel and role
+file formats, and config-defined generic adapters — is in
+[docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md).
 
 ## Documentation
 
-- [docs/architecture.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/architecture.md) -- the layered design and the two core interfaces.
-- [docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md) -- config file, env overrides, generic adapters.
-- [docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md) -- the contract and checklist for adding a CLI.
-- [docs/integration-testing.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/integration-testing.md) -- installing and authenticating each CLI, and running the suite.
-- [docs/mcp-client-integration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/mcp-client-integration.md) -- registration for many clients.
-- [docs/troubleshooting.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/troubleshooting.md) -- common problems and fixes.
-- [docs/security.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/security.md) -- the security model in depth.
+- [docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md) — config file, panels, custom roles, strategies, generic adapters.
+- [docs/architecture.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/architecture.md) — the layered design and the two core interfaces.
+- [docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md) — the contract and checklist for adding a CLI.
+- [docs/mcp-client-integration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/mcp-client-integration.md) — registration for many clients.
+- [docs/integration-testing.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/integration-testing.md) — installing and authenticating each CLI.
+- [docs/troubleshooting.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/troubleshooting.md) — common problems and fixes.
+- [docs/security.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/security.md) — the security model in depth.
+
+## Experimental status
+
+Rutherford drives independent third-party CLIs. Their headless flags, output formats, and auth mechanisms
+change between releases, and a CLI update can change or remove something an adapter relies on. Every flag in
+this repo was verified against the CLI's own `--help` and docs on the date noted above. Pin your CLI
+versions, re-verify after upgrades, and treat the integration as evolving.
 
 ## Contributing
 
-See [CONTRIBUTING.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/CONTRIBUTING.md). The whole core is testable without a real CLI; run
-`just check` before pushing, then `just test-integration` for whatever CLIs your machine has.
+See [CONTRIBUTING.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/CONTRIBUTING.md). The whole
+core is testable without a real CLI; run `just check` before pushing, then `just test-integration` for
+whatever CLIs your machine has installed and authenticated.
 
 ## License
 
