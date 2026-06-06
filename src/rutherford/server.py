@@ -10,6 +10,7 @@ different transport without touching it.
 
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Awaitable
 from typing import Any
@@ -22,6 +23,7 @@ from .context import AppContext, build_app_context, error_payload_from, tool_err
 from .domain.error_codes import ErrorCode
 from .domain.errors import ConfigError, RutherfordError
 from .domain.models import Target
+from .services.setup import apply_setup_plan, build_setup_plan, format_plan_summary
 from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
 from .tools.debate import debate_tool
@@ -29,8 +31,10 @@ from .tools.delegate import delegate_tool
 from .tools.jobs import job_result_tool, job_status_tool
 from .tools.panels import reload_panels_tool
 from .tools.plan import plan_tool
+from .tools.probing import probe_adapter
 from .tools.review import review_tool
 from .tools.roles import list_roles_tool
+from .tools.setup import setup_tool
 
 mcp: FastMCP = FastMCP(
     "rutherford",
@@ -311,6 +315,31 @@ async def reload_panels() -> str:
     return await _guarded(reload_panels_tool(get_app()))
 
 
+@mcp.tool
+async def setup(
+    apply: bool = False,
+    force: bool = False,
+    safety_mode: str = "read_only",
+    trusted_workspaces: list[str] | None = None,
+    panel_name: str = "default",
+) -> str:
+    """Scaffold a starter config and panel from the CLIs you have installed and signed in.
+
+    By default this is a dry run: it returns the proposed files (with their full contents) so you can
+    review them. Pass `apply=true` to write them; an existing file is kept unless `force=true`.
+    """
+    return await _guarded(
+        setup_tool(
+            get_app(),
+            apply=apply,
+            force=force,
+            safety_mode=safety_mode,
+            trusted_workspaces=trusted_workspaces,
+            panel_name=panel_name,
+        )
+    )
+
+
 def _smoke() -> None:
     """Build the context and print a one-line readiness summary, without starting stdio."""
     try:
@@ -322,10 +351,38 @@ def _smoke() -> None:
     print(f"rutherford-mcp-server {__version__}: ready with {len(app.registry)} adapters: {ids}")
 
 
+def _init(args: list[str]) -> None:
+    """Interactive first-run setup: probe the CLIs, show the plan, and write it on confirmation."""
+    assume_yes = "--yes" in args or "-y" in args
+    force = "--force" in args
+    try:
+        app = build_app_context()
+    except ConfigError as exc:
+        print(f"rutherford: configuration error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    statuses = [probe_adapter(adapter) for adapter in app.registry.all()]
+    plan = build_setup_plan(statuses, env=os.environ)
+    print(format_plan_summary(plan))
+    if not assume_yes:
+        reply = input("\nWrite these files? [y/N] ").strip().lower()
+        if reply not in ("y", "yes"):
+            print("Aborted; nothing written.")
+            return
+    written = apply_setup_plan(plan, force=force)
+    if written:
+        print("Wrote:\n" + "\n".join(f"  {path}" for path in written))
+    else:
+        print("Nothing written (files already exist; re-run with --force to overwrite).")
+
+
 def main() -> None:
-    """Console entry point: start the stdio MCP server (or run ``--smoke`` and exit)."""
-    if "--smoke" in sys.argv[1:]:
+    """Console entry point: start the stdio MCP server (or run ``--smoke`` / ``init`` and exit)."""
+    argv = sys.argv[1:]
+    if "--smoke" in argv:
         _smoke()
+        return
+    if argv and argv[0] == "init":
+        _init(argv[1:])
         return
     try:
         global _APP

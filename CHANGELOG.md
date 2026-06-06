@@ -8,6 +8,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Guided first-run setup, in two forms over shared logic: a `setup` MCP tool your agent drives
+  conversationally, and a `rutherford-mcp-server init` CLI wizard. Both probe the installed CLIs,
+  recommend a starter panel from the ones you are signed in to, and scaffold the main `config.toml`
+  and a `panels.toon`. The MCP tool is a dry run by default (it returns the proposed files for
+  review) and writes them with `apply=true`; the CLI prints the plan and writes on confirmation
+  (`--yes` to skip the prompt). Neither overwrites an existing file unless `force` / `--force` is
+  given.
 - Consensus strategies: `consensus` takes a `strategy` (`all-voices` (default) | `unanimous` |
   `majority` | `weighted` | `parity-pair`), and a panel can set one. Any strategy other than
   `all-voices` asks each voice for a verdict and aggregates: `unanimous` agrees only if every voice

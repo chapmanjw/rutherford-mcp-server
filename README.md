@@ -96,7 +96,7 @@ A seventh, well-behaved CLI can be added without code -- see [docs/adding-a-cli.
 
 You drive Rutherford from your MCP client in plain language. You describe what you want, and your
 agent translates it into Rutherford's tools (`delegate`, `consensus`, `debate`, `review`, `plan`,
-`capabilities`, `doctor`, `job_status`, `job_result`, `list_roles`, `reload_panels`) -- you rarely name the tools or
+`capabilities`, `doctor`, `job_status`, `job_result`, `list_roles`, `reload_panels`, `setup`) -- you rarely name the tools or
 their arguments yourself. You name a CLI (`claude_code`, `codex`, `cursor`, `qwen`, `kiro`,
 `opencode`, `goose`, `antigravity`), optionally a model, and what you want done. Everything defaults
 to read-only.
@@ -268,6 +268,11 @@ uv run rutherford-mcp-server --smoke   # prints a readiness line and exits
 Rutherford does not install or authenticate the target CLIs. Install and log in to whichever CLIs
 you want to orchestrate (see [docs/integration-testing.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/integration-testing.md)), then run
 the `doctor` tool to confirm each one is reachable.
+
+To scaffold a starter config and a panel of the CLIs you are signed in to, run
+`rutherford-mcp-server init` (a terminal wizard that shows the plan and writes it on confirmation),
+or once Rutherford is registered, ask your agent to "set up Rutherford" -- the `setup` tool proposes
+the same files for review and writes them when you approve. Neither overwrites an existing file.
 
 ## MCP client registration
 
