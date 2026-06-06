@@ -112,6 +112,8 @@ async def consensus(
     targets: list[Target | str] | str | None = None,
     panel: str | None = None,
     panel_overrides: dict[str, Any] | None = None,
+    strategy: str | None = None,
+    verdict_schema: dict[str, Any] | None = None,
     stances: list[str] | None = None,
     working_dir: str | None = None,
     files: list[str] | None = None,
@@ -130,8 +132,9 @@ async def consensus(
     a saved `panel` (with optional `panel_overrides`) instead of `targets`; the two are mutually
     exclusive. Optional `stances` (parallel to `targets`) steer each voice: for | against | neutral,
     and cannot be combined with the auto-expanded panel. `synthesize=true` adds a server-side combined
-    answer (off by default, so the orchestrator can synthesize the voices itself). With `mode="async"`
-    a job id is returned.
+    answer (off by default). A `strategy` (`all-voices` | `unanimous` | `majority` | `weighted` |
+    `parity-pair`), optionally with a `verdict_schema`, aggregates the voices into an `outcome` instead
+    of returning them individually. With `mode="async"` a job id is returned.
     """
     return await _guarded(
         consensus_tool(
@@ -140,6 +143,8 @@ async def consensus(
             prompt=prompt,
             panel=panel,
             panel_overrides=panel_overrides,
+            strategy=strategy,
+            verdict_schema=verdict_schema,
             stances=stances,
             working_dir=working_dir,
             files=files,

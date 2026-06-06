@@ -12,7 +12,13 @@ import pytest
 
 from rutherford.context import AppContext
 from rutherford.domain.enums import AuthState
-from rutherford.domain.models import ConsensusRequest, DelegationRequest, DelegationResult, Target
+from rutherford.domain.models import (
+    ConsensusRequest,
+    ConsensusResult,
+    DelegationRequest,
+    DelegationResult,
+    Target,
+)
 
 from .helpers import CLI_ENV, available_clis, skip_unless_available
 
@@ -86,6 +92,7 @@ async def test_multi_cli_consensus(real_app: AppContext) -> None:
         ConsensusRequest(targets=targets, prompt=_OK_PROMPT, timeout_s=180),
         base_depth=0,
     )
+    assert isinstance(result, ConsensusResult)  # no strategy -> the legacy every-voice shape
     assert len(result.voices) == 2
     assert {voice.target.cli for voice in result.voices} == set(ready[:2])
 

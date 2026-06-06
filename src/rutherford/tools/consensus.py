@@ -9,8 +9,8 @@ from typing import Any
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode
 from ..domain.models import ConsensusRequest, Target
-from .common import as_target, parse_mode, parse_safety_mode, parse_stances
-from .panels import panel_targets
+from .common import as_target, parse_mode, parse_safety_mode, parse_stances, parse_strategy
+from .panels import panel_for_call
 
 
 async def consensus_tool(
@@ -20,6 +20,8 @@ async def consensus_tool(
     prompt: str,
     panel: str | None = None,
     panel_overrides: dict[str, Any] | None = None,
+    strategy: str | None = None,
+    verdict_schema: dict[str, Any] | None = None,
     stances: list[str] | None = None,
     working_dir: str | None = None,
     files: list[str] | None = None,
@@ -39,11 +41,15 @@ async def consensus_tool(
     ``panel_overrides``) instead of ``targets``; the two are mutually exclusive. Optional ``stances``
     (parallel to ``targets``) steer each voice for/against/neutral and cannot be combined with the
     auto-expanded panel. Optional ``synthesize`` adds a server-side combined answer; it is off by
-    default.
+    default. With a ``strategy`` other than ``all-voices`` (optionally with a ``verdict_schema``), the
+    voices are aggregated into an outcome instead of returned individually.
     """
     target_objs: list[Target]
+    panel_strategy: str | None = None
     if panel is not None:
-        target_objs = panel_targets(app, panel, panel_overrides, targets, stances)
+        resolved = panel_for_call(app, panel, panel_overrides, targets, stances)
+        target_objs = resolved.to_targets()
+        panel_strategy = resolved.strategy
         panel_stances = None  # each panel seat carries its own stance
         expand_all = False
     else:
@@ -55,6 +61,7 @@ async def consensus_tool(
             target_objs = [as_target(targets)]  # a bare "cli" / "cli:model" string
         else:
             target_objs = [as_target(target) for target in targets or []]
+    effective_strategy = parse_strategy(strategy if strategy is not None else (panel_strategy or "all-voices"))
     request = ConsensusRequest(
         targets=target_objs,
         prompt=prompt,
@@ -68,6 +75,8 @@ async def consensus_tool(
         include_raw=include_raw,
         depth=app.base_depth,
         expand_all=expand_all,
+        strategy=effective_strategy,
+        verdict_schema=verdict_schema,
     )
     correlation_id = app.new_correlation_id()
 

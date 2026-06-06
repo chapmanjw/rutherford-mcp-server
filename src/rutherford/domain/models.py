@@ -22,6 +22,7 @@ from .enums import (
     Runtime,
     SafetyMode,
     Stance,
+    Strategy,
 )
 
 # --- The unit of delegation --------------------------------------------------
@@ -260,6 +261,12 @@ class ConsensusRequest(BaseModel):
     include_raw: bool = False
     #: Build the panel from every installed + authenticated adapter instead of ``targets``.
     expand_all: bool = False
+    #: How to aggregate the voices. ``all-voices`` (default) returns every voice unchanged; any
+    #: other strategy asks each voice for a verdict and returns a :class:`StrategyResult`.
+    strategy: Strategy = Strategy.ALL_VOICES
+    #: When set, each voice is asked to return JSON matching this schema (including a ``verdict``
+    #: field); without it, verdicts are read from a final ``VERDICT: <token>`` line.
+    verdict_schema: dict[str, Any] | None = None
 
 
 class SkippedTarget(BaseModel):
@@ -279,6 +286,43 @@ class ConsensusResult(BaseModel):
 
     voices: list[DelegationResult]
     synthesis: str | None = None
+    skipped: list[SkippedTarget] = Field(default_factory=list)
+
+
+# --- Consensus strategies ----------------------------------------------------
+
+
+class VoiceVerdict(BaseModel):
+    """One voice's verdict in a strategy run: the seat, its extracted verdict, and its full answer.
+
+    ``verdict`` is ``None`` when the voice failed or its answer could not be parsed into a verdict
+    (``unparseable``); such a voice is still returned but excluded from the aggregation. ``text`` is
+    the voice's full answer, kept so the reader can see the reasoning behind the verdict.
+    """
+
+    label: str
+    cli: str
+    model: str | None = None
+    weight: float = 1.0
+    parity: bool = False
+    ok: bool = True
+    verdict: str | None = None
+    text: str = ""
+
+
+class StrategyResult(BaseModel):
+    """The aggregated outcome of a consensus strategy, plus every voice's verdict.
+
+    ``outcome`` is the category the strategy reached (``unanimous`` | ``majority`` | ``tied`` |
+    ``split`` | ``agree`` | ``escalate``). ``decision`` is the winning verdict token when one was
+    reached, else ``None``. The legacy :class:`ConsensusResult` shape is what a caller still gets
+    when no strategy (or ``all-voices``) is used; this richer shape appears only when they opt in.
+    """
+
+    strategy: Strategy
+    outcome: str
+    decision: str | None = None
+    voices: list[VoiceVerdict] = Field(default_factory=list)
     skipped: list[SkippedTarget] = Field(default_factory=list)
 
 
@@ -365,7 +409,7 @@ class Job(BaseModel):
     id: str
     kind: str
     status: JobStatus = JobStatus.PENDING
-    result: DelegationResult | ConsensusResult | DebateResult | None = None
+    result: DelegationResult | ConsensusResult | DebateResult | StrategyResult | None = None
     error: ErrorInfo | None = None
     created_at: float = 0.0
     updated_at: float = 0.0

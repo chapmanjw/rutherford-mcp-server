@@ -10,9 +10,9 @@ import pytest
 
 from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import RutherfordConfig
-from rutherford.domain.enums import AuthState, Stance
+from rutherford.domain.enums import AuthState, Stance, Strategy
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import ConsensusRequest, ProcessResult, Target
+from rutherford.domain.models import ConsensusRequest, ConsensusResult, ProcessResult, StrategyResult, Target
 from rutherford.services.consensus import ConsensusService
 from rutherford.services.delegation import DelegationService
 from rutherford.services.roles import load_roles
@@ -125,6 +125,89 @@ async def test_synthesize_produces_a_combined_answer() -> None:
     assert result.synthesis == "combined answer"
     # Two voices plus one synthesis delegation.
     assert len(runner.calls) == 3
+
+
+# --- consensus strategies -----------------------------------------------------------------------
+
+
+def _verdict_runner(verdicts: dict[str, str]) -> FakeProcessRunner:
+    """A runner where each cli answers with its mapped ``VERDICT:`` token."""
+
+    def run_fn(spec: object) -> ProcessResult:
+        cli = spec.argv[0]  # type: ignore[attr-defined]
+        return ProcessResult(exit_code=0, stdout=f"my reasoning\nVERDICT: {verdicts[cli]}")
+
+    return FakeProcessRunner(run_fn=run_fn)
+
+
+async def test_no_strategy_returns_the_legacy_consensus_shape() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.consensus(ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
+    assert isinstance(result, ConsensusResult)  # not a StrategyResult
+
+
+async def test_strategy_appends_a_verdict_instruction_to_each_voice() -> None:
+    runner = _verdict_runner({"a": "yes", "b": "yes"})
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
+    await service.consensus(
+        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", strategy=Strategy.UNANIMOUS)
+    )
+    prompts = [spec.argv[2] for spec, _ in runner.calls]
+    assert all("VERDICT:" in prompt for prompt in prompts)
+
+
+async def test_majority_strategy_returns_the_winning_verdict() -> None:
+    runner = _verdict_runner({"a": "approve", "b": "approve", "c": "block"})
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner)
+    result = await service.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")],
+            prompt="ship it?",
+            strategy=Strategy.MAJORITY,
+        )
+    )
+    assert isinstance(result, StrategyResult)
+    assert result.outcome == "majority"
+    assert result.decision == "approve"
+    assert {voice.cli: voice.verdict for voice in result.voices} == {"a": "approve", "b": "approve", "c": "block"}
+
+
+async def test_weighted_strategy_lets_a_heavy_voice_win() -> None:
+    runner = _verdict_runner({"a": "approve", "b": "approve", "c": "block"})
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner)
+    result = await service.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="a"), Target(cli="b"), Target(cli="c", weight=5.0)],
+            prompt="ship it?",
+            strategy=Strategy.WEIGHTED,
+        )
+    )
+    assert isinstance(result, StrategyResult)
+    assert result.decision == "block"  # the heavy "block" outweighs two "approve" votes
+
+
+async def test_unparseable_voice_is_returned_but_excluded() -> None:
+    def run_fn(spec: object) -> ProcessResult:
+        cli = spec.argv[0]  # type: ignore[attr-defined]
+        if cli == "c":
+            return ProcessResult(exit_code=0, stdout="I won't commit to a verdict.")
+        return ProcessResult(exit_code=0, stdout="reasoning\nVERDICT: approve")
+
+    runner = FakeProcessRunner(run_fn=run_fn)
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner)
+    result = await service.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")],
+            prompt="q",
+            strategy=Strategy.UNANIMOUS,
+        )
+    )
+    assert isinstance(result, StrategyResult)
+    assert result.outcome == "unanimous"  # the unparseable voice did not break unanimity
+    by_cli = {voice.cli: voice for voice in result.voices}
+    assert by_cli["c"].verdict is None  # still returned, marked unparseable
+    assert by_cli["c"].text == "I won't commit to a verdict."
 
 
 # --- (a) expand_all: fan out to every installed + authenticated adapter -------------------------

@@ -18,10 +18,10 @@ from collections.abc import Awaitable, Callable
 from ..domain.enums import JobStatus
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
-from ..domain.models import ConsensusResult, DebateResult, DelegationResult, ErrorInfo, Job
+from ..domain.models import ConsensusResult, DebateResult, DelegationResult, ErrorInfo, Job, StrategyResult
 
-#: A job body: given a progress callback, produces a delegation, consensus, or debate result.
-JobResult = DelegationResult | ConsensusResult | DebateResult
+#: A job body: given a progress callback, produces a delegation, consensus, debate, or strategy result.
+JobResult = DelegationResult | ConsensusResult | DebateResult | StrategyResult
 JobBody = Callable[[Callable[[str], None]], Awaitable[JobResult]]
 
 

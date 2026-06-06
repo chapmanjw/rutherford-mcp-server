@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import pytest
 
-from rutherford.domain.enums import DelegationMode, SafetyMode, Stance
+from rutherford.domain.enums import DelegationMode, SafetyMode, Stance, Strategy
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import Target
-from rutherford.tools.common import as_target, parse_mode, parse_safety_mode, parse_stances
+from rutherford.tools.common import as_target, parse_mode, parse_safety_mode, parse_stances, parse_strategy
 
 
 def test_parse_safety_mode_valid_and_passthrough() -> None:
@@ -35,6 +35,13 @@ def test_parse_stances() -> None:
     assert parse_stances([Stance.FOR]) == [Stance.FOR]
     with pytest.raises(RutherfordError, match="stance"):
         parse_stances(["sideways"])
+
+
+def test_parse_strategy() -> None:
+    assert parse_strategy("parity-pair") is Strategy.PARITY_PAIR
+    assert parse_strategy(Strategy.MAJORITY) is Strategy.MAJORITY
+    with pytest.raises(RutherfordError, match="strategy"):
+        parse_strategy("plurality")
 
 
 def test_as_target_variants() -> None:

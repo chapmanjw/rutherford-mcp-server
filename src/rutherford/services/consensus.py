@@ -14,7 +14,7 @@ import asyncio
 
 from ..adapters.registry import AdapterRegistry
 from ..config.schema import RutherfordConfig
-from ..domain.enums import AuthState, SafetyMode, Stance
+from ..domain.enums import AuthState, SafetyMode, Stance, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import (
@@ -23,10 +23,13 @@ from ..domain.models import (
     DelegationRequest,
     DelegationResult,
     SkippedTarget,
+    StrategyResult,
     Target,
+    VoiceVerdict,
 )
 from ..runtime.depth import ensure_within_target_cap
 from .delegation import DelegationService, ProgressCallback
+from .strategies import aggregate, extract_verdict, verdict_instruction
 
 
 class ConsensusService:
@@ -49,12 +52,14 @@ class ConsensusService:
         correlation_id: str = "",
         base_depth: int = 0,
         on_progress: ProgressCallback | None = None,
-    ) -> ConsensusResult:
+    ) -> ConsensusResult | StrategyResult:
         """Fan out ``req`` across its targets and collect every voice.
 
         With ``expand_all``, the panel is built from every installed + authenticated adapter
         (see :meth:`_expand_all`); otherwise it is the explicit ``targets``. A failing target is
-        its own structured voice, so one bad voice never aborts the panel.
+        its own structured voice, so one bad voice never aborts the panel. With a ``strategy`` other
+        than ``all-voices``, the voices are aggregated into a :class:`StrategyResult`; otherwise the
+        legacy :class:`ConsensusResult` (every voice, plus optional synthesis) is returned unchanged.
         """
         targets, skipped = await self._resolve_targets(req, on_progress)
 
@@ -69,7 +74,7 @@ class ConsensusService:
         requests = [
             DelegationRequest(
                 target=target,
-                prompt=_apply_stance(req.prompt, _stance_for(target, req.stances, index)),
+                prompt=self._voice_prompt(req, target, index),
                 working_dir=req.working_dir,
                 files=req.files,
                 role=target.role or req.role,
@@ -82,11 +87,46 @@ class ConsensusService:
         ]
         voices = list(await asyncio.gather(*(one(i, r) for i, r in enumerate(requests))))
 
+        if req.strategy is not Strategy.ALL_VOICES:
+            return self._aggregate(req, voices, skipped)
+
         synthesis: str | None = None
         if (req.synthesize or self._config.synthesize_default) and voices:
             synthesis = await self._synthesize(req, voices, correlation_id, base_depth)
 
         return ConsensusResult(voices=voices, synthesis=synthesis, skipped=skipped)
+
+    def _voice_prompt(self, req: ConsensusRequest, target: Target, index: int) -> str:
+        """The prompt for one voice: the question, stance-steered, plus a verdict ask under a strategy."""
+        prompt = _apply_stance(req.prompt, _stance_for(target, req.stances, index))
+        if req.strategy is not Strategy.ALL_VOICES:
+            prompt = f"{prompt}\n\n{verdict_instruction(req.verdict_schema)}"
+        return prompt
+
+    def _aggregate(
+        self,
+        req: ConsensusRequest,
+        voices: list[DelegationResult],
+        skipped: list[SkippedTarget],
+    ) -> StrategyResult:
+        """Extract each voice's verdict and reduce the panel to one outcome under ``req.strategy``."""
+        verdicts = [
+            VoiceVerdict(
+                label=voice.target.display_label,
+                cli=voice.target.cli,
+                model=voice.target.model,
+                weight=voice.target.effective_weight,
+                parity=voice.target.is_parity,
+                ok=voice.ok,
+                verdict=extract_verdict(voice.text, req.verdict_schema) if voice.ok else None,
+                text=voice.text,
+            )
+            for voice in voices
+        ]
+        outcome, decision = aggregate(req.strategy, verdicts)
+        return StrategyResult(
+            strategy=req.strategy, outcome=outcome, decision=decision, voices=verdicts, skipped=skipped
+        )
 
     async def _resolve_targets(
         self,

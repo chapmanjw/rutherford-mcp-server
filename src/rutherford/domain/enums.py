@@ -102,3 +102,18 @@ class Stance(StrEnum):
     AGAINST = "against"
     #: No steering (the default).
     NEUTRAL = "neutral"
+
+
+class Strategy(StrEnum):
+    """How a consensus panel's voices are aggregated into an outcome."""
+
+    #: Return every voice with no aggregation (the default, today's behavior).
+    ALL_VOICES = "all-voices"
+    #: Agree only if every voice shares one verdict, otherwise split.
+    UNANIMOUS = "unanimous"
+    #: The verdict with the most votes wins (one voice, one vote); ties are tied.
+    MAJORITY = "majority"
+    #: The verdict with the greatest summed target weight wins; ties are tied.
+    WEIGHTED = "weighted"
+    #: Compare the proposer's verdict against the parity counterweights; disagreement escalates.
+    PARITY_PAIR = "parity-pair"

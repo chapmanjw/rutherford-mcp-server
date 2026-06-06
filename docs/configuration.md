@@ -245,8 +245,28 @@ non-empty `targets` list. A target has `cli` (required, must be a known adapter 
 `role`, `label`, `weight`, `parity`, and `stance` (`for` | `against` | `neutral`).
 `consensus`/`debate`/`review` apply a seat's `cli`, `model`, `role`, `label`, and `stance` (a
 per-seat `role` overrides the call-level role, and `label` is the key the seat appears under in a
-debate transcript). `weight`, `parity`, and the panel `strategy` feed the consensus strategies,
-wired in the next change.
+debate transcript). `weight` and `parity` feed the consensus strategies (see below), and the panel
+`strategy` is adopted by a `consensus` call that uses the panel unless it passes its own.
+
+### Consensus strategies
+
+By default `consensus` returns every voice (`strategy: all-voices`). Any other strategy asks each
+voice for a verdict and aggregates the panel into one `outcome`:
+
+| Strategy | Aggregation |
+|----------|-------------|
+| `all-voices` | Return every voice unchanged. No verdict, no aggregation. (Default.) |
+| `unanimous` | `unanimous` only if every voice shares one verdict, else `split`. |
+| `majority` | One voice, one vote; the most-voted verdict wins, ties are `tied`. |
+| `weighted` | The verdict with the greatest summed target `weight` wins, ties are `tied`. |
+| `parity-pair` | Compare the proposer against the `parity: true` seats; disagreement is `escalate`. |
+
+A verdict is read from a final `VERDICT: <token>` line in each voice's answer. Pass a
+`verdict_schema` (a JSON schema) to instead ask each voice for a JSON object containing a `verdict`
+field. A voice whose answer yields no verdict is `unparseable`: still returned, but left out of the
+tally. The result carries the `strategy`, the `outcome`, a `decision` (the winning verdict token, or
+none), and each voice's `verdict` and full `text`. For `parity-pair`, the proposer is the seat
+labeled `proposer`, or the heaviest non-parity seat.
 
 Panel files are validated when first loaded. A bad file reports every problem at once -- malformed
 TOON, an unknown `cli`, a bad `stance` -- pointing at the file and the offending target index,

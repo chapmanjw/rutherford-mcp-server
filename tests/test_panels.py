@@ -158,6 +158,17 @@ def test_empty_targets_list_is_rejected(tmp_path: Path) -> None:
     assert any("non-empty 'targets'" in problem["error"] for problem in _problems(info.value))
 
 
+def test_unknown_strategy_in_a_panel_is_rejected(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_panels(
+        home / ".rutherford",
+        {"bad": {"strategy": "plurality", "targets": [{"cli": "codex"}, {"cli": "kiro"}]}},
+    )
+    with pytest.raises(RutherfordError) as info:
+        load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p")
+    assert any("unknown strategy" in problem["error"] for problem in _problems(info.value))
+
+
 # --- cache: lazy load, reload, overrides --------------------------------------------------------
 
 
@@ -255,3 +266,27 @@ async def test_reload_panels_tool_lists_panels() -> None:
     out = await reload_panels_tool(app)
     assert "duo" in out
     assert "count: 1" in out
+
+
+async def test_panel_strategy_drives_a_parity_pair_escalation() -> None:
+    # A roundtable whose strategy is parity-pair: proposer approves, the parity dissenter blocks,
+    # so the panel must escalate. The strategy comes from the panel, not the call.
+    store = PanelStore(
+        {
+            "roundtable": Panel(
+                name="roundtable",
+                strategy="parity-pair",
+                targets=[PanelTarget(cli="a", label="proposer"), PanelTarget(cli="b", label="dissenter", parity=True)],
+            )
+        }
+    )
+
+    def run_fn(spec: Any) -> ProcessResult:
+        verdict = "approve" if spec.argv[0] == "a" else "block"
+        return ProcessResult(exit_code=0, stdout=f"reasoning\nVERDICT: {verdict}")
+
+    runner = FakeProcessRunner(run_fn=run_fn)
+    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")], runner=runner, panels=PanelCache.seeded(store))
+    out = await consensus_tool(app, prompt="is this a primitive?", panel="roundtable")
+    assert "strategy: parity-pair" in out
+    assert "outcome: escalate" in out

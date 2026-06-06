@@ -177,6 +177,17 @@ Rutherford's panels" picks up the change without restarting. See
 A `consensus` with server-side synthesis enabled: you get every voice plus one merged answer.
 (Synthesis is off by default -- usually you let your own agent compare the voices.)
 
+### Reduce a panel to a decision
+
+> Ask claude_code, codex, and qwen "is this migration safe to ship?" and take the majority verdict,
+> with each one ending in a one-word VERDICT line.
+
+A `consensus` with a `strategy` (`unanimous`, `majority`, `weighted`, or `parity-pair`). Each voice
+is asked for a verdict and Rutherford returns the `outcome` and the winning `decision` alongside
+every voice's verdict and full reasoning, instead of leaving you to tally them. `weighted` honors
+per-target weights; `parity-pair` flags a proposer-versus-dissenter disagreement as `escalate`. Pass
+a `verdict_schema` to collect the verdict as JSON instead of a `VERDICT:` line.
+
 ### Review code across several reviewers
 
 > Review my staged diff with Rutherford using Claude Code and Codex as reviewers. Findings by file

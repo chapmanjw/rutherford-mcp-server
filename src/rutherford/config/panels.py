@@ -24,7 +24,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from ..domain.enums import Stance
+from ..domain.enums import Stance, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import Target
@@ -42,9 +42,10 @@ _TARGET_KEYS = frozenset({"cli", "model", "role", "label", "weight", "parity", "
 class PanelTarget(BaseModel):
     """One seat in a panel.
 
-    ``cli`` is required; the rest default. ``role`` / ``label`` / ``weight`` / ``parity`` are carried
-    so the panel file is forward-compatible, and become fully effective with the per-target metadata
-    on :class:`~rutherford.domain.models.Target`. ``stance`` steers the seat for/against/neutral.
+    ``cli`` is required; the rest default. ``role`` overrides the call-level role for this seat,
+    ``label`` is the key it appears under in a result, ``stance`` steers it for/against/neutral, and
+    ``weight`` / ``parity`` feed the consensus strategies. Maps directly onto a
+    :class:`~rutherford.domain.models.Target`.
     """
 
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
@@ -65,8 +66,8 @@ class Panel(BaseModel):
 
     name: str
     description: str = ""
-    #: How a consensus over this panel is aggregated. ``all-voices`` returns every voice (today's
-    #: behavior); the other strategies are wired in a later change. Stored now so the file is stable.
+    #: How a consensus over this panel is aggregated (``all-voices`` | ``unanimous`` | ``majority`` |
+    #: ``weighted`` | ``parity-pair``); a consensus call using this panel adopts it unless overridden.
     strategy: str = "all-voices"
     targets: list[PanelTarget]
 
@@ -228,6 +229,13 @@ def _parse_panel(
     for key in record:
         if key not in _PANEL_KEYS:
             problems.append({"path": path, "panel": name, "error": f"unknown panel key {key!r}"})
+
+    strategy = record.get("strategy")
+    if strategy is not None and strategy not in {member.value for member in Strategy}:
+        options = ", ".join(member.value for member in Strategy)
+        problems.append(
+            {"path": path, "panel": name, "error": f"unknown strategy {strategy!r}; choose one of: {options}"}
+        )
 
     raw_targets = record.get("targets")
     if not isinstance(raw_targets, list) or not raw_targets:

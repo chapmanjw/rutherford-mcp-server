@@ -16,7 +16,6 @@ from ..config.panels import Panel
 from ..context import AppContext, tool_success
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
-from ..domain.models import Target
 
 
 async def reload_panels_tool(app: AppContext) -> str:
@@ -31,17 +30,18 @@ def resolve_panel(app: AppContext, name: str, overrides: dict[str, Any] | None) 
     return app.panels.resolve(name, overrides)
 
 
-def panel_targets(
+def panel_for_call(
     app: AppContext,
     name: str,
     overrides: dict[str, Any] | None,
     targets: object,
     stances: object,
-) -> list[Target]:
-    """Resolve a panel into targets (each carrying its own stance), rejecting args passed alongside.
+) -> Panel:
+    """Resolve a panel for a tool call, rejecting ``targets``/``stances`` passed alongside it.
 
     A panel already names its seats and their steering, so combining it with an explicit ``targets``
-    or ``stances`` argument is ambiguous and rejected with ``INVALID_INPUT``.
+    or ``stances`` argument is ambiguous and rejected with ``INVALID_INPUT``. The returned panel's
+    ``to_targets()`` gives the seats (each carrying its own stance) and ``strategy`` the aggregation.
     """
     if targets is not None:
         raise RutherfordError(ErrorCode.INVALID_INPUT, "panel and targets are mutually exclusive; use one or the other")
@@ -49,4 +49,4 @@ def panel_targets(
         raise RutherfordError(
             ErrorCode.INVALID_INPUT, "panel and stances are mutually exclusive; set each seat's stance in the panel"
         )
-    return resolve_panel(app, name, overrides).to_targets()
+    return resolve_panel(app, name, overrides)

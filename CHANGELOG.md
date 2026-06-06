@@ -8,6 +8,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Consensus strategies: `consensus` takes a `strategy` (`all-voices` (default) | `unanimous` |
+  `majority` | `weighted` | `parity-pair`), and a panel can set one. Any strategy other than
+  `all-voices` asks each voice for a verdict and aggregates: `unanimous` agrees only if every voice
+  matches; `majority` is a vote count; `weighted` sums target weights; `parity-pair` compares the
+  proposer against the parity counterweights and escalates on disagreement. Verdicts are read from a
+  final `VERDICT: <token>` line, or from a JSON object when a `verdict_schema` is given; a voice that
+  yields no verdict is `unparseable` -- still returned, excluded from the tally. The result is a
+  `StrategyResult` with an `outcome`, a `decision`, and every voice's verdict and full answer. With
+  no strategy (or `all-voices`), callers still get the legacy every-voice consensus shape.
 - Per-target metadata: a consensus/debate/review target may now carry `role`, `label`, `weight`,
   `parity`, and `stance` alongside `cli` and `model` (as a dict, or via a saved panel). A
   per-target `role` overrides the call-level role for just that seat, `stance` steers just that

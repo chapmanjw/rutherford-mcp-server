@@ -14,7 +14,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from ..domain.enums import DelegationMode, SafetyMode, Stance
+from ..domain.enums import DelegationMode, SafetyMode, Stance, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import Target
@@ -44,6 +44,19 @@ def parse_mode(value: str | DelegationMode) -> DelegationMode:
         return DelegationMode(value)
     except ValueError:
         raise RutherfordError(ErrorCode.INVALID_INPUT, f"unknown mode {value!r}; choose 'sync' or 'async'") from None
+
+
+def parse_strategy(value: str | Strategy) -> Strategy:
+    """Coerce a consensus-strategy string to :class:`Strategy`, or raise ``INVALID_INPUT``."""
+    if isinstance(value, Strategy):
+        return value
+    try:
+        return Strategy(value)
+    except ValueError:
+        options = ", ".join(strategy.value for strategy in Strategy)
+        raise RutherfordError(
+            ErrorCode.INVALID_INPUT, f"unknown strategy {value!r}; choose one of: {options}"
+        ) from None
 
 
 def parse_stances(values: list[str] | None) -> list[Stance] | None:
