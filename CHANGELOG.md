@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-05
+
 ### Added
 
 - Guided first-run setup, in two forms over shared logic: a `setup` MCP tool your agent drives
