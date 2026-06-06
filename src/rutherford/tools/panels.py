@@ -14,7 +14,6 @@ from typing import Any
 
 from ..config.panels import Panel
 from ..context import AppContext, tool_success
-from ..domain.enums import Stance
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import Target
@@ -32,14 +31,14 @@ def resolve_panel(app: AppContext, name: str, overrides: dict[str, Any] | None) 
     return app.panels.resolve(name, overrides)
 
 
-def panel_targets_and_stances(
+def panel_targets(
     app: AppContext,
     name: str,
     overrides: dict[str, Any] | None,
     targets: object,
     stances: object,
-) -> tuple[list[Target], list[Stance] | None]:
-    """Resolve a panel into targets + stances, rejecting ``targets``/``stances`` passed alongside it.
+) -> list[Target]:
+    """Resolve a panel into targets (each carrying its own stance), rejecting args passed alongside.
 
     A panel already names its seats and their steering, so combining it with an explicit ``targets``
     or ``stances`` argument is ambiguous and rejected with ``INVALID_INPUT``.
@@ -50,5 +49,4 @@ def panel_targets_and_stances(
         raise RutherfordError(
             ErrorCode.INVALID_INPUT, "panel and stances are mutually exclusive; set each seat's stance in the panel"
         )
-    panel = resolve_panel(app, name, overrides)
-    return panel.to_targets(), panel.stances()
+    return resolve_panel(app, name, overrides).to_targets()

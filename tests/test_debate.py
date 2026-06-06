@@ -153,6 +153,19 @@ async def test_progress_announces_each_round() -> None:
     assert any("synthesizing" in line for line in lines)
 
 
+async def test_explicit_target_labels_key_the_transcript() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.debate(
+        DebateRequest(
+            targets=[Target(cli="a", label="proposer"), Target(cli="b", label="critic")],
+            prompt="q",
+            rounds=1,
+        )
+    )
+    assert {c.label for c in result.rounds[0].contributions} == {"proposer", "critic"}
+
+
 async def test_all_voices_failing_round_one_yields_no_final() -> None:
     runner = FakeProcessRunner()
     service = _debate([FakeAdapter("a", installed=False), FakeAdapter("b", installed=False)], runner)

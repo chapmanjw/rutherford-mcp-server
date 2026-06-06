@@ -53,8 +53,8 @@ class PanelTarget(BaseModel):
     model: str | None = None
     role: str | None = None
     label: str | None = None
-    weight: float = 1.0
-    parity: bool = False
+    weight: float | None = None
+    parity: bool | None = None
     stance: Stance | None = None
 
 
@@ -71,18 +71,19 @@ class Panel(BaseModel):
     targets: list[PanelTarget]
 
     def to_targets(self) -> list[Target]:
-        """The panel's seats as delegation targets (cli + model; richer fields wire in later)."""
-        return [Target(cli=target.cli, model=target.model) for target in self.targets]
-
-    def stances(self) -> list[Stance] | None:
-        """The per-seat stances, parallel to :meth:`to_targets`, or ``None`` if no seat sets one.
-
-        When at least one seat is steered, every seat needs an explicit stance for the parallel
-        list to line up, so an unsteered seat resolves to :attr:`Stance.NEUTRAL`.
-        """
-        if all(target.stance is None for target in self.targets):
-            return None
-        return [target.stance or Stance.NEUTRAL for target in self.targets]
+        """The panel's seats as delegation targets, carrying each seat's role/label/weight/stance."""
+        return [
+            Target(
+                cli=target.cli,
+                model=target.model,
+                role=target.role,
+                label=target.label,
+                weight=target.weight,
+                parity=target.parity,
+                stance=target.stance,
+            )
+            for target in self.targets
+        ]
 
 
 class PanelStore:

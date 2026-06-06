@@ -10,7 +10,7 @@ from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode
 from ..domain.models import ConsensusRequest, Target
 from .common import as_target, parse_mode, parse_safety_mode, parse_stances
-from .panels import panel_targets_and_stances
+from .panels import panel_targets
 
 
 async def consensus_tool(
@@ -43,7 +43,8 @@ async def consensus_tool(
     """
     target_objs: list[Target]
     if panel is not None:
-        target_objs, panel_stances = panel_targets_and_stances(app, panel, panel_overrides, targets, stances)
+        target_objs = panel_targets(app, panel, panel_overrides, targets, stances)
+        panel_stances = None  # each panel seat carries its own stance
         expand_all = False
     else:
         panel_stances = parse_stances(stances)

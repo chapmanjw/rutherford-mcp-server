@@ -69,10 +69,10 @@ class ConsensusService:
         requests = [
             DelegationRequest(
                 target=target,
-                prompt=_apply_stance(req.prompt, req.stances[index] if req.stances else None),
+                prompt=_apply_stance(req.prompt, _stance_for(target, req.stances, index)),
                 working_dir=req.working_dir,
                 files=req.files,
-                role=req.role,
+                role=target.role or req.role,
                 safety_mode=req.safety_mode,
                 timeout_s=req.timeout_s,
                 include_raw=req.include_raw,
@@ -198,6 +198,13 @@ def _announce_panel(
     on_progress(f"consensus panel: including {names}")
     for entry in skipped:
         on_progress(f"consensus panel: skipping {entry.cli} ({entry.reason})")
+
+
+def _stance_for(target: Target, stances: list[Stance] | None, index: int) -> Stance | None:
+    """The stance steering a voice: the target's own stance, else the parallel ``stances`` entry."""
+    if target.stance is not None:
+        return target.stance
+    return stances[index] if stances else None
 
 
 def _apply_stance(prompt: str, stance: Stance | None) -> str:

@@ -12,10 +12,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import ValidationError
+
 from ..domain.enums import DelegationMode, SafetyMode, Stance
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import Target
+
+#: The per-target metadata keys read from a target dict, beyond ``cli`` and ``model``.
+_TARGET_META_KEYS = ("role", "label", "weight", "parity", "stance")
 
 
 def parse_safety_mode(value: str | SafetyMode) -> SafetyMode:
@@ -61,15 +66,24 @@ def parse_stances(values: list[str] | None) -> list[Stance] | None:
 
 
 def as_target(value: Target | dict[str, Any] | str) -> Target:
-    """Coerce a target given as a :class:`Target`, a ``{cli, model}`` dict, or a ``cli`` /
-    ``cli:model`` string into a :class:`Target`."""
+    """Coerce a target into a :class:`Target`.
+
+    Accepts a :class:`Target`; a ``cli`` / ``cli:model`` string; or a dict with ``cli`` (required),
+    ``model``, and the optional per-seat metadata ``role`` / ``label`` / ``weight`` / ``parity`` /
+    ``stance``. An invalid metadata value (e.g. an unknown stance) raises ``INVALID_INPUT``.
+    """
     if isinstance(value, Target):
         return value
     if isinstance(value, dict):
         cli = value.get("cli")
         if not cli:
             raise RutherfordError(ErrorCode.INVALID_INPUT, "each target needs a 'cli' field")
-        return Target(cli=str(cli), model=value.get("model"))
+        fields: dict[str, Any] = {"cli": str(cli), "model": value.get("model")}
+        fields.update({key: value[key] for key in _TARGET_META_KEYS if key in value})
+        try:
+            return Target(**fields)
+        except ValidationError as exc:
+            raise RutherfordError(ErrorCode.INVALID_INPUT, f"invalid target {value!r}: {exc}") from exc
     if isinstance(value, str):
         cli, _, model = value.partition(":")
         if not cli:

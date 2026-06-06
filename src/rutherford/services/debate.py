@@ -42,6 +42,7 @@ class _Voice:
     target: Target
     label: str
     stance: Stance | None
+    role: str | None
 
 
 class DebateService:
@@ -103,8 +104,9 @@ class DebateService:
             _Voice(
                 index=index,
                 target=target,
-                label=_label(target),
-                stance=req.stances[index] if req.stances else None,
+                label=target.display_label,
+                stance=target.stance if target.stance is not None else (req.stances[index] if req.stances else None),
+                role=target.role or req.role,
             )
             for index, target in enumerate(req.targets)
         ]
@@ -139,7 +141,7 @@ class DebateService:
                 prompt=prompt,
                 working_dir=req.working_dir,
                 files=req.files,
-                role=req.role,
+                role=voice.role,
                 safety_mode=req.safety_mode,
                 timeout_s=req.timeout_s,
                 include_raw=req.include_raw,
@@ -207,11 +209,6 @@ class DebateService:
         return result.text if result.ok else None
 
 
-def _label(target: Target) -> str:
-    """The transcript key for a voice: ``cli:model``, or just ``cli`` at the adapter's default."""
-    return f"{target.cli}:{target.model}" if target.model else target.cli
-
-
 def _latest_text(round_: DebateRound, label: str) -> str:
     """Return ``label``'s answer text from a round, or empty if it did not contribute."""
     for contribution in round_.contributions:
@@ -227,7 +224,7 @@ def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) 
         target=result.target,
         round_index=round_index,
         stance=voice.stance,
-        role=None,
+        role=voice.role,
         ok=result.ok,
         text=result.text,
         raw=result.raw,

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from rutherford.adapters.registry import AdapterRegistry
@@ -61,6 +63,34 @@ async def test_stances_steer_each_prompt() -> None:
     prompts = [spec.argv[2] for spec, _ in runner.calls]
     assert any("Argue in favor" in prompt for prompt in prompts)
     assert any("Argue against" in prompt for prompt in prompts)
+
+
+async def test_per_target_stance_steers_that_voice() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
+    await service.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="a", stance=Stance.FOR), Target(cli="b", stance=Stance.AGAINST)],
+            prompt="adopt gRPC?",
+        )
+    )
+    prompts = [spec.argv[2] for spec, _ in runner.calls]
+    assert any("Argue in favor" in prompt for prompt in prompts)
+    assert any("Argue against" in prompt for prompt in prompts)
+
+
+async def test_per_target_role_overrides_call_role(tmp_path: Path) -> None:
+    (tmp_path / "sleuth.md").write_text("---\nname: sleuth\n---\nBE A SLEUTH.\n", encoding="utf-8")
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    registry = AdapterRegistry([FakeAdapter("a"), FakeAdapter("b")])
+    delegation = DelegationService(registry, runner, RutherfordConfig(), load_roles(extra_dirs=[tmp_path]))
+    service = ConsensusService(delegation, RutherfordConfig(), registry)
+    await service.consensus(
+        ConsensusRequest(targets=[Target(cli="a", role="sleuth"), Target(cli="b")], prompt="who did it?", role=None)
+    )
+    by_cli = {spec.argv[0]: spec.argv[2] for spec, _ in runner.calls}
+    assert "BE A SLEUTH." in by_cli["a"]  # the per-target role was applied to its voice
+    assert "BE A SLEUTH." not in by_cli["b"]  # and only to its voice
 
 
 async def test_target_cap_enforced() -> None:

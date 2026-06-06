@@ -28,17 +28,44 @@ from .enums import (
 
 
 class Target(BaseModel):
-    """A ``(cli, model)`` pair: the unit of delegation.
+    """A delegation target: a ``(cli, model)`` pair plus optional per-seat metadata.
 
     The CLI alone is never the unit. Bring-your-own-model CLIs (OpenCode, Goose) expose many
     models through one adapter, and the same adapter may appear several times in a consensus
     panel with different models. ``model`` is ``None`` to mean the adapter's default model.
+
+    The metadata fields are all optional and default to ``None`` so a bare ``(cli, model)`` target
+    is unchanged on the wire: ``role`` overrides the tool-level role for this seat, ``label`` is the
+    key the seat appears under in a result, ``weight`` and ``parity`` feed the consensus strategies,
+    and ``stance`` steers the seat (taking precedence over a parallel stances list).
     """
 
     model_config = ConfigDict(frozen=True, protected_namespaces=())
 
     cli: str
     model: str | None = None
+    role: str | None = None
+    label: str | None = None
+    weight: float | None = None
+    parity: bool | None = None
+    stance: Stance | None = None
+
+    @property
+    def display_label(self) -> str:
+        """The key this seat appears under: an explicit ``label``, else ``cli:model`` (or ``cli``)."""
+        if self.label:
+            return self.label
+        return f"{self.cli}:{self.model}" if self.model else self.cli
+
+    @property
+    def effective_weight(self) -> float:
+        """The weight used by weighted strategies; ``1.0`` when unset."""
+        return 1.0 if self.weight is None else self.weight
+
+    @property
+    def is_parity(self) -> bool:
+        """Whether this seat is a parity counterweight for the parity-pair strategy."""
+        return bool(self.parity)
 
 
 # --- Small shared value objects ----------------------------------------------

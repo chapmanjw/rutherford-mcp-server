@@ -242,11 +242,11 @@ panels:
 
 A panel record has `description` (optional), `strategy` (optional, default `all-voices`), and a
 non-empty `targets` list. A target has `cli` (required, must be a known adapter id), `model`,
-`role`, `label`, `weight` (default `1.0`), `parity` (default `false`), and `stance`
-(`for` | `against` | `neutral`). Today `consensus`/`debate`/`review` consume a panel's `cli`,
-`model`, and `stance`; `role`, `label`, `weight`, `parity`, and `strategy` are accepted and stored
-so the file is stable, and take effect with the per-target-metadata and strategy changes that
-follow.
+`role`, `label`, `weight`, `parity`, and `stance` (`for` | `against` | `neutral`).
+`consensus`/`debate`/`review` apply a seat's `cli`, `model`, `role`, `label`, and `stance` (a
+per-seat `role` overrides the call-level role, and `label` is the key the seat appears under in a
+debate transcript). `weight`, `parity`, and the panel `strategy` feed the consensus strategies,
+wired in the next change.
 
 Panel files are validated when first loaded. A bad file reports every problem at once -- malformed
 TOON, an unknown `cli`, a bad `stance` -- pointing at the file and the offending target index,

@@ -12,7 +12,7 @@ from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import ConsensusRequest, Target
 from .common import as_target, parse_safety_mode
-from .panels import panel_targets_and_stances
+from .panels import panel_targets
 
 
 async def review_tool(
@@ -42,7 +42,8 @@ async def review_tool(
     review_targets: list[Target]
     review_stances: list[Stance] | None
     if panel is not None:
-        review_targets, review_stances = panel_targets_and_stances(app, panel, panel_overrides, targets, None)
+        review_targets = panel_targets(app, panel, panel_overrides, targets, None)
+        review_stances = None  # each panel seat carries its own stance
     else:
         review_targets = [as_target(target) for target in targets or []]
         review_stances = None

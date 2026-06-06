@@ -36,6 +36,37 @@ def test_target_model_defaults_to_none() -> None:
     assert Target(cli="goose").model is None
 
 
+def test_target_metadata_defaults_to_none() -> None:
+    target = Target(cli="goose")
+    assert target.role is None
+    assert target.label is None
+    assert target.weight is None
+    assert target.parity is None
+    assert target.stance is None
+
+
+def test_target_display_label() -> None:
+    assert Target(cli="a").display_label == "a"
+    assert Target(cli="a", model="m").display_label == "a:m"
+    assert Target(cli="a", model="m", label="primary").display_label == "primary"
+
+
+def test_target_effective_weight_and_parity() -> None:
+    assert Target(cli="a").effective_weight == 1.0
+    assert Target(cli="a", weight=2.5).effective_weight == 2.5
+    assert Target(cli="a").is_parity is False
+    assert Target(cli="a", parity=True).is_parity is True
+
+
+def test_target_with_metadata_is_still_frozen_and_hashable() -> None:
+    from rutherford.domain.enums import Stance
+
+    target = Target(cli="kiro", model="x", label="dissenter", weight=2.0, parity=True, stance=Stance.AGAINST)
+    assert {target, target} == {target}  # hashable with metadata
+    with pytest.raises(ValidationError):
+        target.weight = 3.0  # type: ignore[misc]
+
+
 def test_delegation_request_defaults_to_read_only_sync() -> None:
     req = DelegationRequest(target=Target(cli="codex"), prompt="hi")
     assert req.safety_mode is SafetyMode.READ_ONLY

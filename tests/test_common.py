@@ -52,3 +52,45 @@ def test_as_target_invalid() -> None:
         as_target("")
     with pytest.raises(RutherfordError, match="interpret target"):
         as_target(123)  # type: ignore[arg-type]
+
+
+def test_as_target_full_metadata_dict() -> None:
+    target = as_target(
+        {
+            "cli": "kiro",
+            "model": "deepseek-3.2",
+            "role": "dissenter",
+            "label": "d",
+            "weight": 2,  # int coerces to float
+            "parity": True,
+            "stance": "against",  # string coerces to the enum
+        }
+    )
+    assert target == Target(
+        cli="kiro",
+        model="deepseek-3.2",
+        role="dissenter",
+        label="d",
+        weight=2.0,
+        parity=True,
+        stance=Stance.AGAINST,
+    )
+
+
+def test_as_target_string_forms_carry_no_metadata() -> None:
+    target = as_target("kiro:deepseek-3.2")
+    assert (target.role, target.label, target.weight, target.parity, target.stance) == (None, None, None, None, None)
+    assert target.display_label == "kiro:deepseek-3.2"
+
+
+def test_as_target_label_defaulting() -> None:
+    assert as_target("a").display_label == "a"
+    assert as_target("a:m").display_label == "a:m"
+    assert as_target({"cli": "a", "label": "primary"}).display_label == "primary"
+
+
+def test_as_target_invalid_metadata_raises() -> None:
+    with pytest.raises(RutherfordError, match="invalid target"):
+        as_target({"cli": "a", "stance": "sideways"})
+    with pytest.raises(RutherfordError, match="invalid target"):
+        as_target({"cli": "a", "weight": "heavy"})

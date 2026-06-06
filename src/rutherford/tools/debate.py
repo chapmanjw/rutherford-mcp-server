@@ -10,7 +10,7 @@ from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode, Stance
 from ..domain.models import DebateRequest, Target
 from .common import as_target, parse_mode, parse_safety_mode, parse_stances
-from .panels import panel_targets_and_stances
+from .panels import panel_targets
 
 
 async def debate_tool(
@@ -46,7 +46,8 @@ async def debate_tool(
     target_objs: list[Target]
     debate_stances: list[Stance] | None
     if panel is not None:
-        target_objs, debate_stances = panel_targets_and_stances(app, panel, panel_overrides, targets, stances)
+        target_objs = panel_targets(app, panel, panel_overrides, targets, stances)
+        debate_stances = None  # each panel seat carries its own stance
     else:
         target_objs = [as_target(target) for target in targets or []]
         debate_stances = parse_stances(stances)

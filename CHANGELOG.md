@@ -8,6 +8,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Per-target metadata: a consensus/debate/review target may now carry `role`, `label`, `weight`,
+  `parity`, and `stance` alongside `cli` and `model` (as a dict, or via a saved panel). A
+  per-target `role` overrides the call-level role for just that seat, `stance` steers just that
+  voice (taking precedence over a parallel `stances` list), and `label` is the key the seat appears
+  under in a debate transcript. `weight` and `parity` are carried for the consensus strategies. The
+  legacy target shapes (a `cli` or `cli:model` string, a `{cli}` or `{cli, model}` dict) are
+  unchanged, and a plain target still serializes as just `{cli, model}`.
 - Custom roles now layer across config scopes the same way panels do: after the built-ins and any
   configured `role_dirs`, Rutherford reads a `roles/` directory from `~/.rutherford/`, then
   `<cwd>/.rutherford/`, then `$RUTHERFORD_CONFIG_DIR/`, the closest scope winning a name collision.
