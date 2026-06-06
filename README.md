@@ -193,8 +193,10 @@ more targets.
 > ordered, step-by-step plan, with the files each step touches and the risky parts flagged.
 
 `plan` -- one target, the `planner` role, read-only. The bundled roles are `planner`, `codereviewer`,
-`security`, and `debugger`; ask "what roles does Rutherford have?" to list them, and you can add your
-own (see [docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md)).
+`security`, and `debugger`; ask "what roles does Rutherford have?" to list them (each shows its
+source). Add your own as markdown or TOON files under `~/.rutherford/roles/` or a project's
+`.rutherford/roles/`, with a project role overriding a same-named global one (see
+[docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md)).
 
 ### Let an agent actually make the change
 

@@ -29,6 +29,7 @@ from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import Target
 from ..io.serialize import DecodeError, decode
+from .locations import config_scopes
 
 #: The file searched in each config location.
 PANELS_FILENAME = "panels.toon"
@@ -165,24 +166,6 @@ class PanelCache:
             ) from exc
 
 
-def _home_dir(env: Mapping[str, str]) -> Path:
-    """The user's home directory, honoring an injected environment for testability."""
-    raw = env.get("USERPROFILE") or env.get("HOME")
-    return Path(raw) if raw else Path.home()
-
-
-def _config_dirs(env: Mapping[str, str], cwd: Path) -> list[tuple[str, Path]]:
-    """The panel config locations, lowest precedence first (later wins on a name collision)."""
-    dirs: list[tuple[str, Path]] = [
-        ("user", _home_dir(env) / ".rutherford"),
-        ("project", cwd / ".rutherford"),
-    ]
-    config_dir = env.get("RUTHERFORD_CONFIG_DIR")
-    if config_dir:
-        dirs.append(("env", Path(config_dir)))
-    return dirs
-
-
 def load_panels(
     known_clis: Iterable[str],
     *,
@@ -206,7 +189,7 @@ def load_panels(
     merged: dict[str, Panel] = {}
     problems: list[dict[str, Any]] = []
 
-    for _source, directory in _config_dirs(environ, working_dir):
+    for _source, directory in config_scopes(environ, working_dir):
         path = directory / PANELS_FILENAME
         if not path.exists():
             continue

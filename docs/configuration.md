@@ -56,7 +56,7 @@ All fields are optional. Unset fields take the listed default.
 | `generic_adapters` | `list[GenericAdapterConfig]` | `[]` | Config-defined adapters with no code module. |
 | `default_safety_mode` | `string` | `"read_only"` | Safety posture applied when a caller omits the field. One of `read_only`, `propose`, `write`, `yolo`. |
 | `default_timeout_s` | `float` | `300.0` | Per-run timeout in seconds. |
-| `role_dirs` | `list[str]` | `[]` | Extra directories to search for role markdown files. Built-in roles always load. |
+| `role_dirs` | `list[str]` | `[]` | Extra directories to search for custom role files (in addition to the well-known scopes; see Custom roles). Built-in roles always load. |
 | `max_depth` | `int` | `3` | Maximum delegation depth. Delegations at this depth are refused. |
 | `max_targets` | `int` | `8` | Maximum targets per consensus or debate call. |
 | `max_debate_rounds` | `int` | `4` | Maximum rounds a single `debate` call may run. Each round is a full panel pass. |
@@ -253,6 +253,47 @@ TOON, an unknown `cli`, a bad `stance` -- pointing at the file and the offending
 rather than failing on the first error. A panel naming an unknown CLI is an error; a panel whose
 CLI is installed but unauthenticated still loads, and that voice is skipped at run time with the
 usual reason.
+
+---
+
+## Custom roles
+
+A role is a named persona whose text becomes a system prompt (or a prompt prefix on CLIs without a
+system-prompt flag). The four built-ins -- `planner`, `codereviewer`, `security`, `debugger` --
+always load. Custom roles are layered on top, lowest precedence first:
+
+1. Built-in roles.
+2. Each directory in the `role_dirs` config field (`source: config`).
+3. `~/.rutherford/roles/` (`source: user`).
+4. `<cwd>/.rutherford/roles/` (`source: project`).
+5. `$RUTHERFORD_CONFIG_DIR/roles/` (`source: env`).
+
+A later layer overrides an earlier one by role name, so a project role beats a same-named home
+role -- the same closest-scope-wins rule panels use. `list_roles` reports each role's `source`.
+
+A role file is either markdown or TOON:
+
+```markdown
+---
+name: citation-auditor
+display_name: Citation Auditor
+description: Third-seat auditor that checks every source.
+---
+You are auditing an answer for unsupported claims. For each claim, ...
+```
+
+```toon
+name: citation-auditor
+display_name: Citation Auditor
+description: Third-seat auditor that checks every source.
+system_prompt: |
+  You are auditing an answer for unsupported claims. For each claim, ...
+```
+
+For markdown the body after the frontmatter is the system prompt; for TOON it is the
+`system_prompt` field. The filename is the default role name when `name` is omitted. A file that
+fails to parse (bad TOON, an empty body) is logged at warning level and skipped, so one malformed
+role never stops the others -- or the server -- from loading.
 
 ---
 

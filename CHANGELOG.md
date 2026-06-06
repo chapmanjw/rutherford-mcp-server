@@ -8,6 +8,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Custom roles now layer across config scopes the same way panels do: after the built-ins and any
+  configured `role_dirs`, Rutherford reads a `roles/` directory from `~/.rutherford/`, then
+  `<cwd>/.rutherford/`, then `$RUTHERFORD_CONFIG_DIR/`, the closest scope winning a name collision.
+  Each role records its `source` (`builtin` | `config` | `user` | `project` | `env`), now reported
+  by `list_roles`. Role files may be markdown (the body is the system prompt) or TOON (a
+  `system_prompt` field). A malformed role file is logged and skipped rather than crashing the
+  server.
 - Saved panels: a named, reusable set of targets defined in a `panels.toon` file, referenced by
   `panel="..."` on `consensus`, `debate`, and `review` instead of spelling out the targets each
   call (with optional one-off `panel_overrides`). Panels are discovered across
