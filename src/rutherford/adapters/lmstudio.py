@@ -14,6 +14,11 @@ configured ``[adapters.lmstudio] default_model`` is used (the delegation service
 if neither is set the adapter raises a clear error. ``available_models`` lists the installed LLMs by
 parsing ``lms ls --json``.
 
+Remote models work transparently: a model loaded on another machine over LM Studio's **LM Link**
+appears in ``lms ls`` with its normal model key, and ``lms chat`` routes to whichever device has it
+(preferring an already-loaded instance), so a remote model needs no special handling here -- pass the
+plain model key, not a device-qualified one (``lms chat`` rejects ``<deviceId>:<modelKey>``).
+
 LM Studio's CLI has a native ``-s/--system-prompt`` flag, so the role preamble rides there rather
 than being prepended to the prompt. Auth is a non-issue for local inference (``lms login`` is only
 for publishing to LM Studio Hub). Sampling params live in the model's LM Studio config, not the CLI.

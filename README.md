@@ -93,6 +93,12 @@ or set `[adapters.<id>] default_model` in your config (they have no built-in def
 `capabilities`/`doctor` mark them `optional: true`, and they stay out of an auto-`all` panel unless
 you name them. Local CPU/iGPU inference is slow, so a longer `[adapters.<id>] timeout_s` and per-CLI
 flags via `extra_args` are worth setting — see [docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md).
+
+LM Studio also reaches **remote models over [LM Link](https://lmstudio.ai)**: a model loaded on
+another machine on your network is addressed by its normal model key (e.g. `openai/gpt-oss-120b`) and
+runs on that machine — `capabilities` lists it and `delegate`/`consensus` route to it with no extra
+setup, so a single panel can span your local box and several remote machines.
+
 An eleventh, well-behaved CLI can be added without code — see
 [docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md).
 

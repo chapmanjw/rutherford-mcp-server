@@ -143,6 +143,11 @@ no separate `lms load` and no running `lms server` are required.
   built-in default -- name a model per call with `model=` (the LM Studio model key, e.g.
   `google/gemma-4-12b`; see `lms ls`), or set `[adapters.lmstudio] default_model`. The integration
   test delegates at the configured default, so set one before running it.
+- Remote models via LM Link: a model loaded on another machine on your network (connected through LM
+  Studio's LM Link; see `lms link status`) is reachable by its normal model key and runs on that
+  machine -- no extra config, and `available_models` lists it. Use the plain model key, not a
+  device-qualified `<deviceId>:<modelKey>` (which `lms chat` rejects). When a model exists on several
+  devices, LM Studio prefers an already-loaded instance; to pin one, use `lms link set-preferred-device`.
 - Output cleanup: `lms chat` streams the model-load progress bar to stdout and a reasoning model
   emits a `<think>...</think>` block; the adapter strips both so the answer is clean. Sampling lives
   in the model's LM Studio config; `--ttl` (residency) and other `lms chat` flags go in

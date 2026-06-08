@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Documentation
+
+- Document that the `lmstudio` adapter works with **LM Studio's LM Link**: a model loaded on another
+  machine on your network is reachable by its normal model key (e.g. `openai/gpt-oss-120b`), so
+  `capabilities` lists it and a delegation/consensus routes to that machine -- a panel can span
+  several machines. No code change; LM Studio's `lms chat` handles the routing (use the plain model
+  key, not a device-qualified one).
+
 ## [1.0.0] - 2026-06-08
 
 ### Added
