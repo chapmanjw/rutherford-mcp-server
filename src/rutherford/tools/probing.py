@@ -18,6 +18,7 @@ def probe_adapter(adapter: CLIAdapter, *, diagnostic: bool = False) -> AdapterSt
     """Build an :class:`AdapterStatus` for ``adapter``. Never raises on a probe failure."""
     detected = adapter.detect()
     capabilities = adapter.capabilities()
+    optional = bool(getattr(adapter, "optional", False))
     if detected.installed:
         auth = adapter.check_auth()
         try:
@@ -28,11 +29,12 @@ def probe_adapter(adapter: CLIAdapter, *, diagnostic: bool = False) -> AdapterSt
         auth = AuthStatus(state=AuthState.UNKNOWN, detail="not installed")
         models = []
 
-    notes = _diagnose(adapter, detected.installed, auth) if diagnostic else []
+    notes = _diagnose(adapter, detected.installed, auth, models, optional) if diagnostic else []
     return AdapterStatus(
         id=adapter.id,
         display_name=adapter.display_name,
         installed=detected.installed,
+        optional=optional,
         path=detected.path,
         version=detected.version,
         auth=auth,
@@ -43,10 +45,25 @@ def probe_adapter(adapter: CLIAdapter, *, diagnostic: bool = False) -> AdapterSt
     )
 
 
-def _diagnose(adapter: CLIAdapter, installed: bool, auth: AuthStatus) -> list[str]:
-    """Produce actionable notes for an unavailable or unauthenticated target."""
+def _diagnose(
+    adapter: CLIAdapter,
+    installed: bool,
+    auth: AuthStatus,
+    models: list[str],
+    optional: bool,
+) -> list[str]:
+    """Produce notes for an unavailable, unauthenticated, or not-ready target.
+
+    An ``optional`` adapter (a local model the user need not run) is never framed as a missing
+    requirement: its absence or empty model list reads as "only if you want it", not as an error.
+    """
+    binary = getattr(adapter, "binary", adapter.id)
     if not installed:
-        binary = getattr(adapter, "binary", adapter.id)
+        if optional:
+            return [
+                f"optional: a local model via {binary}. Install it and pull a model "
+                f"(e.g. `{binary} pull <model>`) only if you want local delegation; otherwise ignore."
+            ]
         return [f"{binary} was not found on PATH; install it (see docs/integration-testing.md)"]
     notes: list[str] = []
     if auth.state is AuthState.NEEDS_LOGIN:
@@ -55,4 +72,9 @@ def _diagnose(adapter: CLIAdapter, installed: bool, auth: AuthStatus) -> list[st
         notes.append(f"no credential found: {auth.detail}")
     elif auth.state is AuthState.UNKNOWN and auth.detail:
         notes.append(f"auth state could not be verified non-interactively: {auth.detail}")
+    if optional and not models:
+        notes.append(
+            f"optional: {binary} is installed but no models are available -- start the daemon "
+            f"(e.g. `{binary} serve`) and pull a model only if you want local delegation."
+        )
     return notes

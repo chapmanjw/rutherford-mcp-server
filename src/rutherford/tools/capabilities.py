@@ -22,8 +22,10 @@ async def capabilities_tool(app: AppContext) -> str:
     block the event loop.
     """
     adapters = app.registry.all()
-    statuses = await asyncio.gather(*(asyncio.to_thread(probe_adapter, adapter) for adapter in adapters))
-    return tool_success(list(statuses))
+    statuses = list(await asyncio.gather(*(asyncio.to_thread(probe_adapter, adapter) for adapter in adapters)))
+    for status in statuses:
+        status.default_model = app.config.default_model_for(status.id)
+    return tool_success(statuses)
 
 
 async def doctor_tool(app: AppContext, *, live: bool = True) -> str:
@@ -41,6 +43,8 @@ async def doctor_tool(app: AppContext, *, live: bool = True) -> str:
         *(asyncio.to_thread(probe_adapter, adapter, diagnostic=True) for adapter in adapters)
     )
     status_list = list(statuses)
+    for status in status_list:
+        status.default_model = app.config.default_model_for(status.id)
     if live:
         status_list = await asyncio.gather(*(_verify_live(app, status) for status in status_list))
     payload = {

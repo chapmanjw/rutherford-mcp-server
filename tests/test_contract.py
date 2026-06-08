@@ -110,6 +110,7 @@ def test_registry_has_all_builtins() -> None:
         "cursor",
         "goose",
         "kiro",
+        "ollama",
         "opencode",
         "qwen",
     ]

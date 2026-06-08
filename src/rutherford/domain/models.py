@@ -425,10 +425,16 @@ class AdapterStatus(BaseModel):
     id: str
     display_name: str
     installed: bool
+    #: True for an adapter you only need if you opt in (e.g. a local model). ``doctor`` frames an
+    #: absent or not-ready optional adapter as "only if you want it", never as something to fix.
+    optional: bool = False
     path: str | None = None
     version: str | None = None
     auth: AuthStatus
     models: list[str] = Field(default_factory=list)
+    #: The configured default model (`[adapters.<id>] default_model`), so a reader can see which model
+    #: a no-model delegation will use. ``None`` when no default is configured for this adapter.
+    default_model: str | None = None
     capabilities: AdapterCapabilities
     runtime: Runtime = Runtime.NATIVE
     notes: list[str] = Field(default_factory=list)

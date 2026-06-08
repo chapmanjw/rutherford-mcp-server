@@ -248,7 +248,7 @@ Read the field path and fix the corresponding key in your `rutherford.toml` or `
 
 **Cause.** The `cli` field in a `Target` does not match any registered adapter id. The registry is a closed mapping; an unknown id raises `RegistryError` with `ErrorCode.UNKNOWN_TARGET` and lists the known ids.
 
-**Fix.** Use the `capabilities` tool to see every registered adapter id. The built-in ids are: `claude_code`, `codex`, `opencode`, `goose`, `kiro`, `antigravity`. Config-defined generic adapters are registered under their configured `id` field. Check spelling -- the id is case-sensitive.
+**Fix.** Use the `capabilities` tool to see every registered adapter id. The built-in ids are: `claude_code`, `codex`, `cursor`, `qwen`, `kiro`, `opencode`, `goose`, `ollama`, `antigravity`. Config-defined generic adapters are registered under their configured `id` field. Check spelling -- the id is case-sensitive.
 
 ---
 

@@ -58,6 +58,12 @@ class DelegationService:
         on_progress: ProgressCallback | None = None,
     ) -> DelegationResult:
         """Run ``req`` against its target CLI and return the normalized result."""
+        # Fill in the per-adapter configured default model when the call names none, so
+        # ``[adapters.<id>] default_model`` is honored before the adapter ever sees the request.
+        if req.target.model is None:
+            configured = self._config.default_model_for(req.target.cli)
+            if configured:
+                req = req.model_copy(update={"target": req.target.model_copy(update={"model": configured})})
         ctx = InvocationContext(
             target=req.target,
             safety_mode=req.safety_mode,
@@ -120,6 +126,8 @@ class DelegationService:
         """
         try:
             spec = adapter.build_invocation(req, ctx)
+        except RutherfordError as exc:  # a validation error (e.g. no model) keeps its own code
+            return self._error(ctx, exc), None
         except Exception as exc:  # an adapter bug becomes a structured result, not a server crash
             return self._fail(ctx, ErrorCode.INTERNAL, f"build_invocation failed: {exc}"), None
 

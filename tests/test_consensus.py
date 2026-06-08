@@ -231,6 +231,20 @@ async def test_expand_all_fans_out_to_authenticated_adapters() -> None:
     assert "not installed" in skipped["d"]
 
 
+async def test_expand_all_excludes_optional_adapters() -> None:
+    # An optional adapter (a local model) is installed + authenticated, but must NOT auto-join the
+    # "all" panel -- it only participates when named explicitly, so it never silently slows it.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    adapters = [FakeAdapter("a"), FakeAdapter("ollama", optional=True)]
+    service = _consensus(adapters, runner)
+    result = await service.consensus(ConsensusRequest(prompt="q", expand_all=True))
+
+    assert {voice.target.cli for voice in result.voices} == {"a"}
+    skipped = {entry.cli: entry.reason for entry in result.skipped}
+    assert "ollama" in skipped
+    assert "optional" in skipped["ollama"]
+
+
 async def test_expand_all_announces_panel_via_progress() -> None:
     runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
     adapters = [FakeAdapter("a"), FakeAdapter("b", auth_state=AuthState.NEEDS_LOGIN)]

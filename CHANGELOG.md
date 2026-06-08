@@ -6,6 +6,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- New built-in `ollama` adapter: delegate to a local model through `ollama run <model>` (prompt on
+  stdin), which keeps Rutherford's CLI-only contract -- it drives the Ollama command, never the HTTP
+  API. Bring your own model via the `model` argument; it has no built-in default, so when a call
+  names none the configured `[adapters.ollama] default_model` is used, and with neither set the
+  adapter returns a clear error that lists the models you have installed. Sampling and residency come
+  from the model's Modelfile and the daemon (`OLLAMA_KEEP_ALIVE`); the adapter sets no flags for them.
+- `[adapters.<id>] default_model` is now honored: when a delegation names no model, the configured
+  default for that adapter is filled in (the field was documented but previously unused). First-run
+  `setup` / `init` also detect an installed Ollama: the `init` wizard lists your pulled models and
+  lets you pick the local-coding default (or skip), writing `[adapters.ollama] default_model`.
+- An `optional` adapter flag, surfaced by `capabilities` and `doctor`. The `ollama` adapter is
+  optional: an absent or model-less Ollama reads as "only if you want it", never as an error.
+  Optional adapters are also excluded from a `consensus` / `debate` auto-`"all"` panel (and from the
+  setup starter panel) unless named explicitly, so a slow local model never silently joins an
+  otherwise-cloud panel; the `skipped` list records why.
+
 ## [0.2.0] - 2026-06-05
 
 ### Added

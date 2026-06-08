@@ -20,6 +20,7 @@ not installed, or not authenticated is skipped with a clear reason rather than f
 | Goose | `RUTHERFORD_IT_GOOSE` |
 | Cursor | `RUTHERFORD_IT_CURSOR` |
 | Qwen Code | `RUTHERFORD_IT_QWEN` |
+| Ollama (local, optional) | `RUTHERFORD_IT_OLLAMA` |
 
 A contributor with only Codex and Claude Code installed sets `RUTHERFORD_IT_CLAUDE=1` and
 `RUTHERFORD_IT_CODEX=1`; the rest skip.
@@ -93,6 +94,24 @@ set the API key) yourself, so the headless runner can reuse the session.
   (`OPENAI_API_KEY` with `--auth-type openai`, or `DASHSCOPE_API_KEY`). Qwen OAuth has no
   non-interactive check, so `capabilities` shows `unknown` and `doctor` verifies it live.
 - Smoke: `qwen -o json "say ok"`
+
+### Ollama (`ollama`) — optional, local
+
+A local model rather than a cloud CLI, and entirely opt-in: skip this whole section if you do not
+want local delegation. `capabilities`/`doctor` mark it `optional: true`, so an absent or
+model-less Ollama reads as "only if you want it", never as a missing requirement.
+
+- Install: the Ollama daemon (`brew install ollama` on macOS, or the installer from
+  [ollama.com](https://ollama.com)); start it with `ollama serve` (or the desktop app).
+- Authenticate: none -- a local daemon needs no credentials.
+- Get a model: `ollama pull <model>` (or build a custom Modelfile). The adapter has no built-in
+  default -- name a model per call with `model=`, or set `[adapters.ollama] default_model` in your
+  config (the `setup` wizard offers to fill it in from your installed models). The integration test
+  delegates at the configured default, so set one before running it. Bring whatever model you like --
+  one adapter fronts them all.
+- Residency/sampling are the daemon's: per-model `num_ctx`/`temperature` come from the Modelfile,
+  and `OLLAMA_KEEP_ALIVE` governs how long a model stays loaded. The CLI exposes no flags for these.
+- Smoke: `printf 'say ok' | ollama run <your-model>`
 
 ## What the suite covers
 

@@ -112,3 +112,4 @@ Run `just check` (lint, format, license header, mypy strict, unit tests with the
 | Goose | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key | 2026-05-30 (docs) |
 | Cursor | `cursor` | `cursor-agent -p --output-format json --trust` (prompt on stdin) | `cursor-agent login` or `CURSOR_API_KEY` | 2026-05-30 |
 | Qwen Code | `qwen` | `qwen -o json` (prompt on stdin) | `qwen` OAuth or `OPENAI_API_KEY` | 2026-05-30 |
+| Ollama (local, optional) | `ollama` | `ollama run <model>` (prompt on stdin) | none -- local daemon | 2026-06-08 |

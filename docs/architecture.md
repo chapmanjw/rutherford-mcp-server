@@ -27,8 +27,9 @@ services           src/rutherford/services/
 adapters           src/rutherford/adapters/
                    base.py        -- CLIAdapter Protocol + BaseCLIAdapter
                    registry.py    -- closed id -> adapter mapping
-                   claude_code.py, codex.py, opencode.py, goose.py,
-                   kiro.py, antigravity.py, generic.py
+                   claude_code.py, codex.py, cursor.py, qwen.py,
+                   kiro.py, opencode.py, goose.py, ollama.py,
+                   antigravity.py, generic.py
         |
 runtime            src/rutherford/runtime/
                    process.py     -- ProcessRunner Protocol + AsyncProcessRunner
@@ -211,6 +212,9 @@ The current quirks, by adapter:
 | `goose` | `goose` | `--output-format json` emits a single JSON object; schema is not formally versioned -- parse defensively |
 | `kiro` | `kiro-cli` | Plain markdown to stdout; no JSON mode for the answer |
 | `antigravity` | `agy` | stdout is unreliable; `parse_output` reads the transcript file (see below) |
+| `cursor` | `cursor-agent` | `--output-format json`; final answer taken from the JSON result event |
+| `qwen` | `qwen` | `-o json` event array; answer from the last `result` event, else the last `assistant` message |
+| `ollama` | `ollama` | Plain text on stdout from `ollama run`; empty output is a `PARSE_ERROR` (local model, optional) |
 | `generic` | configurable | Plain text (default) or last JSON object on stdout, with optional dotted `json_text_path` extraction |
 
 ### Antigravity transcript quirk

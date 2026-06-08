@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from rutherford.adapters.registry import AdapterRegistry
-from rutherford.config.schema import RutherfordConfig
+from rutherford.config.schema import AdapterConfig, RutherfordConfig
 from rutherford.domain.enums import SafetyMode
 from rutherford.domain.models import DelegationRequest, ProcessResult, Target
 from rutherford.runtime.depth import ENV_DEPTH
@@ -43,6 +43,16 @@ async def test_successful_delegation_overlays_depth_env() -> None:
     assert result.text == "the answer"
     spec, _timeout = runner.calls[0]
     assert spec.env[ENV_DEPTH] == "1"
+
+
+async def test_configured_default_model_fills_in_when_call_names_none() -> None:
+    # `[adapters.fake] default_model` is honored before the adapter builds the invocation, so a call
+    # that names no model runs against the configured one.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    config = RutherfordConfig(adapters={"fake": AdapterConfig(default_model="m9")})
+    await _service([FakeAdapter("fake")], runner, config).delegate(_req())
+    spec, _ = runner.calls[0]
+    assert "--model" in spec.argv and "m9" in spec.argv
 
 
 async def test_nonzero_exit_is_a_failed_result() -> None:

@@ -166,11 +166,16 @@ class ConsensusService:
         them live -- so they are included optimistically; a genuinely unauthenticated one returns a
         failed voice rather than being silently dropped. Not-installed and definitively
         unauthenticated (needs_login / api_key_missing) adapters are skipped with a reason, as are
-        any past the ``max_targets`` cap. Each included target uses the adapter's default model.
+        any past the ``max_targets`` cap. **Optional adapters (a local model) are excluded from the
+        auto panel** -- they only join when named explicitly, so the opt-in local model never silently
+        slows an otherwise-cloud panel. Each included target uses the adapter's default model.
         """
         included: list[Target] = []
         skipped: list[SkippedTarget] = []
         for adapter in self._registry.all():
+            if bool(getattr(adapter, "optional", False)):
+                skipped.append(SkippedTarget(cli=adapter.id, reason="optional; name it explicitly to include"))
+                continue
             detected = await asyncio.to_thread(adapter.detect)
             if not detected.installed:
                 skipped.append(SkippedTarget(cli=adapter.id, reason="not installed or not on PATH"))

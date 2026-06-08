@@ -93,6 +93,9 @@ class BaseCLIAdapter(ABC):
     binary: str
     static_models: tuple[str, ...] = ()
     version_args: tuple[str, ...] = ("--version",)
+    #: True for an adapter the user only needs if they opt in (e.g. a local model). Surfaced by
+    #: ``capabilities``/``doctor`` so an absent one reads as optional, not as a missing requirement.
+    optional: bool = False
 
     def __init__(self, probe: CommandProbe | None = None) -> None:
         self._probe: CommandProbe = probe if probe is not None else SystemProbe()

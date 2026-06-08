@@ -22,6 +22,7 @@ CLI_ENV: dict[str, str] = {
     "goose": "RUTHERFORD_IT_GOOSE",
     "cursor": "RUTHERFORD_IT_CURSOR",
     "qwen": "RUTHERFORD_IT_QWEN",
+    "ollama": "RUTHERFORD_IT_OLLAMA",
 }
 
 _TRUTHY = {"1", "true", "yes", "on"}

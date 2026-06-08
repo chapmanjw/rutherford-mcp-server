@@ -116,9 +116,11 @@ class FakeAdapter:
         auth_state: AuthState = AuthState.AUTHENTICATED,
         supports_resume: bool = True,
         fallback_model: str | None = None,
+        optional: bool = False,
     ) -> None:
         self.id = adapter_id
         self.display_name = adapter_id.replace("_", " ").title()
+        self.optional = optional
         self._models = list(models)
         self._installed = installed
         self._auth_state = auth_state

@@ -8,8 +8,9 @@ import pytest
 
 import rutherford.server as server
 from rutherford.adapters.claude_code import ClaudeCodeAdapter
+from rutherford.config.schema import AdapterConfig, RutherfordConfig
 from rutherford.domain.enums import AuthState
-from rutherford.domain.models import ProcessResult
+from rutherford.domain.models import AdapterCapabilities, AdapterStatus, AuthStatus, ProcessResult
 from rutherford.tools.capabilities import capabilities_tool, doctor_tool
 from rutherford.tools.roles import list_roles_tool
 from tests.fakes import FakeAdapter, FakeProbe, FakeProcessRunner, make_app
@@ -28,6 +29,30 @@ async def test_doctor_diagnoses_uninstalled_adapter() -> None:
     out = await doctor_tool(app)
     assert "not found on PATH" in out
     assert "max_depth" in out
+
+
+async def test_capabilities_marks_optional_adapter() -> None:
+    app = make_app(adapters=[FakeAdapter("ollama", optional=True), FakeAdapter("a")])
+    out = await capabilities_tool(app)
+    assert "optional: true" in out
+
+
+async def test_doctor_frames_absent_optional_adapter_as_optional_not_an_error() -> None:
+    app = make_app(adapters=[FakeAdapter("ollama", installed=False, optional=True)])
+    out = await doctor_tool(app)
+    # An absent optional adapter reads as "only if you want it", never as something to fix.
+    assert "optional" in out
+    assert "only if you want local delegation" in out
+    assert "was not found on PATH" not in out
+
+
+async def test_capabilities_shows_the_configured_default_model() -> None:
+    app = make_app(
+        adapters=[FakeAdapter("ollama")],
+        config=RutherfordConfig(adapters={"ollama": AdapterConfig(default_model="qwen2.5-coder")}),
+    )
+    out = await capabilities_tool(app)
+    assert "default_model" in out and "qwen2.5-coder" in out
 
 
 async def test_doctor_verifies_unknown_auth_by_default() -> None:
@@ -115,6 +140,41 @@ async def test_list_roles_includes_builtins() -> None:
     out = await list_roles_tool(app)
     assert "planner" in out
     assert "codereviewer" in out
+
+
+def _ollama_status(models: list[str]) -> AdapterStatus:
+    return AdapterStatus(
+        id="ollama",
+        display_name="Ollama (local model)",
+        installed=True,
+        optional=True,
+        auth=AuthStatus(state=AuthState.AUTHENTICATED),
+        models=models,
+        capabilities=AdapterCapabilities(),
+    )
+
+
+def test_init_model_picker_selects_by_number(monkeypatch: pytest.MonkeyPatch) -> None:
+    status = _ollama_status(["coder-next:latest", "phi3", "llama3"])
+    # Ordered list is [suggested coding model, ...rest]; choice "2" picks phi3.
+    monkeypatch.setattr("builtins.input", lambda *_: "2")
+    assert server._prompt_ollama_model([status]) == "phi3"
+
+
+def test_init_model_picker_defaults_to_suggested_on_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    status = _ollama_status(["llama3", "coder-next:latest"])
+    monkeypatch.setattr("builtins.input", lambda *_: "")  # empty reply -> the suggested coding model
+    assert server._prompt_ollama_model([status]) == "coder-next:latest"
+
+
+def test_init_model_picker_returns_none_without_ollama() -> None:
+    assert server._prompt_ollama_model([]) is None
+
+
+def test_init_model_picker_skip_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    status = _ollama_status(["coder-next:latest", "phi3"])
+    monkeypatch.setattr("builtins.input", lambda *_: "0")  # 0 = skip, don't set a default
+    assert server._prompt_ollama_model([status]) is None
 
 
 def test_server_smoke_prints_ready(capsys: pytest.CaptureFixture[str]) -> None:
