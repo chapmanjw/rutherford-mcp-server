@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-08
+
 ### Added
 
 - New built-in `lmstudio` adapter: delegate to a local [LM Studio](https://lmstudio.ai) model through
