@@ -23,6 +23,7 @@ CLI_ENV: dict[str, str] = {
     "cursor": "RUTHERFORD_IT_CURSOR",
     "qwen": "RUTHERFORD_IT_QWEN",
     "ollama": "RUTHERFORD_IT_OLLAMA",
+    "lmstudio": "RUTHERFORD_IT_LMSTUDIO",
 }
 
 _TRUTHY = {"1", "true", "yes", "on"}

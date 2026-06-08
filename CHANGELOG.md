@@ -8,6 +8,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- New built-in `lmstudio` adapter: delegate to a local [LM Studio](https://lmstudio.ai) model through
+  `lms chat <model> -p "<prompt>"`, staying CLI-only -- it drives the `lms` command, never LM Studio's
+  HTTP server, and JIT-loads the model (no separate `lms load` or running server). Bring your own
+  model via the `model` argument (the LM Studio model key, e.g. `google/gemma-4-12b`) or
+  `[adapters.lmstudio] default_model`; it has no built-in default. The role preamble rides in the
+  native `-s` system-prompt flag, and `parse_output` strips the stdout load-progress bar and any
+  `<think>...</think>` reasoning block so the answer is clean. Like `ollama`, it is `optional` (kept
+  out of an auto-`"all"` panel) and honors `[adapters.lmstudio] timeout_s` / `extra_args` (e.g.
+  `--ttl`).
 - New built-in `ollama` adapter: delegate to a local model through `ollama run <model>` (prompt on
   stdin), which keeps Rutherford's CLI-only contract -- it drives the Ollama command, never the HTTP
   API. Bring your own model via the `model` argument or `[adapters.ollama] default_model`; the

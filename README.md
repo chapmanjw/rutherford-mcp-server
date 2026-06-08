@@ -6,10 +6,11 @@
 
 Give your AI coding agent a crew. Rutherford is a [Model Context Protocol](https://modelcontextprotocol.io)
 server that lets one coding CLI delegate work to, debate with, and build consensus across a group of
-others — Claude Code, Codex, Cursor, Qwen Code, Antigravity, Kiro, OpenCode, and Goose, plus an
-optional local model via Ollama. It runs them as headless subprocesses and brings their answers back
-in one normalized shape. It is CLI-only: it orchestrates terminal coding agents and never calls a
-model provider API directly (the local model is reached through the `ollama` command, not its API).
+others — Claude Code, Codex, Cursor, Qwen Code, Antigravity, Kiro, OpenCode, and Goose, plus
+optional local models via Ollama and LM Studio. It runs them as headless subprocesses and brings
+their answers back in one normalized shape. It is CLI-only: it orchestrates terminal coding agents
+and never calls a model provider API directly (a local model is reached through its own command —
+`ollama` or `lms` — not its HTTP API).
 
 ```
 .---------.
@@ -61,6 +62,7 @@ read-only by default, and depth-bounded so a CLI that calls itself can't recurse
         +--> cursor-agent -p --output-format json
         +--> qwen -o json
         +--> ollama run <model>   (optional local model)
+        +--> lms chat <model> -p "..."   (optional local model)
         +--> agy -p "..."   (answer read from the transcript file)
 ```
 
@@ -84,13 +86,14 @@ keeps all of its CLI-specific details in one file, so a change is a one-file edi
 | Goose | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key |
 | Antigravity | `antigravity` | `agy -p "<prompt>"` (answer from the transcript file) | Google account login |
 | Ollama (local) | `ollama` | `ollama run <model>` (prompt on stdin) | none — local daemon |
+| LM Studio (local) | `lmstudio` | `lms chat <model> -p "<prompt>"` | none — local |
 
-Ollama is an optional, bring-your-own local model: name a model per call with `model=`, or set
-`[adapters.ollama] default_model` in your config (it has no built-in default). `capabilities`/`doctor`
-mark it `optional: true`, and it stays out of an auto-`all` panel unless you name it. Local CPU/iGPU
-inference is slow, so a longer `[adapters.ollama] timeout_s` and Ollama flags via `extra_args` are
-worth setting — see [docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md).
-A tenth, well-behaved CLI can be added without code — see
+Ollama and LM Studio are optional, bring-your-own local models: name a model per call with `model=`,
+or set `[adapters.<id>] default_model` in your config (they have no built-in default).
+`capabilities`/`doctor` mark them `optional: true`, and they stay out of an auto-`all` panel unless
+you name them. Local CPU/iGPU inference is slow, so a longer `[adapters.<id>] timeout_s` and per-CLI
+flags via `extra_args` are worth setting — see [docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md).
+An eleventh, well-behaved CLI can be added without code — see
 [docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md).
 
 ---
@@ -112,7 +115,7 @@ uv tool install rutherford-mcp-server
 Rutherford does not install or authenticate the target CLIs — it drives the ones you already have. Install
 whichever you want a crew of, and log in to each (subscription login or the relevant API key; see
 [docs/integration-testing.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/integration-testing.md)).
-You don't need all nine; two is enough for a consensus or a debate.
+You don't need all ten; two is enough for a consensus or a debate.
 
 ### 3. Register Rutherford with your MCP client
 
@@ -194,7 +197,7 @@ id you can resume later. Add a model if you want a specific one ("ask Kiro with 
 A `consensus` across three targets, one independent voice each, run in parallel. To poll *everyone* you're
 signed in to, just don't name targets: "ask every coding agent I'm logged into whether a UUID or a ULID is
 a better primary key." Rutherford builds the panel from every installed, authenticated CLI (optional local models like Ollama
-are left out unless you name them) and tells you in `skipped` which it left out and why.
+and LM Studio are left out unless you name them) and tells you in `skipped` which it left out and why.
 
 ### Run a real debate
 

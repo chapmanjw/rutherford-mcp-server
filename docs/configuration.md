@@ -182,6 +182,13 @@ default_model = "qwen2.5-coder:latest"
 timeout_s     = 900.0
 extra_args    = ["--keepalive", "30s"]
 
+# A local LM Studio model. Same shape: no built-in default, so set the model key (from `lms ls`).
+# Sampling lives in the model's LM Studio config; extra_args carries `lms chat` flags such as --ttl.
+[adapters.lmstudio]
+default_model = "google/gemma-4-12b"
+timeout_s     = 900.0
+extra_args    = ["--ttl", "3600"]
+
 # A config-defined generic adapter -- no code module required.
 [[generic_adapters]]
 id           = "my_internal_tool"

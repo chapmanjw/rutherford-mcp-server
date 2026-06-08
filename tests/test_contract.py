@@ -112,6 +112,7 @@ def test_registry_has_all_builtins() -> None:
         "cursor",
         "goose",
         "kiro",
+        "lmstudio",
         "ollama",
         "opencode",
         "qwen",

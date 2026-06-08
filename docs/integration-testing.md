@@ -21,6 +21,7 @@ not installed, or not authenticated is skipped with a clear reason rather than f
 | Cursor | `RUTHERFORD_IT_CURSOR` |
 | Qwen Code | `RUTHERFORD_IT_QWEN` |
 | Ollama (local, optional) | `RUTHERFORD_IT_OLLAMA` |
+| LM Studio (local, optional) | `RUTHERFORD_IT_LMSTUDIO` |
 
 A contributor with only Codex and Claude Code installed sets `RUTHERFORD_IT_CLAUDE=1` and
 `RUTHERFORD_IT_CODEX=1`; the rest skip.
@@ -126,6 +127,30 @@ model-less Ollama reads as "only if you want it", never as a missing requirement
   thinking, or a custom Modelfile that corrects the template. (Observed with the `gemma4`
   `hf.co/unsloth/gemma-4-12B-it-qat-GGUF` quants on Ollama 0.30.6.)
 - Smoke: `printf 'say ok' | ollama run <your-model>`
+
+### LM Studio (`lmstudio`) — optional, local
+
+Another local model rather than a cloud CLI, and entirely opt-in: skip this section if you do not
+want local delegation. `capabilities`/`doctor` mark it `optional: true`. The adapter drives
+`lms chat <model> -p "<prompt>"` ("print response to stdout and quit"), which JIT-loads the model —
+no separate `lms load` and no running `lms server` are required.
+
+- Install: LM Studio (from [lmstudio.ai](https://lmstudio.ai)); the `lms` CLI ships with it (run
+  `lms bootstrap` once if `lms` is not on PATH).
+- Authenticate: none -- local inference needs no credentials (`lms login` is only for publishing to
+  LM Studio Hub).
+- Get a model: download one in the LM Studio app or with `lms get <model>`. The adapter has no
+  built-in default -- name a model per call with `model=` (the LM Studio model key, e.g.
+  `google/gemma-4-12b`; see `lms ls`), or set `[adapters.lmstudio] default_model`. The integration
+  test delegates at the configured default, so set one before running it.
+- Output cleanup: `lms chat` streams the model-load progress bar to stdout and a reasoning model
+  emits a `<think>...</think>` block; the adapter strips both so the answer is clean. Sampling lives
+  in the model's LM Studio config; `--ttl` (residency) and other `lms chat` flags go in
+  `[adapters.lmstudio] extra_args`.
+- Slow hardware: same cold-load caveat as Ollama -- the first call loads the weights into RAM and on
+  a CPU/iGPU can exceed the 300s default. Pre-load with `lms load <model>` (or a prior call with
+  `--ttl`), and raise `[adapters.lmstudio] timeout_s`.
+- Smoke: `lms chat <your-model> -p "say ok"`
 
 ## What the suite covers
 
