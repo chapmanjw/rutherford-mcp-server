@@ -68,7 +68,7 @@ def build_setup_plan(
 
     A CLI is "ready" when it is installed and either authenticated or auth-unknown (the optimistic
     case doctor verifies live). The starter panel is the ready, non-optional CLIs, proposed only
-    when at least two are ready -- an opt-in local model (Ollama) is never auto-added to it. The
+    when at least two are ready -- an opt-in local model is never auto-added to it. The
     config carries the chosen default safety mode and any trusted workspaces.
     """
     detected: list[DetectedCli] = []

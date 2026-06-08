@@ -71,9 +71,9 @@ Saved panels below) so the main config stays small.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `true` | Set to `false` to remove this adapter from the registry at startup. |
-| `default_model` | `string` or omitted | none | Model passed when the caller names none. Required to use Ollama without a per-call `model=`, since it has no built-in default. |
+| `default_model` | `string` or omitted | none | Model passed when the caller names none. Required to use a local adapter (Ollama or LM Studio) without a per-call `model=`, since neither has a built-in default. |
 | `timeout_s` | `float` or omitted | none | Per-adapter run timeout in seconds. Overrides the global `default_timeout_s` for this adapter when a call names no `timeout_s`. Useful for a slow local model whose cold load can exceed the global budget. |
-| `extra_args` | `list[str]` | `[]` | Extra CLI arguments appended verbatim to the adapter's invocation. Honored by the Ollama adapter (e.g. `["--keepalive", "30s"]` or `["--format", "json"]`); other built-in adapters ignore it. |
+| `extra_args` | `list[str]` | `[]` | Extra CLI arguments appended verbatim to the adapter's invocation. Honored by the local-model adapters Ollama (e.g. `["--keepalive", "30s"]`) and LM Studio (e.g. `["--ttl", "3600"]`); the cloud-CLI adapters ignore it, and generic adapters carry their own `extra_args`. |
 
 ---
 

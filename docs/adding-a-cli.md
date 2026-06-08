@@ -113,4 +113,4 @@ Run `just check` (lint, format, license header, mypy strict, unit tests with the
 | Cursor | `cursor` | `cursor-agent -p --output-format json --trust` (prompt on stdin) | `cursor-agent login` or `CURSOR_API_KEY` | 2026-05-30 |
 | Qwen Code | `qwen` | `qwen -o json` (prompt on stdin) | `qwen` OAuth or `OPENAI_API_KEY` | 2026-05-30 |
 | Ollama (local, optional) | `ollama` | `ollama run <model>` (prompt on stdin) | none -- local daemon | 2026-06-08 |
-| LM Studio (local, optional) | `lms` | `lms chat <model> -p "<prompt>"` (`-s` system prompt) | none -- local | 2026-06-08 |
+| LM Studio (local, optional) | `lmstudio` | `lms chat <model> -p "<prompt>"` (`-s` system prompt) | none -- local | 2026-06-08 |

@@ -63,11 +63,13 @@ class AdapterConfig(BaseModel):
     default_model: str | None = None
     #: Per-adapter run timeout in seconds. Overrides the global ``default_timeout_s`` for this
     #: adapter when a call names no ``timeout_s``; ``None`` falls back to the global default. Useful
-    #: for slow local models (e.g. Ollama on a CPU) whose cold load can exceed the global budget.
+    #: for a slow local model (e.g. Ollama on a CPU, or LM Studio's JIT model load) whose cold load
+    #: can exceed the global budget.
     timeout_s: float | None = None
     #: Extra command-line arguments appended verbatim to the adapter's invocation. Honored by the
-    #: Ollama adapter (e.g. ``["--keepalive", "30s"]`` or ``["--format", "json"]``); generic
-    #: adapters carry their own ``extra_args`` in :class:`GenericAdapterConfig`.
+    #: local-model adapters -- Ollama (e.g. ``["--keepalive", "30s"]``) and LM Studio (e.g.
+    #: ``["--ttl", "3600"]``); generic adapters carry their own ``extra_args`` in
+    #: :class:`GenericAdapterConfig`.
     extra_args: list[str] = Field(default_factory=list)
 
 

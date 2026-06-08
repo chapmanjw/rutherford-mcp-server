@@ -29,8 +29,8 @@ All notable changes to this project are documented in this file. The format is b
   `delegate(cli="ollama")` work without naming a model on every call.
 - Two new per-adapter config fields under `[adapters.<id>]`: `timeout_s` overrides the global
   `default_timeout_s` for one adapter (useful for a slow local model whose cold load exceeds the
-  global budget), and `extra_args` appends extra CLI flags to the invocation (honored by the Ollama
-  adapter, e.g. `["--keepalive", "30s"]`).
+  global budget), and `extra_args` appends extra CLI flags to the invocation (honored by the
+  `ollama` and `lmstudio` adapters, e.g. `["--keepalive", "30s"]` or `["--ttl", "3600"]`).
 - An `optional` adapter flag, surfaced by `capabilities` and `doctor`. The `ollama` adapter is
   optional: an absent or model-less Ollama reads as "only if you want it", never as an error.
   Optional adapters are excluded from a `consensus` auto-`"all"` panel (and from the setup starter
