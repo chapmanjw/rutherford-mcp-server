@@ -77,6 +77,21 @@ For `codex` specifically, the prompt is passed on **stdin** (not as an argv elem
 
 ---
 
+### Windows: `codex` answers from the prompt only / `windows sandbox: spawn setup refresh` / `blocked by policy`
+
+**Cause.** On Windows, Codex sandboxes every shell command it runs, and `codex exec` runs under an approval policy. Two defaults break a headless, nested `codex exec` (the kind Rutherford spawns):
+
+- Codex's default `[windows] sandbox = "elevated"` (in `~/.codex/config.toml`) needs a UAC/administrator setup step that a non-interactive child process cannot complete, so every tool call fails with `windows sandbox: spawn setup refresh`.
+- The default approval policy blocks any command Codex deems "untrusted" with `rejected: blocked by policy`, because a headless run has no one to approve.
+
+With either in play Codex cannot read files or run commands and silently degrades to answering from the prompt alone -- which can look like a normal (but uninformed) response in a consensus or debate.
+
+**Fix (built in).** The `codex` adapter passes `-c approval_policy=never` for the read_only/propose/write modes and, on native Windows, `-c windows.sandbox=unelevated` (Codex's documented fallback sandbox -- a restricted token, no admin setup). The read-only sandbox still prevents writes; `approval_policy=never` only removes a prompt nothing could answer. No configuration is required.
+
+**If you still see it,** confirm your Codex build supports the `unelevated` Windows sandbox and `-c` config overrides, and run `doctor`. Codex's trusted-command classifier may still decline a *complex* command under `approval_policy=never` (it runs simple reads and retries simpler variants), which is expected. You can also set `[windows] sandbox = "unelevated"` and `approval_policy = "never"` in your own `~/.codex/config.toml` to make every Codex invocation (interactive included) behave the same way.
+
+---
+
 ### WSL path issues -- wrong working directory passed to a Linux CLI
 
 **Cause.** When a generic adapter has `runtime = "wsl_interop"`, or when a native Windows host invokes a Linux CLI via WSL interop, `runtime/paths.py` translates paths between Windows and WSL forms before building the `InvocationSpec`. `translate_path` converts `C:\Users\x` to `/mnt/c/Users/x` when running on Windows targeting a WSL runtime, and the reverse when running on WSL targeting a native Windows runtime.

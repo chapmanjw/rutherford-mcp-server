@@ -49,6 +49,8 @@ from ..domain.models import (
     ProcessResult,
     SafetyFlags,
 )
+from ..runtime.platform import PlatformInfo, detect_platform
+from ..runtime.probe import CommandProbe
 from .base import BaseCLIAdapter
 from .results import error_result, nonzero_result, success_result, timeout_result
 
@@ -61,6 +63,12 @@ class CodexAdapter(BaseCLIAdapter):
     binary = "codex"
     static_models: tuple[str, ...] = ()
     version_args = ("--version",)
+
+    def __init__(self, probe: CommandProbe | None = None, *, platform: PlatformInfo | None = None) -> None:
+        super().__init__(probe)
+        #: Resolved once at construction so ``map_safety`` stays a pure function of its inputs.
+        #: Injectable so the Windows sandbox flag is unit-testable from any host.
+        self._platform = platform if platform is not None else detect_platform()
 
     def check_auth(self) -> AuthStatus:
         """Resolve auth from ``codex doctor --json``, falling back to the env key / persisted session.
@@ -105,21 +113,35 @@ class CodexAdapter(BaseCLIAdapter):
         )
 
     def map_safety(self, mode: SafetyMode) -> SafetyFlags:
-        """Map every SafetyMode to a Codex sandbox policy, defaulting to read-only.
+        """Map every SafetyMode to Codex sandbox + approval flags, defaulting to read-only.
 
-        ``codex exec`` is already non-interactive and takes no approval-policy flag (``-a`` exists
-        only on the interactive ``codex``); the sandbox policy alone controls write access.
-        read_only and propose use the read-only sandbox; write uses workspace-write; yolo bypasses
-        the sandbox and approvals entirely.
+        Sandbox policy: read_only/propose use the read-only sandbox, write uses workspace-write, yolo
+        uses the bypass flag. ``codex exec`` is non-interactive, so the sandboxed modes also pass
+        ``-c approval_policy=never``: the default approval policy blocks any command Codex deems
+        "untrusted" with no approver, which silently breaks even read commands (it cannot read files or
+        run tools). The read-only sandbox still prevents writes; ``never`` only drops a prompt nothing
+        could answer. On native Windows it adds ``-c windows.sandbox=unelevated`` so a headless, nested
+        ``codex exec`` does not need the UAC-gated "elevated" sandbox setup, which fails with
+        "windows sandbox: spawn setup refresh" when spawned as a deep child process; the flag is a no-op
+        off Windows. yolo already bypasses both the sandbox and approvals, so it needs neither.
         """
-        if mode is SafetyMode.WRITE:
-            return SafetyFlags(args=["-s", "workspace-write"], note="workspace-write sandbox")
         if mode is SafetyMode.YOLO:
             return SafetyFlags(
                 args=["--dangerously-bypass-approvals-and-sandbox"],
                 note="bypass all approvals and sandboxing",
             )
-        return SafetyFlags(args=["-s", "read-only"], note="read-only sandbox")
+        sandbox = "workspace-write" if mode is SafetyMode.WRITE else "read-only"
+        args = ["-s", sandbox, "-c", "approval_policy=never", *self._windows_sandbox_args()]
+        return SafetyFlags(args=args, note=f"{sandbox} sandbox, non-interactive (approval_policy=never)")
+
+    def _windows_sandbox_args(self) -> list[str]:
+        """``-c windows.sandbox=unelevated`` on native Windows, else empty.
+
+        Codex's default "elevated" Windows sandbox needs UAC/admin setup a headless, nested subprocess
+        cannot obtain; "unelevated" is the documented fallback (a restricted token, no admin setup). See
+        docs/troubleshooting.md.
+        """
+        return ["-c", "windows.sandbox=unelevated"] if self._platform.is_windows else []
 
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
         """Build the ``codex exec`` (or ``codex exec resume``) invocation.
@@ -275,19 +297,26 @@ def _parse_doctor_json(stdout: str) -> dict[str, Any] | None:
 
 
 def _resume_safety_args(exec_safety_args: list[str]) -> list[str]:
-    """Translate the fresh-``exec`` sandbox flags into the form ``codex exec resume`` accepts.
+    """Translate the fresh-``exec`` safety flags into the form ``codex exec resume`` accepts.
 
     ``resume`` rejects ``-s/--sandbox`` but accepts ``-c <key=value>`` config overrides and the
     ``--dangerously-bypass-approvals-and-sandbox`` flag. So a ``["-s", "<mode>"]`` pair becomes
-    ``["-c", "sandbox_mode=<mode>"]`` (the unquoted value parses as the literal mode string), and
-    the yolo bypass flag passes through unchanged. Deriving from ``map_safety`` keeps the resume
-    posture in lockstep with the fresh posture -- no second source of truth to drift.
+    ``["-c", "sandbox_mode=<mode>"]`` (the unquoted value parses as the literal mode string) while every
+    other flag passes through unchanged -- the ``-c approval_policy=never`` /
+    ``-c windows.sandbox=unelevated`` overrides and the yolo bypass flag. Deriving from ``map_safety``
+    keeps the resume posture in lockstep with the fresh posture, no second source of truth to drift.
     """
-    if "-s" in exec_safety_args:
-        index = exec_safety_args.index("-s")
-        sandbox_mode = exec_safety_args[index + 1]
-        return ["-c", f"sandbox_mode={sandbox_mode}"]
-    return list(exec_safety_args)
+    out: list[str] = []
+    index = 0
+    while index < len(exec_safety_args):
+        arg = exec_safety_args[index]
+        if arg in ("-s", "--sandbox") and index + 1 < len(exec_safety_args):
+            out += ["-c", f"sandbox_mode={exec_safety_args[index + 1]}"]
+            index += 2
+        else:
+            out.append(arg)
+            index += 1
+    return out
 
 
 def _is_resume_error(stderr: str) -> bool:

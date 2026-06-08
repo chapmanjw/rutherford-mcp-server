@@ -18,6 +18,7 @@ from rutherford.domain.models import (
     ProcessResult,
     Target,
 )
+from rutherford.runtime.platform import OSFamily, PlatformInfo
 from rutherford.services.delegation import DelegationService
 from rutherford.services.roles import load_roles
 from tests.fakes import FakeProbe, FakeProcessRunner
@@ -42,6 +43,11 @@ def _req(**kwargs: object) -> DelegationRequest:
     base: dict[str, object] = {"target": Target(cli="codex", model="gpt-5-codex"), "prompt": "say hi"}
     base.update(kwargs)
     return DelegationRequest(**base)  # type: ignore[arg-type]
+
+
+def _platform(*, windows: bool) -> PlatformInfo:
+    """A fixed platform so the Windows-only sandbox flag is testable from any host."""
+    return PlatformInfo(os_family=OSFamily.WINDOWS if windows else OSFamily.LINUX, is_wsl=False)
 
 
 # --- build_invocation --------------------------------------------------------
@@ -166,18 +172,46 @@ def test_build_invocation_never_builds_a_shell_string() -> None:
 # --- map_safety --------------------------------------------------------------
 
 
-def test_map_safety_covers_every_mode() -> None:
-    adapter = CodexAdapter()
+def test_map_safety_non_windows() -> None:
+    adapter = CodexAdapter(platform=_platform(windows=False))
     flags = {mode: adapter.map_safety(mode) for mode in SafetyMode}
-    assert flags[SafetyMode.READ_ONLY].args == ["-s", "read-only"]
-    assert flags[SafetyMode.PROPOSE].args == ["-s", "read-only"]
-    assert flags[SafetyMode.WRITE].args == ["-s", "workspace-write"]
+    # Sandboxed modes run non-interactively (approval_policy=never) so an untrusted command is not
+    # blocked with no approver; the read-only sandbox still prevents writes.
+    assert flags[SafetyMode.READ_ONLY].args == ["-s", "read-only", "-c", "approval_policy=never"]
+    assert flags[SafetyMode.PROPOSE].args == ["-s", "read-only", "-c", "approval_policy=never"]
+    assert flags[SafetyMode.WRITE].args == ["-s", "workspace-write", "-c", "approval_policy=never"]
     assert flags[SafetyMode.YOLO].args == ["--dangerously-bypass-approvals-and-sandbox"]
+
+
+def test_map_safety_windows_adds_unelevated_sandbox() -> None:
+    adapter = CodexAdapter(platform=_platform(windows=True))
+    read_only = ["-s", "read-only", "-c", "approval_policy=never", "-c", "windows.sandbox=unelevated"]
+    write = ["-s", "workspace-write", "-c", "approval_policy=never", "-c", "windows.sandbox=unelevated"]
+    assert adapter.map_safety(SafetyMode.READ_ONLY).args == read_only
+    assert adapter.map_safety(SafetyMode.WRITE).args == write
+    # yolo bypasses the sandbox entirely, so no windows override is added.
+    assert adapter.map_safety(SafetyMode.YOLO).args == ["--dangerously-bypass-approvals-and-sandbox"]
 
 
 def test_build_invocation_write_mode_adds_workspace_write() -> None:
     spec = CodexAdapter().build_invocation(_req(), _ctx(safety=SafetyMode.WRITE))
     assert "workspace-write" in spec.argv
+
+
+def test_build_invocation_windows_adds_unelevated_and_approval() -> None:
+    spec = CodexAdapter(platform=_platform(windows=True)).build_invocation(_req(), _ctx())
+    assert "approval_policy=never" in spec.argv
+    assert "windows.sandbox=unelevated" in spec.argv
+
+
+def test_build_invocation_resume_carries_approval_and_windows_overrides() -> None:
+    # resume rejects -s; the sandbox becomes -c sandbox_mode=, and the approval/windows overrides ride
+    # along as -c pairs rather than being dropped.
+    spec = CodexAdapter(platform=_platform(windows=True)).build_invocation(_req(session_id="th-1"), _ctx())
+    assert "-s" not in spec.argv
+    assert "-c" in spec.argv and spec.argv[spec.argv.index("-c") + 1] == "sandbox_mode=read-only"
+    assert "approval_policy=never" in spec.argv
+    assert "windows.sandbox=unelevated" in spec.argv
 
 
 # --- parse_output (golden) ---------------------------------------------------
@@ -306,7 +340,7 @@ def _codex_service(runner: FakeProcessRunner) -> DelegationService:
         run_fn=lambda argv: ProcessResult(exit_code=0, stdout="codex-cli 0.135.0"),
     )
     return DelegationService(
-        AdapterRegistry([CodexAdapter(probe=probe)]),
+        AdapterRegistry([CodexAdapter(probe=probe, platform=_platform(windows=False))]),
         runner,
         RutherfordConfig(),
         load_roles(),
@@ -343,7 +377,9 @@ async def test_delegate_codex_fresh_session_is_unchanged() -> None:
     spec, _timeout = runner.calls[0]
     assert spec.argv[:4] == ["codex", "exec", "--json", "--skip-git-repo-check"]
     assert "resume" not in spec.argv
-    assert spec.argv[-2:] == ["-s", "read-only"]  # fresh path keeps the -s sandbox flag
+    # fresh path keeps the -s sandbox flag, now with the non-interactive approval override (no windows
+    # override here: the service injects a non-Windows platform)
+    assert spec.argv[-4:] == ["-s", "read-only", "-c", "approval_policy=never"]
     assert spec.stdin == "hello"
 
 

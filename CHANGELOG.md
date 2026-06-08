@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- The `codex` adapter now runs `codex exec` non-interactively so it works headless on Windows. For the
+  sandboxed safety modes (read_only/propose/write) it passes `-c approval_policy=never`: without it the
+  default approval policy blocks every command Codex deems "untrusted" (`rejected: blocked by policy`),
+  because a spawned subprocess has no one to approve, so Codex could not even read files and silently
+  degraded to answering from the prompt alone. On native Windows it also passes
+  `-c windows.sandbox=unelevated`: Codex's default `elevated` sandbox needs UAC/administrator setup a
+  nested, non-interactive process cannot complete (`windows sandbox: spawn setup refresh`), and
+  `unelevated` is the documented fallback (a restricted token, no admin setup). The read-only sandbox
+  still prevents writes; `approval_policy=never` only removes a prompt nothing could answer. The `resume`
+  path carries the same overrides as `-c` config values (`_resume_safety_args` now preserves every flag,
+  not just the sandbox mode), and the `map_safety` docstring no longer claims `codex exec` has no
+  approval-policy control. See docs/troubleshooting.md.
+
 ### Documentation
 
 - Document that the `lmstudio` adapter works with **LM Studio's LM Link**: a model loaded on another
