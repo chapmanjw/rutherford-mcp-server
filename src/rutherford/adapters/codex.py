@@ -253,6 +253,14 @@ class CodexAdapter(BaseCLIAdapter):
 
         return success_result(ctx, raw, answer, session_id=session_id, cost=cost)
 
+    def check_output_contract(self, raw: ProcessResult) -> bool:
+        """A successful codex run must emit at least one JSONL event (``--json``).
+
+        The drift canary for this adapter: if a future CLI build stops emitting the event stream
+        but still exits cleanly, this is what catches the silent regression at the delegation layer.
+        """
+        return bool(_parse_events(raw.stdout))
+
 
 def _doctor_auth_ok(stdout: str) -> bool | None:
     """Return the auth verdict from ``codex doctor --json``: ``True`` ok, ``False`` a problem, ``None`` absent.

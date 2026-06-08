@@ -79,6 +79,15 @@ class CLIAdapter(Protocol):
         """Map the raw process result to the normalized envelope, including on failure."""
         ...
 
+    def check_output_contract(self, raw: ProcessResult) -> bool:
+        """Whether ``raw`` matches this adapter's expected successful-output shape (a drift canary).
+
+        Checked centrally only when ``parse_output`` already returned ``ok``; a ``False`` there fails
+        the result with ``CONTRACT_MISMATCH`` so silent output drift (the CLI's machine-readable
+        format changing underneath the adapter) becomes a loud failure rather than a trusted result.
+        """
+        ...
+
 
 class BaseCLIAdapter(ABC):
     """Shared scaffolding for concrete adapters.
@@ -123,6 +132,16 @@ class BaseCLIAdapter(ABC):
         rejects named models) overrides this to return an always-available model id (``"auto"``).
         """
         return None
+
+    def check_output_contract(self, raw: ProcessResult) -> bool:
+        """Assume the output contract holds. Adapters with a known machine-readable shape override.
+
+        The default is lenient on purpose: most adapters have no contract beyond "exit 0 with text",
+        and a false ``False`` here would fail a genuine success. An adapter with a structured output
+        (Claude's JSON envelope, Codex's JSONL event stream) overrides this to assert that shape, so
+        the delegation service can fail a drifted-but-ok result with ``CONTRACT_MISMATCH``.
+        """
+        return True
 
     # --- helpers for subclasses ---------------------------------------------
 

@@ -117,6 +117,7 @@ class FakeAdapter:
         supports_resume: bool = True,
         fallback_model: str | None = None,
         optional: bool = False,
+        contract_ok: bool = True,
     ) -> None:
         self.id = adapter_id
         self.display_name = adapter_id.replace("_", " ").title()
@@ -126,6 +127,7 @@ class FakeAdapter:
         self._auth_state = auth_state
         self._supports_resume = supports_resume
         self._fallback_model = fallback_model
+        self._contract_ok = contract_ok
 
     def detect(self) -> DetectResult:
         if not self._installed:
@@ -189,6 +191,9 @@ class FakeAdapter:
             error=error,
             safety_mode=ctx.safety_mode,
         )
+
+    def check_output_contract(self, raw: ProcessResult) -> bool:
+        return self._contract_ok
 
 
 def make_app(

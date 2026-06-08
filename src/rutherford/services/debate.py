@@ -41,6 +41,9 @@ class _Voice:
     index: int
     target: Target
     label: str
+    #: A unique key for survival and own-position lookup, so two seats sharing a ``(cli, model)`` --
+    #: and therefore a display ``label`` -- do not collapse into one survivor.
+    seat_id: str
     stance: Stance | None
     role: str | None
 
@@ -81,11 +84,11 @@ class DebateService:
                 req, active, round_index, previous, correlation_id, base_depth, on_progress
             )
             rounds.append(DebateRound(index=round_index, contributions=contributions))
-            survivors = {c.label for c in contributions if c.ok}
-            active = [voice for voice in active if voice.label in survivors]
+            survivors = {c.seat_id for c in contributions if c.ok}
+            active = [voice for voice in active if voice.seat_id in survivors]
 
-        final = await self._synthesize_final(req, rounds, correlation_id, base_depth, on_progress)
-        return DebateResult(prompt=req.prompt, rounds=rounds, final=final)
+        final, synthesis_by = await self._synthesize_final(req, rounds, correlation_id, base_depth, on_progress)
+        return DebateResult(prompt=req.prompt, rounds=rounds, final=final, synthesis_by=synthesis_by)
 
     def _resolve_voices(self, req: DebateRequest) -> list[_Voice]:
         """Validate the panel and build the ordered list of debate voices."""
@@ -100,16 +103,32 @@ class DebateService:
                 ErrorCode.INVALID_INPUT,
                 f"stances ({len(req.stances)}) must match targets ({len(req.targets)})",
             )
-        return [
-            _Voice(
-                index=index,
-                target=target,
-                label=target.display_label,
-                stance=target.stance if target.stance is not None else (req.stances[index] if req.stances else None),
-                role=target.role or req.role,
+        # Disambiguate duplicate display labels (two unlabeled same-(cli, model) seats) so the
+        # transcript is unambiguous, while seat_id (index-based) keeps survival/lookup unique.
+        base_labels = [target.display_label for target in req.targets]
+        duplicated = {label for label in base_labels if base_labels.count(label) > 1}
+        seen: dict[str, int] = {}
+        voices: list[_Voice] = []
+        for index, target in enumerate(req.targets):
+            base = target.display_label
+            if base in duplicated:
+                seen[base] = seen.get(base, 0) + 1
+                label = base if seen[base] == 1 else f"{base}#{seen[base]}"
+            else:
+                label = base
+            voices.append(
+                _Voice(
+                    index=index,
+                    target=target,
+                    label=label,
+                    seat_id=f"{index}:{base}",
+                    stance=target.stance
+                    if target.stance is not None
+                    else (req.stances[index] if req.stances else None),
+                    role=target.role or req.role,
+                )
             )
-            for index, target in enumerate(req.targets)
-        ]
+        return voices
 
     def _resolve_rounds(self, req: DebateRequest) -> int:
         """Validate the requested round count against the configured cap."""
@@ -161,11 +180,11 @@ class DebateService:
         """Build the prompt for ``voice`` this round: a fresh answer, or a rebuttal of the others."""
         if previous is None:
             return _apply_stance(req.prompt, voice.stance)
-        own = _latest_text(previous, voice.label)
+        own = _latest_text(previous, voice.seat_id)
         others = [
             (contribution.label, contribution.text)
             for contribution in previous.contributions
-            if contribution.label != voice.label and contribution.ok and contribution.text.strip()
+            if contribution.seat_id != voice.seat_id and contribution.ok and contribution.text.strip()
         ]
         return _rebuttal_prompt(req.prompt, own, others, voice.stance)
 
@@ -176,14 +195,19 @@ class DebateService:
         correlation_id: str,
         base_depth: int,
         on_progress: ProgressCallback | None,
-    ) -> str | None:
-        """Delegate a closing pass over the final positions, stating where the panel landed."""
+    ) -> tuple[str | None, str | None]:
+        """Delegate a closing pass over the final positions, stating where the panel landed.
+
+        Returns ``(final, synthesizer_label)``. Uses the caller-named ``judge`` when given (ideally a
+        non-participant), otherwise the first surviving voice -- recorded in ``synthesis_by`` so the
+        reader can see a participant wrote it.
+        """
         if not req.synthesize or not rounds:
-            return None
+            return None, None
         final_round = rounds[-1]
         closing = [c for c in final_round.contributions if c.ok and c.text.strip()]
         if not closing:
-            return None
+            return None, None
         _announce(on_progress, "debate: synthesizing the closing statement")
         transcript = "\n\n".join(f"## {c.label}\n{c.text}" for c in closing)
         prompt = (
@@ -193,8 +217,9 @@ class DebateService:
             "Write the closing summary: state where they converged, lay out the remaining "
             "disagreements and the strongest case on each side, and give your best overall answer."
         )
+        judge_target = req.judge or closing[0].target
         synth_request = DelegationRequest(
-            target=closing[0].target,
+            target=judge_target,
             prompt=prompt,
             working_dir=req.working_dir,
             safety_mode=SafetyMode.READ_ONLY,
@@ -206,13 +231,13 @@ class DebateService:
             correlation_id=f"{correlation_id}:final",
             base_depth=base_depth + 1,
         )
-        return result.text if result.ok else None
+        return (result.text if result.ok else None), judge_target.display_label
 
 
-def _latest_text(round_: DebateRound, label: str) -> str:
-    """Return ``label``'s answer text from a round, or empty if it did not contribute."""
+def _latest_text(round_: DebateRound, seat_id: str) -> str:
+    """Return this seat's answer text from a round, or empty if it did not contribute."""
     for contribution in round_.contributions:
-        if contribution.label == label:
+        if contribution.seat_id == seat_id:
             return contribution.text
     return ""
 
@@ -221,6 +246,7 @@ def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) 
     """Fold a delegation result into a transcript contribution for ``voice``."""
     return DebateContribution(
         label=voice.label,
+        seat_id=voice.seat_id,
         target=result.target,
         round_index=round_index,
         stance=voice.stance,

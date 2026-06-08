@@ -270,6 +270,10 @@ class ConsensusRequest(BaseModel):
     #: When set, each voice is asked to return JSON matching this schema (including a ``verdict``
     #: field); without it, verdicts are read from a final ``VERDICT: <token>`` line.
     verdict_schema: dict[str, Any] | None = None
+    #: An optional target to write the synthesis (used only when ``synthesize`` is on). Defaults to the
+    #: first successful voice when unset; pass a distinct CLI so an independent, non-participant judge
+    #: combines the panel instead of one of the debaters.
+    judge: Target | None = None
 
 
 class SkippedTarget(BaseModel):
@@ -289,6 +293,9 @@ class ConsensusResult(BaseModel):
 
     voices: list[DelegationResult]
     synthesis: str | None = None
+    #: The display label of the target that wrote the synthesis (a judge if one was named, else the
+    #: first successful voice), so a reader can see whether the synthesizer was a panel participant.
+    synthesis_by: str | None = None
     skipped: list[SkippedTarget] = Field(default_factory=list)
 
 
@@ -310,16 +317,21 @@ class VoiceVerdict(BaseModel):
     parity: bool = False
     ok: bool = True
     verdict: str | None = None
+    #: Why this voice has no verdict, so an excluded voice is never silent: ``failed`` (the voice
+    #: errored), ``unparseable`` (it answered but no verdict could be extracted), or ``None`` when a
+    #: verdict was extracted. Lets a reader tell a mis-parse from an abstention.
+    no_verdict_reason: str | None = None
     text: str = ""
 
 
 class StrategyResult(BaseModel):
     """The aggregated outcome of a consensus strategy, plus every voice's verdict.
 
-    ``outcome`` is the category the strategy reached (``unanimous`` | ``majority`` | ``tied`` |
-    ``split`` | ``agree`` | ``escalate``). ``decision`` is the winning verdict token when one was
-    reached, else ``None``. The legacy :class:`ConsensusResult` shape is what a caller still gets
-    when no strategy (or ``all-voices``) is used; this richer shape appears only when they opt in.
+    ``outcome`` is the category the strategy reached (``unanimous`` | ``majority`` | ``no_majority`` |
+    ``plurality`` | ``tied`` | ``split`` | ``agree`` | ``escalate`` | ``no_quorum``). ``decision`` is
+    the winning verdict token when one was reached, else ``None``. The legacy :class:`ConsensusResult`
+    shape is what a caller still gets when no strategy (or ``all-voices``) is used; this richer shape
+    appears only when they opt in.
     """
 
     strategy: Strategy
@@ -356,6 +368,9 @@ class DebateRequest(BaseModel):
     timeout_s: float | None = None
     depth: int = 0
     include_raw: bool = False
+    #: An optional target to write the closing synthesis. Defaults to the first surviving voice when
+    #: unset; pass a distinct CLI for an independent, non-participant judge.
+    judge: Target | None = None
 
 
 class DebateContribution(BaseModel):
@@ -369,6 +384,10 @@ class DebateContribution(BaseModel):
     """
 
     label: str
+    #: A unique internal key for this seat, distinct from the human-facing ``label``. Survival and
+    #: own-position lookup key on this so two seats that share a ``(cli, model)`` (and thus a label)
+    #: never merge into one. Empty only for contributions built outside the debate service.
+    seat_id: str = ""
     target: Target
     round_index: int
     stance: Stance | None = None
@@ -400,6 +419,9 @@ class DebateResult(BaseModel):
     prompt: str
     rounds: list[DebateRound] = Field(default_factory=list)
     final: str | None = None
+    #: The display label of the target that wrote the closing synthesis (a judge if named, else the
+    #: first surviving voice).
+    synthesis_by: str | None = None
     skipped: list[SkippedTarget] = Field(default_factory=list)
 
 

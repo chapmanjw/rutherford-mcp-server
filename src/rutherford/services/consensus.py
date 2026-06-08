@@ -91,10 +91,11 @@ class ConsensusService:
             return self._aggregate(req, voices, skipped)
 
         synthesis: str | None = None
+        synthesis_by: str | None = None
         if (req.synthesize or self._config.synthesize_default) and voices:
-            synthesis = await self._synthesize(req, voices, correlation_id, base_depth)
+            synthesis, synthesis_by = await self._synthesize(req, voices, correlation_id, base_depth)
 
-        return ConsensusResult(voices=voices, synthesis=synthesis, skipped=skipped)
+        return ConsensusResult(voices=voices, synthesis=synthesis, synthesis_by=synthesis_by, skipped=skipped)
 
     def _voice_prompt(self, req: ConsensusRequest, target: Target, index: int) -> str:
         """The prompt for one voice: the question, stance-steered, plus a verdict ask under a strategy."""
@@ -110,20 +111,29 @@ class ConsensusService:
         skipped: list[SkippedTarget],
     ) -> StrategyResult:
         """Extract each voice's verdict and reduce the panel to one outcome under ``req.strategy``."""
-        verdicts = [
-            VoiceVerdict(
-                label=voice.target.display_label,
-                cli=voice.target.cli,
-                model=voice.target.model,
-                weight=voice.target.effective_weight,
-                parity=voice.target.is_parity,
-                ok=voice.ok,
-                verdict=extract_verdict(voice.text, req.verdict_schema) if voice.ok else None,
-                text=voice.text,
+        verdicts: list[VoiceVerdict] = []
+        for voice in voices:
+            extracted = extract_verdict(voice.text, req.verdict_schema) if voice.ok else None
+            if not voice.ok:
+                reason: str | None = "failed"
+            elif extracted is None:
+                reason = "unparseable"
+            else:
+                reason = None
+            verdicts.append(
+                VoiceVerdict(
+                    label=voice.target.display_label,
+                    cli=voice.target.cli,
+                    model=voice.target.model,
+                    weight=voice.target.effective_weight,
+                    parity=voice.target.is_parity,
+                    ok=voice.ok,
+                    verdict=extracted,
+                    no_verdict_reason=reason,
+                    text=voice.text,
+                )
             )
-            for voice in voices
-        ]
-        outcome, decision = aggregate(req.strategy, verdicts)
+        outcome, decision = aggregate(req.strategy, verdicts, min_quorum=self._config.min_quorum)
         return StrategyResult(
             strategy=req.strategy, outcome=outcome, decision=decision, voices=verdicts, skipped=skipped
         )
@@ -199,11 +209,16 @@ class ConsensusService:
         voices: list[DelegationResult],
         correlation_id: str,
         base_depth: int,
-    ) -> str | None:
-        """Delegate a combining pass to the first successful voice's target."""
+    ) -> tuple[str | None, str | None]:
+        """Delegate a combining pass to the nominated judge, else the first successful voice.
+
+        Returns ``(synthesis, synthesizer_label)`` so the result records who wrote it: a caller-named
+        ``judge`` (ideally a non-participant) when given, otherwise the first successful voice -- a panel
+        participant, which the ``synthesis_by`` field makes visible rather than hidden.
+        """
         ok_voices = [voice for voice in voices if voice.ok and voice.text.strip()]
         if not ok_voices:
-            return None
+            return None, None
         transcript = "\n\n".join(
             f"## {voice.target.cli}" + (f" ({voice.target.model})" if voice.target.model else "") + f"\n{voice.text}"
             for voice in ok_voices
@@ -215,8 +230,9 @@ class ConsensusService:
             "Write one synthesized answer: state where they agree, flag where they disagree, and give "
             "your best combined recommendation."
         )
+        judge_target = req.judge or ok_voices[0].target
         synth_request = DelegationRequest(
-            target=ok_voices[0].target,
+            target=judge_target,
             prompt=prompt,
             working_dir=req.working_dir,
             safety_mode=SafetyMode.READ_ONLY,
@@ -228,7 +244,7 @@ class ConsensusService:
             correlation_id=f"{correlation_id}:synthesis",
             base_depth=base_depth + 1,
         )
-        return result.text if result.ok else None
+        return (result.text if result.ok else None), judge_target.display_label
 
 
 def _announce_panel(

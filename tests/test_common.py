@@ -40,8 +40,9 @@ def test_parse_stances() -> None:
 def test_parse_strategy() -> None:
     assert parse_strategy("parity-pair") is Strategy.PARITY_PAIR
     assert parse_strategy(Strategy.MAJORITY) is Strategy.MAJORITY
+    assert parse_strategy("plurality") is Strategy.PLURALITY
     with pytest.raises(RutherfordError, match="strategy"):
-        parse_strategy("plurality")
+        parse_strategy("bogus-strategy")
 
 
 def test_as_target_variants() -> None:

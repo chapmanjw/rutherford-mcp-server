@@ -96,10 +96,27 @@ class RutherfordConfig(BaseModel):
     max_targets: int = 8
     #: Maximum number of rounds a single debate call may run (each round is a full panel pass).
     max_debate_rounds: int = 4
+    #: Minimum number of parseable voices (ok, with an extracted verdict) an aggregating consensus
+    #: strategy needs before it will return a decision; below it the outcome is ``no_quorum``. Guards
+    #: against certifying an outcome off one surviving voice when the rest failed.
+    min_quorum: int = Field(default=1, ge=1)
+    #: Maximum CLI subprocess delegations Rutherford runs at once, across every panel (a global
+    #: semaphore in the delegation primitive). Decouples panel width from host process pressure: a
+    #: wide consensus or a multi-round debate cannot launch more than this many heavy agent
+    #: subprocesses simultaneously. Defaults to ``max_targets`` so a single auto-panel is unchanged;
+    #: raise on a big box, lower on a laptop.
+    max_concurrency: int = Field(default=8, ge=1)
     #: Absolute paths under which write/yolo delegations are permitted.
     trusted_workspaces: list[str] = Field(default_factory=list)
     #: Whether consensus synthesizes server-side by default (off by default per the spec).
     synthesize_default: bool = False
+    #: Opt-in: after a ``read_only`` or ``propose`` delegation whose working directory is a git repo,
+    #: compare ``git status`` before and after and fail the result with ``READONLY_VIOLATED`` if the
+    #: tree changed -- turning the safety promise into a checked invariant. Off by default: it adds a
+    #: git call per delegation, and under concurrent fan-out on a *shared* tree one voice's mutation
+    #: is mis-attributed to its peers, so it is soundest for a single delegation (worktree isolation
+    #: gives per-voice soundness). Only git working directories are checked.
+    verify_read_only: bool = False
 
     def default_model_for(self, adapter_id: str) -> str | None:
         """Return the configured default model for ``adapter_id``, if any."""

@@ -24,12 +24,19 @@ class ErrorCode(StrEnum):
     UNSUPPORTED_SAFETY_MODE = "UNSUPPORTED_SAFETY_MODE"
     #: A write or yolo delegation targeted a workspace that is not on the trusted allowlist.
     WORKSPACE_NOT_TRUSTED = "WORKSPACE_NOT_TRUSTED"
+    #: A read_only or propose delegation mutated its git working tree, caught by the optional
+    #: post-run verification (``verify_read_only``). The safety promise was not kept by the CLI.
+    READONLY_VIOLATED = "READONLY_VIOLATED"
     #: The run exceeded its timeout and its process tree was killed.
     TIMEOUT = "TIMEOUT"
     #: The CLI exited with a non-zero status.
     NONZERO_EXIT = "NONZERO_EXIT"
     #: The CLI's output could not be parsed into a normalized result.
     PARSE_ERROR = "PARSE_ERROR"
+    #: The CLI reported success but its output did not match the adapter's expected machine-readable
+    #: shape -- a drift canary. The CLI's output format likely changed underneath the adapter, so a
+    #: result that would otherwise read as ``ok`` is failed loudly instead of trusted silently.
+    CONTRACT_MISMATCH = "CONTRACT_MISMATCH"
     #: A session-resume invocation was rejected by the CLI's argument parser (a Rutherford/CLI
     #: mismatch), distinct from a normal non-zero exit so a lost resume is not silently swallowed.
     RESUME_FAILED = "RESUME_FAILED"

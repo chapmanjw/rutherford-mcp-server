@@ -149,6 +149,14 @@ class ClaudeCodeAdapter(BaseCLIAdapter):
             cost=_extract_cost(payload),
         )
 
+    def check_output_contract(self, raw: ProcessResult) -> bool:
+        """A successful claude run must carry a JSON result object (``--output-format json``).
+
+        The drift canary for this adapter: if a future CLI build stops emitting the JSON envelope
+        but still exits cleanly, this is what catches the silent regression at the delegation layer.
+        """
+        return _last_json_object(raw.stdout) is not None
+
 
 #: ``CLAUDE_CODE_USE_*`` switches that route Claude Code to a cloud backend whose credential is an
 #: AWS/GCP chain -- not an Anthropic key or login -- so a cheap probe cannot verify reachability.

@@ -21,6 +21,7 @@ async def debate_tool(
     panel: str | None = None,
     panel_overrides: dict[str, Any] | None = None,
     rounds: int = 2,
+    judge: Any = None,
     stances: list[str] | None = None,
     working_dir: str | None = None,
     files: list[str] | None = None,
@@ -64,6 +65,7 @@ async def debate_tool(
         timeout_s=timeout_s,
         include_raw=include_raw,
         depth=app.base_depth,
+        judge=as_target(judge) if judge is not None else None,
     )
     correlation_id = app.new_correlation_id()
 

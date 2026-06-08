@@ -162,7 +162,7 @@ def test_unknown_strategy_in_a_panel_is_rejected(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write_panels(
         home / ".rutherford",
-        {"bad": {"strategy": "plurality", "targets": [{"cli": "codex"}, {"cli": "kiro"}]}},
+        {"bad": {"strategy": "bogus-strategy", "targets": [{"cli": "codex"}, {"cli": "kiro"}]}},
     )
     with pytest.raises(RutherfordError) as info:
         load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p")

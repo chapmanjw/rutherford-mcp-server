@@ -11,6 +11,8 @@ failure (unknown target, missing binary, timeout, non-zero exit, parse failure) 
 
 from __future__ import annotations
 
+import asyncio
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
@@ -48,6 +50,10 @@ class DelegationService:
         self._runner = runner
         self._config = config
         self._roles = roles
+        #: Bounds how many CLI subprocesses run at once across every panel that shares this service
+        #: (consensus fan-out, debate rounds, nested self-delegation), so panel width does not become
+        #: unbounded host process pressure.
+        self._semaphore = asyncio.Semaphore(config.max_concurrency)
 
     async def delegate(
         self,
@@ -105,10 +111,26 @@ class DelegationService:
             except RutherfordError as exc:
                 return self._error(ctx, exc)
 
+        # Optional read_only enforcement: snapshot the git tree before the run so a non-mutating
+        # delegation that nonetheless writes is caught (off by default; only for git working dirs).
+        verify = self._config.verify_read_only and not is_mutating(req.safety_mode) and bool(req.working_dir)
+        before = await asyncio.to_thread(_git_status, req.working_dir) if verify and req.working_dir else None
+
         result, raw = await self._execute(adapter, req, ctx, base_depth, on_progress)
 
         if self._should_fallback(adapter, req, result):
             result, raw = await self._fallback(adapter, req, ctx, base_depth, on_progress)
+
+        if before is not None and req.working_dir:
+            after = await asyncio.to_thread(_git_status, req.working_dir)
+            if after is not None and after != before:
+                result = self._fail(
+                    ctx,
+                    ErrorCode.READONLY_VIOLATED,
+                    f"{req.safety_mode.value} delegation to {req.target.cli} modified the git working tree "
+                    "at working_dir, which a non-mutating mode must not do",
+                    raw=raw,
+                )
 
         result.raw = _combine_raw(raw) if (req.include_raw and raw is not None) else None
         return result
@@ -136,12 +158,28 @@ class DelegationService:
         # Precedence: an explicit per-call timeout, else the per-adapter ``[adapters.<id>]
         # timeout_s``, else the global default. A slow local model can set the per-adapter one.
         timeout = req.timeout_s or self._config.timeout_for(req.target.cli) or self._config.default_timeout_s
-        raw = await self._runner.run(spec, timeout, on_progress)
+        # Gate the actual subprocess on the global concurrency semaphore so a wide panel cannot launch
+        # more than ``max_concurrency`` heavy agents at once. Held only around the run, not the
+        # pure build/parse, to keep the critical section to the expensive part.
+        async with self._semaphore:
+            raw = await self._runner.run(spec, timeout, on_progress)
 
         try:
             result = adapter.parse_output(raw, ctx)
         except Exception as exc:  # a quirky parse must not crash the server
             result = self._fail(ctx, ErrorCode.PARSE_ERROR, f"parse_output failed: {exc}", raw=raw)
+
+        # Drift canary: a result that claims success must still match the adapter's expected output
+        # shape. Enforced only on an ``ok`` result (a failure already carries its own code) so a
+        # silently drifted-but-clean run fails loudly with CONTRACT_MISMATCH instead of being trusted.
+        if result.ok and not _contract_ok(adapter, raw):
+            result = self._fail(
+                ctx,
+                ErrorCode.CONTRACT_MISMATCH,
+                f"{req.target.cli} reported success but its output did not match the expected shape "
+                "for this adapter -- the CLI's machine-readable output format may have changed",
+                raw=raw,
+            )
         return result, raw
 
     def _should_fallback(self, adapter: CLIAdapter, req: DelegationRequest, result: DelegationResult) -> bool:
@@ -226,6 +264,41 @@ def _combine_raw(raw: ProcessResult) -> str:
     if raw.stderr.strip():
         return f"{raw.stdout}\n--- stderr ---\n{raw.stderr}"
     return raw.stdout
+
+
+def _contract_ok(adapter: CLIAdapter, raw: ProcessResult | None) -> bool:
+    """Whether the adapter's output contract holds for ``raw``, defaulting to ``True`` on any doubt.
+
+    A defensive wrapper around ``adapter.check_output_contract``: a missing raw result (the build
+    failed, nothing ran) or a buggy contract check must never turn a real success into a spurious
+    CONTRACT_MISMATCH, so only an explicit ``False`` is treated as a contract violation.
+    """
+    if raw is None:
+        return True
+    try:
+        return adapter.check_output_contract(raw) is not False
+    except Exception:
+        return True
+
+
+def _git_status(working_dir: str) -> str | None:
+    """Return ``git status --porcelain`` for ``working_dir``, or ``None`` when it cannot be read.
+
+    ``None`` means the directory is not a git repo or git is unavailable, so read_only verification
+    is skipped (it cannot snapshot a non-git tree cheaply). A non-``None`` value that differs before
+    and after a run signals the tree was mutated.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "-C", working_dir, "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return completed.stdout if completed.returncode == 0 else None
 
 
 #: Substrings that mark a failure as "this model is not available to you" rather than a real

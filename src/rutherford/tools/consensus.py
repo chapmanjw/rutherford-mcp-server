@@ -22,6 +22,7 @@ async def consensus_tool(
     panel_overrides: dict[str, Any] | None = None,
     strategy: str | None = None,
     verdict_schema: dict[str, Any] | None = None,
+    judge: Any = None,
     stances: list[str] | None = None,
     working_dir: str | None = None,
     files: list[str] | None = None,
@@ -77,6 +78,7 @@ async def consensus_tool(
         expand_all=expand_all,
         strategy=effective_strategy,
         verdict_schema=verdict_schema,
+        judge=as_target(judge) if judge is not None else None,
     )
     correlation_id = app.new_correlation_id()
 

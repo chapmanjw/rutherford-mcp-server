@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -12,7 +14,14 @@ from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.domain.enums import AuthState, Stance, Strategy
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import ConsensusRequest, ConsensusResult, ProcessResult, StrategyResult, Target
+from rutherford.domain.models import (
+    ConsensusRequest,
+    ConsensusResult,
+    InvocationSpec,
+    ProcessResult,
+    StrategyResult,
+    Target,
+)
 from rutherford.services.consensus import ConsensusService
 from rutherford.services.delegation import DelegationService
 from rutherford.services.roles import load_roles
@@ -127,6 +136,27 @@ async def test_synthesize_produces_a_combined_answer() -> None:
     assert len(runner.calls) == 3
 
 
+async def test_synthesis_uses_a_named_judge_target() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("j")], runner)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", synthesize=True, judge=Target(cli="j"))
+    )
+    assert result.synthesis is not None
+    assert result.synthesis_by == "j"  # the named non-participant judge wrote it
+    assert any(spec.argv[0] == "j" for spec, _ in runner.calls)  # synthesis was delegated to the judge
+
+
+async def test_synthesis_defaults_to_first_voice_and_records_it() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", synthesize=True)
+    )
+    # With no judge, a participant synthesizes -- but who is now surfaced, not hidden.
+    assert result.synthesis_by == "a"
+
+
 # --- consensus strategies -----------------------------------------------------------------------
 
 
@@ -187,7 +217,7 @@ async def test_weighted_strategy_lets_a_heavy_voice_win() -> None:
     assert result.decision == "block"  # the heavy "block" outweighs two "approve" votes
 
 
-async def test_unparseable_voice_is_returned_but_excluded() -> None:
+async def test_unparseable_voice_is_returned_and_vetoes_unanimity() -> None:
     def run_fn(spec: object) -> ProcessResult:
         cli = spec.argv[0]  # type: ignore[attr-defined]
         if cli == "c":
@@ -204,10 +234,32 @@ async def test_unparseable_voice_is_returned_but_excluded() -> None:
         )
     )
     assert isinstance(result, StrategyResult)
-    assert result.outcome == "unanimous"  # the unparseable voice did not break unanimity
+    # The fixed bug: a voice that did not produce a verdict vetoes unanimity rather than being
+    # silently excluded so the survivors certify "unanimous".
+    assert result.outcome == "split"
     by_cli = {voice.cli: voice for voice in result.voices}
-    assert by_cli["c"].verdict is None  # still returned, marked unparseable
+    assert by_cli["c"].verdict is None  # still returned
+    assert by_cli["c"].no_verdict_reason == "unparseable"  # and the reason is recorded, not silent
     assert by_cli["c"].text == "I won't commit to a verdict."
+
+
+async def test_strategy_records_failed_voice_reason() -> None:
+    # A failed voice is kept in the tally denominator with reason "failed", so an outcome is never
+    # certified off a minority of survivors without a trace of who dropped out.
+    runner = _verdict_runner({"a": "approve", "b": "approve"})
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c", installed=False)], runner)
+    result = await service.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")],
+            prompt="q",
+            strategy=Strategy.MAJORITY,
+        )
+    )
+    assert isinstance(result, StrategyResult)
+    assert result.outcome == "majority" and result.decision == "approve"  # 2 of 3 eligible
+    by_cli = {voice.cli: voice for voice in result.voices}
+    assert by_cli["c"].ok is False
+    assert by_cli["c"].no_verdict_reason == "failed"
 
 
 # --- (a) expand_all: fan out to every installed + authenticated adapter -------------------------
@@ -323,3 +375,33 @@ async def test_expand_all_with_nothing_authenticated_returns_empty_panel() -> No
     assert result.voices == []
     assert {entry.cli for entry in result.skipped} == {"a", "b"}
     assert result.synthesis is None
+
+
+# --- (d) the global concurrency cap bounds parallel fan-out -------------------------------------
+
+
+class _ConcurrencyRunner:
+    """A ProcessRunner with a real await point, so a test can observe how many runs overlap."""
+
+    def __init__(self) -> None:
+        self.active = 0
+        self.max_active = 0
+
+    async def run(
+        self, spec: InvocationSpec, timeout_s: float, on_progress: Callable[[str], None] | None = None
+    ) -> ProcessResult:
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        await asyncio.sleep(0.02)
+        self.active -= 1
+        return ProcessResult(exit_code=0, stdout="ok")
+
+
+async def test_max_concurrency_bounds_parallel_fan_out() -> None:
+    runner = _ConcurrencyRunner()
+    cfg = RutherfordConfig(max_concurrency=2)
+    registry = AdapterRegistry([FakeAdapter(f"a{i}") for i in range(4)])
+    service = ConsensusService(DelegationService(registry, runner, cfg, load_roles()), cfg, registry)
+    result = await service.consensus(ConsensusRequest(targets=[Target(cli=f"a{i}") for i in range(4)], prompt="q"))
+    assert len(result.voices) == 4 and all(voice.ok for voice in result.voices)
+    assert runner.max_active <= 2  # the global semaphore capped concurrent subprocesses (4 -> 2)

@@ -11,12 +11,14 @@ from __future__ import annotations
 import pytest
 
 from rutherford.context import AppContext
-from rutherford.domain.enums import AuthState
+from rutherford.domain.enums import AuthState, Strategy
 from rutherford.domain.models import (
     ConsensusRequest,
     ConsensusResult,
+    DebateRequest,
     DelegationRequest,
     DelegationResult,
+    StrategyResult,
     Target,
 )
 
@@ -102,3 +104,51 @@ def test_auth_state_is_reported_not_hung(real_app: AppContext) -> None:
     for cli_id in CLI_ENV:
         auth = real_app.registry.get(cli_id).check_auth()
         assert auth.state in set(AuthState)
+
+
+async def test_consensus_strategy_returns_a_sound_outcome(real_app: AppContext) -> None:
+    # F1: a real strategy run aggregates live VERDICT lines. Every eligible voice is in the tally
+    # with either a verdict or a recorded reason -- never a silent drop -- and the outcome is one of
+    # the sound categories (a true majority, no_majority, or no_quorum).
+    ready = available_clis(real_app)
+    if len(ready) < 2:
+        pytest.skip("need at least two opted-in CLIs for a strategy consensus")
+    targets = [Target(cli=cli_id) for cli_id in ready[:3]]
+    result = await real_app.consensus.consensus(
+        ConsensusRequest(
+            targets=targets,
+            prompt="Is the integer 4 an even number? Answer in one short sentence.",
+            strategy=Strategy.MAJORITY,
+            timeout_s=180,
+        ),
+        base_depth=0,
+    )
+    assert isinstance(result, StrategyResult)
+    assert len(result.voices) == len(targets)
+    for voice in result.voices:
+        assert voice.verdict is not None or voice.no_verdict_reason in {"failed", "unparseable"}
+    assert result.outcome in {"majority", "no_majority", "no_quorum"}
+    if result.outcome == "majority":
+        assert result.decision  # a real winning token, e.g. "yes"
+
+
+async def test_debate_two_same_cli_seats_do_not_collide(real_app: AppContext) -> None:
+    # Seat-identity fix: two seats of the same CLI (same model) must not merge into one. Each gets a
+    # distinct transcript label and a distinct identity.
+    ready = available_clis(real_app)
+    if not ready:
+        pytest.skip("no CLI opted in for integration testing")
+    cli_id = ready[0]
+    result = await real_app.debate.debate(
+        DebateRequest(
+            targets=[Target(cli=cli_id), Target(cli=cli_id)],
+            prompt="In one sentence: are tabs or spaces better for indentation, and why?",
+            rounds=2,
+            synthesize=False,
+            timeout_s=180,
+        ),
+        base_depth=0,
+    )
+    round_one = result.rounds[0].contributions
+    assert {c.label for c in round_one} == {cli_id, f"{cli_id}#2"}  # disambiguated, not merged
+    assert len({c.seat_id for c in round_one}) == 2  # two distinct identities

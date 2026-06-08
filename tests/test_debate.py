@@ -173,3 +173,39 @@ async def test_all_voices_failing_round_one_yields_no_final() -> None:
     assert len(result.rounds) == 1  # nobody survived to argue a second round
     assert all(not c.ok for c in result.rounds[0].contributions)
     assert result.final is None
+
+
+async def test_duplicate_seat_labels_do_not_collide() -> None:
+    # The fixed bug: two unlabeled same-(cli, model) seats share a display label, so keying identity
+    # on the label merged them into one survivor and fed each the wrong "own previous position".
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="my position"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="a"), Target(cli="b")], prompt="q", rounds=2)
+    )
+    round_one = result.rounds[0].contributions
+    assert {c.label for c in round_one} == {"a", "a#2", "b"}  # disambiguated, not two "a"
+    assert len({c.seat_id for c in round_one}) == 3  # three distinct identities
+    assert len(result.rounds[1].contributions) == 3  # all three survive independently
+    # A later-round rebuttal shows the duplicate twin as a separate participant's position.
+    later_prompts = [spec.argv[2] for spec, _ in runner.calls][3:]
+    assert any("## a#2" in prompt for prompt in later_prompts)
+
+
+async def test_closing_uses_a_named_judge() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="closing"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("j")], runner)
+    result = await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, judge=Target(cli="j"))
+    )
+    assert result.final == "closing"
+    assert result.synthesis_by == "j"  # an independent, non-participant judge wrote the closing
+    assert any(spec.argv[0] == "j" for spec, _ in runner.calls)
+
+
+async def test_closing_defaults_to_a_participant_and_records_it() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.debate(DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1))
+    # No judge: a participant writes the closing, but synthesis_by surfaces which one.
+    assert result.synthesis_by in {"a", "b"}

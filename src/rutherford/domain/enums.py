@@ -109,11 +109,17 @@ class Strategy(StrEnum):
 
     #: Return every voice with no aggregation (the default, today's behavior).
     ALL_VOICES = "all-voices"
-    #: Agree only if every voice shares one verdict, otherwise split.
+    #: Agree only if EVERY eligible voice weighed in and shares one verdict; a failed or unparseable
+    #: voice vetoes unanimity (outcome ``split``).
     UNANIMOUS = "unanimous"
-    #: The verdict with the most votes wins (one voice, one vote); ties are tied.
+    #: A true majority: one verdict must exceed 50% of all eligible voices (failed/unparseable voices
+    #: count in the denominator). No verdict over the bar is ``no_majority``.
     MAJORITY = "majority"
-    #: The verdict with the greatest summed target weight wins; ties are tied.
+    #: A plurality: the single most-voted verdict wins even below 50% (the pre-1.x ``majority``
+    #: behavior); a tie at the top is ``tied``.
+    PLURALITY = "plurality"
+    #: A true majority by weight: one verdict must exceed 50% of the total eligible weight, else
+    #: ``no_majority``.
     WEIGHTED = "weighted"
     #: Compare the proposer's verdict against the parity counterweights; disagreement escalates.
     PARITY_PAIR = "parity-pair"

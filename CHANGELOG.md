@@ -6,8 +6,52 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- An optional `judge` target on `consensus` and `debate`: the closing synthesis is performed by a
+  named seat you choose rather than always by the first voice, so the panel can be judged by a
+  neutral third party (or a stronger model) instead of by a participant. The result records
+  `synthesis_by` (the judge's label), and with no `judge` the previous behavior -- the first ok voice
+  synthesizes -- is unchanged.
+- A `plurality` consensus strategy: the top-scoring verdict wins even without a true majority (ties
+  return `tied`). This is the lenient counterpart to the now-strict `majority`, so a caller can pick
+  "most votes wins" explicitly instead of getting it by accident.
+- A `max_concurrency` config field: a global semaphore in the delegation primitive bounds how many
+  CLI subprocesses run at once across every panel (a wide consensus, a multi-round debate, nested
+  self-delegation), decoupling panel width from host process pressure. Raise it on a big box, lower
+  it on a laptop.
+- A `min_quorum` config field (default 1): the minimum number of parseable voices an aggregating
+  strategy needs before it returns a decision; below it the outcome is `no_quorum`. Guards against
+  certifying an outcome off a single surviving voice when the rest failed.
+- Opt-in `read_only` enforcement via a `verify_read_only` config field (off by default): after a
+  non-mutating delegation whose working directory is a git repo, Rutherford compares `git status`
+  before and after the run and fails the result with the new `READONLY_VIOLATED` code if the tree
+  changed -- turning the safety promise into a checked invariant. Off by default because it adds a
+  git call per delegation and, under concurrent fan-out on a *shared* tree, one voice's write is
+  mis-attributed to its peers; it is soundest for a single delegation (per-voice soundness awaits
+  worktree isolation). Only git working directories are checked.
+- An output-contract drift canary: an adapter can assert the machine-readable shape a successful run
+  must have (`check_output_contract`), and a result that claims success but does not match is failed
+  with the new `CONTRACT_MISMATCH` code instead of being trusted. The `claude_code` adapter asserts
+  a JSON result envelope and `codex` asserts a JSONL event stream, so a silent change to either CLI's
+  `--json` output surfaces as a loud failure rather than a degraded answer.
+
 ### Fixed
 
+- Consensus strategy aggregation no longer certifies an outcome off the surviving voices alone. A
+  failed or unparseable voice now counts in the denominator: `majority` and `weighted` require a true
+  majority of *all eligible* voices (more than half), returning `no_majority` otherwise, and
+  `unanimous` treats any unparseable voice as a veto (the outcome is `split`, not a false unanimous).
+  Every eligible voice appears in the tally with either a verdict or a recorded `no_verdict_reason`
+  (`failed` / `unparseable`), never a silent drop. (The old lenient "top scorer wins" behavior is
+  still available as the new `plurality` strategy.)
+- A nested JSON object in a CLI's verdict output is parsed correctly. Verdict extraction now scans
+  for balanced top-level JSON objects (respecting string literals and escapes) instead of matching
+  the last `{`-to-`}` span, so a verdict embedded in or alongside other JSON is read, not mangled.
+- Two debate seats of the same CLI no longer collide. Each seat carries a distinct `seat_id` and a
+  disambiguated transcript label (`claude_code`, then `claude_code#2`, `claude_code#3`), so a panel
+  can run the same CLI in two seats (e.g. opposing stances) and their positions stay separate through
+  every round instead of one overwriting the other.
 - The `codex` adapter now runs `codex exec` non-interactively so it works headless on Windows. For the
   sandboxed safety modes (read_only/propose/write) it passes `-c approval_policy=never`: without it the
   default approval policy blocks every command Codex deems "untrusted" (`rejected: blocked by policy`),

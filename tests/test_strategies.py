@@ -35,6 +35,14 @@ def test_extract_verdict_from_json_when_schema_given() -> None:
     assert extract_verdict('reasoning...\n{"verdict": "Block", "why": "risky"}', schema) == "block"
 
 
+def test_extract_verdict_from_nested_json_object() -> None:
+    # The fixed bug: a verdict object with an object-valued field must still parse. The old
+    # non-greedy `\{.*?\}` regex stopped at the first '}', dropping the whole verdict.
+    schema = {"type": "object"}
+    text = 'reasoning...\n{"verdict": "Block", "evidence": {"file": "x.py", "line": 12}}'
+    assert extract_verdict(text, schema) == "block"
+
+
 def test_extract_verdict_json_without_verdict_field_is_none() -> None:
     schema = {"type": "object"}
     assert extract_verdict('{"answer": "yes"}', schema) is None
@@ -58,32 +66,74 @@ def test_unanimous_agrees_and_splits() -> None:
     assert aggregate(Strategy.UNANIMOUS, [_voice("a", "approve"), _voice("b", "block")]) == ("split", None)
 
 
-def test_unanimous_with_no_verdicts_is_split() -> None:
-    assert aggregate(Strategy.UNANIMOUS, [_voice("a", None)]) == ("split", None)
+def test_unanimous_with_no_verdicts_is_no_quorum() -> None:
+    # No parseable voice cannot certify anything (default min_quorum is 1).
+    assert aggregate(Strategy.UNANIMOUS, [_voice("a", None)]) == ("no_quorum", None)
 
 
-def test_majority_counts_votes_and_ties() -> None:
-    voices = [_voice("a", "approve"), _voice("b", "approve"), _voice("c", "block")]
-    assert aggregate(Strategy.MAJORITY, voices) == ("majority", "approve")
+def test_unanimous_vetoed_by_a_failed_or_unparseable_voice() -> None:
+    # The fixed quorum-of-one bug: every eligible voice must weigh in, so an unparseable or failed
+    # voice forces a split instead of certifying unanimity off the survivors.
+    mixed = [_voice("a", "approve"), _voice("b", "approve"), _voice("c", None)]
+    assert aggregate(Strategy.UNANIMOUS, mixed) == ("split", None)
+    one_of_eight = [_voice("a", "approve")] + [_voice(f"f{i}", None, ok=False) for i in range(7)]
+    assert aggregate(Strategy.UNANIMOUS, one_of_eight) == ("split", None)
+
+
+def test_majority_requires_over_half_of_all_eligible_voices() -> None:
+    assert aggregate(Strategy.MAJORITY, [_voice("a", "approve"), _voice("b", "approve"), _voice("c", "block")]) == (
+        "majority",
+        "approve",
+    )  # 2 of 3
+    plurality = [_voice("a", "approve"), _voice("b", "approve"), _voice("c", "block"), _voice("d", "escalate")]
+    assert aggregate(Strategy.MAJORITY, plurality) == ("no_majority", None)  # 2 of 4 is not > 50%
     tied = [_voice("a", "approve"), _voice("b", "block")]
-    assert aggregate(Strategy.MAJORITY, tied) == ("tied", None)
+    assert aggregate(Strategy.MAJORITY, tied) == ("no_majority", None)
+
+
+def test_majority_counts_failed_voices_in_the_denominator() -> None:
+    # One "approve" plus seven failures is not a majority of eight (the quorum-of-one bug).
+    voices = [_voice("a", "approve")] + [_voice(f"f{i}", None, ok=False) for i in range(7)]
+    assert aggregate(Strategy.MAJORITY, voices) == ("no_majority", None)
 
 
 def test_majority_ignores_weight() -> None:
-    # Two light "approve" votes beat one heavy "block" by count.
     voices = [_voice("a", "approve"), _voice("b", "approve"), _voice("c", "block", weight=10.0)]
     assert aggregate(Strategy.MAJORITY, voices) == ("majority", "approve")
 
 
+def test_plurality_wins_below_half_and_ties() -> None:
+    # The pre-1.x "majority" behavior, now named plurality: top scorer wins even under 50%.
+    voices = [_voice("a", "approve"), _voice("b", "approve"), _voice("c", "block"), _voice("d", "escalate")]
+    assert aggregate(Strategy.PLURALITY, voices) == ("plurality", "approve")  # 2 of 4 still wins
+    tied = [_voice("a", "approve"), _voice("b", "block")]
+    assert aggregate(Strategy.PLURALITY, tied) == ("tied", None)
+
+
 def test_weighted_uses_summed_weight() -> None:
-    # One heavy "block" outweighs two light "approve" votes.
+    # One heavy "block" carries a true majority of weight (5 of 7).
     voices = [_voice("a", "approve"), _voice("b", "approve"), _voice("c", "block", weight=5.0)]
     assert aggregate(Strategy.WEIGHTED, voices) == ("majority", "block")
 
 
-def test_weighted_ties() -> None:
+def test_weighted_requires_over_half_of_total_weight() -> None:
     voices = [_voice("a", "approve", weight=2.0), _voice("b", "block", weight=2.0)]
-    assert aggregate(Strategy.WEIGHTED, voices) == ("tied", None)
+    assert aggregate(Strategy.WEIGHTED, voices) == ("no_majority", None)  # 2 of 4 is not > 50%
+
+
+def test_weighted_counts_failed_voice_weight_in_the_denominator() -> None:
+    voices = [
+        _voice("a", "approve", weight=3.0),
+        _voice("b", "block", weight=2.0),
+        _voice("c", None, ok=False, weight=4.0),
+    ]
+    assert aggregate(Strategy.WEIGHTED, voices) == ("no_majority", None)  # approve 3 of 9 weight
+
+
+def test_min_quorum_floor_blocks_a_thin_panel() -> None:
+    voices = [_voice("a", "approve"), _voice("b", None, ok=False)]
+    assert aggregate(Strategy.MAJORITY, voices, min_quorum=2) == ("no_quorum", None)
+    assert aggregate(Strategy.UNANIMOUS, voices, min_quorum=2) == ("no_quorum", None)
 
 
 def test_parity_pair_escalates_on_disagreement() -> None:
@@ -105,8 +155,3 @@ def test_parity_pair_falls_back_to_heaviest_non_parity_proposer() -> None:
     # No seat labeled "proposer": the heaviest non-parity voice plays that role.
     voices = [_voice("a", "approve", weight=3.0), _voice("b", "approve", parity=True)]
     assert aggregate(Strategy.PARITY_PAIR, voices) == ("agree", "approve")
-
-
-def test_unparseable_voices_are_excluded_from_the_tally() -> None:
-    voices = [_voice("a", "approve"), _voice("b", "approve"), _voice("c", None)]
-    assert aggregate(Strategy.UNANIMOUS, voices) == ("unanimous", "approve")
