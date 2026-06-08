@@ -14,12 +14,18 @@ from rutherford.domain.models import DelegationRequest, InvocationContext, Proce
 from tests.fakes import FakeProbe
 
 
-def _ctx(model: str | None = "coder-next", *, role_preamble: str | None = None) -> InvocationContext:
+def _ctx(
+    model: str | None = "coder-next",
+    *,
+    role_preamble: str | None = None,
+    extra_args: list[str] | None = None,
+) -> InvocationContext:
     return InvocationContext(
         target=Target(cli="ollama", model=model),
         safety_mode=SafetyMode.READ_ONLY,
         correlation_id="t",
         role_preamble=role_preamble,
+        extra_args=extra_args or [],
     )
 
 
@@ -34,21 +40,48 @@ def test_adapter_is_optional() -> None:
 def test_build_invocation_runs_named_model_with_prompt_on_stdin() -> None:
     adapter = OllamaAdapter()
     spec = adapter.build_invocation(_req("coder-next", prompt="reverse a string"), _ctx("coder-next"))
-    assert spec.argv == ["ollama", "run", "coder-next"]
+    # --hidethinking keeps a reasoning model's trace out of stdout; the prompt rides on stdin.
+    assert spec.argv == ["ollama", "run", "coder-next", "--hidethinking"]
     assert spec.stdin == "reverse a string"
     assert "reverse a string" not in spec.argv  # never concatenated into the command line
 
 
-def test_build_invocation_requires_a_model_and_lists_installed() -> None:
-    # No built-in default: with no model from the call or config, the adapter refuses rather than
-    # guessing, and the error names the models that ARE installed so the user can pick one.
-    listing = "NAME                  ID   SIZE\nqwen2.5-coder:latest  abc  1 GB\n"
-    adapter = OllamaAdapter(probe=FakeProbe(run_fn=lambda argv: ProcessResult(exit_code=0, stdout=listing)))
+def test_build_invocation_appends_configured_extra_args() -> None:
+    # ``[adapters.ollama] extra_args`` the service resolved (e.g. --keepalive) are appended verbatim.
+    adapter = OllamaAdapter()
+    spec = adapter.build_invocation(_req("coder-next"), _ctx("coder-next", extra_args=["--keepalive", "30s"]))
+    assert spec.argv == ["ollama", "run", "coder-next", "--hidethinking", "--keepalive", "30s"]
+
+
+def test_build_invocation_is_pure_no_subprocess_when_model_missing() -> None:
+    # With no model resolvable the adapter refuses with INVALID_INPUT, pointing at default_model.
+    # It must NOT shell out to `ollama list` to do so (build_invocation stays pure).
+    probe = FakeProbe(run_fn=lambda argv: ProcessResult(exit_code=0, stdout="should not be called"))
+    adapter = OllamaAdapter(probe=probe)
     with pytest.raises(RutherfordError) as info:
         adapter.build_invocation(_req(None), _ctx(None))
     assert info.value.code == ErrorCode.INVALID_INPUT
     assert "default_model" in str(info.value)
-    assert "qwen2.5-coder:latest" in str(info.value)
+    assert probe.calls == []  # no `ollama list` on the build path
+
+
+def test_detect_version_reads_running_version() -> None:
+    out = "ollama version is 0.5.7\n"
+    probe = FakeProbe(
+        which_map={"ollama": "/usr/bin/ollama"}, run_fn=lambda argv: ProcessResult(exit_code=0, stdout=out)
+    )
+    assert OllamaAdapter(probe=probe).detect().version == "0.5.7"
+
+
+def test_detect_version_ignores_daemon_down_warning() -> None:
+    # `ollama --version` exits 0 with the daemon down but prints a warning line first; the adapter
+    # reports the client version, never the warning string.
+    out = "Warning: could not connect to a running Ollama instance\nWarning: client version is 0.5.7\n"
+    probe = FakeProbe(
+        which_map={"ollama": "/usr/bin/ollama"}, run_fn=lambda argv: ProcessResult(exit_code=0, stdout=out)
+    )
+    adapter = OllamaAdapter(probe=probe)
+    assert adapter.detect().version == "0.5.7"
 
 
 def test_role_preamble_is_prepended_to_the_prompt() -> None:

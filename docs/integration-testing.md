@@ -106,11 +106,16 @@ model-less Ollama reads as "only if you want it", never as a missing requirement
 - Authenticate: none -- a local daemon needs no credentials.
 - Get a model: `ollama pull <model>` (or build a custom Modelfile). The adapter has no built-in
   default -- name a model per call with `model=`, or set `[adapters.ollama] default_model` in your
-  config (the `setup` wizard offers to fill it in from your installed models). The integration test
-  delegates at the configured default, so set one before running it. Bring whatever model you like --
-  one adapter fronts them all.
+  config. The integration test delegates at the configured default, so set one before running it.
+  Bring whatever model you like -- one adapter fronts them all.
 - Residency/sampling are the daemon's: per-model `num_ctx`/`temperature` come from the Modelfile,
-  and `OLLAMA_KEEP_ALIVE` governs how long a model stays loaded. The CLI exposes no flags for these.
+  and `OLLAMA_KEEP_ALIVE` governs how long a model stays loaded. Flags `ollama run` *does* expose
+  (`--keepalive`, `--format`) can be set via `[adapters.ollama] extra_args`.
+- Slow hardware: local inference on a CPU or iGPU (no discrete GPU) is slow, and the FIRST call to a
+  model is slowest because Ollama reads the weights from disk into RAM (a cold load) -- and pulls the
+  model first if it is not already present. That first round-trip can exceed the 300s default
+  timeout. Pre-pull with `ollama pull <model>`, and raise `[adapters.ollama] timeout_s` (per-adapter)
+  or the per-call `timeout_s`.
 - Smoke: `printf 'say ok' | ollama run <your-model>`
 
 ## What the suite covers

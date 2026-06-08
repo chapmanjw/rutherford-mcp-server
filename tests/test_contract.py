@@ -48,6 +48,8 @@ def test_satisfies_interface(adapter: CLIAdapter) -> None:
     assert isinstance(adapter, CLIAdapter)
     assert isinstance(adapter.id, str) and adapter.id
     assert isinstance(adapter.display_name, str) and adapter.display_name
+    # `optional` is part of the contract (the runtime-checkable Protocol verifies presence, not type).
+    assert isinstance(adapter.optional, bool)
 
 
 @pytest.mark.parametrize("adapter", _ADAPTERS, ids=_IDS)

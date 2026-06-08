@@ -61,6 +61,14 @@ class AdapterConfig(BaseModel):
 
     enabled: bool = True
     default_model: str | None = None
+    #: Per-adapter run timeout in seconds. Overrides the global ``default_timeout_s`` for this
+    #: adapter when a call names no ``timeout_s``; ``None`` falls back to the global default. Useful
+    #: for slow local models (e.g. Ollama on a CPU) whose cold load can exceed the global budget.
+    timeout_s: float | None = None
+    #: Extra command-line arguments appended verbatim to the adapter's invocation. Honored by the
+    #: Ollama adapter (e.g. ``["--keepalive", "30s"]`` or ``["--format", "json"]``); generic
+    #: adapters carry their own ``extra_args`` in :class:`GenericAdapterConfig`.
+    extra_args: list[str] = Field(default_factory=list)
 
 
 class RutherfordConfig(BaseModel):
@@ -95,3 +103,13 @@ class RutherfordConfig(BaseModel):
         """Return the configured default model for ``adapter_id``, if any."""
         entry = self.adapters.get(adapter_id)
         return entry.default_model if entry is not None else None
+
+    def timeout_for(self, adapter_id: str) -> float | None:
+        """Return the configured per-adapter timeout (seconds) for ``adapter_id``, if any."""
+        entry = self.adapters.get(adapter_id)
+        return entry.timeout_s if entry is not None else None
+
+    def extra_args_for(self, adapter_id: str) -> list[str]:
+        """Return the configured extra CLI args for ``adapter_id`` (empty when none)."""
+        entry = self.adapters.get(adapter_id)
+        return list(entry.extra_args) if entry is not None else []

@@ -10,19 +10,23 @@ All notable changes to this project are documented in this file. The format is b
 
 - New built-in `ollama` adapter: delegate to a local model through `ollama run <model>` (prompt on
   stdin), which keeps Rutherford's CLI-only contract -- it drives the Ollama command, never the HTTP
-  API. Bring your own model via the `model` argument; it has no built-in default, so when a call
-  names none the configured `[adapters.ollama] default_model` is used, and with neither set the
-  adapter returns a clear error that lists the models you have installed. Sampling and residency come
-  from the model's Modelfile and the daemon (`OLLAMA_KEEP_ALIVE`); the adapter sets no flags for them.
+  API. Bring your own model via the `model` argument or `[adapters.ollama] default_model`; the
+  adapter has no built-in default, so with neither set it returns a clear error. A reasoning model's
+  chain-of-thought is kept out of the answer (`--hidethinking`, a no-op on non-reasoning models), so
+  pin a reasonably current Ollama. Sampling params come from the model's Modelfile; flags Ollama
+  *does* expose (`--keepalive`, `--format`) can be set via `extra_args` (below).
 - `[adapters.<id>] default_model` is now honored: when a delegation names no model, the configured
-  default for that adapter is filled in (the field was documented but previously unused). First-run
-  `setup` / `init` also detect an installed Ollama: the `init` wizard lists your pulled models and
-  lets you pick the local-coding default (or skip), writing `[adapters.ollama] default_model`.
+  default for that adapter is filled in (the field was documented but previously unused). This makes
+  `delegate(cli="ollama")` work without naming a model on every call.
+- Two new per-adapter config fields under `[adapters.<id>]`: `timeout_s` overrides the global
+  `default_timeout_s` for one adapter (useful for a slow local model whose cold load exceeds the
+  global budget), and `extra_args` appends extra CLI flags to the invocation (honored by the Ollama
+  adapter, e.g. `["--keepalive", "30s"]`).
 - An `optional` adapter flag, surfaced by `capabilities` and `doctor`. The `ollama` adapter is
   optional: an absent or model-less Ollama reads as "only if you want it", never as an error.
-  Optional adapters are also excluded from a `consensus` / `debate` auto-`"all"` panel (and from the
-  setup starter panel) unless named explicitly, so a slow local model never silently joins an
-  otherwise-cloud panel; the `skipped` list records why.
+  Optional adapters are excluded from a `consensus` auto-`"all"` panel (and from the setup starter
+  panel) unless named explicitly, so a slow local model never silently joins an otherwise-cloud
+  panel; the `skipped` list records why.
 
 ## [0.2.0] - 2026-06-05
 

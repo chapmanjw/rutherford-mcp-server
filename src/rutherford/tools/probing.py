@@ -18,7 +18,7 @@ def probe_adapter(adapter: CLIAdapter, *, diagnostic: bool = False) -> AdapterSt
     """Build an :class:`AdapterStatus` for ``adapter``. Never raises on a probe failure."""
     detected = adapter.detect()
     capabilities = adapter.capabilities()
-    optional = bool(getattr(adapter, "optional", False))
+    optional = adapter.optional
     if detected.installed:
         auth = adapter.check_auth()
         try:

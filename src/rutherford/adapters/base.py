@@ -43,6 +43,9 @@ class CLIAdapter(Protocol):
 
     id: str
     display_name: str
+    #: Whether the adapter is opt-in (a local model the user need not run). An absent optional
+    #: adapter reads as "only if you want it", and it is excluded from an auto-``all`` panel.
+    optional: bool
 
     def detect(self) -> DetectResult:
         """Report whether the binary is installed and runnable (path and version, or absent)."""

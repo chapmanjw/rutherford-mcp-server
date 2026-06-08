@@ -86,9 +86,11 @@ keeps all of its CLI-specific details in one file, so a change is a one-file edi
 | Ollama (local) | `ollama` | `ollama run <model>` (prompt on stdin) | none — local daemon |
 
 Ollama is an optional, bring-your-own local model: name a model per call with `model=`, or set
-`[adapters.ollama] default_model` in your config (the setup wizard offers to fill this in from your
-installed models). `capabilities`/`doctor` mark it `optional: true`, and it stays out of an auto-`all`
-panel unless you name it. A tenth, well-behaved CLI can be added without code — see
+`[adapters.ollama] default_model` in your config (it has no built-in default). `capabilities`/`doctor`
+mark it `optional: true`, and it stays out of an auto-`all` panel unless you name it. Local CPU/iGPU
+inference is slow, so a longer `[adapters.ollama] timeout_s` and Ollama flags via `extra_args` are
+worth setting — see [docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md).
+A tenth, well-behaved CLI can be added without code — see
 [docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md).
 
 ---
@@ -156,8 +158,7 @@ rutherford-mcp-server init
 ```
 
 It prints the plan and writes the files only after you confirm (it never overwrites an existing file).
-If you have Ollama installed, it lists your pulled models and lets you choose the local-coding default
-(or skip). Once Rutherford is registered, you can do the same conversationally — ask your agent to "set
+Once Rutherford is registered, you can do the same conversationally — ask your agent to "set
 up Rutherford" and the `setup` tool proposes the same files for you to approve. Then have your agent run
 `doctor` to confirm each CLI is installed, authenticated, and reachable.
 

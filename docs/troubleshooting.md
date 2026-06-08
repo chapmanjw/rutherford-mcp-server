@@ -97,8 +97,10 @@ If a working directory arrives in the wrong form (e.g. a Windows path reaching a
 
 **Fix.**
 - Raise the per-call `timeout_s` parameter on the `delegate` or `consensus` call.
-- Raise `default_timeout_s` in config (default is `300.0` seconds). Set it in your `rutherford.toml` / `%APPDATA%\rutherford\config.toml`, or via the `RUTHERFORD_DEFAULT_TIMEOUT_S` env var.
+- Raise `default_timeout_s` in config (default is `300.0` seconds). Set it in your `rutherford.toml` / `%APPDATA%\rutherford\config.toml`, or via the `RUTHERFORD_DEFAULT_TIMEOUT_S` env var. For a single slow adapter, set a per-adapter `[adapters.<id>] timeout_s` instead of raising the global default.
 - For long-running tasks, use `mode="async"` on the `delegate` call: it returns a job id immediately and you poll via `job_status` / `job_result`. The timeout still applies to the underlying run, so raise it accordingly.
+
+**Local models (Ollama) are a special case.** `ollama run` is a thin client for the separate `ollama serve` daemon; the generation runs inside the daemon, which is *not* a child of the process Rutherford spawns. A `TIMEOUT` kills the `ollama run` client and Rutherford stops waiting, but the daemon keeps generating to completion -- on a CPU/iGPU-only machine the fans keep spinning after the timeout is reported. To free the machine immediately, run `ollama stop <model>`; to bound how long a model stays resident, set a short `OLLAMA_KEEP_ALIVE` (e.g. `30s`) for the daemon. The first call to a model is also the slowest (cold weight-load, plus a pull if it is not present), so prefer a generous `[adapters.ollama] timeout_s`.
 
 ---
 

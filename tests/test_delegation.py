@@ -7,6 +7,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+from rutherford.adapters.base import CLIAdapter
+from rutherford.adapters.ollama import OllamaAdapter
 from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import AdapterConfig, RutherfordConfig
 from rutherford.domain.enums import SafetyMode
@@ -14,11 +16,11 @@ from rutherford.domain.models import DelegationRequest, ProcessResult, Target
 from rutherford.runtime.depth import ENV_DEPTH
 from rutherford.services.delegation import DelegationService
 from rutherford.services.roles import load_roles
-from tests.fakes import FakeAdapter, FakeProcessRunner
+from tests.fakes import FakeAdapter, FakeProbe, FakeProcessRunner
 
 
 def _service(
-    adapters: Sequence[FakeAdapter],
+    adapters: Sequence[CLIAdapter],
     runner: FakeProcessRunner,
     config: RutherfordConfig | None = None,
 ) -> DelegationService:
@@ -53,6 +55,46 @@ async def test_configured_default_model_fills_in_when_call_names_none() -> None:
     await _service([FakeAdapter("fake")], runner, config).delegate(_req())
     spec, _ = runner.calls[0]
     assert "--model" in spec.argv and "m9" in spec.argv
+
+
+async def test_ollama_no_model_uses_configured_default_end_to_end() -> None:
+    # The headline behavior, exercised through the real OllamaAdapter and the service together: a
+    # no-model call resolves `[adapters.ollama] default_model`, and the adapter builds the right argv
+    # (model + --hidethinking) with the prompt on stdin.
+    adapter = OllamaAdapter(probe=FakeProbe(which_map={"ollama": "/usr/bin/ollama"}))
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="PONG\n"))
+    config = RutherfordConfig(adapters={"ollama": AdapterConfig(default_model="m9")})
+    result = await _service([adapter], runner, config).delegate(_req("ollama"))
+    assert result.ok and result.text == "PONG"
+    spec, _ = runner.calls[0]
+    assert spec.argv == ["ollama", "run", "m9", "--hidethinking"]
+    assert spec.stdin == "question"
+
+
+async def test_ollama_configured_extra_args_reach_the_invocation() -> None:
+    # `[adapters.ollama] extra_args` are resolved by the service into the context and appended.
+    adapter = OllamaAdapter(probe=FakeProbe(which_map={"ollama": "/usr/bin/ollama"}))
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    config = RutherfordConfig(adapters={"ollama": AdapterConfig(default_model="m9", extra_args=["--keepalive", "30s"])})
+    await _service([adapter], runner, config).delegate(_req("ollama"))
+    spec, _ = runner.calls[0]
+    assert spec.argv == ["ollama", "run", "m9", "--hidethinking", "--keepalive", "30s"]
+
+
+async def test_per_adapter_timeout_overrides_the_global_default() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    config = RutherfordConfig(default_timeout_s=300.0, adapters={"fake": AdapterConfig(timeout_s=900.0)})
+    await _service([FakeAdapter("fake")], runner, config).delegate(_req())
+    _spec, timeout = runner.calls[0]
+    assert timeout == 900.0
+
+
+async def test_explicit_call_timeout_beats_the_per_adapter_one() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    config = RutherfordConfig(adapters={"fake": AdapterConfig(timeout_s=900.0)})
+    await _service([FakeAdapter("fake")], runner, config).delegate(_req(timeout_s=42.0))
+    _spec, timeout = runner.calls[0]
+    assert timeout == 42.0
 
 
 async def test_nonzero_exit_is_a_failed_result() -> None:

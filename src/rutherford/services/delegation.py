@@ -70,6 +70,7 @@ class DelegationService:
             working_dir=req.working_dir,
             correlation_id=correlation_id,
             depth=base_depth,
+            extra_args=self._config.extra_args_for(req.target.cli),
         )
 
         try:
@@ -132,7 +133,9 @@ class DelegationService:
             return self._fail(ctx, ErrorCode.INTERNAL, f"build_invocation failed: {exc}"), None
 
         spec = spec.model_copy(update={"env": {**spec.env, **child_depth_env(base_depth)}})
-        timeout = req.timeout_s or self._config.default_timeout_s
+        # Precedence: an explicit per-call timeout, else the per-adapter ``[adapters.<id>]
+        # timeout_s``, else the global default. A slow local model can set the per-adapter one.
+        timeout = req.timeout_s or self._config.timeout_for(req.target.cli) or self._config.default_timeout_s
         raw = await self._runner.run(spec, timeout, on_progress)
 
         try:

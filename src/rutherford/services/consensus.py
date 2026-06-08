@@ -173,7 +173,7 @@ class ConsensusService:
         included: list[Target] = []
         skipped: list[SkippedTarget] = []
         for adapter in self._registry.all():
-            if bool(getattr(adapter, "optional", False)):
+            if adapter.optional:
                 skipped.append(SkippedTarget(cli=adapter.id, reason="optional; name it explicitly to include"))
                 continue
             detected = await asyncio.to_thread(adapter.detect)

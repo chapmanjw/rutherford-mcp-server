@@ -71,7 +71,9 @@ Saved panels below) so the main config stays small.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `true` | Set to `false` to remove this adapter from the registry at startup. |
-| `default_model` | `string` or omitted | none | Model string passed when the caller does not specify one. |
+| `default_model` | `string` or omitted | none | Model passed when the caller names none. Required to use Ollama without a per-call `model=`, since it has no built-in default. |
+| `timeout_s` | `float` or omitted | none | Per-adapter run timeout in seconds. Overrides the global `default_timeout_s` for this adapter when a call names no `timeout_s`. Useful for a slow local model whose cold load can exceed the global budget. |
+| `extra_args` | `list[str]` | `[]` | Extra CLI arguments appended verbatim to the adapter's invocation. Honored by the Ollama adapter (e.g. `["--keepalive", "30s"]` or `["--format", "json"]`); other built-in adapters ignore it. |
 
 ---
 
@@ -171,6 +173,14 @@ default_model = "claude-sonnet-4-6"
 
 [adapters.codex]
 enabled = false   # disable without removing from enabled_adapters
+
+# A local Ollama model. It has no built-in default, so set one here (or pass model= per call).
+# Sampling (temperature, num_ctx) lives in the model's Modelfile, not here; extra_args carries the
+# flags `ollama run` does expose. Local CPU/iGPU inference is slow, so give it a longer timeout.
+[adapters.ollama]
+default_model = "qwen2.5-coder:latest"
+timeout_s     = 900.0
+extra_args    = ["--keepalive", "30s"]
 
 # A config-defined generic adapter -- no code module required.
 [[generic_adapters]]

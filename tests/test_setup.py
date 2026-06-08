@@ -19,11 +19,18 @@ from rutherford.tools.setup import setup_tool
 from tests.fakes import FakeAdapter, FakeProcessRunner, make_app
 
 
-def _status(adapter_id: str, *, installed: bool = True, auth: AuthState = AuthState.AUTHENTICATED) -> AdapterStatus:
+def _status(
+    adapter_id: str,
+    *,
+    installed: bool = True,
+    auth: AuthState = AuthState.AUTHENTICATED,
+    optional: bool = False,
+) -> AdapterStatus:
     return AdapterStatus(
         id=adapter_id,
         display_name=adapter_id.title(),
         installed=installed,
+        optional=optional,
         auth=AuthStatus(state=auth),
         capabilities=AdapterCapabilities(),
     )
@@ -59,60 +66,17 @@ def test_plan_recommends_ready_clis_and_proposes_a_panel(tmp_path: Path) -> None
     assert [t["cli"] for t in decoded["panels"]["default"]["targets"]] == ["claude_code", "codex"]
 
 
-def test_plan_auto_configures_ollama_default_and_keeps_it_out_of_the_panel(tmp_path: Path) -> None:
-    ollama = AdapterStatus(
-        id="ollama",
-        display_name="Ollama (local model)",
-        installed=True,
-        optional=True,
-        auth=AuthStatus(state=AuthState.AUTHENTICATED),
-        models=["llama3", "qwen2.5-coder:latest", "phi3"],
-        capabilities=AdapterCapabilities(),
-    )
-    plan = build_setup_plan([_status("claude_code"), _status("codex"), ollama], env=_env(tmp_path))
+def test_optional_adapter_is_kept_out_of_the_starter_panel(tmp_path: Path) -> None:
+    # An installed + authenticated optional adapter (a local model) is ready, but setup must not
+    # auto-add it to the starter panel, and must not write any config for it -- it is opt-in.
+    statuses = [_status("claude_code"), _status("codex"), _status("ollama", optional=True)]
+    plan = build_setup_plan(statuses, env=_env(tmp_path))
 
-    config_file = next(f for f in plan.files if f.kind == "config")
-    # Writes a per-adapter section, preferring the coding model from what is installed.
-    assert "[adapters.ollama]" in config_file.content
-    assert "default_model = 'qwen2.5-coder:latest'" in config_file.content
-    assert any("Ollama default model" in note for note in plan.notes)
-    # The optional local model is configured but NOT auto-added to the starter panel.
     assert plan.recommended_panel == ["claude_code", "codex"]
-
-
-def test_setup_uses_the_chosen_ollama_model_over_the_suggestion(tmp_path: Path) -> None:
-    ollama = AdapterStatus(
-        id="ollama",
-        display_name="Ollama (local model)",
-        installed=True,
-        optional=True,
-        auth=AuthStatus(state=AuthState.AUTHENTICATED),
-        models=["qwen2.5-coder:latest", "phi3"],
-        capabilities=AdapterCapabilities(),
-    )
-    # The wizard's pick wins over the suggested coding model.
-    plan = build_setup_plan([_status("claude_code"), ollama], env=_env(tmp_path), ollama_model="phi3")
-    config_file = next(f for f in plan.files if f.kind == "config")
-    assert "default_model = 'phi3'" in config_file.content
-    # The note tells the user, in plain terms, how to change it.
-    note = next(n for n in plan.notes if "Ollama default model" in n)
-    assert "ollama list" in note and "init --force" in note
-
-
-def test_setup_skip_leaves_ollama_unconfigured_but_notes_how(tmp_path: Path) -> None:
-    ollama = AdapterStatus(
-        id="ollama",
-        display_name="Ollama (local model)",
-        installed=True,
-        optional=True,
-        auth=AuthStatus(state=AuthState.AUTHENTICATED),
-        models=["coder-next:latest"],
-        capabilities=AdapterCapabilities(),
-    )
-    plan = build_setup_plan([_status("claude_code"), ollama], env=_env(tmp_path), configure_ollama=False)
+    panels_file = next(f for f in plan.files if f.kind == "panels")
+    assert [t["cli"] for t in decode(panels_file.content)["panels"]["default"]["targets"]] == ["claude_code", "codex"]
     config_file = next(f for f in plan.files if f.kind == "config")
     assert "[adapters.ollama]" not in config_file.content  # nothing forced on the user
-    assert any("no default model was set" in note for note in plan.notes)
 
 
 def test_plan_skips_panel_when_fewer_than_two_ready(tmp_path: Path) -> None:

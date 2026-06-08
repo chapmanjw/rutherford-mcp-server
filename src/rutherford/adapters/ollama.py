@@ -15,12 +15,21 @@ set the adapter raises a clear error rather than guessing a model that may not b
 
 Ollama only generates text -- it has no tools and cannot touch the workspace -- so every
 ``SafetyMode`` maps to no flags, there is no system-prompt flag (the role preamble is prepended to
-the prompt), and no session resume. Auth is a non-issue for a local daemon. Per-call sampling params
-(``num_ctx``/``temperature``/``num_predict``) come from the model's Modelfile, and residency from the
-daemon's ``OLLAMA_KEEP_ALIVE`` -- the CLI exposes no flags for them.
+the prompt), and no session resume. Auth is a non-issue for a local daemon. A reasoning model
+streams its chain-of-thought to stdout by default, so the adapter passes ``--hidethinking`` to keep
+that trace out of the answer (the model still reasons internally); on a non-reasoning model it is a
+no-op. Per-call sampling params (``num_ctx``/``temperature``/``num_predict``) come from the model's
+Modelfile -- the CLI exposes no flags for them -- but flags that *do* exist (residency via
+``--keepalive``, ``--format json``) can be set through ``[adapters.ollama] extra_args``, which the
+service resolves and the adapter appends.
+
+``--hidethinking`` requires a reasonably current Ollama (the flag shipped with the 2025 "thinking"
+release); on an older build it would be rejected, so pin a recent Ollama.
 """
 
 from __future__ import annotations
+
+import re
 
 from ..domain.enums import AuthState, OutputMode, SafetyMode
 from ..domain.error_codes import ErrorCode
@@ -60,6 +69,25 @@ class OllamaAdapter(BaseCLIAdapter):
             return []
         return _parse_model_names(result.stdout)
 
+    def _detect_version(self) -> str | None:
+        """Read the Ollama version, ignoring the daemon-down warning preamble.
+
+        ``ollama --version`` exits 0 even when the daemon is not running, but then writes a
+        ``Warning: could not connect to a running Ollama instance`` line (and a ``Warning: client
+        version is <X>`` line) to stdout. Take the version from whichever line carries the
+        ``version is <X>`` token rather than blindly the first line, so ``capabilities``/``doctor``
+        never display the warning string as the version.
+        """
+        result = self._probe.run([self.binary, *self.version_args], timeout_s=15.0)
+        if result.exit_code != 0:
+            return None
+        text = (result.stdout or result.stderr).strip()
+        for line in text.splitlines():
+            match = re.search(r"version is (\S+)", line)
+            if match:
+                return match.group(1)
+        return None
+
     def capabilities(self) -> AdapterCapabilities:
         """Advertise Ollama's flags: model selection and list-models, plain text, nothing else."""
         return AdapterCapabilities(
@@ -77,25 +105,27 @@ class OllamaAdapter(BaseCLIAdapter):
         return SafetyFlags(args=[], note="ollama run only generates text; it cannot modify the workspace")
 
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
-        """Build ``ollama run <model>`` with the (preamble-composed) prompt fed on stdin.
+        """Build ``ollama run <model> --hidethinking`` with the prompt fed on stdin.
 
-        Pure on the success path: returns an argv list and an stdin string, never a shell command
-        line. Ollama has no system-prompt flag, so the role preamble is prepended to the prompt. The
-        model is the target's model (the service fills it from ``[adapters.ollama] default_model``
-        when the call omits one); with no model resolvable, raise ``INVALID_INPUT`` -- listing the
-        installed models -- rather than guess a model that may not exist.
+        Pure: returns an argv list and an stdin string, never a shell command line and never a
+        subprocess. Ollama has no system-prompt flag, so the role preamble is prepended to the
+        prompt. ``--hidethinking`` keeps a reasoning model's chain-of-thought out of stdout so the
+        answer is clean (the model still reasons internally); on a non-reasoning model it is a
+        no-op. Any ``[adapters.ollama] extra_args`` the service resolved (e.g. ``--keepalive 30s``)
+        are appended. The model is the target's model (the service fills it from
+        ``[adapters.ollama] default_model`` when the call omits one); with no model resolvable,
+        raise ``INVALID_INPUT`` rather than guess a model that may not exist.
         """
         model = req.target.model
         if not model:
-            installed = ", ".join(self.available_models()) or "(none pulled)"
             raise RutherfordError(
                 ErrorCode.INVALID_INPUT,
-                "no Ollama model specified -- pass model= or set [adapters.ollama] default_model in "
-                f"your Rutherford config. Installed models: {installed}",
+                "no Ollama model specified -- pass model= or set [adapters.ollama] default_model "
+                "in your Rutherford config (run `ollama list` to see your installed models).",
             )
         prompt = self._compose_prompt(req.prompt, ctx.role_preamble)
         return InvocationSpec(
-            argv=[self.binary, "run", model],
+            argv=[self.binary, "run", model, "--hidethinking", *ctx.extra_args],
             cwd=req.working_dir,
             stdin=prompt,
         )

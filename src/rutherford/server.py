@@ -22,8 +22,8 @@ from . import __version__
 from .context import AppContext, build_app_context, error_payload_from, tool_error
 from .domain.error_codes import ErrorCode
 from .domain.errors import ConfigError, RutherfordError
-from .domain.models import AdapterStatus, Target
-from .services.setup import _ollama_models, _prefer_coder, apply_setup_plan, build_setup_plan, format_plan_summary
+from .domain.models import Target
+from .services.setup import apply_setup_plan, build_setup_plan, format_plan_summary
 from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
 from .tools.debate import debate_tool
@@ -352,36 +352,6 @@ def _smoke() -> None:
     print(f"rutherford-mcp-server {__version__}: ready with {len(app.registry)} adapters: {ids}")
 
 
-def _prompt_ollama_model(statuses: list[AdapterStatus]) -> str | None:
-    """Interactively ask which installed Ollama model to use as the default.
-
-    Returns the chosen model, or ``None`` when the user skips (option 0) or Ollama has no models
-    pulled (so nothing is asked). The suggested coding model is choice 1, taken on an empty reply.
-    """
-    models = _ollama_models(statuses)
-    if not models:
-        return None
-    suggested = _prefer_coder(models)
-    ordered = [suggested, *[model for model in models if model != suggested]]
-    print("\nOllama is installed. Choose the default model for local coding delegation:")
-    for index, model in enumerate(ordered, start=1):
-        print(f"  {index}) {model}" + ("  (suggested)" if model == suggested else ""))
-    print("  0) skip -- don't set a default (name the model per call, or don't use Ollama)")
-    reply = input("Pick a number [1], or 0 to skip: ").strip().lower()
-    if not reply:
-        return suggested
-    if reply in ("0", "s", "skip"):
-        return None
-    try:
-        choice = int(reply)
-    except ValueError:
-        choice = -1
-    if 1 <= choice <= len(ordered):
-        return ordered[choice - 1]
-    print(f"Not a valid choice; using {suggested!r}.")
-    return suggested
-
-
 def _init(args: list[str]) -> None:
     """Interactive first-run setup: probe the CLIs, show the plan, and write it on confirmation."""
     assume_yes = "--yes" in args or "-y" in args
@@ -392,11 +362,7 @@ def _init(args: list[str]) -> None:
         print(f"rutherford: configuration error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     statuses = [probe_adapter(adapter) for adapter in app.registry.all()]
-    if assume_yes:
-        plan = build_setup_plan(statuses, env=os.environ)
-    else:
-        chosen = _prompt_ollama_model(statuses)
-        plan = build_setup_plan(statuses, env=os.environ, ollama_model=chosen, configure_ollama=chosen is not None)
+    plan = build_setup_plan(statuses, env=os.environ)
     print(format_plan_summary(plan))
     if not assume_yes:
         reply = input("\nWrite these files? [y/N] ").strip().lower()

@@ -10,7 +10,7 @@ import rutherford.server as server
 from rutherford.adapters.claude_code import ClaudeCodeAdapter
 from rutherford.config.schema import AdapterConfig, RutherfordConfig
 from rutherford.domain.enums import AuthState
-from rutherford.domain.models import AdapterCapabilities, AdapterStatus, AuthStatus, ProcessResult
+from rutherford.domain.models import ProcessResult
 from rutherford.tools.capabilities import capabilities_tool, doctor_tool
 from rutherford.tools.roles import list_roles_tool
 from tests.fakes import FakeAdapter, FakeProbe, FakeProcessRunner, make_app
@@ -140,41 +140,6 @@ async def test_list_roles_includes_builtins() -> None:
     out = await list_roles_tool(app)
     assert "planner" in out
     assert "codereviewer" in out
-
-
-def _ollama_status(models: list[str]) -> AdapterStatus:
-    return AdapterStatus(
-        id="ollama",
-        display_name="Ollama (local model)",
-        installed=True,
-        optional=True,
-        auth=AuthStatus(state=AuthState.AUTHENTICATED),
-        models=models,
-        capabilities=AdapterCapabilities(),
-    )
-
-
-def test_init_model_picker_selects_by_number(monkeypatch: pytest.MonkeyPatch) -> None:
-    status = _ollama_status(["coder-next:latest", "phi3", "llama3"])
-    # Ordered list is [suggested coding model, ...rest]; choice "2" picks phi3.
-    monkeypatch.setattr("builtins.input", lambda *_: "2")
-    assert server._prompt_ollama_model([status]) == "phi3"
-
-
-def test_init_model_picker_defaults_to_suggested_on_empty(monkeypatch: pytest.MonkeyPatch) -> None:
-    status = _ollama_status(["llama3", "coder-next:latest"])
-    monkeypatch.setattr("builtins.input", lambda *_: "")  # empty reply -> the suggested coding model
-    assert server._prompt_ollama_model([status]) == "coder-next:latest"
-
-
-def test_init_model_picker_returns_none_without_ollama() -> None:
-    assert server._prompt_ollama_model([]) is None
-
-
-def test_init_model_picker_skip_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    status = _ollama_status(["coder-next:latest", "phi3"])
-    monkeypatch.setattr("builtins.input", lambda *_: "0")  # 0 = skip, don't set a default
-    assert server._prompt_ollama_model([status]) is None
 
 
 def test_server_smoke_prints_ready(capsys: pytest.CaptureFixture[str]) -> None:

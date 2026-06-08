@@ -184,6 +184,9 @@ class InvocationContext(BaseModel):
     depth: int = 0
     role_preamble: str | None = None
     transcript_dir: str | None = None
+    #: Extra CLI args the service resolved from ``[adapters.<id>] extra_args`` for this target.
+    #: An adapter that supports passthrough flags (e.g. Ollama) appends these to its argv.
+    extra_args: list[str] = Field(default_factory=list)
 
 
 # --- Delegation request / result --------------------------------------------

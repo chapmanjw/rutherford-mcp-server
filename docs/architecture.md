@@ -214,7 +214,7 @@ The current quirks, by adapter:
 | `antigravity` | `agy` | stdout is unreliable; `parse_output` reads the transcript file (see below) |
 | `cursor` | `cursor-agent` | `--output-format json`; final answer taken from the JSON result event |
 | `qwen` | `qwen` | `-o json` event array; answer from the last `result` event, else the last `assistant` message |
-| `ollama` | `ollama` | Plain text on stdout from `ollama run`; empty output is a `PARSE_ERROR` (local model, optional) |
+| `ollama` | `ollama` | Plain text on stdout from `ollama run --hidethinking` (the flag keeps a reasoning model's chain-of-thought out of the answer); empty output is a `PARSE_ERROR` (local model, optional) |
 | `generic` | configurable | Plain text (default) or last JSON object on stdout, with optional dotted `json_text_path` extraction |
 
 ### Antigravity transcript quirk
