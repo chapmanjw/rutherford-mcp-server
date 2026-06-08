@@ -116,6 +116,15 @@ model-less Ollama reads as "only if you want it", never as a missing requirement
   model first if it is not already present. That first round-trip can exceed the 300s default
   timeout. Pre-pull with `ollama pull <model>`, and raise `[adapters.ollama] timeout_s` (per-adapter)
   or the per-call `timeout_s`.
+- Output quality is the model's, not the adapter's. The adapter passes through exactly what
+  `ollama run` writes (after stripping the spinner's ANSI). Some GGUFs -- bleeding-edge or community
+  quants -- ship a chat template that leaks control tokens (e.g. `<|channel>...<channel|>`) into the
+  answer as literal text, and no `ollama run` flag strips them: `--hidethinking` only suppresses
+  Ollama's *native* thinking channel, so it is inert on a model Ollama does not flag as a thinking
+  model. Check `ollama show <model>` -- if `thinking` is absent from Capabilities, `--hidethinking`
+  does nothing. The fix is upstream: a cleaner model/quant, a newer Ollama that supports the model's
+  thinking, or a custom Modelfile that corrects the template. (Observed with the `gemma4`
+  `hf.co/unsloth/gemma-4-12B-it-qat-GGUF` quants on Ollama 0.30.6.)
 - Smoke: `printf 'say ok' | ollama run <your-model>`
 
 ## What the suite covers
