@@ -104,18 +104,23 @@ class DebateService:
                 f"stances ({len(req.stances)}) must match targets ({len(req.targets)})",
             )
         # Disambiguate duplicate display labels (two unlabeled same-(cli, model) seats) so the
-        # transcript is unambiguous, while seat_id (index-based) keeps survival/lookup unique.
+        # transcript is unambiguous, while seat_id (index-based) keeps survival/lookup unique. A
+        # generated "#N" suffix skips any label already in use -- an explicit label or one already
+        # assigned -- so a caller who hand-labels a seat "claude_code#2" cannot collide with the
+        # auto-generated suffix for an unlabeled claude_code seat.
         base_labels = [target.display_label for target in req.targets]
         duplicated = {label for label in base_labels if base_labels.count(label) > 1}
+        taken: set[str] = set(base_labels)
         seen: dict[str, int] = {}
         voices: list[_Voice] = []
         for index, target in enumerate(req.targets):
             base = target.display_label
             if base in duplicated:
                 seen[base] = seen.get(base, 0) + 1
-                label = base if seen[base] == 1 else f"{base}#{seen[base]}"
+                label = base if seen[base] == 1 else _next_free_label(base, taken)
             else:
                 label = base
+            taken.add(label)
             voices.append(
                 _Voice(
                     index=index,
@@ -198,9 +203,11 @@ class DebateService:
     ) -> tuple[str | None, str | None]:
         """Delegate a closing pass over the final positions, stating where the panel landed.
 
-        Returns ``(final, synthesizer_label)``. Uses the caller-named ``judge`` when given (ideally a
-        non-participant), otherwise the first surviving voice -- recorded in ``synthesis_by`` so the
-        reader can see a participant wrote it.
+        Returns ``(final, synthesizer_label)``, or ``(None, None)`` when no synthesis was produced --
+        no surviving voice, or the synthesis run itself failed -- so ``synthesis_by`` never names an
+        author for a synthesis that does not exist. Uses the caller-named ``judge`` when given
+        (ideally a non-participant), otherwise the first surviving voice, whose disambiguated debate
+        label is reported so the reader can map it back to a transcript seat.
         """
         if not req.synthesize or not rounds:
             return None, None
@@ -231,7 +238,25 @@ class DebateService:
             correlation_id=f"{correlation_id}:final",
             base_depth=base_depth + 1,
         )
-        return (result.text if result.ok else None), judge_target.display_label
+        if not result.ok or not result.text.strip():
+            return None, None  # no synthesis produced; do not name an author for one that is absent
+        # For an explicit judge, report the target that actually answered (reflects any model
+        # fallback); for the default first-survivor path, report that seat's disambiguated debate
+        # label so the reader can map synthesis_by back to a transcript seat.
+        synthesizer_label = result.target.display_label if req.judge else closing[0].label
+        return result.text, synthesizer_label
+
+
+def _next_free_label(base: str, taken: set[str]) -> str:
+    """Return the first ``base#n`` (n >= 2) not already in ``taken``.
+
+    Used to disambiguate duplicate seat labels without ever colliding with a label that already
+    exists -- an explicit caller-supplied one or a previously assigned generated one.
+    """
+    n = 2
+    while f"{base}#{n}" in taken:
+        n += 1
+    return f"{base}#{n}"
 
 
 def _latest_text(round_: DebateRound, seat_id: str) -> str:

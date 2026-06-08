@@ -11,7 +11,7 @@ workspace allowlist, and config-defined generic adapters. Invalid config raises
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..domain.enums import OutputMode, Runtime, SafetyMode
 
@@ -103,20 +103,39 @@ class RutherfordConfig(BaseModel):
     #: Maximum CLI subprocess delegations Rutherford runs at once, across every panel (a global
     #: semaphore in the delegation primitive). Decouples panel width from host process pressure: a
     #: wide consensus or a multi-round debate cannot launch more than this many heavy agent
-    #: subprocesses simultaneously. Defaults to ``max_targets`` so a single auto-panel is unchanged;
-    #: raise on a big box, lower on a laptop.
+    #: subprocesses simultaneously. When not set explicitly it defaults to ``max_targets`` (see the
+    #: validator below), so raising ``max_targets`` does not silently throttle a single auto-panel;
+    #: set it explicitly to pin a different cap (e.g. lower on a laptop). Read once at startup.
     max_concurrency: int = Field(default=8, ge=1)
     #: Absolute paths under which write/yolo delegations are permitted.
     trusted_workspaces: list[str] = Field(default_factory=list)
     #: Whether consensus synthesizes server-side by default (off by default per the spec).
     synthesize_default: bool = False
-    #: Opt-in: after a ``read_only`` or ``propose`` delegation whose working directory is a git repo,
-    #: compare ``git status`` before and after and fail the result with ``READONLY_VIOLATED`` if the
-    #: tree changed -- turning the safety promise into a checked invariant. Off by default: it adds a
-    #: git call per delegation, and under concurrent fan-out on a *shared* tree one voice's mutation
-    #: is mis-attributed to its peers, so it is soundest for a single delegation (worktree isolation
-    #: gives per-voice soundness). Only git working directories are checked.
+    #: Opt-in: after a *successful* ``read_only`` or ``propose`` delegation whose working directory is
+    #: a git repo, fingerprint the tree under ``working_dir`` before and after (status with
+    #: ``--ignored=matching`` plus the unstaged and staged diffs, scoped to that subtree) and fail the
+    #: result with ``READONLY_VIOLATED`` if it changed -- making the safety promise a checked
+    #: invariant. Off by default (it adds git calls per delegation). What it catches and does not: it
+    #: detects a further edit to an already-dirty file (content, not just status) and a write to a
+    #: gitignored path, and scopes to ``working_dir`` so unrelated changes elsewhere in the repo are
+    #: not mis-attributed; but a write *outside* the repo is unobservable, and under concurrent fan-out
+    #: on a *shared* tree a peer's write can still be attributed here (soundest for a single
+    #: delegation -- worktree isolation gives per-voice soundness). Checked only when the run itself
+    #: succeeded, so a real failure (timeout, non-zero exit, drift) is never masked.
     verify_read_only: bool = False
+
+    @model_validator(mode="after")
+    def _default_concurrency_to_targets(self) -> RutherfordConfig:
+        """Default ``max_concurrency`` to ``max_targets`` when it was not set explicitly.
+
+        Keeps the documented coupling honest: an operator who raises ``max_targets`` (in a config file
+        or via ``RUTHERFORD_MAX_TARGETS``) gets a matching concurrency cap, so a single auto-panel is
+        not silently throttled to the old default; an explicit ``max_concurrency`` still wins (e.g. a
+        lower cap on a laptop). Runs at load time; the semaphore is built once at startup.
+        """
+        if "max_concurrency" not in self.model_fields_set:
+            self.max_concurrency = self.max_targets
+        return self
 
     def default_model_for(self, adapter_id: str) -> str | None:
         """Return the configured default model for ``adapter_id``, if any."""

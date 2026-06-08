@@ -157,6 +157,18 @@ async def test_synthesis_defaults_to_first_voice_and_records_it() -> None:
     assert result.synthesis_by == "a"
 
 
+async def test_synthesis_with_a_failing_judge_records_no_author() -> None:
+    # The bulletproofing fix: a named judge that cannot run produces no synthesis, so synthesis_by
+    # must be None rather than claiming the absent judge wrote one.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("j", installed=False)], runner)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", synthesize=True, judge=Target(cli="j"))
+    )
+    assert result.synthesis is None
+    assert result.synthesis_by is None
+
+
 # --- consensus strategies -----------------------------------------------------------------------
 
 
@@ -405,3 +417,25 @@ async def test_max_concurrency_bounds_parallel_fan_out() -> None:
     result = await service.consensus(ConsensusRequest(targets=[Target(cli=f"a{i}") for i in range(4)], prompt="q"))
     assert len(result.voices) == 4 and all(voice.ok for voice in result.voices)
     assert runner.max_active <= 2  # the global semaphore capped concurrent subprocesses (4 -> 2)
+
+
+async def test_one_shared_cap_bounds_concurrent_consensus_and_debate() -> None:
+    # The headline F9 property: ONE semaphore on the shared DelegationService bounds concurrency
+    # across a consensus AND a debate running at once -- not a per-call cap. A future refactor that
+    # moved the semaphore into a per-call object would let this exceed the cap and fail here.
+    from rutherford.domain.models import DebateRequest
+    from rutherford.services.debate import DebateService
+
+    runner = _ConcurrencyRunner()
+    cfg = RutherfordConfig(max_concurrency=2)
+    registry = AdapterRegistry([FakeAdapter(f"a{i}") for i in range(4)])
+    delegation = DelegationService(registry, runner, cfg, load_roles())
+    consensus = ConsensusService(delegation, cfg, registry)
+    debate = DebateService(delegation, cfg)
+    await asyncio.gather(
+        consensus.consensus(ConsensusRequest(targets=[Target(cli=f"a{i}") for i in range(4)], prompt="q")),
+        debate.debate(
+            DebateRequest(targets=[Target(cli="a0"), Target(cli="a1")], prompt="q", rounds=2, synthesize=False)
+        ),
+    )
+    assert runner.max_active <= 2  # both panels share one cap

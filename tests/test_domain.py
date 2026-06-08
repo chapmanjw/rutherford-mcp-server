@@ -58,6 +58,13 @@ def test_target_effective_weight_and_parity() -> None:
     assert Target(cli="a", parity=True).is_parity is True
 
 
+def test_target_rejects_a_negative_weight() -> None:
+    # A negative weight would shrink the weighted-strategy denominator and fake a majority.
+    with pytest.raises(ValidationError):
+        Target(cli="a", weight=-1.0)
+    assert Target(cli="a", weight=0.0).effective_weight == 0.0  # zero is allowed (no influence)
+
+
 def test_target_with_metadata_is_still_frozen_and_hashable() -> None:
     from rutherford.domain.enums import Stance
 

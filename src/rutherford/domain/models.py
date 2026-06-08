@@ -47,7 +47,10 @@ class Target(BaseModel):
     model: str | None = None
     role: str | None = None
     label: str | None = None
-    weight: float | None = None
+    #: A non-negative voting weight for the ``weighted`` strategy; ``None`` means the default 1.0. A
+    #: negative weight is rejected -- it would shrink the strategy denominator and let one voice
+    #: manufacture a "majority".
+    weight: float | None = Field(default=None, ge=0)
     parity: bool | None = None
     stance: Stance | None = None
 
@@ -313,7 +316,9 @@ class VoiceVerdict(BaseModel):
     label: str
     cli: str
     model: str | None = None
-    weight: float = 1.0
+    #: Non-negative voting weight for the ``weighted`` strategy; a negative weight is rejected so a
+    #: voice cannot shrink the denominator and manufacture a majority.
+    weight: float = Field(default=1.0, ge=0)
     parity: bool = False
     ok: bool = True
     verdict: str | None = None

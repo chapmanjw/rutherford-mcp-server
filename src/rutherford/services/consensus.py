@@ -212,9 +212,11 @@ class ConsensusService:
     ) -> tuple[str | None, str | None]:
         """Delegate a combining pass to the nominated judge, else the first successful voice.
 
-        Returns ``(synthesis, synthesizer_label)`` so the result records who wrote it: a caller-named
-        ``judge`` (ideally a non-participant) when given, otherwise the first successful voice -- a panel
-        participant, which the ``synthesis_by`` field makes visible rather than hidden.
+        Returns ``(synthesis, synthesizer_label)``, or ``(None, None)`` when no synthesis was produced
+        -- no successful voice, or the synthesis run itself failed -- so ``synthesis_by`` never names an
+        author for a synthesis that does not exist. The label is the target that actually answered
+        (reflecting any model fallback): a caller-named ``judge`` when given (ideally a non-participant),
+        otherwise the first successful voice, which ``synthesis_by`` makes visible rather than hidden.
         """
         ok_voices = [voice for voice in voices if voice.ok and voice.text.strip()]
         if not ok_voices:
@@ -244,7 +246,9 @@ class ConsensusService:
             correlation_id=f"{correlation_id}:synthesis",
             base_depth=base_depth + 1,
         )
-        return (result.text if result.ok else None), judge_target.display_label
+        if not result.ok or not result.text.strip():
+            return None, None  # no synthesis produced; do not name an author for one that is absent
+        return result.text, result.target.display_label
 
 
 def _announce_panel(

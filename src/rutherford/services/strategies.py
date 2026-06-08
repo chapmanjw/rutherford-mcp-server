@@ -25,7 +25,7 @@ from typing import Any
 
 from ..domain.enums import Strategy
 from ..domain.models import VoiceVerdict
-from ..io.jsontext import last_json_object
+from ..io.jsontext import iter_json_objects
 
 #: Matches a ``VERDICT: <token>`` line anywhere in an answer; the last match wins.
 _VERDICT_LINE = re.compile(r"^\s*VERDICT:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
@@ -56,11 +56,19 @@ def _verdict_from_line(text: str) -> str | None:
 
 
 def _verdict_from_json(text: str) -> str | None:
-    obj = last_json_object(text)
-    if not isinstance(obj, dict):
-        return None
-    verdict = obj.get("verdict")
-    return _normalize(verdict) if isinstance(verdict, str) and verdict.strip() else None
+    """Return the verdict from the last JSON object that carries a usable ``verdict`` string.
+
+    Not merely the last object: a model often appends a trailing footer object (token usage, a
+    "done" marker) after its verdict object, so scan every object and keep the last one whose
+    ``verdict`` is a non-empty string. A trailing footer without a ``verdict`` no longer shadows the
+    vote (which would otherwise mis-record the voice as ``unparseable``).
+    """
+    chosen: str | None = None
+    for obj in iter_json_objects(text):
+        verdict = obj.get("verdict")
+        if isinstance(verdict, str) and verdict.strip():
+            chosen = verdict
+    return _normalize(chosen) if chosen is not None else None
 
 
 def _normalize(token: str) -> str:
@@ -95,7 +103,7 @@ def aggregate(strategy: Strategy, voices: list[VoiceVerdict], *, min_quorum: int
         total_weight = sum(voice.weight for voice in voices)  # failed voices keep their weight in the denominator
         return _strict_majority(sums, total_weight)
     if strategy is Strategy.PARITY_PAIR:
-        return _parity_pair(voices, parseable)
+        return _parity_pair(voices)
     return ("split", None)  # defensive; ALL_VOICES does not aggregate
 
 
@@ -120,7 +128,12 @@ def _strict_majority(scores: dict[Any, float] | Counter[Any], total: float) -> t
 
 
 def _plurality(scores: dict[Any, float] | Counter[Any]) -> tuple[str, str | None]:
-    """The single highest-scoring verdict wins even below 50%; a tie at the top is ``tied``."""
+    """The single highest-scoring verdict wins even below 50%; a tie at the top is ``tied``.
+
+    This is the deliberately lenient rule: unlike ``majority``/``weighted`` it does not require a
+    >50% share, so it can certify off a minority of the parseable voices. The only floor on it is
+    ``min_quorum`` (applied in :func:`aggregate`); raise that to refuse a thin plurality.
+    """
     if not scores:
         return ("tied", None)
     top = max(scores.values())
@@ -130,12 +143,20 @@ def _plurality(scores: dict[Any, float] | Counter[Any]) -> tuple[str, str | None
     return ("tied", None)
 
 
-def _parity_pair(voices: list[VoiceVerdict], parseable: list[VoiceVerdict]) -> tuple[str, str | None]:
-    """The proposer's verdict must match every parity counterweight, or the panel escalates."""
+def _parity_pair(voices: list[VoiceVerdict]) -> tuple[str, str | None]:
+    """The proposer's verdict must match every parity counterweight, or the panel escalates.
+
+    Every parity seat must weigh in: a counterweight that failed or produced no verdict is a
+    non-answer that cannot corroborate, so it vetoes agreement and the panel escalates -- rather than
+    declaring agreement off only the parity voices that happened to parse. This honors the same
+    "failed/unparseable voices are not silently dropped" invariant as the counting strategies.
+    """
     proposer = _find_proposer(voices)
-    parity_voices = [voice for voice in parseable if voice.parity]
+    parity_voices = [voice for voice in voices if voice.parity]
     if proposer is None or proposer.verdict is None or not parity_voices:
         return ("escalate", None)
+    if any(not voice.ok or voice.verdict is None for voice in parity_voices):
+        return ("escalate", None)  # a counterweight that did not answer cannot corroborate
     if {voice.verdict for voice in parity_voices} == {proposer.verdict}:
         return ("agree", proposer.verdict)
     return ("escalate", None)

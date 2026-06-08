@@ -111,26 +111,33 @@ class DelegationService:
             except RutherfordError as exc:
                 return self._error(ctx, exc)
 
-        # Optional read_only enforcement: snapshot the git tree before the run so a non-mutating
+        # Optional read_only enforcement: fingerprint the git tree before the run so a non-mutating
         # delegation that nonetheless writes is caught (off by default; only for git working dirs).
         verify = self._config.verify_read_only and not is_mutating(req.safety_mode) and bool(req.working_dir)
-        before = await asyncio.to_thread(_git_status, req.working_dir) if verify and req.working_dir else None
+        before = await asyncio.to_thread(_git_fingerprint, req.working_dir) if verify and req.working_dir else None
 
         result, raw = await self._execute(adapter, req, ctx, base_depth, on_progress)
 
         if self._should_fallback(adapter, req, result):
             result, raw = await self._fallback(adapter, req, ctx, base_depth, on_progress)
 
-        if before is not None and req.working_dir:
-            after = await asyncio.to_thread(_git_status, req.working_dir)
+        # Check the tree only when the run actually succeeded. A run that already failed (timeout,
+        # non-zero exit, parse/contract error) keeps its real error -- overwriting it with
+        # READONLY_VIOLATED would hide why it failed, and a partial write from a crashed run is not
+        # the invariant this guards. ``fallback_from`` is carried onto the violation so a fallback on
+        # the offending run is not lost.
+        if result.ok and before is not None and req.working_dir:
+            after = await asyncio.to_thread(_git_fingerprint, req.working_dir)
             if after is not None and after != before:
+                fallback_from = result.fallback_from
                 result = self._fail(
                     ctx,
                     ErrorCode.READONLY_VIOLATED,
                     f"{req.safety_mode.value} delegation to {req.target.cli} modified the git working tree "
-                    "at working_dir, which a non-mutating mode must not do",
+                    "under working_dir, which a non-mutating mode must not do",
                     raw=raw,
                 )
+                result.fallback_from = fallback_from
 
         result.raw = _combine_raw(raw) if (req.include_raw and raw is not None) else None
         return result
@@ -281,16 +288,48 @@ def _contract_ok(adapter: CLIAdapter, raw: ProcessResult | None) -> bool:
         return True
 
 
-def _git_status(working_dir: str) -> str | None:
-    """Return ``git status --porcelain`` for ``working_dir``, or ``None`` when it cannot be read.
+def _git_fingerprint(working_dir: str) -> str | None:
+    """Return a content fingerprint of the tree under ``working_dir``, or ``None`` if it cannot be read.
 
-    ``None`` means the directory is not a git repo or git is unavailable, so read_only verification
-    is skipped (it cannot snapshot a non-git tree cheaply). A non-``None`` value that differs before
-    and after a run signals the tree was mutated.
+    Combines ``git status --porcelain --ignored=matching`` with the unstaged and staged diffs, all
+    scoped to the ``working_dir`` subtree (the ``-- .`` pathspec), so the snapshot reflects content,
+    not just status codes:
+
+    * Status codes alone miss a *further* edit to an already-modified tracked file (its porcelain line
+      is unchanged); the diffs catch the content change.
+    * ``--ignored=matching`` surfaces a write to a gitignored path (a scratch dir, ``.env``, build
+      output) that plain status hides. A pre-existing ignored file cancels out across before/after, so
+      only a *new* ignored write moves the fingerprint.
+    * ``-- .`` scopes to the subtree, so an unrelated change elsewhere in a larger repo is not
+      mis-attributed to this delegation.
+
+    ``None`` means the directory is not a git repo or git is unavailable, so verification is skipped.
+    A non-``None`` value that differs before and after a run signals the subtree was mutated. Remaining
+    limits, documented on ``verify_read_only``: a write *outside* the repo is unobservable this way,
+    and under concurrent fan-out on a shared tree a peer's write can still be attributed here.
+    """
+    parts: list[str] = []
+    for args in (
+        ["status", "--porcelain", "--ignored=matching", "--", "."],
+        ["diff", "--", "."],
+        ["diff", "--cached", "--", "."],
+    ):
+        section = _git_run(working_dir, args)
+        if section is None:
+            return None
+        parts.append(section)
+    return "\x1e".join(parts)
+
+
+def _git_run(working_dir: str, args: list[str]) -> str | None:
+    """Run a read-only ``git`` command in ``working_dir`` and return stdout, or ``None`` on failure.
+
+    ``--no-optional-locks`` keeps a concurrent ``git`` process from being blocked by (or blocking on)
+    the index lock during these read-only queries.
     """
     try:
         completed = subprocess.run(
-            ["git", "-C", working_dir, "status", "--porcelain"],
+            ["git", "-C", working_dir, "--no-optional-locks", *args],
             capture_output=True,
             text=True,
             timeout=15,

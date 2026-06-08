@@ -69,6 +69,8 @@ def _env_overrides(env: Mapping[str, str]) -> dict[str, Any]:
         overrides["max_depth"] = _as_int("RUTHERFORD_MAX_DEPTH", value)
     if (value := env.get("RUTHERFORD_MAX_TARGETS")) is not None:
         overrides["max_targets"] = _as_int("RUTHERFORD_MAX_TARGETS", value)
+    if (value := env.get("RUTHERFORD_MAX_CONCURRENCY")) is not None:
+        overrides["max_concurrency"] = _as_int("RUTHERFORD_MAX_CONCURRENCY", value)
     if (value := env.get("RUTHERFORD_DEFAULT_TIMEOUT_S")) is not None:
         overrides["default_timeout_s"] = _as_float("RUTHERFORD_DEFAULT_TIMEOUT_S", value)
     if (value := env.get("RUTHERFORD_DEFAULT_SAFETY")) is not None:

@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from rutherford.domain.enums import Strategy
 from rutherford.domain.models import VoiceVerdict
 from rutherford.services.strategies import aggregate, extract_verdict, verdict_instruction
@@ -51,6 +54,29 @@ def test_extract_verdict_json_without_verdict_field_is_none() -> None:
 def test_extract_verdict_invalid_json_is_none() -> None:
     schema = {"type": "object"}
     assert extract_verdict("not json at all", schema) is None
+
+
+def test_extract_verdict_ignores_a_trailing_array_of_objects() -> None:
+    # The drift the bulletproofing audit caught: a verdict object followed by a trailing array of
+    # objects (a "related files" list). The scanner does not descend into the array, so the real
+    # verdict still wins instead of being shadowed by the last array element.
+    schema = {"type": "object"}
+    text = '{"verdict": "block"}\nRelated: [{"file": "a.py"}, {"verdict": "approve"}]'
+    assert extract_verdict(text, schema) == "block"
+
+
+def test_extract_verdict_prefers_the_last_object_that_has_a_verdict() -> None:
+    # A trailing footer object (token usage, a "done" marker) without a verdict must not shadow the
+    # real verdict and mis-record the voice as unparseable.
+    schema = {"type": "object"}
+    text = '{"verdict": "approve"}\n{"tokens": 42, "done": true}'
+    assert extract_verdict(text, schema) == "approve"
+
+
+def test_voice_verdict_rejects_a_negative_weight() -> None:
+    # A negative weight would shrink the strategy denominator and let one voice fake a majority.
+    with pytest.raises(ValidationError):
+        VoiceVerdict(label="a", cli="a", verdict="approve", weight=-1.0)
 
 
 def test_verdict_instruction_differs_by_mode() -> None:
@@ -155,3 +181,14 @@ def test_parity_pair_falls_back_to_heaviest_non_parity_proposer() -> None:
     # No seat labeled "proposer": the heaviest non-parity voice plays that role.
     voices = [_voice("a", "approve", weight=3.0), _voice("b", "approve", parity=True)]
     assert aggregate(Strategy.PARITY_PAIR, voices) == ("agree", "approve")
+
+
+def test_parity_pair_escalates_when_a_counterweight_fails() -> None:
+    # The bulletproofing fix: a parity counterweight that failed or produced no verdict cannot
+    # corroborate, so the panel escalates rather than agreeing off only the surviving counterweights.
+    voices = [
+        _voice("proposer", "approve"),
+        _voice("d1", "approve", parity=True),
+        _voice("d2", None, ok=False, parity=True),
+    ]
+    assert aggregate(Strategy.PARITY_PAIR, voices) == ("escalate", None)

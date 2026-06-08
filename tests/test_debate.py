@@ -209,3 +209,35 @@ async def test_closing_defaults_to_a_participant_and_records_it() -> None:
     result = await service.debate(DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1))
     # No judge: a participant writes the closing, but synthesis_by surfaces which one.
     assert result.synthesis_by in {"a", "b"}
+
+
+async def test_explicit_label_colliding_with_a_generated_suffix_stays_distinct() -> None:
+    # The bulletproofing fix: a caller who hand-labels a seat "a#2" must not collide with the
+    # auto-generated "#2" for two unlabeled "a" seats. All display labels stay distinct, and no
+    # rebuttal prompt shows two different seats under one "## a#2" heading.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="my position"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.debate(
+        DebateRequest(
+            targets=[Target(cli="a"), Target(cli="a"), Target(cli="a", label="a#2")],
+            prompt="q",
+            rounds=2,
+        )
+    )
+    round_one = result.rounds[0].contributions
+    assert len({c.label for c in round_one}) == 3  # three distinct display labels, no collision
+    assert len({c.seat_id for c in round_one}) == 3
+    later_prompts = [spec.argv[2] for spec, _ in runner.calls][3:]
+    assert all(prompt.count("## a#2") <= 1 for prompt in later_prompts)
+
+
+async def test_closing_with_a_failing_judge_records_no_author() -> None:
+    # The bulletproofing fix: a named judge that cannot run produces no synthesis, so synthesis_by
+    # must not claim the judge authored one that does not exist.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("j", installed=False)], runner)
+    result = await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, judge=Target(cli="j"))
+    )
+    assert result.final is None
+    assert result.synthesis_by is None

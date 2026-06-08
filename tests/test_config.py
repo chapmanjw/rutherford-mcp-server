@@ -93,3 +93,30 @@ def test_default_model_for() -> None:
     config = RutherfordConfig(adapters={"opencode": AdapterConfig(default_model="anthropic/claude-sonnet-4-6")})
     assert config.default_model_for("opencode") == "anthropic/claude-sonnet-4-6"
     assert config.default_model_for("absent") is None
+
+
+def test_max_concurrency_defaults_to_max_targets(tmp_path: Path) -> None:
+    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+    assert config.max_concurrency == config.max_targets == 8
+
+
+def test_max_concurrency_follows_a_raised_max_targets(tmp_path: Path) -> None:
+    # Raising max_targets must not silently throttle a single auto-panel to the old default of 8.
+    (tmp_path / "rutherford.toml").write_text("max_targets = 16\n", encoding="utf-8")
+    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+    assert config.max_targets == 16
+    assert config.max_concurrency == 16
+
+
+def test_explicit_max_concurrency_wins_over_the_derived_default(tmp_path: Path) -> None:
+    (tmp_path / "rutherford.toml").write_text("max_targets = 16\nmax_concurrency = 4\n", encoding="utf-8")
+    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+    assert config.max_targets == 16
+    assert config.max_concurrency == 4  # an explicit cap (e.g. a laptop) is respected
+
+
+def test_max_concurrency_env_override(tmp_path: Path) -> None:
+    env = _env(tmp_path / "empty")
+    env["RUTHERFORD_MAX_CONCURRENCY"] = "3"
+    config = load_config(env=env, cwd=tmp_path)
+    assert config.max_concurrency == 3
