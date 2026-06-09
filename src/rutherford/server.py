@@ -44,7 +44,8 @@ mcp: FastMCP = FastMCP(
         "CLI, `consensus` to ask several in parallel, `debate` to have several argue across rounds "
         "(returning the full transcript), and `capabilities`/`doctor` to see which are installed and "
         "authenticated. Delegations default to read_only; write and yolo are explicit opt-in. Long "
-        "tasks can run as background jobs (mode=async), polled with job_status / job_result."
+        "tasks can run as background jobs (mode=async), enumerated with list_jobs, polled with "
+        "job_status / job_result, and cancelled with cancel_job."
     ),
 )
 
@@ -52,10 +53,18 @@ _APP: AppContext | None = None
 
 
 def get_app() -> AppContext:
-    """Return the shared application context, building it lazily on first use."""
+    """Return the shared application context, building it lazily on first use.
+
+    Logging is configured here on the lazy build (not in ``build_app_context``, which tests drive
+    directly and want quiet), so any real entry point -- the ``rutherford`` console script via
+    ``main`` or an embedded ``fastmcp run server.py:mcp`` that reaches a tool -- has structured
+    logging set up (stderr, ``propagate=False``) before the first event, rather than dropping events
+    or letting an unconfigured logger propagate to a host's root stdout handler.
+    """
     global _APP
     if _APP is None:
         _APP = build_app_context()
+        configure_logging(_APP.config.log_level, _APP.config.log_format)
     return _APP
 
 
@@ -139,9 +148,11 @@ async def consensus(
     a saved `panel` (with optional `panel_overrides`) instead of `targets`; the two are mutually
     exclusive. Optional `stances` (parallel to `targets`) steer each voice: for | against | neutral,
     and cannot be combined with the auto-expanded panel. `synthesize=true` adds a server-side combined
-    answer (off by default). A `strategy` (`all-voices` | `unanimous` | `majority` | `weighted` |
-    `parity-pair`), optionally with a `verdict_schema`, aggregates the voices into an `outcome` instead
-    of returning them individually. With `mode="async"` a job id is returned.
+    answer (off by default). A `strategy` (`all-voices` | `unanimous` | `majority` | `plurality` |
+    `weighted` | `parity-pair`), optionally with a `verdict_schema`, aggregates the voices into an
+    `outcome` instead of returning them individually. Optional `judge` names a target (ideally a
+    non-participant) that writes the synthesis or closing instead of the first voice; recorded as
+    `synthesis_by` in the result. With `mode="async"` a job id is returned.
     """
     return await _guarded(
         consensus_tool(
@@ -191,9 +202,10 @@ async def debate(
     are mutually exclusive. `rounds` (default 2) is how many passes the panel makes: round one is each
     voice's independent answer, and each later round shows a voice the others' latest positions and
     asks it to rebut and revise. Optional `stances` (parallel to `targets`) keep a voice arguing for |
-    against | neutral throughout. `synthesize=true` (default) adds a closing summary. The result's
-    `rounds` hold every voice's answer at every round, so the discussion is fully retraceable. With
-    `mode="async"` a job id is returned.
+    against | neutral throughout. `synthesize=true` (default) adds a closing summary. Optional `judge`
+    names a target (ideally a non-participant) that writes the closing synthesis instead of the first
+    voice; recorded as `synthesis_by` in the result. The result's `rounds` hold every voice's answer
+    at every round, so the discussion is fully retraceable. With `mode="async"` a job id is returned.
     """
     return await _guarded(
         debate_tool(

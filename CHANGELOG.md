@@ -67,6 +67,25 @@ All notable changes to this project are documented in this file. The format is b
   `consensus` / `debate` / `review` is one clean `UNKNOWN_TARGET` at the tool boundary instead of a
   buried failed voice.
 
+### Changed
+
+- **Consensus strategy semantics (behavior change for existing callers).** `majority` and `weighted`
+  now require a *true* majority -- more than half of all eligible voices / summed weight -- and return
+  `no_majority` otherwise; previously they returned the top-scoring verdict even below 50%. A 1.0.0
+  caller using `strategy=majority` may now receive `no_majority` where it previously got a decision.
+  The old "top scorer wins" behavior is available unchanged as the new `plurality` strategy, and
+  `unanimous` / `parity-pair` now also count failed/unparseable voices (see Fixed). This is a
+  deliberate correctness fix -- the old `majority` was effectively a plurality -- and ships in a minor
+  because the project is pre-stable (Alpha), but callers that switch on `outcome` should review it.
+- **Stricter config validation can reject a previously-accepted config at load.** Numeric fields now
+  enforce bounds (a zero/negative `max_depth`, `default_timeout_s`, `max_targets`, `max_debate_rounds`,
+  etc. is refused, with generous upper caps), a config-driven generic adapter with
+  `output_mode = "jsonl"` or `"transcript"` is refused (those need a code adapter; 1.0.0 accepted them
+  but silently returned the raw stream), and `output_mode = "json"` now requires `json_text_path`. A
+  config relying on any of these now fails fast at startup with a clear `ConfigError` -- the intended
+  firm-up, but an upgrade note. (`trusted_workspaces` / `role_dirs` are now resolved to absolute paths
+  and a missing directory warns rather than failing -- it still fails safe.)
+
 ### Fixed
 
 - Consensus strategy aggregation no longer certifies an outcome off the surviving voices alone. A

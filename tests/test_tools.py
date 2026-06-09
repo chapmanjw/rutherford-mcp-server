@@ -15,6 +15,7 @@ from rutherford.domain.enums import AuthState
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import ProcessResult
 from rutherford.tools.consensus import consensus_tool
+from rutherford.tools.debate import debate_tool
 from rutherford.tools.delegate import delegate_tool
 from rutherford.tools.jobs import job_result_tool, job_status_tool
 from tests.fakes import FakeAdapter, FakeProcessRunner, make_app
@@ -54,6 +55,23 @@ async def test_consensus_tool_unknown_target_is_a_clean_boundary_error() -> None
     app = make_app(adapters=[FakeAdapter("fake")])
     with pytest.raises(RutherfordError) as info:
         await consensus_tool(app, targets=[{"cli": "fake"}, {"cli": "ghost"}], prompt="q")
+    assert info.value.code == "UNKNOWN_TARGET"
+
+
+async def test_consensus_tool_unknown_judge_is_a_clean_boundary_error() -> None:
+    # A typo'd judge is a clean UNKNOWN_TARGET, not a silent no-synthesis.
+    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")])
+    with pytest.raises(RutherfordError) as info:
+        await consensus_tool(
+            app, targets=[{"cli": "a"}, {"cli": "b"}], prompt="q", synthesize=True, judge={"cli": "ghost"}
+        )
+    assert info.value.code == "UNKNOWN_TARGET"
+
+
+async def test_debate_tool_unknown_judge_is_a_clean_boundary_error() -> None:
+    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")])
+    with pytest.raises(RutherfordError) as info:
+        await debate_tool(app, prompt="q", targets=["a", "b"], judge={"cli": "ghost"})
     assert info.value.code == "UNKNOWN_TARGET"
 
 

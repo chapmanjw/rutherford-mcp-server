@@ -18,8 +18,9 @@ Windows, macOS, and Linux.
 claude mcp add rutherford -- rutherford-mcp-server
 ```
 
-Then, in a session, the Rutherford tools (`delegate`, `consensus`, `review`, `plan`,
-`capabilities`, `doctor`, `job_status`, `job_result`, `list_roles`) are available.
+Then, in a session, the Rutherford tools (`delegate`, `consensus`, `debate`, `review`, `plan`,
+`capabilities`, `doctor`, `job_status`, `job_result`, `list_jobs`, `cancel_job`, `list_roles`,
+`reload_panels`, `setup`) are available.
 
 ## Claude Desktop
 

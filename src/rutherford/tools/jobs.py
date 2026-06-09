@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""The ``job_status`` and ``job_result`` tools for background executions."""
+"""Background-job tools: ``job_status``, ``job_result``, ``list_jobs``, and ``cancel_job``."""
 
 from __future__ import annotations
 

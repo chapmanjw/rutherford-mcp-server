@@ -234,12 +234,13 @@ voice's verdict alongside its full reasoning. The strategies:
 | Strategy | What it does |
 | --- | --- |
 | `all-voices` | Every voice, no aggregation (the default). |
-| `unanimous` | Agrees only if every voice matches, otherwise reports a split. |
-| `majority` | One voice, one vote; the most-voted verdict wins. |
-| `weighted` | The verdict with the greatest summed target weight wins. |
-| `parity-pair` | Compares a proposer against parity counterweights; disagreement escalates. |
+| `unanimous` | Every eligible voice must weigh in and agree; a failed or unparseable voice vetoes. |
+| `majority` | A verdict must exceed 50% of all eligible voices (failed/unparseable count in the denominator); no verdict over the bar is `no_majority`. |
+| `plurality` | The single top-scoring verdict wins even below 50%; a tie at the top is `tied`. (This was the pre-1.1 `majority` behavior.) |
+| `weighted` | Like `majority` but on summed target weight: one verdict must exceed 50% of total eligible weight, else `no_majority`. |
+| `parity-pair` | Compares a proposer against parity counterweights; disagreement or a missing counterweight escalates. |
 
-Verdicts are read from a final `VERDICT: <token>` line, or as JSON if you pass a `verdict_schema`.
+Verdicts are read from a final `VERDICT: <token>` line, or as JSON if you pass a `verdict_schema`. The `min_quorum` config field (default `1`) sets how many parseable voices an aggregating strategy needs; below it the outcome is `no_quorum`. An optional `judge` target (ideally a non-participant) writes the synthesis or closing instead of the first voice, recorded as `synthesis_by` in the result. The same `judge` option applies to `debate`.
 
 ### Save a crew as a panel and reuse it
 
@@ -305,8 +306,7 @@ accident. See the safety model below.
 > Start a big refactor on OpenCode in the background — "convert the data layer to the repository pattern" in
 > `C:\work\myrepo` — and just give me the job id.
 
-`delegate` (or `consensus` / `debate`) in async mode returns a job id immediately. "Is that Rutherford job
-done yet? Show me the result if it finished" polls `job_status` / `job_result`.
+`delegate` (or `consensus` / `debate`) in async mode returns a job id immediately. Use `list_jobs` to see all retained jobs, `job_status` / `job_result` to poll a specific one, and `cancel_job` to cancel a running or pending job.
 
 ### Get a fresh, unbiased take on your own work
 

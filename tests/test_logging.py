@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -13,9 +14,11 @@ import pytest
 
 from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import RutherfordConfig
-from rutherford.domain.models import DelegationRequest, ProcessResult, Target
+from rutherford.domain.enums import JobStatus
+from rutherford.domain.models import DelegationRequest, DelegationResult, ProcessResult, Target
 from rutherford.runtime.logging import LOGGER_NAME, configure_logging, log_event
 from rutherford.services.delegation import DelegationService
+from rutherford.services.jobs import JobService
 from rutherford.services.roles import load_roles
 from tests.fakes import FakeAdapter, FakeProcessRunner
 
@@ -75,3 +78,27 @@ async def test_delegation_emits_a_delegate_event() -> None:
     assert delegate_events[0]["correlation_id"] == "cid-1"
     assert delegate_events[0]["cli"] == "a"
     assert delegate_events[0]["ok"] is True
+
+
+async def test_failed_job_logs_error_type_not_the_exception_message() -> None:
+    # A crashing body's exception message could carry prompt/secret content; the structured log must
+    # record only the exception TYPE, never the message.
+    stream = _stream()
+    service = JobService()
+
+    async def body(progress: object) -> DelegationResult:
+        raise ValueError("SECRET prompt content that must not be logged")
+
+    job = service.submit("delegate", body)
+    for _ in range(500):
+        if service.get(job.id).status is JobStatus.FAILED:
+            break
+        await asyncio.sleep(0)
+    finished = [
+        json.loads(line)
+        for line in stream.getvalue().splitlines()
+        if line.strip() and json.loads(line).get("event") == "job_finished"
+    ]
+    assert finished and finished[0]["status"] == "failed"
+    assert finished[0]["error_type"] == "ValueError"
+    assert "SECRET" not in stream.getvalue()  # the exception message never reaches the logs

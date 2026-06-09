@@ -23,6 +23,8 @@ EXPECTED_TOOLS = {
     "doctor",
     "job_status",
     "job_result",
+    "list_jobs",
+    "cancel_job",
     "list_roles",
     "reload_panels",
     "setup",
@@ -45,7 +47,7 @@ def wired_server() -> Iterator[None]:
 async def test_mcp_lists_all_tools(wired_server: None) -> None:
     async with Client(server.mcp) as client:
         names = {tool.name for tool in await client.list_tools()}
-        assert names >= EXPECTED_TOOLS
+        assert names == EXPECTED_TOOLS  # exact: a new/removed tool must update this set (and the docs)
 
 
 async def test_mcp_delegate_round_trip(wired_server: None) -> None:

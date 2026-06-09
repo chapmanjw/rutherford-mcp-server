@@ -97,24 +97,32 @@ class JobStore:
             job.updated_at = self._clock()
 
     def complete(self, job_id: str, result: JobResult) -> None:
-        """Record a finished job. The job succeeded even if its delegation result is ``ok=false``."""
+        """Record a finished job. The job succeeded even if its delegation result is ``ok=false``.
+
+        A no-op if the job is already terminal -- e.g. it was cancelled while its body ran (and the
+        body swallowed the cancellation and returned), so a late ``complete`` cannot flip CANCELLED
+        back to SUCCEEDED.
+        """
         job = self._jobs.get(job_id)
-        if job is not None:
+        if job is not None and job.status not in _TERMINAL_STATUSES:
             job.result = result
             job.status = JobStatus.SUCCEEDED
             job.updated_at = self._clock()
 
     def fail(self, job_id: str, error: ErrorInfo) -> None:
-        """Record that the job itself errored (an exception, not a delegation failure)."""
+        """Record that the job itself errored (an exception, not a delegation failure).
+
+        A no-op if the job is already terminal (e.g. cancelled), so a late failure cannot overwrite it.
+        """
         job = self._jobs.get(job_id)
-        if job is not None:
+        if job is not None and job.status not in _TERMINAL_STATUSES:
             job.error = error
             job.status = JobStatus.FAILED
             job.updated_at = self._clock()
 
     def _touch(self, job_id: str, status: JobStatus) -> None:
         job = self._jobs.get(job_id)
-        if job is not None:
+        if job is not None and job.status not in _TERMINAL_STATUSES:
             job.status = status
             job.updated_at = self._clock()
 
@@ -174,7 +182,9 @@ class JobService:
             raise
         except Exception as exc:  # a crashing job body becomes a failed job, not a server crash
             self._store.fail(job_id, ErrorInfo(code=str(ErrorCode.INTERNAL), message=str(exc)))
-            log_event("job_finished", job_id=job_id, status=JobStatus.FAILED.value, error=str(exc))
+            # Log only the exception TYPE, not str(exc): a crashing body's message could carry prompt
+            # or file content. The full message is still on the job's result for job_result to return.
+            log_event("job_finished", job_id=job_id, status=JobStatus.FAILED.value, error_type=type(exc).__name__)
 
     def cancel(self, job_id: str) -> Job:
         """Cancel a running/pending job, killing its CLI process tree; return the updated job.

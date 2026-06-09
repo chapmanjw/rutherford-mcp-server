@@ -152,9 +152,13 @@ class RutherfordConfig(BaseModel):
     #: so ``capabilities`` / ``doctor`` / ``expand_all`` do not re-fork the same ``--version`` / status
     #: subprocesses within one burst. ``0`` disables caching. ``doctor``'s live check invalidates first.
     probe_cache_ttl_s: float = Field(default=10.0, ge=0)
-    #: Hard per-probe timeout ceiling (seconds): a metadata probe is capped at ``min(its own, this)`` so
-    #: a CLI whose ``--version`` hangs cannot stall ``capabilities`` / ``expand_all`` for long.
-    probe_timeout_s: float = Field(default=8.0, ge=1)
+    #: Hard per-probe timeout ceiling (seconds): a metadata probe is capped at ``min(its own, this)``
+    #: so a hung probe cannot stall ``capabilities`` / ``doctor`` / ``expand_all`` forever. The default
+    #: (20s) is sized to the longest *legitimate* adapter probe -- ``codex doctor --json`` asks for 20s
+    #: and a slow auth/version check for 15s -- so the ceiling acts only as a hang guard and never
+    #: shortens a probe an adapter deliberately budgeted (an 8s default did, mis-reporting a slow but
+    #: valid Bedrock/custom-provider auth as logged-out). Lower it only if you accept that risk.
+    probe_timeout_s: float = Field(default=20.0, ge=1)
     #: Seconds a finished background job is retained before eviction.
     job_ttl_s: float = Field(default=3600.0, ge=1)
     #: Maximum number of background jobs retained at once; creating one past the cap (after evicting

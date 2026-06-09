@@ -116,6 +116,12 @@ def test_explicit_max_concurrency_wins_over_the_derived_default(tmp_path: Path) 
     assert config.max_concurrency == 4  # an explicit cap (e.g. a laptop) is respected
 
 
+def test_probe_timeout_default_covers_the_longest_auth_probe() -> None:
+    # The ceiling must not shorten a deliberate auth probe (codex doctor asks for 20s); an 8s default
+    # truncated it and mis-reported a slow but valid auth as logged-out.
+    assert RutherfordConfig().probe_timeout_s >= 20.0
+
+
 def test_max_concurrency_env_override(tmp_path: Path) -> None:
     env = _env(tmp_path / "empty")
     env["RUTHERFORD_MAX_CONCURRENCY"] = "3"

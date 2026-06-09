@@ -9,7 +9,15 @@ from typing import Any
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode
 from ..domain.models import ConsensusRequest, Target
-from .common import as_target, ensure_known_targets, parse_mode, parse_safety_mode, parse_stances, parse_strategy
+from .common import (
+    as_target,
+    ensure_known_cli,
+    ensure_known_targets,
+    parse_mode,
+    parse_safety_mode,
+    parse_stances,
+    parse_strategy,
+)
 from .panels import panel_for_call
 
 
@@ -64,6 +72,9 @@ async def consensus_tool(
             target_objs = [as_target(target) for target in targets or []]
     if not expand_all:
         ensure_known_targets(app.registry, target_objs)  # a clean tool-boundary error, not a buried voice
+    judge_target = as_target(judge) if judge is not None else None
+    if judge_target is not None:
+        ensure_known_cli(app.registry, judge_target.cli)  # a typo'd judge is a clean error, not silent no-synthesis
     effective_strategy = parse_strategy(strategy if strategy is not None else (panel_strategy or "all-voices"))
     request = ConsensusRequest(
         targets=target_objs,
@@ -80,7 +91,7 @@ async def consensus_tool(
         expand_all=expand_all,
         strategy=effective_strategy,
         verdict_schema=verdict_schema,
-        judge=as_target(judge) if judge is not None else None,
+        judge=judge_target,
     )
     correlation_id = app.new_correlation_id()
 

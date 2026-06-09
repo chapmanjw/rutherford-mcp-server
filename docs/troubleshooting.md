@@ -216,7 +216,7 @@ For `goose` specifically: `GOOSE_MODE=auto` is reportedly ignored when the `clau
 
 ### `JOB_NOT_FOUND` -- polling a job that no longer exists
 
-**Cause.** Background jobs live in memory with a TTL of `3600` seconds (one hour, as defined in `JobStore.__init__`). After a job reaches `SUCCEEDED` or `FAILED` status and the TTL elapses, it is evicted on the next `get` call. Calling `job_status` or `job_result` after eviction returns `JOB_NOT_FOUND`.
+**Cause.** Background jobs live in memory with a TTL set by `job_ttl_s` (default `3600` seconds / one hour). After a job reaches a terminal status (`succeeded`, `failed`, or `cancelled`) and the TTL elapses, it is evicted on the next `get` call. Calling `job_status` or `job_result` after eviction returns `JOB_NOT_FOUND`.
 
 Jobs are also lost if the Rutherford server process restarts, since nothing is persisted to disk.
 
@@ -278,11 +278,14 @@ Read the field path and fix the corresponding key in your `rutherford.toml` or `
 | `BINARY_NOT_FOUND` | Run `doctor`; install the CLI per `docs/integration-testing.md` |
 | `AUTH_REQUIRED` | Run `doctor`; log in or set the API key env var once |
 | `WORKSPACE_NOT_TRUSTED` | Pass `trust_workspace=true` or add path to `trusted_workspaces` |
+| `READONLY_VIOLATED` | A `read_only`/`propose` delegation modified the git working tree; check the CLI output or disable `verify_read_only` |
+| `CONTRACT_MISMATCH` | An adapter's output did not satisfy the expected contract (e.g. wrong type or missing field); check CLI version against adapter verification date |
+| `TOO_MANY_JOBS` | Cap of `max_jobs` retained background jobs reached; collect and let jobs expire, or raise `max_jobs` in config |
 | `TIMEOUT` | Raise `timeout_s` on the call or `default_timeout_s` in config |
 | `MAX_DEPTH_EXCEEDED` | Raise `max_depth` in config (default 3); check for self-referential prompts |
 | `TOO_MANY_TARGETS` | Reduce targets or raise `max_targets` (default 8) |
 | `TRANSCRIPT_NOT_FOUND` | Pin `agy` version; serialize concurrent `agy` calls; check `include_raw` |
 | `PARSE_ERROR` | Set `include_raw=true`; compare CLI version to adapter verification date |
-| `JOB_NOT_FOUND` | Collect results before TTL (1 hour); id is a hex uuid4 string |
+| `JOB_NOT_FOUND` | Collect results before TTL (`job_ttl_s`, default 1 hour); id is a hex uuid4 string |
 | `ROLE_NOT_FOUND` | Add directory to `role_dirs`; run `roles` tool to list visible roles |
 | `UNKNOWN_TARGET` | Run `capabilities` to list registered adapter ids |

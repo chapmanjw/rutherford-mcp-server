@@ -55,16 +55,25 @@ All fields are optional. Unset fields take the listed default.
 | `adapters` | `dict[str, AdapterConfig]` | `{}` | Per-adapter overrides keyed by adapter id. |
 | `generic_adapters` | `list[GenericAdapterConfig]` | `[]` | Config-defined adapters with no code module. |
 | `default_safety_mode` | `string` | `"read_only"` | Safety posture applied when a caller omits the field. One of `read_only`, `propose`, `write`, `yolo`. |
-| `default_timeout_s` | `float` | `300.0` | Per-run timeout in seconds. |
+| `default_timeout_s` | `float` | `300.0` | Per-run timeout in seconds (must be > 0). |
 | `role_dirs` | `list[str]` | `[]` | Extra directories to search for custom role files (in addition to the well-known scopes; see Custom roles). Built-in roles always load. |
-| `max_depth` | `int` | `3` | Maximum delegation depth. Delegations at this depth are refused. |
-| `max_targets` | `int` | `8` | Maximum targets per consensus or debate call. |
-| `max_debate_rounds` | `int` | `4` | Maximum rounds a single `debate` call may run. Each round is a full panel pass. |
+| `max_depth` | `int` | `3` | Maximum delegation depth (1–10). Delegations at this depth are refused. |
+| `max_targets` | `int` | `8` | Maximum targets per consensus or debate call (1–32). |
+| `max_debate_rounds` | `int` | `4` | Maximum rounds a single `debate` call may run (1–10). Each round is a full panel pass. |
+| `min_quorum` | `int` | `1` | Minimum parseable voices (with an extracted verdict) an aggregating strategy needs before it will certify an outcome. Below it the outcome is `no_quorum`. Guards against certifying a result off one surviving voice when the rest failed. |
+| `max_concurrency` | `int` | `max_targets` | Global cap on concurrent CLI subprocesses across all panels. Defaults to `max_targets` when not set explicitly. Overrideable via `RUTHERFORD_MAX_CONCURRENCY`. |
+| `trusted_workspaces` | `list[str]` | `[]` | Absolute paths under which `write` and `yolo` delegations are permitted. |
+| `synthesize_default` | `bool` | `false` | Whether consensus synthesizes server-side by default. |
+| `verify_read_only` | `bool` | `false` | Opt-in: after a successful `read_only` or `propose` delegation whose working directory is a git repo, fail the result with `READONLY_VIOLATED` if the tree changed. Off by default (adds git calls per delegation). |
+| `probe_cache_ttl_s` | `float` | `10.0` | Seconds to cache an adapter's metadata probe results (`detect` / `check_auth` / `available_models`). Set to `0` to disable. Prevents redundant subprocess forks when `capabilities` / `doctor` / `expand_all` run in quick succession. |
+| `probe_timeout_s` | `float` | `20.0` | Hard ceiling (seconds, ≥ 1) on a single metadata probe. A hung probe cannot stall `capabilities` / `doctor` / `expand_all` beyond this limit. |
+| `job_ttl_s` | `float` | `3600.0` | Seconds a finished background job is retained before eviction (≥ 1). |
+| `max_jobs` | `int` | `100` | Maximum background jobs retained at once (≥ 1). Creating a job past this cap (after evicting expired jobs) fails with `TOO_MANY_JOBS`. |
+| `log_level` | `string` | `"info"` | Structured-log verbosity. One of `debug`, `info`, `warning`, `error`. Logs go to stderr as JSON. |
+| `log_format` | `string` | `"json"` | Structured-log format. `json` emits one JSON object per line to stderr; `off` silences all logging. |
 
 Saved panels and custom roles are not fields of this file; they live in their own files (see
 Saved panels below) so the main config stays small.
-| `trusted_workspaces` | `list[str]` | `[]` | Absolute paths under which `write` and `yolo` delegations are permitted. |
-| `synthesize_default` | `bool` | `false` | Whether consensus synthesizes server-side by default. |
 
 ### `AdapterConfig` fields (under `[adapters.<id>]`)
 
@@ -88,6 +97,7 @@ entire config.
 | `RUTHERFORD_CONFIG_DIR` | path | A panels/roles config directory searched ahead of the project and home locations (see Saved panels). |
 | `RUTHERFORD_MAX_DEPTH` | integer | `max_depth` |
 | `RUTHERFORD_MAX_TARGETS` | integer | `max_targets` |
+| `RUTHERFORD_MAX_CONCURRENCY` | integer | `max_concurrency` |
 | `RUTHERFORD_DEFAULT_TIMEOUT_S` | float | `default_timeout_s` |
 | `RUTHERFORD_DEFAULT_SAFETY` | string | `default_safety_mode` |
 | `RUTHERFORD_TRUSTED_WORKSPACES` | `os.pathsep`-delimited paths | `trusted_workspaces` |
@@ -123,8 +133,8 @@ it is written to stdin and omitted from the argv.
 | `model_flag` | `string` or omitted | none | Flag prefix for model selection (e.g. `"--model"`). Omit if the CLI has no model flag. |
 | `working_dir_flag` | `string` or omitted | none | Flag prefix for working directory (e.g. `"--dir"`). Omit if the CLI uses process cwd only. |
 | `extra_args` | `list[str]` | `[]` | Arguments appended after safety/model/working-dir args, before the prompt. |
-| `output_mode` | `string` | `"text"` | How to extract the answer. One of `text`, `json`, `jsonl`, `transcript`. |
-| `json_text_path` | `string` or omitted | none | Dotted key path into the parsed JSON object (e.g. `"message.content"`). Only used when `output_mode` is `json`. Omit to return the full JSON object as text. |
+| `output_mode` | `string` | `"text"` | How to extract the answer. The generic adapter supports only `text` and `json`; `jsonl` and `transcript` require a code adapter and are rejected at load time. |
+| `json_text_path` | `string` or omitted | none | Dotted key path into the parsed JSON object (e.g. `"message.content"`). Required when `output_mode` is `json`. |
 | `safety` | `GenericSafetyConfig` | all empty lists | Per-safety-mode argv fragments. |
 | `version_args` | `list[str]` | `["--version"]` | Args passed to probe the binary version. |
 | `static_models` | `list[str]` | `[]` | Hard-coded model list reported by the adapter (no runtime query). |
@@ -270,13 +280,17 @@ debate transcript). `weight` and `parity` feed the consensus strategies (see bel
 By default `consensus` returns every voice (`strategy: all-voices`). Any other strategy asks each
 voice for a verdict and aggregates the panel into one `outcome`:
 
-| Strategy | Aggregation |
-|----------|-------------|
-| `all-voices` | Return every voice unchanged. No verdict, no aggregation. (Default.) |
-| `unanimous` | `unanimous` only if every voice shares one verdict, else `split`. |
-| `majority` | One voice, one vote; the most-voted verdict wins, ties are `tied`. |
-| `weighted` | The verdict with the greatest summed target `weight` wins, ties are `tied`. |
-| `parity-pair` | Compare the proposer against the `parity: true` seats; disagreement is `escalate`. |
+| Strategy | Aggregation | Possible outcomes |
+|----------|-------------|-------------------|
+| `all-voices` | Return every voice unchanged. No verdict, no aggregation. (Default.) | — |
+| `unanimous` | Every eligible voice must weigh in and agree; a failed or unparseable voice vetoes. | `unanimous`, `split`, `no_quorum` |
+| `majority` | A verdict must exceed 50% of **all** eligible voices (failed/unparseable count in the denominator). No verdict over the bar gives `no_majority`. | `majority`, `no_majority`, `no_quorum` |
+| `plurality` | The single top-scoring verdict wins even below 50%; a tie at the top is `tied`. (This was the pre-1.1 `majority` behavior.) | `plurality`, `tied`, `no_quorum` |
+| `weighted` | Like `majority` but on summed target `weight`: one verdict must exceed 50% of the total eligible weight, else `no_majority`. | `majority`, `no_majority`, `no_quorum` |
+| `parity-pair` | The proposer's verdict must match every parity counterweight; a missing, failed, or disagreeing counterweight is `escalate`. | `agree`, `escalate`, `no_quorum` |
+
+The `min_quorum` config field (default `1`) sets the minimum parseable voices an aggregating strategy
+needs before it will certify an outcome. Below that floor the outcome is `no_quorum`.
 
 A verdict is read from a final `VERDICT: <token>` line in each voice's answer. Pass a
 `verdict_schema` (a JSON schema) to instead ask each voice for a JSON object containing a `verdict`

@@ -137,6 +137,20 @@ def test_store_cancel_unknown_raises() -> None:
     assert info.value.code == "JOB_NOT_FOUND"
 
 
+def test_a_cancelled_job_is_not_overwritten_by_a_late_completion_or_failure() -> None:
+    # If a body swallows CancelledError and returns (or later raises), complete()/fail() must not
+    # flip the already-CANCELLED job back to SUCCEEDED/FAILED.
+    store = JobStore()
+    job = store.create("a")
+    store.cancel(job.id)
+    store.complete(job.id, _result())
+    assert store.get(job.id).status is JobStatus.CANCELLED
+    store.fail(job.id, ErrorInfo(code="INTERNAL", message="late"))
+    assert store.get(job.id).status is JobStatus.CANCELLED
+    store.mark_running(job.id)
+    assert store.get(job.id).status is JobStatus.CANCELLED
+
+
 def test_list_jobs_is_newest_first_and_excludes_evicted() -> None:
     clock = _Clock()
     store = JobStore(ttl_s=10.0, clock=clock)

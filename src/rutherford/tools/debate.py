@@ -9,7 +9,7 @@ from typing import Any
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode, Stance
 from ..domain.models import DebateRequest, Target
-from .common import as_target, ensure_known_targets, parse_mode, parse_safety_mode, parse_stances
+from .common import as_target, ensure_known_cli, ensure_known_targets, parse_mode, parse_safety_mode, parse_stances
 from .panels import panel_for_call
 
 
@@ -53,6 +53,9 @@ async def debate_tool(
         target_objs = [as_target(target) for target in targets or []]
         debate_stances = parse_stances(stances)
     ensure_known_targets(app.registry, target_objs)  # a clean tool-boundary error, not a buried voice
+    judge_target = as_target(judge) if judge is not None else None
+    if judge_target is not None:
+        ensure_known_cli(app.registry, judge_target.cli)  # a typo'd judge is a clean error, not silent no-synthesis
     request = DebateRequest(
         targets=target_objs,
         prompt=prompt,
@@ -66,7 +69,7 @@ async def debate_tool(
         timeout_s=timeout_s,
         include_raw=include_raw,
         depth=app.base_depth,
-        judge=as_target(judge) if judge is not None else None,
+        judge=judge_target,
     )
     correlation_id = app.new_correlation_id()
 
