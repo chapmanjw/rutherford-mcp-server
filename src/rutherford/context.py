@@ -26,11 +26,13 @@ from .domain.error_codes import ErrorCode
 from .domain.errors import RutherfordError
 from .io.serialize import encode
 from .runtime.depth import current_depth
+from .runtime.probe import SystemProbe
+from .runtime.probe_cache import CachingProbe
 from .runtime.process import AsyncProcessRunner, ProcessRunner
 from .services.consensus import ConsensusService
 from .services.debate import DebateService
 from .services.delegation import DelegationService
-from .services.jobs import JobService
+from .services.jobs import JobService, JobStore
 from .services.roles import RoleStore, load_roles
 
 
@@ -66,6 +68,9 @@ class AppContext:
     jobs: JobService
     #: The depth this server runs at, read from ``RUTHERFORD_DEPTH`` when it was spawned.
     base_depth: int = 0
+    #: The caching probe wrapping the adapters' metadata calls, when one was built (``None`` when a
+    #: registry was injected, e.g. in tests). ``doctor`` invalidates it before a live re-check.
+    probe_cache: CachingProbe | None = None
 
     def new_correlation_id(self) -> str:
         """Mint a short correlation id for a tool call."""
@@ -91,13 +96,22 @@ def build_app_context(
     resolved_runner = runner if runner is not None else AsyncProcessRunner()
     resolved_depth = current_depth() if base_depth is None else base_depth
 
-    resolved_registry = registry if registry is not None else build_registry(resolved_config)
+    probe_cache: CachingProbe | None = None
+    if registry is not None:
+        resolved_registry = registry
+    else:
+        probe_cache = CachingProbe(
+            SystemProbe(),
+            ttl_s=resolved_config.probe_cache_ttl_s,
+            ceiling_s=resolved_config.probe_timeout_s,
+        )
+        resolved_registry = build_registry(resolved_config, probe=probe_cache)
     resolved_roles = roles if roles is not None else load_roles(resolved_config.role_dirs)
     resolved_panels = panels if panels is not None else PanelCache(lambda: load_panels(resolved_registry.ids()))
     delegation = DelegationService(resolved_registry, resolved_runner, resolved_config, resolved_roles)
     consensus = ConsensusService(delegation, resolved_config, resolved_registry)
     debate = DebateService(delegation, resolved_config)
-    jobs = JobService()
+    jobs = JobService(JobStore(ttl_s=resolved_config.job_ttl_s, max_jobs=resolved_config.max_jobs))
     return AppContext(
         config=resolved_config,
         registry=resolved_registry,
@@ -108,4 +122,5 @@ def build_app_context(
         debate=debate,
         jobs=jobs,
         base_depth=resolved_depth,
+        probe_cache=probe_cache,
     )

@@ -42,8 +42,30 @@ All notable changes to this project are documented in this file. The format is b
 - An output-contract drift canary: an adapter can assert the machine-readable shape a successful run
   must have (`check_output_contract`), and a result that claims success but does not match is failed
   with the new `CONTRACT_MISMATCH` code instead of being trusted. The `claude_code` adapter asserts
-  a JSON result envelope and `codex` asserts a JSONL event stream, so a silent change to either CLI's
-  `--json` output surfaces as a loud failure rather than a degraded answer.
+  a JSON result envelope and `codex` asserts a JSONL event stream, and the `opencode`, `qwen`, and
+  `cursor` adapters now assert theirs too, so a silent change to a CLI's `--json` output surfaces as
+  a loud failure rather than a degraded answer.
+- `list_jobs` and `cancel_job` MCP tools, plus a job lifecycle: background jobs now have a configurable
+  `job_ttl_s` and a `max_jobs` cap (creating one past the cap fails with the new `TOO_MANY_JOBS`
+  code), `list_jobs` enumerates them newest-first, and `cancel_job` cancels a running/pending job --
+  killing its CLI process tree -- and records the new `cancelled` status. A lost job id is no longer
+  unrecoverable, and a runaway async fan-out is bounded.
+- Probe caching and a per-probe timeout ceiling: adapter metadata probes (`detect` / `check_auth` /
+  `available_models`) are cached for `probe_cache_ttl_s` (default 10s) and capped at `probe_timeout_s`
+  (default 8s), so `capabilities` / `doctor` / consensus auto-expansion no longer re-fork the same
+  `--version` / status subprocesses each call, and a CLI whose probe hangs cannot stall the snapshot.
+  `doctor` invalidates the cache before its live re-check.
+- Structured logging to stderr (config `log_level` / `log_format`, JSON by default, `off` to silence):
+  one JSON line per delegation and per job-lifecycle event, keyed on the correlation id that already
+  flows through the services, so a failed panel is traceable. No prompt/response content is logged,
+  and stdout (the MCP channel) is never written to.
+- Fail-fast input and config validation: numeric config fields are bounded (a zero/negative
+  `max_depth`, `default_timeout_s`, `max_targets`, etc. is rejected at load), a JSON generic adapter
+  must declare `json_text_path` (and `jsonl`/`transcript` generic adapters are rejected -- they need a
+  code adapter), `trusted_workspaces` / `role_dirs` are resolved to absolute paths with a warning on a
+  missing directory (a typo'd trust path no longer silently never matches), and an unknown `cli` id in
+  `consensus` / `debate` / `review` is one clean `UNKNOWN_TARGET` at the tool boundary instead of a
+  buried failed voice.
 
 ### Fixed
 
@@ -79,6 +101,20 @@ All notable changes to this project are documented in this file. The format is b
   path carries the same overrides as `-c` config values (`_resume_safety_args` now preserves every flag,
   not just the sandbox mode), and the `map_safety` docstring no longer claims `codex exec` has no
   approval-policy control. See docs/troubleshooting.md.
+- Adapter output parsing no longer turns a drifted CLI response into a confident wrong answer (an
+  adversarial audit of every adapter's `parse_output`):
+  - `claude_code` and `cursor` no longer return the literal string `"None"` (or an empty answer marked
+    `ok`) when the JSON envelope's `result` field is null or missing -- that is now a `PARSE_ERROR`.
+  - `qwen` no longer drops the real answer (carried in the assistant event) when the `result` event's
+    field has drifted, and fails loudly if neither carries text.
+  - the config-driven generic adapter no longer returns a Python `repr` of a non-string value when
+    `json_text_path` resolves to a dict/list/bool (drifted shape) -- that is now a `PARSE_ERROR`.
+  - `antigravity` no longer masks transcript-schema drift by returning unreliable stdout as a
+    successful answer, and no longer attributes a *different* (stale or another project's)
+    conversation's transcript to a run when the working dir is not in the index.
+  - `lmstudio` no longer leaks an entire chain-of-thought when a reasoning model is truncated
+    mid-`<think>` (now a `PARSE_ERROR`), and no longer deletes a literal `<think>...</think>` that
+    appears inside a legitimate answer (the strip is anchored to a leading reasoning block).
 
 ### Documentation
 

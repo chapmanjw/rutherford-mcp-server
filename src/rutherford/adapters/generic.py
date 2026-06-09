@@ -125,7 +125,9 @@ class GenericAdapter(BaseCLIAdapter):
                 return None
             if self._config.json_text_path:
                 value = _dotted_get(payload, self._config.json_text_path)
-                return None if value is None else str(value)
+                if value is None or isinstance(value, (dict, list, bool)):
+                    return None
+                return str(value)
             return json.dumps(payload, ensure_ascii=False)
         # TEXT, JSONL, and TRANSCRIPT generic CLIs return their stdout verbatim.
         return stdout.strip()

@@ -7,11 +7,14 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from toon import decode
 
 from rutherford.domain.enums import JobStatus
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import DelegationResult, ErrorInfo, Job, Target
 from rutherford.services.jobs import JobService, JobStore
+from rutherford.tools.jobs import cancel_job_tool, list_jobs_tool
+from tests.fakes import make_app
 
 
 class _Clock:
@@ -98,3 +101,82 @@ async def test_service_failing_body_marks_failed() -> None:
     assert final.status is JobStatus.FAILED
     assert final.error is not None
     assert "kaboom" in final.error.message
+
+
+def test_max_jobs_cap_raises_too_many_jobs() -> None:
+    store = JobStore(max_jobs=2)
+    store.create("a")
+    store.create("b")
+    with pytest.raises(RutherfordError) as info:
+        store.create("c")
+    assert info.value.code == "TOO_MANY_JOBS"
+
+
+def test_eviction_frees_a_slot_before_the_cap_bites() -> None:
+    clock = _Clock()
+    store = JobStore(ttl_s=10.0, max_jobs=1, clock=clock)
+    job = store.create("a")
+    store.complete(job.id, _result())
+    clock.now = 100.0  # the completed job is now expired
+    store.create("b")  # evicts the expired job first, so it does not hit the cap
+
+
+def test_store_cancel_marks_cancelled_and_leaves_terminal_jobs_unchanged() -> None:
+    store = JobStore()
+    job = store.create("a")
+    assert store.cancel(job.id).status is JobStatus.CANCELLED
+    assert store.cancel(job.id).status is JobStatus.CANCELLED  # already terminal: unchanged
+    done = store.create("b")
+    store.complete(done.id, _result())
+    assert store.cancel(done.id).status is JobStatus.SUCCEEDED  # a succeeded job is not flipped
+
+
+def test_store_cancel_unknown_raises() -> None:
+    with pytest.raises(RutherfordError) as info:
+        JobStore().cancel("missing")
+    assert info.value.code == "JOB_NOT_FOUND"
+
+
+def test_list_jobs_is_newest_first_and_excludes_evicted() -> None:
+    clock = _Clock()
+    store = JobStore(ttl_s=10.0, clock=clock)
+    a = store.create("a")
+    clock.now = 1.0
+    b = store.create("b")
+    assert [job.id for job in store.list_jobs()] == [b.id, a.id]  # newest first
+    store.complete(a.id, _result())
+    clock.now = 100.0
+    assert [job.id for job in store.list_jobs()] == [b.id]  # the expired terminal job is gone
+
+
+async def test_service_cancels_a_running_job() -> None:
+    service = JobService()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def body(progress: object) -> DelegationResult:
+        started.set()
+        await release.wait()  # block until cancelled
+        return _result()
+
+    job = service.submit("delegate", body)
+    await started.wait()
+    assert service.cancel(job.id).status is JobStatus.CANCELLED
+    await asyncio.sleep(0)  # let the cancellation propagate
+    assert service.get(job.id).status is JobStatus.CANCELLED
+
+
+async def test_job_tools_list_and_cancel() -> None:
+    app = make_app()
+    release = asyncio.Event()
+
+    async def body(progress: object) -> DelegationResult:
+        await release.wait()
+        return _result()
+
+    job = app.jobs.submit("delegate", body)
+    listed = decode(await list_jobs_tool(app))
+    assert any(entry["id"] == job.id for entry in listed["jobs"])
+    cancelled = decode(await cancel_job_tool(app, job_id=job.id))
+    assert cancelled["status"] == "cancelled"
+    release.set()

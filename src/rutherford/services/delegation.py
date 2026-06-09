@@ -30,6 +30,7 @@ from ..domain.models import (
     ProcessResult,
 )
 from ..runtime.depth import child_depth_env, ensure_within_depth
+from ..runtime.logging import log_event
 from ..runtime.process import ProcessRunner
 from .roles import RoleStore
 
@@ -140,6 +141,18 @@ class DelegationService:
                 result.fallback_from = fallback_from
 
         result.raw = _combine_raw(raw) if (req.include_raw and raw is not None) else None
+        log_event(
+            "delegate",
+            correlation_id=correlation_id,
+            cli=req.target.cli,
+            model=req.target.model,
+            safety_mode=req.safety_mode.value,
+            depth=base_depth,
+            duration_s=round(result.duration_s, 3),
+            ok=result.ok,
+            error_code=result.error.code if result.error else None,
+            fallback_from=result.fallback_from,
+        )
         return result
 
     async def _execute(

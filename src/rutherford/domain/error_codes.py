@@ -52,6 +52,8 @@ class ErrorCode(StrEnum):
     TOO_MANY_TARGETS = "TOO_MANY_TARGETS"
     #: A referenced background job id does not exist (or its result has expired).
     JOB_NOT_FOUND = "JOB_NOT_FOUND"
+    #: A background job could not be created because the configured ``max_jobs`` cap is reached.
+    TOO_MANY_JOBS = "TOO_MANY_JOBS"
     #: A named role could not be found in any configured role directory.
     ROLE_NOT_FOUND = "ROLE_NOT_FOUND"
     #: A named panel could not be found in any discovered panels file.

@@ -166,6 +166,53 @@ def test_parse_garbage_stdout_is_parse_error() -> None:
     assert result.error.code == "PARSE_ERROR"
 
 
+# --- parse_output: output-drift regression tests -----------------------------
+
+
+def test_parse_result_absent_is_parse_error() -> None:
+    """A success envelope with no `result` key must yield PARSE_ERROR, not ok=True."""
+    payload = '{"session_id": "abc", "subtype": "success", "is_error": false}'
+    raw = ProcessResult(exit_code=0, stdout=payload, duration_s=1.0)
+    result = CursorAdapter().parse_output(raw, _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "PARSE_ERROR"
+
+
+def test_parse_result_null_is_parse_error_not_none_string() -> None:
+    """`result: null` must yield PARSE_ERROR; the text field must not be the string 'None'."""
+    payload = '{"result": null, "session_id": "abc", "subtype": "success", "is_error": false}'
+    raw = ProcessResult(exit_code=0, stdout=payload, duration_s=1.0)
+    result = CursorAdapter().parse_output(raw, _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "PARSE_ERROR"
+    assert result.text != "None"
+
+
+def test_parse_nonempty_result_still_succeeds() -> None:
+    """The happy path: a non-empty `result` string must still yield ok=True."""
+    payload = '{"result": "hello world", "session_id": "abc", "subtype": "success", "is_error": false}'
+    raw = ProcessResult(exit_code=0, stdout=payload, duration_s=1.0)
+    result = CursorAdapter().parse_output(raw, _ctx())
+    assert result.ok
+    assert result.text == "hello world"
+    assert result.session_id == "abc"
+
+
+# --- check_output_contract ---------------------------------------------------
+
+
+def test_check_output_contract_passes_with_json() -> None:
+    raw = ProcessResult(exit_code=0, stdout='{"result": "ok"}', duration_s=1.0)
+    assert CursorAdapter().check_output_contract(raw) is True
+
+
+def test_check_output_contract_fails_without_json() -> None:
+    raw = ProcessResult(exit_code=0, stdout="plain text output", duration_s=1.0)
+    assert CursorAdapter().check_output_contract(raw) is False
+
+
 # --- detect / check_auth / available_models ----------------------------------
 
 

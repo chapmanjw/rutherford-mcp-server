@@ -157,6 +157,27 @@ def test_parse_garbage_stdout_is_parse_error() -> None:
     assert result.error.code == "PARSE_ERROR"
 
 
+def test_parse_result_null_is_parse_error_not_none_string() -> None:
+    # Regression: `result: null` in the JSON envelope must not produce ok=True with text="None".
+    stdout = '{"type":"result","subtype":"success","is_error":false,"result":null,"session_id":"abc"}'
+    raw = ProcessResult(exit_code=0, stdout=stdout, duration_s=1.0)
+    result = ClaudeCodeAdapter().parse_output(raw, _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "PARSE_ERROR"
+    assert result.text != "None"
+
+
+def test_parse_result_absent_is_parse_error() -> None:
+    # Regression: a success envelope with no `result` key must not return ok=True with empty text.
+    stdout = '{"type":"result","subtype":"success","is_error":false,"session_id":"abc"}'
+    raw = ProcessResult(exit_code=0, stdout=stdout, duration_s=1.0)
+    result = ClaudeCodeAdapter().parse_output(raw, _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "PARSE_ERROR"
+
+
 # --- detect / check_auth / available_models ----------------------------------
 
 

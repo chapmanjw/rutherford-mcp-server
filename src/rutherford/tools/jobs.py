@@ -30,3 +30,28 @@ async def job_result_tool(app: AppContext, *, job_id: str) -> str:
     if job.error is not None:
         return tool_success({"id": job.id, "status": job.status, "error": job.error})
     return tool_success(job.result)
+
+
+async def list_jobs_tool(app: AppContext) -> str:
+    """List background jobs (id, kind, status, timestamps), newest first."""
+    jobs = app.jobs.list_jobs()
+    return tool_success(
+        {
+            "jobs": [
+                {
+                    "id": job.id,
+                    "kind": job.kind,
+                    "status": job.status,
+                    "created_at": job.created_at,
+                    "updated_at": job.updated_at,
+                }
+                for job in jobs
+            ]
+        }
+    )
+
+
+async def cancel_job_tool(app: AppContext, *, job_id: str) -> str:
+    """Cancel a running or pending background job; return its id and new status."""
+    job = app.jobs.cancel(job_id)
+    return tool_success({"id": job.id, "status": job.status})

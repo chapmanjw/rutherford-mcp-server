@@ -45,6 +45,8 @@ class FakeProbe:
         self._run_fn = run_fn
         self._default = default_result or ProcessResult(exit_code=0, stdout="", stderr="")
         self.calls: list[list[str]] = []
+        #: The ``timeout_s`` each ``run`` was asked to use, so a test can assert a probe ceiling.
+        self.timeouts: list[float] = []
 
     def which(self, name: str) -> str | None:
         return self._which.get(name)
@@ -57,6 +59,7 @@ class FakeProbe:
         env: dict[str, str] | None = None,
     ) -> ProcessResult:
         self.calls.append(list(argv))
+        self.timeouts.append(timeout_s)
         if self._run_fn is not None:
             return self._run_fn(argv)
         return self._default

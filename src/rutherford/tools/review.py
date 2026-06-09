@@ -11,7 +11,7 @@ from ..domain.enums import Stance
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import ConsensusRequest, Target
-from .common import as_target, parse_safety_mode
+from .common import as_target, ensure_known_targets, parse_safety_mode
 from .panels import panel_for_call
 
 
@@ -47,6 +47,7 @@ async def review_tool(
     else:
         review_targets = [as_target(target) for target in targets or []]
         review_stances = None
+    ensure_known_targets(app.registry, review_targets)  # a clean tool-boundary error, not a buried voice
 
     request = ConsensusRequest(
         targets=review_targets,

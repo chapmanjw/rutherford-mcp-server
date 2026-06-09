@@ -163,7 +163,8 @@ class CursorAdapter(BaseCLIAdapter):
                 text=raw.stdout.strip(),
             )
 
-        text = str(payload.get("result", ""))
+        raw_text = payload.get("result")
+        text = raw_text if isinstance(raw_text, str) else ""
         session_id = payload.get("session_id")
         subtype = str(payload.get("subtype", ""))
         is_error = bool(payload.get("is_error")) or (subtype != "" and subtype != "success")
@@ -171,7 +172,14 @@ class CursorAdapter(BaseCLIAdapter):
         if raw.exit_code != 0 or is_error:
             message = text or subtype or "cursor-agent reported an error"
             return error_result(ctx, raw, "NONZERO_EXIT", str(message), text=text)
-
+        if not text.strip():
+            return error_result(
+                ctx,
+                raw,
+                "PARSE_ERROR",
+                "cursor-agent reported success but the JSON object had no `result` text",
+                text=raw.stdout.strip(),
+            )
         return success_result(
             ctx,
             raw,
@@ -179,6 +187,10 @@ class CursorAdapter(BaseCLIAdapter):
             session_id=str(session_id) if session_id else None,
             cost=_extract_cost(payload),
         )
+
+    def check_output_contract(self, raw: ProcessResult) -> bool:
+        """A successful cursor run must carry a JSON result object (--output-format json)."""
+        return _last_json_object(raw.stdout) is not None
 
 
 def _last_json_object(stdout: str) -> dict[str, Any] | None:

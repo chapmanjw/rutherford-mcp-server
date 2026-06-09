@@ -38,6 +38,8 @@ async def doctor_tool(app: AppContext, *, live: bool = True) -> str:
     ``whoami``. That spends a small model call for each such adapter; pass ``live=False`` for a
     metadata-only check with no model calls (``capabilities`` is the always-cheap snapshot).
     """
+    if app.probe_cache is not None:
+        app.probe_cache.invalidate()  # a diagnostic run wants fresh probes, not cached metadata
     adapters = app.registry.all()
     statuses = await asyncio.gather(
         *(asyncio.to_thread(probe_adapter, adapter, diagnostic=True) for adapter in adapters)
@@ -52,6 +54,7 @@ async def doctor_tool(app: AppContext, *, live: bool = True) -> str:
         "depth": app.base_depth,
         "max_depth": app.config.max_depth,
         "max_targets": app.config.max_targets,
+        "max_concurrency": app.config.max_concurrency,
         "default_safety_mode": app.config.default_safety_mode,
     }
     return tool_success(payload)

@@ -14,6 +14,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from ..adapters.registry import AdapterRegistry
 from ..domain.enums import DelegationMode, SafetyMode, Stance, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
@@ -103,3 +104,20 @@ def as_target(value: Target | dict[str, Any] | str) -> Target:
             raise RutherfordError(ErrorCode.INVALID_INPUT, "target string must be 'cli' or 'cli:model'")
         return Target(cli=cli, model=model or None)
     raise RutherfordError(ErrorCode.INVALID_INPUT, f"cannot interpret target {value!r}")
+
+
+def ensure_known_cli(registry: AdapterRegistry, cli_id: str) -> None:
+    """Raise ``UNKNOWN_TARGET`` if ``cli_id`` is not a registered adapter.
+
+    Called at the tool boundary so a typo'd CLI id is one clean error naming the known adapters,
+    rather than (for consensus/debate) a buried failed *voice* the caller has to dig out.
+    """
+    if not registry.has(cli_id):
+        known = ", ".join(registry.ids()) or "(none)"
+        raise RutherfordError(ErrorCode.UNKNOWN_TARGET, f"unknown CLI id {cli_id!r}; known adapters: {known}")
+
+
+def ensure_known_targets(registry: AdapterRegistry, targets: list[Target]) -> None:
+    """Validate every target's ``cli`` against the registry (see :func:`ensure_known_cli`)."""
+    for target in targets:
+        ensure_known_cli(registry, target.cli)

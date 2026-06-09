@@ -23,12 +23,13 @@ from .context import AppContext, build_app_context, error_payload_from, tool_err
 from .domain.error_codes import ErrorCode
 from .domain.errors import ConfigError, RutherfordError
 from .domain.models import Target
+from .runtime.logging import configure_logging
 from .services.setup import apply_setup_plan, build_setup_plan, format_plan_summary
 from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
 from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
-from .tools.jobs import job_result_tool, job_status_tool
+from .tools.jobs import cancel_job_tool, job_result_tool, job_status_tool, list_jobs_tool
 from .tools.panels import reload_panels_tool
 from .tools.plan import plan_tool
 from .tools.probing import probe_adapter
@@ -229,6 +230,18 @@ async def job_result(job_id: str) -> str:
 
 
 @mcp.tool
+async def list_jobs() -> str:
+    """List background jobs (id, kind, status, timestamps), newest first."""
+    return await _guarded(list_jobs_tool(get_app()))
+
+
+@mcp.tool
+async def cancel_job(job_id: str) -> str:
+    """Cancel a running or pending background job, killing its CLI process tree."""
+    return await _guarded(cancel_job_tool(get_app(), job_id=job_id))
+
+
+@mcp.tool
 async def review(
     targets: list[Target] | None = None,
     panel: str | None = None,
@@ -395,6 +408,8 @@ def main() -> None:
     except ConfigError as exc:
         print(f"rutherford: configuration error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
+    # Structured logs go to stderr (stdout is the MCP channel); configured from the loaded config.
+    configure_logging(_APP.config.log_level, _APP.config.log_format)
     # Suppress the FastMCP startup banner so a stdio client's stderr log stays clean.
     mcp.run(show_banner=False)
 

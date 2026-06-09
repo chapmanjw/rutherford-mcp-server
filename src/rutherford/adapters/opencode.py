@@ -139,6 +139,10 @@ class OpenCodeAdapter(BaseCLIAdapter):
         models = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         return models or list(self.static_models)
 
+    def check_output_contract(self, raw: ProcessResult) -> bool:
+        """A successful opencode run must emit at least one JSONL event (--format json)."""
+        return bool(_parse_events(raw.stdout))
+
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         """Map the OpenCode NDJSON event stream to the normalized envelope. Never raises."""
         if raw.timed_out:

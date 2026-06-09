@@ -78,6 +78,46 @@ def test_parse_transcript_not_found(tmp_path: Path) -> None:
     assert result.error.code == "TRANSCRIPT_NOT_FOUND"
 
 
+def test_parse_no_transcript_nonempty_stdout_is_error(tmp_path: Path) -> None:
+    """Bug 1 regression: exit_code=0 with no readable transcript must fail, even with stdout text.
+
+    The old code returned ok=True using raw.stdout as the answer.  Stdout is documented-unreliable
+    (banners, progress bars, ANSI), so a missing transcript must always be TRANSCRIPT_NOT_FOUND.
+    The ANSI-stripped stdout is surfaced only as debug ``text`` on the error result.
+    """
+    adapter = AntigravityAdapter(data_root=tmp_path / "empty")
+    stdout_text = "\x1b[32mRunning...\x1b[0m some banner text"
+    result = adapter.parse_output(ProcessResult(exit_code=0, stdout=stdout_text), _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "TRANSCRIPT_NOT_FOUND"
+    # ANSI-stripped stdout must appear in debug text, not as the successful answer
+    assert "Running..." in result.text
+    assert "\x1b" not in result.text
+
+
+def test_parse_working_dir_not_in_index_does_not_use_other_conversation(tmp_path: Path) -> None:
+    """Bug 2 regression: working_dir provided but absent from index must not return another
+    conversation's answer.
+
+    The old code fell back to _newest_brain_entry() unconditionally, which could return a well-
+    formed transcript from a completely different run.
+    """
+    root = tmp_path / "agdata"
+    # Write a transcript for a different conversation (no workspace mapping for our working_dir).
+    _write_transcript(root, "other-conv", _LINES)
+
+    our_workspace = tmp_path / "our-proj"
+    our_workspace.mkdir()
+    # Deliberately do NOT register our_workspace in last_conversations.json.
+
+    adapter = AntigravityAdapter(data_root=root)
+    result = adapter.parse_output(ProcessResult(exit_code=0, stdout=""), _ctx(str(our_workspace)))
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "TRANSCRIPT_NOT_FOUND"
+
+
 def test_parse_timeout(tmp_path: Path) -> None:
     adapter = AntigravityAdapter(data_root=tmp_path / "empty")
     result = adapter.parse_output(ProcessResult(exit_code=None, timed_out=True), _ctx())

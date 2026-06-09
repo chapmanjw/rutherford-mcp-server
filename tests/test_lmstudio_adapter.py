@@ -114,6 +114,27 @@ def test_parse_output_strips_load_progress_and_think_block() -> None:
     assert result.text == "OK"
 
 
+def test_parse_output_think_tag_in_body_is_preserved() -> None:
+    # A closed <think>...</think> pair that appears in the MIDDLE of the answer (e.g. an
+    # explanation of reasoning models or an XML/regex example) must survive verbatim.
+    # The anchored _THINK_RE must not touch it.
+    body = "Some intro text.\n<think>example tag</think>\nSome trailing text."
+    result = LMStudioAdapter().parse_output(ProcessResult(exit_code=0, stdout=body), _ctx())
+    assert result.ok
+    assert result.text == body.strip()
+
+
+def test_parse_output_unterminated_think_is_parse_error() -> None:
+    # When a reasoning model is truncated mid-thought the closing </think> is absent.
+    # lms exits 0, but returning the raw monologue as ok=True is wrong; fail loudly.
+    raw = "<think>\nI am reasoning about this forever...\n"
+    result = LMStudioAdapter().parse_output(ProcessResult(exit_code=0, stdout=raw), _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "PARSE_ERROR"
+    assert "unterminated" in result.error.message
+
+
 def test_parse_output_plain_answer_passes_through() -> None:
     result = LMStudioAdapter().parse_output(ProcessResult(exit_code=0, stdout="PONG\n"), _ctx())
     assert result.ok and result.text == "PONG"

@@ -41,7 +41,7 @@ from ..domain.models import (
 )
 from ..runtime.probe import CommandProbe
 from .base import BaseCLIAdapter
-from .results import error_result, nonzero_result, success_result, timeout_result
+from .results import error_result, nonzero_result, strip_ansi, success_result, timeout_result
 
 
 class AntigravityAdapter(BaseCLIAdapter):
@@ -118,13 +118,13 @@ class AntigravityAdapter(BaseCLIAdapter):
         conv_id, text = self._read_transcript(ctx.working_dir)
         if text:
             return success_result(ctx, raw, text, session_id=conv_id)
-        if raw.stdout.strip():
-            return success_result(ctx, raw, raw.stdout.strip(), session_id=conv_id)
+        debug = strip_ansi(raw.stdout).strip()
         return error_result(
             ctx,
             raw,
             ErrorCode.TRANSCRIPT_NOT_FOUND,
             "agy produced no readable transcript; pin the agy version and check the brain/ layout",
+            text=debug,
         )
 
     # --- transcript handling -------------------------------------------------
@@ -143,18 +143,28 @@ class AntigravityAdapter(BaseCLIAdapter):
         return conv_id, text
 
     def _resolve_conversation_id(self, working_dir: str | None) -> str | None:
-        """Look the workspace up in the conversation index, else use the newest brain entry."""
+        """Look the workspace up in the conversation index, else use the newest brain entry.
+
+        When *working_dir* is provided but is absent from the index the run is likely a first
+        delegation to that directory and the globally-newest brain entry belongs to a different
+        conversation.  Return ``None`` in that case so ``parse_output`` emits
+        ``TRANSCRIPT_NOT_FOUND`` rather than silently returning another conversation's answer.
+        The global-newest fallback is only used when no *working_dir* was supplied at all.
+        """
         index = self._data_root / "cache" / "last_conversations.json"
-        if working_dir and index.is_file():
-            try:
-                mapping = json.loads(index.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                mapping = {}
-            if isinstance(mapping, dict):
-                wanted = str(Path(working_dir))
-                for key, value in mapping.items():
-                    if Path(key) == Path(wanted) and isinstance(value, str):
-                        return value
+        if working_dir:
+            if index.is_file():
+                try:
+                    mapping = json.loads(index.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    mapping = {}
+                if isinstance(mapping, dict):
+                    wanted = str(Path(working_dir))
+                    for key, value in mapping.items():
+                        if Path(key) == Path(wanted) and isinstance(value, str):
+                            return value
+            # working_dir was given but not in the index: do NOT fall back to the global newest.
+            return None
         return self._newest_brain_entry()
 
     def _newest_brain_entry(self) -> str | None:

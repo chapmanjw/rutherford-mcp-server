@@ -52,8 +52,11 @@ from ..domain.models import (
 from .base import BaseCLIAdapter
 from .results import error_result, nonzero_result, strip_ansi, success_result, timeout_result
 
-#: A reasoning model's chain-of-thought, which ``lms chat`` prints before the answer.
-_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+#: A reasoning model's chain-of-thought leading block, which ``lms chat`` prints before the answer.
+#: Anchored to ``\A`` so only a single *leading* block is removed; a literal ``<think>`` tag that
+#: appears in the middle of the model's answer (e.g. in an explanation of reasoning models or an
+#: XML/regex example) is left intact.
+_THINK_RE = re.compile(r"\A\s*<think>.*?</think>\s*", re.DOTALL)
 
 
 class LMStudioAdapter(BaseCLIAdapter):
@@ -142,6 +145,14 @@ class LMStudioAdapter(BaseCLIAdapter):
         if raw.exit_code not in (0, None):
             return nonzero_result(ctx, raw)
         text = _clean_output(raw.stdout)
+        if "<think>" in text and "</think>" not in text:
+            return error_result(
+                ctx,
+                raw,
+                ErrorCode.PARSE_ERROR,
+                "lms output contains an unterminated <think> block "
+                "(the model output was likely truncated mid-reasoning)",
+            )
         if not text:
             return error_result(
                 ctx,

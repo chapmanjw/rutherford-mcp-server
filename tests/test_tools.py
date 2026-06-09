@@ -49,6 +49,14 @@ async def test_delegate_tool_bad_safety_mode_raises() -> None:
         await delegate_tool(app, cli="fake", prompt="q", safety_mode="bogus")
 
 
+async def test_consensus_tool_unknown_target_is_a_clean_boundary_error() -> None:
+    # An unknown CLI in a fan-out tool is one clean UNKNOWN_TARGET, not a buried failed voice.
+    app = make_app(adapters=[FakeAdapter("fake")])
+    with pytest.raises(RutherfordError) as info:
+        await consensus_tool(app, targets=[{"cli": "fake"}, {"cli": "ghost"}], prompt="q")
+    assert info.value.code == "UNKNOWN_TARGET"
+
+
 async def test_delegate_tool_async_returns_job_then_result() -> None:
     app = make_app(
         adapters=[FakeAdapter("fake")], runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="bg-answer"))

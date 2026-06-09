@@ -6,10 +6,36 @@ from __future__ import annotations
 
 import pytest
 
+from rutherford.adapters.registry import AdapterRegistry
 from rutherford.domain.enums import DelegationMode, SafetyMode, Stance, Strategy
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import Target
-from rutherford.tools.common import as_target, parse_mode, parse_safety_mode, parse_stances, parse_strategy
+from rutherford.tools.common import (
+    as_target,
+    ensure_known_cli,
+    ensure_known_targets,
+    parse_mode,
+    parse_safety_mode,
+    parse_stances,
+    parse_strategy,
+)
+from tests.fakes import FakeAdapter
+
+
+def test_ensure_known_cli_accepts_registered_and_rejects_unknown() -> None:
+    registry = AdapterRegistry([FakeAdapter("a"), FakeAdapter("b")])
+    ensure_known_cli(registry, "a")  # registered: no raise
+    with pytest.raises(RutherfordError) as info:
+        ensure_known_cli(registry, "ghost")
+    assert info.value.code == "UNKNOWN_TARGET"
+
+
+def test_ensure_known_targets_validates_every_target() -> None:
+    registry = AdapterRegistry([FakeAdapter("a")])
+    ensure_known_targets(registry, [Target(cli="a")])  # all known: no raise
+    with pytest.raises(RutherfordError) as info:
+        ensure_known_targets(registry, [Target(cli="a"), Target(cli="ghost")])
+    assert info.value.code == "UNKNOWN_TARGET"
 
 
 def test_parse_safety_mode_valid_and_passthrough() -> None:

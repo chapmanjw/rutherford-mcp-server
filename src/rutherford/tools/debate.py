@@ -9,7 +9,7 @@ from typing import Any
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode, Stance
 from ..domain.models import DebateRequest, Target
-from .common import as_target, parse_mode, parse_safety_mode, parse_stances
+from .common import as_target, ensure_known_targets, parse_mode, parse_safety_mode, parse_stances
 from .panels import panel_for_call
 
 
@@ -52,6 +52,7 @@ async def debate_tool(
     else:
         target_objs = [as_target(target) for target in targets or []]
         debate_stances = parse_stances(stances)
+    ensure_known_targets(app.registry, target_objs)  # a clean tool-boundary error, not a buried voice
     request = DebateRequest(
         targets=target_objs,
         prompt=prompt,

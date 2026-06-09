@@ -91,6 +91,8 @@ class JobStatus(StrEnum):
     SUCCEEDED = "succeeded"
     #: Finished with an error; an error result is available.
     FAILED = "failed"
+    #: Cancelled by the caller before it finished; its CLI process tree was killed.
+    CANCELLED = "cancelled"
 
 
 class Stance(StrEnum):

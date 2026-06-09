@@ -145,7 +145,8 @@ class QwenAdapter(BaseCLIAdapter):
 
         result_event = _last_event_of_type(events, "result")
         if result_event is not None:
-            text = str(result_event.get("result", ""))
+            raw_answer = result_event.get("result")
+            text = str(raw_answer) if isinstance(raw_answer, str) else ""
             session_id = result_event.get("session_id")
             is_error = bool(result_event.get("is_error"))
             if raw.exit_code != 0 or is_error:
@@ -153,6 +154,23 @@ class QwenAdapter(BaseCLIAdapter):
                 if raw.exit_code != 0 and not text:
                     return nonzero_result(ctx, raw, text=text)
                 return error_result(ctx, raw, "NONZERO_EXIT", str(message), text=text)
+            if not isinstance(raw_answer, str) or not raw_answer.strip():
+                fallback = _last_assistant_text(events)
+                if fallback is not None and fallback.strip():
+                    return success_result(
+                        ctx,
+                        raw,
+                        fallback,
+                        session_id=str(session_id) if session_id else None,
+                        cost=_extract_cost(result_event.get("usage")),
+                    )
+                return error_result(
+                    ctx,
+                    raw,
+                    "PARSE_ERROR",
+                    "qwen result event carried no text answer",
+                    text=raw.stdout.strip(),
+                )
             return success_result(
                 ctx,
                 raw,
@@ -177,6 +195,10 @@ class QwenAdapter(BaseCLIAdapter):
             "qwen -o json produced no result or assistant message",
             text=raw.stdout.strip(),
         )
+
+    def check_output_contract(self, raw: ProcessResult) -> bool:
+        """A successful qwen run must emit a parseable JSON event array."""
+        return bool(_parse_events(raw.stdout))
 
 
 def _parse_events(stdout: str) -> list[dict[str, Any]] | None:

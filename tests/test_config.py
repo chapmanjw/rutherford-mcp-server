@@ -7,10 +7,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from rutherford.config.loader import deep_merge, load_config
-from rutherford.config.schema import AdapterConfig, RutherfordConfig
-from rutherford.domain.enums import SafetyMode
+from rutherford.config.schema import AdapterConfig, GenericAdapterConfig, RutherfordConfig
+from rutherford.domain.enums import OutputMode, SafetyMode
 from rutherford.domain.errors import ConfigError
 
 
@@ -120,3 +121,44 @@ def test_max_concurrency_env_override(tmp_path: Path) -> None:
     env["RUTHERFORD_MAX_CONCURRENCY"] = "3"
     config = load_config(env=env, cwd=tmp_path)
     assert config.max_concurrency == 3
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_depth": 0},
+        {"default_timeout_s": -1.0},
+        {"max_targets": 0},
+        {"max_debate_rounds": 0},
+        {"probe_timeout_s": 0},
+        {"max_jobs": 0},
+    ],
+)
+def test_out_of_range_numeric_fields_are_rejected(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        RutherfordConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_generic_adapter_rejects_unparseable_output_modes() -> None:
+    # jsonl/transcript need a code adapter; the generic adapter would dump the raw stream.
+    with pytest.raises(ValidationError):
+        GenericAdapterConfig(
+            id="x", display_name="X", binary="x", output_mode=OutputMode.JSONL, json_text_path="result"
+        )
+    with pytest.raises(ValidationError):
+        GenericAdapterConfig(id="x", display_name="X", binary="x", output_mode=OutputMode.TRANSCRIPT)
+    # json without a path has no way to extract the answer.
+    with pytest.raises(ValidationError):
+        GenericAdapterConfig(id="x", display_name="X", binary="x", output_mode=OutputMode.JSON)
+    # text, and json with a path, are valid.
+    GenericAdapterConfig(id="x", display_name="X", binary="x", output_mode=OutputMode.TEXT)
+    GenericAdapterConfig(id="x", display_name="X", binary="x", output_mode=OutputMode.JSON, json_text_path="result")
+
+
+def test_dirs_resolve_to_absolute_and_a_missing_dir_warns_not_raises(tmp_path: Path) -> None:
+    # An existing dir resolves to absolute; a missing one is kept (resolved) with a warning, not a
+    # hard error -- an MCP stdio server should still start, and a missing trust path fails safe.
+    missing = tmp_path / "nope"
+    config = RutherfordConfig(trusted_workspaces=[str(tmp_path)], role_dirs=[str(missing)])
+    assert config.trusted_workspaces == [str(tmp_path.resolve())]
+    assert config.role_dirs == [str(missing.resolve())]

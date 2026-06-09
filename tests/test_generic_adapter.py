@@ -95,7 +95,9 @@ def test_parse_nonzero_and_timeout() -> None:
 
 
 def test_capabilities_reflect_config() -> None:
-    adapter = GenericAdapter(_cfg(model_flag="--model", working_dir_flag="--dir", output_mode=OutputMode.JSON))
+    adapter = GenericAdapter(
+        _cfg(model_flag="--model", working_dir_flag="--dir", output_mode=OutputMode.JSON, json_text_path="result")
+    )
     caps = adapter.capabilities()
     assert caps.supports_model_selection
     assert caps.supports_working_dir
@@ -112,3 +114,15 @@ def test_check_auth(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_check_auth_unknown_without_env() -> None:
     assert GenericAdapter(_cfg()).check_auth().state is AuthState.UNKNOWN
+
+
+def test_parse_json_non_scalar_leaf_is_parse_error() -> None:
+    """A dict leaf at json_text_path must not be str()-coerced; it must be a PARSE_ERROR."""
+    adapter = GenericAdapter(_cfg(output_mode=OutputMode.JSON, json_text_path="result"))
+    result = adapter.parse_output(
+        ProcessResult(exit_code=0, stdout='{"result": {"text": "hi"}}'),
+        _ctx(),
+    )
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "PARSE_ERROR"

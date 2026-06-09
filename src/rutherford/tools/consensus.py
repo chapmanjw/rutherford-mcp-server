@@ -9,7 +9,7 @@ from typing import Any
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode
 from ..domain.models import ConsensusRequest, Target
-from .common import as_target, parse_mode, parse_safety_mode, parse_stances, parse_strategy
+from .common import as_target, ensure_known_targets, parse_mode, parse_safety_mode, parse_stances, parse_strategy
 from .panels import panel_for_call
 
 
@@ -62,6 +62,8 @@ async def consensus_tool(
             target_objs = [as_target(targets)]  # a bare "cli" / "cli:model" string
         else:
             target_objs = [as_target(target) for target in targets or []]
+    if not expand_all:
+        ensure_known_targets(app.registry, target_objs)  # a clean tool-boundary error, not a buried voice
     effective_strategy = parse_strategy(strategy if strategy is not None else (panel_strategy or "all-voices"))
     request = ConsensusRequest(
         targets=target_objs,

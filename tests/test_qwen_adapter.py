@@ -203,3 +203,36 @@ def test_check_auth_unknown_without_env(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_available_models_static() -> None:
     assert QwenAdapter().available_models() == []
+
+
+# --- parse_output drift regression tests -------------------------------------
+
+
+def test_parse_result_event_missing_answer_falls_back_to_assistant_text() -> None:
+    # result event is present but its "result" field is absent; the real answer is in the
+    # assistant event -- the fix must use that fallback, not discard it and return ok=True/text="".
+    stdout = (
+        "["
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"the real answer"}]}},'
+        '{"type":"result","subtype":"success","session_id":"s1","is_error":false,"usage":{"input_tokens":10,"output_tokens":3,"total_tokens":13}}'
+        "]"
+    )
+    raw = ProcessResult(exit_code=0, stdout=stdout, duration_s=0.1)
+    result = QwenAdapter().parse_output(raw, _ctx())
+    assert result.ok
+    assert result.text == "the real answer"
+
+
+def test_parse_result_event_no_answer_no_assistant_is_parse_error() -> None:
+    # result event is present with no "result" field, and no assistant event -- must be PARSE_ERROR.
+    stdout = (
+        "["
+        '{"type":"system","subtype":"init","session_id":"s2"},'
+        '{"type":"result","subtype":"success","session_id":"s2","is_error":false}'
+        "]"
+    )
+    raw = ProcessResult(exit_code=0, stdout=stdout, duration_s=0.1)
+    result = QwenAdapter().parse_output(raw, _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "PARSE_ERROR"

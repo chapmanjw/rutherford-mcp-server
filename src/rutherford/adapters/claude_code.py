@@ -134,12 +134,21 @@ class ClaudeCodeAdapter(BaseCLIAdapter):
                 text=raw.stdout.strip(),
             )
 
-        text = str(payload.get("result", ""))
+        raw_text = payload.get("result")
+        text = raw_text if isinstance(raw_text, str) else ""
         session_id = payload.get("session_id")
         is_error = bool(payload.get("is_error")) or str(payload.get("subtype", "")).startswith("error")
         if raw.exit_code != 0 or is_error:
             message = text or payload.get("subtype") or "claude reported an error"
             return error_result(ctx, raw, "NONZERO_EXIT", str(message), text=text)
+        if not text.strip():
+            return error_result(
+                ctx,
+                raw,
+                "PARSE_ERROR",
+                "claude reported success but the JSON object had no `result` text",
+                text=raw.stdout.strip(),
+            )
 
         return success_result(
             ctx,

@@ -11,9 +11,15 @@ workspace allowlist, and config-defined generic adapters. Invalid config raises
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..domain.enums import OutputMode, Runtime, SafetyMode
+
+_log = logging.getLogger(__name__)
 
 
 class GenericSafetyConfig(BaseModel):
@@ -53,6 +59,25 @@ class GenericAdapterConfig(BaseModel):
     auth_env: list[str] = Field(default_factory=list)
     runtime: Runtime = Runtime.NATIVE
 
+    @model_validator(mode="after")
+    def _validate_output_mode(self) -> GenericAdapterConfig:
+        """Constrain the generic adapter's ``output_mode`` to what it can actually parse.
+
+        JSONL (a streaming event protocol) and transcript (an on-disk file) outputs need bespoke
+        parsing the generic adapter does not implement -- it would silently return the raw stream
+        verbatim as the answer -- so they require a code adapter and are rejected at load. JSON needs
+        ``json_text_path`` or the adapter has no way to extract the answer. Caught here as a
+        ``ConfigError`` rather than as a confusing wrong/empty answer at parse time.
+        """
+        if self.output_mode in (OutputMode.JSONL, OutputMode.TRANSCRIPT):
+            raise ValueError(
+                f"generic adapter {self.id!r}: output_mode={self.output_mode.value} needs a code adapter; "
+                "the generic adapter supports only text and json"
+            )
+        if self.output_mode is OutputMode.JSON and not self.json_text_path:
+            raise ValueError(f"generic adapter {self.id!r}: output_mode=json requires json_text_path")
+        return self
+
 
 class AdapterConfig(BaseModel):
     """Per-adapter overrides applied to a built-in or generic adapter."""
@@ -65,7 +90,7 @@ class AdapterConfig(BaseModel):
     #: adapter when a call names no ``timeout_s``; ``None`` falls back to the global default. Useful
     #: for a slow local model (e.g. Ollama on a CPU, or LM Studio's JIT model load) whose cold load
     #: can exceed the global budget.
-    timeout_s: float | None = None
+    timeout_s: float | None = Field(default=None, gt=0)
     #: Extra command-line arguments appended verbatim to the adapter's invocation. Honored by the
     #: local-model adapters -- Ollama (e.g. ``["--keepalive", "30s"]``) and LM Studio (e.g.
     #: ``["--ttl", "3600"]``); generic adapters carry their own ``extra_args`` in
@@ -87,15 +112,15 @@ class RutherfordConfig(BaseModel):
     #: Default safety posture when a caller does not specify one.
     default_safety_mode: SafetyMode = SafetyMode.READ_ONLY
     #: Default per-run timeout in seconds.
-    default_timeout_s: float = 300.0
+    default_timeout_s: float = Field(default=300.0, gt=0)
     #: Extra directories to search for role markdown files (built-in roles always load).
     role_dirs: list[str] = Field(default_factory=list)
     #: Maximum delegation depth before a chain is refused.
-    max_depth: int = 3
+    max_depth: int = Field(default=3, ge=1, le=10)
     #: Maximum number of targets a single consensus call may fan out to.
-    max_targets: int = 8
+    max_targets: int = Field(default=8, ge=1, le=32)
     #: Maximum number of rounds a single debate call may run (each round is a full panel pass).
-    max_debate_rounds: int = 4
+    max_debate_rounds: int = Field(default=4, ge=1, le=10)
     #: Minimum number of parseable voices (ok, with an extracted verdict) an aggregating consensus
     #: strategy needs before it will return a decision; below it the outcome is ``no_quorum``. Guards
     #: against certifying an outcome off one surviving voice when the rest failed.
@@ -123,6 +148,23 @@ class RutherfordConfig(BaseModel):
     #: delegation -- worktree isolation gives per-voice soundness). Checked only when the run itself
     #: succeeded, so a real failure (timeout, non-zero exit, drift) is never masked.
     verify_read_only: bool = False
+    #: Seconds to cache an adapter's metadata probe (``detect`` / ``check_auth`` / ``available_models``)
+    #: so ``capabilities`` / ``doctor`` / ``expand_all`` do not re-fork the same ``--version`` / status
+    #: subprocesses within one burst. ``0`` disables caching. ``doctor``'s live check invalidates first.
+    probe_cache_ttl_s: float = Field(default=10.0, ge=0)
+    #: Hard per-probe timeout ceiling (seconds): a metadata probe is capped at ``min(its own, this)`` so
+    #: a CLI whose ``--version`` hangs cannot stall ``capabilities`` / ``expand_all`` for long.
+    probe_timeout_s: float = Field(default=8.0, ge=1)
+    #: Seconds a finished background job is retained before eviction.
+    job_ttl_s: float = Field(default=3600.0, ge=1)
+    #: Maximum number of background jobs retained at once; creating one past the cap (after evicting
+    #: expired jobs) fails with ``TOO_MANY_JOBS``.
+    max_jobs: int = Field(default=100, ge=1)
+    #: Structured-log verbosity (stderr, JSON lines). ``debug`` | ``info`` | ``warning`` | ``error``.
+    log_level: Literal["debug", "info", "warning", "error"] = "info"
+    #: Structured-log format: ``json`` (one JSON object per line, to stderr) or ``off`` to silence it.
+    #: stdout is the MCP channel and is never written to.
+    log_format: Literal["json", "off"] = "json"
 
     @model_validator(mode="after")
     def _default_concurrency_to_targets(self) -> RutherfordConfig:
@@ -135,6 +177,20 @@ class RutherfordConfig(BaseModel):
         """
         if "max_concurrency" not in self.model_fields_set:
             self.max_concurrency = self.max_targets
+        return self
+
+    @model_validator(mode="after")
+    def _resolve_dirs(self) -> RutherfordConfig:
+        """Resolve ``trusted_workspaces`` / ``role_dirs`` to absolute paths and warn on a missing one.
+
+        Resolving makes the trusted-workspace match reliable regardless of the process cwd. A
+        configured directory that does not exist is logged as a warning (it would otherwise fail
+        silently -- a typo'd trust path that never matches, or a role dir whose files never load) but
+        is not a hard error: an MCP stdio server should still start, and a missing trust path fails
+        safe (the write is denied), so a warning is the right balance over bricking startup.
+        """
+        self.trusted_workspaces = [_resolve_dir("trusted_workspaces", p) for p in self.trusted_workspaces]
+        self.role_dirs = [_resolve_dir("role_dirs", p) for p in self.role_dirs]
         return self
 
     def default_model_for(self, adapter_id: str) -> str | None:
@@ -151,3 +207,15 @@ class RutherfordConfig(BaseModel):
         """Return the configured extra CLI args for ``adapter_id`` (empty when none)."""
         entry = self.adapters.get(adapter_id)
         return list(entry.extra_args) if entry is not None else []
+
+
+def _resolve_dir(field: str, raw: str) -> str:
+    """Resolve ``raw`` to an absolute path, warning (not failing) if the directory does not exist."""
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except OSError:
+        _log.warning("config %s: could not resolve path %r; leaving it as-is", field, raw)
+        return raw
+    if not resolved.is_dir():
+        _log.warning("config %s: directory does not exist: %s", field, resolved)
+    return str(resolved)

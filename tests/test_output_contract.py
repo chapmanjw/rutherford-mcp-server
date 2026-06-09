@@ -87,3 +87,43 @@ def test_codex_contract_fails_when_no_events_are_emitted() -> None:
     adapter = CodexAdapter()
     raw = ProcessResult(exit_code=0, stdout="not jsonl, just a line of prose")
     assert adapter.check_output_contract(raw) is False
+
+
+from rutherford.adapters.opencode import OpenCodeAdapter  # noqa: E402
+
+
+def test_opencode_contract_holds_for_a_jsonl_event_stream() -> None:
+    adapter = OpenCodeAdapter()
+    stdout = "\n".join(
+        [
+            '{"type": "text", "sessionID": "s1", "part": {"text": "hello"}}',
+            '{"type": "step_finish", "sessionID": "s1", "part": {"tokens": {"input": 10, "output": 5}, "cost": 0.001}}',
+        ]
+    )
+    assert adapter.check_output_contract(ProcessResult(exit_code=0, stdout=stdout)) is True
+
+
+def test_opencode_contract_fails_when_no_events_are_emitted() -> None:
+    adapter = OpenCodeAdapter()
+    raw = ProcessResult(exit_code=0, stdout="not jsonl, just a line of prose")
+    assert adapter.check_output_contract(raw) is False
+
+
+from rutherford.adapters.qwen import QwenAdapter  # noqa: E402
+
+
+def test_qwen_contract_holds_for_a_json_event_array() -> None:
+    adapter = QwenAdapter()
+    stdout = (
+        "["
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}},'
+        '{"type":"result","subtype":"success","session_id":"s1","is_error":false,"result":"hi"}'
+        "]"
+    )
+    assert adapter.check_output_contract(ProcessResult(exit_code=0, stdout=stdout)) is True
+
+
+def test_qwen_contract_fails_when_output_is_prose() -> None:
+    adapter = QwenAdapter()
+    raw = ProcessResult(exit_code=0, stdout="plain text, not a json array")
+    assert adapter.check_output_contract(raw) is False
