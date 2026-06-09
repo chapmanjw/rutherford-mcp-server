@@ -20,7 +20,6 @@ has no ``-q``/``--quiet`` flag; ``--format json`` is what keeps stdout machine-r
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from ..domain.enums import AuthState, OutputMode, SafetyMode
@@ -36,6 +35,7 @@ from ..domain.models import (
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
+from .parsing import CostSpec, extract_cost, parse_jsonl
 from .results import error_result, nonzero_result, success_result, timeout_result
 
 #: Permission payload for read-only / propose: deny edits and shell commands.
@@ -141,14 +141,14 @@ class OpenCodeAdapter(BaseCLIAdapter):
 
     def check_output_contract(self, raw: ProcessResult) -> bool:
         """A successful opencode run must emit at least one JSONL event (--format json)."""
-        return bool(_parse_events(raw.stdout))
+        return bool(parse_jsonl(raw.stdout))
 
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         """Map the OpenCode NDJSON event stream to the normalized envelope. Never raises."""
         if raw.timed_out:
             return timeout_result(ctx, raw)
 
-        events = _parse_events(raw.stdout)
+        events = parse_jsonl(raw.stdout)
         text = _extract_text(events)
         session_id = _extract_session_id(events)
         cost = _extract_cost(events)
@@ -174,22 +174,6 @@ class OpenCodeAdapter(BaseCLIAdapter):
             session_id=session_id,
             cost=cost,
         )
-
-
-def _parse_events(stdout: str) -> list[dict[str, Any]]:
-    """Return every line of ``stdout`` that parses as a JSON object, in order."""
-    events: list[dict[str, Any]] = []
-    for line in stdout.splitlines():
-        candidate = line.strip()
-        if not candidate.startswith("{"):
-            continue
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            events.append(parsed)
-    return events
 
 
 def _extract_text(events: list[dict[str, Any]]) -> str:
@@ -234,6 +218,11 @@ def _extract_session_id(events: list[dict[str, Any]]) -> str | None:
     return None
 
 
+#: OpenCode's ``step_finish`` event carries the USD ``cost`` inline and the token counts nested under
+#: ``tokens`` (``input`` / ``output``) -- on either the event or its ``part``.
+_COST = CostSpec(usd_key="cost", tokens_key="tokens", input_keys=("input",), output_keys=("output",))
+
+
 def _extract_cost(events: list[dict[str, Any]]) -> Cost | None:
     """Build a :class:`Cost` from the last ``step_finish`` event that carries usage/cost."""
     for event in reversed(events):
@@ -241,11 +230,7 @@ def _extract_cost(events: list[dict[str, Any]]) -> Cost | None:
             continue
         part = event.get("part")
         source = part if isinstance(part, dict) else event
-        tokens = source.get("tokens")
-        usd = source.get("cost")
-        input_tokens = tokens.get("input") if isinstance(tokens, dict) else None
-        output_tokens = tokens.get("output") if isinstance(tokens, dict) else None
-        if usd is None and input_tokens is None and output_tokens is None:
-            continue
-        return Cost(usd=usd, input_tokens=input_tokens, output_tokens=output_tokens)
+        cost = extract_cost(source, _COST)
+        if cost is not None:
+            return cost
     return None

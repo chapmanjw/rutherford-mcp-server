@@ -52,7 +52,8 @@ from ..domain.models import (
 from ..runtime.platform import PlatformInfo, detect_platform
 from ..runtime.probe import CommandProbe
 from .base import BaseCLIAdapter
-from .results import error_result, nonzero_result, success_result, timeout_result
+from .parsing import CostSpec, extract_cost, finalize_answer, parse_jsonl
+from .results import error_result, timeout_result
 
 
 class CodexAdapter(BaseCLIAdapter):
@@ -195,7 +196,7 @@ class CodexAdapter(BaseCLIAdapter):
         if raw.timed_out:
             return timeout_result(ctx, raw)
 
-        events = _parse_events(raw.stdout)
+        events = parse_jsonl(raw.stdout)
 
         session_id: str | None = None
         answer: str | None = None
@@ -213,7 +214,7 @@ class CodexAdapter(BaseCLIAdapter):
                 if text is not None:
                     answer = text
             elif etype == "turn.completed":
-                cost = _extract_cost(event.get("usage")) or cost
+                cost = extract_cost(event.get("usage"), _COST) or cost
             elif etype == "turn.failed":
                 err = event.get("error")
                 if isinstance(err, dict):
@@ -223,9 +224,10 @@ class CodexAdapter(BaseCLIAdapter):
             elif etype == "error":
                 failure = str(event.get("message") or "codex reported an error")
 
-        if raw.exit_code != 0:
-            if answer is not None:
-                return success_result(ctx, raw, answer, session_id=session_id, cost=cost)
+        # A rejected `codex exec resume` exits non-zero with a clap usage error and no answer on
+        # stdout; surface it as a distinct RESUME_FAILED (not an opaque non-zero exit) so a lost
+        # resume is never silent. Every other case is the shared answer/failure decision.
+        if raw.exit_code != 0 and answer is None:
             parse_error = _argument_parse_error(raw.stderr)
             if parse_error is not None and _is_resume_error(raw.stderr):
                 return error_result(
@@ -237,21 +239,16 @@ class CodexAdapter(BaseCLIAdapter):
                     "retry without a session_id to start a fresh session.",
                     text="",
                 )
-            return nonzero_result(ctx, raw, text=failure or "")
 
-        if failure is not None:
-            return error_result(ctx, raw, ErrorCode.NONZERO_EXIT, failure, text=answer or "")
-
-        if answer is None:
-            return error_result(
-                ctx,
-                raw,
-                ErrorCode.PARSE_ERROR,
-                "codex --json produced no agent message",
-                text=raw.stdout.strip(),
-            )
-
-        return success_result(ctx, raw, answer, session_id=session_id, cost=cost)
+        return finalize_answer(
+            ctx,
+            raw,
+            answer=answer,
+            session_id=session_id,
+            cost=cost,
+            failure=failure,
+            no_output_message="codex --json produced no agent message",
+        )
 
     def check_output_contract(self, raw: ProcessResult) -> bool:
         """A successful codex run must emit at least one JSONL event (``--json``).
@@ -259,7 +256,7 @@ class CodexAdapter(BaseCLIAdapter):
         The drift canary for this adapter: if a future CLI build stops emitting the event stream
         but still exits cleanly, this is what catches the silent regression at the delegation layer.
         """
-        return bool(_parse_events(raw.stdout))
+        return bool(parse_jsonl(raw.stdout))
 
 
 def _doctor_auth_ok(stdout: str) -> bool | None:
@@ -359,22 +356,6 @@ def _argument_parse_error(stderr: str) -> str | None:
     return text.splitlines()[0].strip()
 
 
-def _parse_events(stdout: str) -> list[dict[str, Any]]:
-    """Return the JSON objects from a JSONL stream, skipping blank or unparseable lines."""
-    events: list[dict[str, Any]] = []
-    for line in stdout.splitlines():
-        candidate = line.strip()
-        if not candidate.startswith("{"):
-            continue
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            events.append(parsed)
-    return events
-
-
 def _agent_message_text(item: Any) -> str | None:
     """Return the text of an agent-message item, handling both event shapes, or ``None``.
 
@@ -393,12 +374,6 @@ def _agent_message_text(item: Any) -> str | None:
     return None
 
 
-def _extract_cost(usage: Any) -> Cost | None:
-    """Build a :class:`Cost` from a ``turn.completed`` usage block, if any tokens are present."""
-    if not isinstance(usage, dict):
-        return None
-    input_tokens = usage.get("input_tokens")
-    output_tokens = usage.get("output_tokens")
-    if input_tokens is None and output_tokens is None:
-        return None
-    return Cost(input_tokens=input_tokens, output_tokens=output_tokens)
+#: Codex carries token counts directly in a ``turn.completed`` ``usage`` block (``input_tokens`` /
+#: ``output_tokens``), with no USD figure -- the default cost spec.
+_COST = CostSpec()

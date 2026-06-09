@@ -45,7 +45,7 @@ from ..domain.models import (
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
-from .results import error_result, nonzero_result, strip_ansi, success_result, timeout_result
+from .parsing import TextParser
 
 
 class OllamaAdapter(BaseCLIAdapter):
@@ -132,19 +132,14 @@ class OllamaAdapter(BaseCLIAdapter):
 
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         """Return the model's text answer, or a normalized failure on timeout/non-zero/empty output."""
-        if raw.timed_out:
-            return timeout_result(ctx, raw)
-        if raw.exit_code not in (0, None):
-            return nonzero_result(ctx, raw)
-        text = strip_ansi(raw.stdout).strip()
-        if not text:
-            return error_result(
-                ctx,
-                raw,
-                ErrorCode.PARSE_ERROR,
-                "ollama produced no output (the model may have failed to load or the context overflowed)",
-            )
-        return success_result(ctx, raw, text)
+        return _PARSER.parse(raw, ctx)
+
+
+#: Ollama drives a local model that should always produce text, so an empty answer on a clean exit
+#: is a parse failure (a failed load or an overflowed context), not an empty success.
+_PARSER = TextParser(
+    empty_message="ollama produced no output (the model may have failed to load or the context overflowed)",
+)
 
 
 def _parse_model_names(stdout: str) -> list[str]:

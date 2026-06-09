@@ -21,14 +21,13 @@ Flags verified 2026-05-30 against ``cursor-agent --help`` (cursor-agent 2026.05.
 
 from __future__ import annotations
 
-import json
+from collections.abc import Mapping
 from typing import Any
 
 from ..domain.enums import OutputMode, SafetyMode
 from ..domain.models import (
     AdapterCapabilities,
     AuthStatus,
-    Cost,
     DelegationRequest,
     DelegationResult,
     InvocationContext,
@@ -37,7 +36,7 @@ from ..domain.models import (
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
-from .results import error_result, nonzero_result, success_result, timeout_result
+from .parsing import CostSpec, JsonEnvelopeParser
 
 
 class CursorAdapter(BaseCLIAdapter):
@@ -144,77 +143,29 @@ class CursorAdapter(BaseCLIAdapter):
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         """Parse the single JSON object into the normalized envelope, defensively.
 
-        Reads the last stdout line that parses as a JSON object. ``result`` is the answer,
-        ``session_id`` resumes, and a failure is signalled by ``is_error`` true, a non-success
-        ``subtype``, or a non-zero exit. ``usage`` gives token counts. Never raises.
+        Reads the last JSON object in stdout. ``result`` is the answer, ``session_id`` resumes,
+        and a failure is signalled by ``is_error`` true, a non-success ``subtype``, or a non-zero
+        exit. ``usage`` gives token counts. Never raises.
         """
-        if raw.timed_out:
-            return timeout_result(ctx, raw)
-
-        payload = _last_json_object(raw.stdout)
-        if payload is None:
-            if raw.exit_code != 0:
-                return nonzero_result(ctx, raw)
-            return error_result(
-                ctx,
-                raw,
-                "PARSE_ERROR",
-                "cursor-agent --output-format json produced no parseable JSON object",
-                text=raw.stdout.strip(),
-            )
-
-        raw_text = payload.get("result")
-        text = raw_text if isinstance(raw_text, str) else ""
-        session_id = payload.get("session_id")
-        subtype = str(payload.get("subtype", ""))
-        is_error = bool(payload.get("is_error")) or (subtype != "" and subtype != "success")
-
-        if raw.exit_code != 0 or is_error:
-            message = text or subtype or "cursor-agent reported an error"
-            return error_result(ctx, raw, "NONZERO_EXIT", str(message), text=text)
-        if not text.strip():
-            return error_result(
-                ctx,
-                raw,
-                "PARSE_ERROR",
-                "cursor-agent reported success but the JSON object had no `result` text",
-                text=raw.stdout.strip(),
-            )
-        return success_result(
-            ctx,
-            raw,
-            text,
-            session_id=str(session_id) if session_id else None,
-            cost=_extract_cost(payload),
-        )
+        return _PARSER.parse(raw, ctx)
 
     def check_output_contract(self, raw: ProcessResult) -> bool:
         """A successful cursor run must carry a JSON result object (--output-format json)."""
-        return _last_json_object(raw.stdout) is not None
+        return _PARSER.contract_ok(raw)
 
 
-def _last_json_object(stdout: str) -> dict[str, Any] | None:
-    """Return the last line of ``stdout`` that parses as a JSON object, or ``None``."""
-    for line in reversed(stdout.splitlines()):
-        candidate = line.strip()
-        if not candidate.startswith("{"):
-            continue
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
-    return None
+def _is_error(payload: Mapping[str, Any]) -> bool:
+    """Cursor signals an error via ``is_error`` true or any ``subtype`` other than ``success``."""
+    subtype = str(payload.get("subtype", ""))
+    return bool(payload.get("is_error")) or (subtype != "" and subtype != "success")
 
 
-def _extract_cost(payload: dict[str, Any]) -> Cost | None:
-    """Build a :class:`Cost` from the cursor JSON ``usage`` block, if any tokens are present."""
-    usage = payload.get("usage")
-    if not isinstance(usage, dict):
-        return None
-    input_tokens = usage.get("inputTokens")
-    output_tokens = usage.get("outputTokens")
-    if input_tokens is None and output_tokens is None:
-        return None
-    return Cost(input_tokens=input_tokens, output_tokens=output_tokens)
+#: The shared envelope parser configured for Cursor: the answer is ``result``, the cost is the token
+#: counts under ``usage`` (``inputTokens``/``outputTokens``), and Cursor reports no USD figure.
+_PARSER = JsonEnvelopeParser(
+    cli_name="cursor-agent",
+    is_error=_is_error,
+    cost=CostSpec(tokens_key="usage", input_keys=("inputTokens",), output_keys=("outputTokens",)),
+    no_object_message="cursor-agent --output-format json produced no parseable JSON object",
+    no_text_message="cursor-agent reported success but the JSON object had no `result` text",
+)

@@ -50,7 +50,8 @@ from ..domain.models import (
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
-from .results import error_result, nonzero_result, strip_ansi, success_result, timeout_result
+from .parsing import TextParser, render_terminal, strip_leading_reasoning
+from .results import strip_ansi
 
 #: A reasoning model's chain-of-thought leading block, which ``lms chat`` prints before the answer.
 #: Anchored to ``\A`` so only a single *leading* block is removed; a literal ``<think>`` tag that
@@ -140,40 +141,40 @@ class LMStudioAdapter(BaseCLIAdapter):
 
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         """Return the model's text answer, cleaned of the load-progress bar and any think block."""
-        if raw.timed_out:
-            return timeout_result(ctx, raw)
-        if raw.exit_code not in (0, None):
-            return nonzero_result(ctx, raw)
-        text = _clean_output(raw.stdout)
-        if "<think>" in text and "</think>" not in text:
-            return error_result(
-                ctx,
-                raw,
-                ErrorCode.PARSE_ERROR,
-                "lms output contains an unterminated <think> block "
-                "(the model output was likely truncated mid-reasoning)",
-            )
-        if not text:
-            return error_result(
-                ctx,
-                raw,
-                ErrorCode.PARSE_ERROR,
-                "lms produced no output (the model may have failed to load)",
-            )
-        return success_result(ctx, raw, text)
+        return _PARSER.parse(raw, ctx)
 
 
 def _clean_output(stdout: str) -> str:
-    """Strip the load-progress bar, ANSI, and any ``<think>`` block, leaving the answer.
+    """Strip the load-progress bar, ANSI, and any leading ``<think>`` block, leaving the answer.
 
     ``lms chat`` writes its model-load progress to stdout as carriage-return overwrites on one line.
-    After removing ANSI, normalize CRLF, then collapse each line to what survives the last bare
-    carriage return -- exactly what a terminal would render -- which drops the progress run. Finally
-    remove a ``<think>...</think>`` reasoning block.
+    :func:`~rutherford.adapters.parsing.render_terminal` renders that away (collapsing each line to
+    what survives the last bare carriage return, after stripping ANSI); then a single *leading*
+    ``<think>...</think>`` reasoning block is removed and the text trimmed.
     """
-    text = strip_ansi(stdout).replace("\r\n", "\n")
-    rendered = "\n".join(line.rsplit("\r", 1)[-1] for line in text.split("\n"))
-    return _THINK_RE.sub("", rendered).strip()
+    return strip_leading_reasoning(render_terminal(stdout), _THINK_RE).strip()
+
+
+def _unterminated_think(text: str) -> str | None:
+    """Flag a cleaned answer that still holds an *unterminated* ``<think>`` block, else ``None``.
+
+    ``_clean_output`` removes a complete leading ``<think>...</think>``; if an opening ``<think>``
+    survives with no closing tag, the model's output was truncated mid-reasoning -- a parse failure,
+    not a usable answer.
+    """
+    if "<think>" in text and "</think>" not in text:
+        return "lms output contains an unterminated <think> block (the model output was likely truncated mid-reasoning)"
+    return None
+
+
+#: LM Studio drives a local model that should always produce text. The cleaner renders the
+#: load-progress bar away and removes a leading think block; the validator fails an unterminated
+#: think block (truncated reasoning); an empty answer means a failed load.
+_PARSER = TextParser(
+    clean=_clean_output,
+    empty_message="lms produced no output (the model may have failed to load)",
+    validate=_unterminated_think,
+)
 
 
 def _parse_model_keys(stdout: str) -> list[str]:

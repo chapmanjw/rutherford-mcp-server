@@ -21,14 +21,12 @@ Flags verified 2026-05-30 against ``qwen --help`` (qwen 0.17.0).
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from ..domain.enums import AuthState, OutputMode, SafetyMode
 from ..domain.models import (
     AdapterCapabilities,
     AuthStatus,
-    Cost,
     DelegationRequest,
     DelegationResult,
     InvocationContext,
@@ -37,6 +35,7 @@ from ..domain.models import (
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
+from .parsing import CostSpec, extract_cost, finalize_answer, last_event, parse_json_array, str_field
 from .results import error_result, nonzero_result, success_result, timeout_result
 
 
@@ -131,7 +130,7 @@ class QwenAdapter(BaseCLIAdapter):
         if raw.timed_out:
             return timeout_result(ctx, raw)
 
-        events = _parse_events(raw.stdout)
+        events = parse_json_array(raw.stdout)
         if events is None:
             if raw.exit_code != 0:
                 return nonzero_result(ctx, raw)
@@ -143,18 +142,17 @@ class QwenAdapter(BaseCLIAdapter):
                 text=raw.stdout.strip(),
             )
 
-        result_event = _last_event_of_type(events, "result")
+        result_event = last_event(events, "result")
         if result_event is not None:
-            raw_answer = result_event.get("result")
-            text = str(raw_answer) if isinstance(raw_answer, str) else ""
+            text = str_field(result_event, "result")
             session_id = result_event.get("session_id")
-            is_error = bool(result_event.get("is_error"))
-            if raw.exit_code != 0 or is_error:
+            cost = extract_cost(result_event.get("usage"), _COST)
+            if raw.exit_code != 0 or bool(result_event.get("is_error")):
                 message = text or result_event.get("subtype") or "qwen reported an error"
                 if raw.exit_code != 0 and not text:
                     return nonzero_result(ctx, raw, text=text)
                 return error_result(ctx, raw, "NONZERO_EXIT", str(message), text=text)
-            if not isinstance(raw_answer, str) or not raw_answer.strip():
+            if not text.strip():
                 fallback = _last_assistant_text(events)
                 if fallback is not None and fallback.strip():
                     return success_result(
@@ -162,7 +160,7 @@ class QwenAdapter(BaseCLIAdapter):
                         raw,
                         fallback,
                         session_id=str(session_id) if session_id else None,
-                        cost=_extract_cost(result_event.get("usage")),
+                        cost=cost,
                     )
                 return error_result(
                     ctx,
@@ -176,51 +174,27 @@ class QwenAdapter(BaseCLIAdapter):
                 raw,
                 text,
                 session_id=str(session_id) if session_id else None,
-                cost=_extract_cost(result_event.get("usage")),
+                cost=cost,
             )
 
-        # No result element: fall back to the last assistant message.
-        answer = _last_assistant_text(events)
-        if raw.exit_code != 0:
-            if answer is not None:
-                return success_result(ctx, raw, answer)
-            return nonzero_result(ctx, raw)
-        if answer is not None:
-            return success_result(ctx, raw, answer)
-
-        return error_result(
+        # No result element: fall back to the last assistant message. An assistant answer (if any)
+        # is the result even on a non-zero exit; with neither result nor assistant text it is a
+        # parse failure on a clean exit, a non-zero exit otherwise.
+        return finalize_answer(
             ctx,
             raw,
-            "PARSE_ERROR",
-            "qwen -o json produced no result or assistant message",
-            text=raw.stdout.strip(),
+            answer=_last_assistant_text(events),
+            no_output_message="qwen -o json produced no result or assistant message",
         )
 
     def check_output_contract(self, raw: ProcessResult) -> bool:
         """A successful qwen run must emit a parseable JSON event array."""
-        return bool(_parse_events(raw.stdout))
+        return bool(parse_json_array(raw.stdout))
 
 
-def _parse_events(stdout: str) -> list[dict[str, Any]] | None:
-    """Return the list of event objects from a JSON array, or ``None`` if it is not one."""
-    candidate = stdout.strip()
-    if not candidate:
-        return None
-    try:
-        parsed = json.loads(candidate)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(parsed, list):
-        return None
-    return [event for event in parsed if isinstance(event, dict)]
-
-
-def _last_event_of_type(events: list[dict[str, Any]], etype: str) -> dict[str, Any] | None:
-    """Return the last event whose ``type`` equals ``etype``, or ``None``."""
-    for event in reversed(events):
-        if event.get("type") == etype:
-            return event
-    return None
+#: qwen carries token counts directly in a ``result`` event's ``usage`` block, including a
+#: ``total_tokens`` figure alongside ``input_tokens`` / ``output_tokens``.
+_COST = CostSpec(total_keys=("total_tokens",))
 
 
 def _last_assistant_text(events: list[dict[str, Any]]) -> str | None:
@@ -229,7 +203,7 @@ def _last_assistant_text(events: list[dict[str, Any]]) -> str | None:
     The assistant event carries ``message.content`` as a list of parts; we join the text of the
     ``{"type":"text","text":...}`` parts.
     """
-    assistant = _last_event_of_type(events, "assistant")
+    assistant = last_event(events, "assistant")
     if assistant is None:
         return None
     message = assistant.get("message")
@@ -247,15 +221,3 @@ def _last_assistant_text(events: list[dict[str, Any]]) -> str | None:
     if not parts:
         return None
     return "".join(parts)
-
-
-def _extract_cost(usage: Any) -> Cost | None:
-    """Build a :class:`Cost` from a qwen ``usage`` block, if any tokens are present."""
-    if not isinstance(usage, dict):
-        return None
-    input_tokens = usage.get("input_tokens")
-    output_tokens = usage.get("output_tokens")
-    total_tokens = usage.get("total_tokens")
-    if input_tokens is None and output_tokens is None and total_tokens is None:
-        return None
-    return Cost(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens)

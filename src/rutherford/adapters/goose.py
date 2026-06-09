@@ -30,7 +30,7 @@ from ..domain.models import (
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
-from .results import nonzero_result, strip_ansi, success_result, timeout_result
+from .parsing import TextParser
 
 
 class GooseAdapter(BaseCLIAdapter):
@@ -118,13 +118,13 @@ class GooseAdapter(BaseCLIAdapter):
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         """Map the raw process result to the normalized envelope; never raises.
 
-        Timeout maps to ``TIMEOUT``; a non-zero exit maps to ``NONZERO_EXIT`` (surfacing
-        stderr). On a zero exit the trimmed stdout is the answer -- including the empty string,
-        which is still treated as success. Goose does not surface a resumable session id in
+        Timeout maps to ``TIMEOUT``; a non-zero exit maps to ``NONZERO_EXIT`` (surfacing stderr).
+        On a zero exit the ANSI-stripped, trimmed stdout is the answer -- including the empty
+        string, which is still treated as success. Goose does not surface a resumable session id in
         headless text output, so ``session_id`` is ``None``.
         """
-        if raw.timed_out:
-            return timeout_result(ctx, raw)
-        if raw.exit_code != 0:
-            return nonzero_result(ctx, raw)
-        return success_result(ctx, raw, strip_ansi(raw.stdout).strip(), session_id=None)
+        return _PARSER.parse(raw, ctx)
+
+
+#: Goose answers in plain text and treats an empty answer on a clean exit as success.
+_PARSER = TextParser(allow_empty=True)

@@ -13,7 +13,6 @@ whose output needs custom parsing (streaming events, transcript files) still nee
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from ..config.schema import GenericAdapterConfig
 from ..domain.enums import AuthState, OutputMode, SafetyMode
@@ -30,6 +29,7 @@ from ..domain.models import (
 )
 from ..runtime.probe import CommandProbe
 from .base import BaseCLIAdapter
+from .parsing import as_text, dotted_get, last_json_object
 from .results import error_result, nonzero_result, success_result, timeout_result
 
 
@@ -118,41 +118,21 @@ class GenericAdapter(BaseCLIAdapter):
         return success_result(ctx, raw, text)
 
     def _extract_text(self, stdout: str) -> str | None:
-        """Extract the final answer per the configured output mode."""
+        """Extract the final answer per the configured output mode.
+
+        For a JSON CLI the answer is the last top-level JSON object (via the robust
+        :func:`~rutherford.io.jsontext.last_json_object` scanner, which tolerates prose around the
+        object and skips a trailing array), then either the whole object re-serialized or, when a
+        ``json_text_path`` is configured, the scalar leaf at that dotted path. A non-scalar leaf
+        (object/list/bool) or a missing path yields ``None`` -- reported as a parse failure rather
+        than a stringified container. TEXT/JSONL/TRANSCRIPT generic CLIs return stdout verbatim.
+        """
         if self._config.output_mode is OutputMode.JSON:
-            payload = _last_json_object(stdout)
+            payload = last_json_object(stdout)
             if payload is None:
                 return None
             if self._config.json_text_path:
-                value = _dotted_get(payload, self._config.json_text_path)
-                if value is None or isinstance(value, (dict, list, bool)):
-                    return None
-                return str(value)
+                return as_text(dotted_get(payload, self._config.json_text_path))
             return json.dumps(payload, ensure_ascii=False)
         # TEXT, JSONL, and TRANSCRIPT generic CLIs return their stdout verbatim.
         return stdout.strip()
-
-
-def _last_json_object(stdout: str) -> dict[str, Any] | None:
-    """Return the last line of ``stdout`` (or the whole text) that parses as a JSON object."""
-    for candidate in (*reversed(stdout.splitlines()), stdout):
-        text = candidate.strip()
-        if not text.startswith("{"):
-            continue
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
-    return None
-
-
-def _dotted_get(payload: dict[str, Any], path: str) -> Any:
-    """Follow a dotted key path (e.g. ``message.content``) into nested dicts."""
-    current: Any = payload
-    for key in path.split("."):
-        if not isinstance(current, dict) or key not in current:
-            return None
-        current = current[key]
-    return current

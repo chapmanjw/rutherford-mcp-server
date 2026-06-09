@@ -15,13 +15,13 @@ Flags verified 2026-05-30 against ``claude --help`` (Claude Code 2.1.158).
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from ..domain.enums import AuthState, OutputMode, SafetyMode
 from ..domain.models import (
     AdapterCapabilities,
     AuthStatus,
-    Cost,
     DelegationRequest,
     DelegationResult,
     InvocationContext,
@@ -30,7 +30,7 @@ from ..domain.models import (
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
-from .results import error_result, nonzero_result, success_result, timeout_result
+from .parsing import CostSpec, JsonEnvelopeParser, last_json_object
 
 
 class ClaudeCodeAdapter(BaseCLIAdapter):
@@ -119,44 +119,7 @@ class ClaudeCodeAdapter(BaseCLIAdapter):
         return InvocationSpec(argv=argv, env=dict(safety.env), cwd=req.working_dir)
 
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
-        if raw.timed_out:
-            return timeout_result(ctx, raw)
-
-        payload = _last_json_object(raw.stdout)
-        if payload is None:
-            if raw.exit_code != 0:
-                return nonzero_result(ctx, raw)
-            return error_result(
-                ctx,
-                raw,
-                "PARSE_ERROR",
-                "claude --output-format json produced no parseable JSON object",
-                text=raw.stdout.strip(),
-            )
-
-        raw_text = payload.get("result")
-        text = raw_text if isinstance(raw_text, str) else ""
-        session_id = payload.get("session_id")
-        is_error = bool(payload.get("is_error")) or str(payload.get("subtype", "")).startswith("error")
-        if raw.exit_code != 0 or is_error:
-            message = text or payload.get("subtype") or "claude reported an error"
-            return error_result(ctx, raw, "NONZERO_EXIT", str(message), text=text)
-        if not text.strip():
-            return error_result(
-                ctx,
-                raw,
-                "PARSE_ERROR",
-                "claude reported success but the JSON object had no `result` text",
-                text=raw.stdout.strip(),
-            )
-
-        return success_result(
-            ctx,
-            raw,
-            text,
-            session_id=str(session_id) if session_id else None,
-            cost=_extract_cost(payload),
-        )
+        return _PARSER.parse(raw, ctx)
 
     def check_output_contract(self, raw: ProcessResult) -> bool:
         """A successful claude run must carry a JSON result object (``--output-format json``).
@@ -164,7 +127,7 @@ class ClaudeCodeAdapter(BaseCLIAdapter):
         The drift canary for this adapter: if a future CLI build stops emitting the JSON envelope
         but still exits cleanly, this is what catches the silent regression at the delegation layer.
         """
-        return _last_json_object(raw.stdout) is not None
+        return _PARSER.contract_ok(raw)
 
 
 #: ``CLAUDE_CODE_USE_*`` switches that route Claude Code to a cloud backend whose credential is an
@@ -211,30 +174,20 @@ def _parse_status_json(stdout: str) -> dict[str, Any] | None:
         whole = None
     if isinstance(whole, dict):
         return whole
-    return _last_json_object(stdout)
+    return last_json_object(stdout)
 
 
-def _last_json_object(stdout: str) -> dict[str, Any] | None:
-    """Return the last line of ``stdout`` that parses as a JSON object, or ``None``."""
-    for line in reversed(stdout.splitlines()):
-        candidate = line.strip()
-        if not candidate.startswith("{"):
-            continue
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
-    return None
+def _is_error(payload: Mapping[str, Any]) -> bool:
+    """Claude signals an error via ``is_error`` true or an ``error``-prefixed ``subtype``."""
+    return bool(payload.get("is_error")) or str(payload.get("subtype", "")).startswith("error")
 
 
-def _extract_cost(payload: dict[str, Any]) -> Cost | None:
-    """Build a :class:`Cost` from the claude JSON result, if any cost fields are present."""
-    usd = payload.get("total_cost_usd")
-    usage = payload.get("usage") or {}
-    input_tokens = usage.get("input_tokens") if isinstance(usage, dict) else None
-    output_tokens = usage.get("output_tokens") if isinstance(usage, dict) else None
-    if usd is None and input_tokens is None and output_tokens is None:
-        return None
-    return Cost(usd=usd, input_tokens=input_tokens, output_tokens=output_tokens)
+#: The shared envelope parser configured for Claude Code: the answer is ``result``, the cost is a
+#: top-level ``total_cost_usd`` plus the token counts nested under ``usage``.
+_PARSER = JsonEnvelopeParser(
+    cli_name="claude",
+    is_error=_is_error,
+    cost=CostSpec(usd_key="total_cost_usd", tokens_key="usage"),
+    no_object_message="claude --output-format json produced no parseable JSON object",
+    no_text_message="claude reported success but the JSON object had no `result` text",
+)

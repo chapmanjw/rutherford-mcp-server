@@ -33,7 +33,7 @@ from ..domain.models import (
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
-from .results import nonzero_result, strip_ansi, success_result, timeout_result
+from .parsing import TextParser
 
 
 class KiroAdapter(BaseCLIAdapter):
@@ -122,14 +122,14 @@ class KiroAdapter(BaseCLIAdapter):
         The chat answer is Markdown on stdout with ANSI color codes and a ``> `` response marker
         in ``--no-interactive`` mode; ANSI sequences are stripped so the text is clean. Success
         returns the trimmed text with no session id. A timeout maps to ``TIMEOUT`` and a non-zero
-        exit to ``NONZERO_EXIT``.
+        exit to ``NONZERO_EXIT`` carrying the cleaned partial output (stderr is the message).
         """
-        if raw.timed_out:
-            return timeout_result(ctx, raw)
-        text = strip_ansi(raw.stdout).strip()
-        if raw.exit_code != 0:
-            return nonzero_result(ctx, raw, text=text)
-        return success_result(ctx, raw, text, session_id=None)
+        return _PARSER.parse(raw, ctx)
+
+
+#: Kiro answers in plain text. An empty answer on a clean exit is success; a non-zero exit carries
+#: the cleaned partial output on the result (stderr remains the error message).
+_PARSER = TextParser(allow_empty=True, surface_text_on_nonzero=True)
 
 
 def _model_names(payload: Any) -> list[str]:
