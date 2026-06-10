@@ -4,6 +4,70 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Breaking
+
+- A config-defined generic adapter must now declare its read-only posture: config load fails unless
+  `safety.read_only` is a non-empty argv fragment OR `natively_read_only = true` explicitly declares
+  the CLI cannot write or execute by default. Previously an omitted fragment silently ran the CLI in
+  its native (possibly write-capable) posture while the result claimed `safety_mode=read_only`. An
+  existing config that omitted both now fails at startup with the fix named in the error.
+- `default_safety_mode` is now honored: when a `delegate` / `consensus` / `debate` call omits
+  `safety_mode`, the configured default applies (it was previously documented but inert -- every call
+  silently ran `read_only`). An explicit `safety_mode` always wins over config, and mutating modes
+  remain gated by the trusted-workspace check.
+- The `review` and `plan` tools no longer accept `safety_mode`; both are clamped to `read_only`.
+  Their docstrings said "read-only" while forwarding `write`/`yolo` into the delegation; the name is
+  now enforced. A mutating run is `delegate`/`consensus` by design.
+- Claude Code's prompt (with any role preamble folded in) now rides stdin instead of argv, and
+  `--append-system-prompt` is no longer used (`capabilities().supports_system_prompt` is now
+  `false`). This lifts the ~32K Windows command-line ceiling on long prompts and survives the
+  npm `.cmd`-shim newline truncation.
+
+### Fixed
+
+- The process runner no longer deadlocks when a CLI fills its output pipes before consuming a large
+  stdin prompt (output drains now start before stdin is written), and a single stderr line over
+  64 KiB no longer crashes the delegation (chunked stderr drain). The timeout/cancel tree-kill now
+  waits for killed survivors to be reaped and is shared with the metadata probe, so a timed-out
+  wrapper's forked CLI is reaped on both paths.
+- One raising adapter probe no longer aborts an entire consensus or debate panel: `detect()` and
+  `fallback_model()` are contained as structured failures, and panel fan-out folds any escaped
+  exception into that one voice.
+- `[adapters.<id>] enabled = false` now disables a config-defined generic adapter too, and duplicate
+  generic adapter ids fail registry construction instead of silently overwriting each other.
+- Cursor's safety mapping fails closed: an unknown (future) safety mode now maps to `--mode ask`,
+  not Cursor's edit-capable default.
+- Antigravity's write-equals-bypass posture is surfaced instead of silent: a `write_uses_bypass`
+  capability flag, a `doctor` note, and the safety-flags note all state that `write` and `yolo` are
+  equivalent on this adapter (agy print mode has no granular approval).
+- A truncated trailing JSON array in a model's answer can no longer steal the "last object" from the
+  real verdict on the consensus strategy path, and OpenCode cumulative-snapshot streams (including
+  interleaved multi-part streams) no longer return doubled text.
+- A negative seat `weight` in a `panels.toon` now fails at load as `PANEL_INVALID` (naming the file
+  and seat) instead of as a raw validation error mid-call.
+- `setup` validates `safety_mode` at the tool boundary (a bogus value can no longer be written into
+  `config.toml` where it would block the next startup) and applies its plan with exclusive-create
+  writes, so a file appearing between planning and applying is skipped, never clobbered.
+- An unexpected server error now returns a fixed message to the MCP client while the full traceback
+  goes to the server-side log (exception text could previously leak paths or input to the client).
+- Error codes are typed as the closed `ErrorCode` contract end to end: a typoed code now fails at
+  construction instead of serializing into a client-visible envelope (the wire shape is unchanged).
+- Antigravity's newest-conversation fallback tolerates a brain/ directory vanishing mid-scan, the
+  probe cache keys results by effective timeout (a short-budget `timed_out` verdict is never served
+  to a longer-budget call), and the short OpenAI model families (o1/o3/o4) are matched as whole
+  tokens so an unrelated segment cannot mis-infer the provider.
+
+### Added
+
+- Gate hardening: `pytest -m integration` now FAILS when zero CLIs are opted in (set
+  `RUTHERFORD_IT_ALLOW_EMPTY=1` to permit an empty run explicitly); the live model-selection and
+  timeout tests assert real outcomes; optional local adapters without a configured `default_model`
+  skip with the exact config named; a per-file coverage floor (80% across `adapters/`, `services/`,
+  `runtime/`) and the entrypoint smoke check joined `just check` and CI; Python 3.13 joined the CI
+  matrix.
+
 ## [1.2.0] - 2026-06-09
 
 ### Added

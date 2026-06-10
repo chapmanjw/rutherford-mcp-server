@@ -24,6 +24,7 @@ from .enums import (
     Stance,
     Strategy,
 )
+from .error_codes import ErrorCode
 
 # --- The unit of delegation --------------------------------------------------
 
@@ -154,9 +155,15 @@ class Artifact(BaseModel):
 
 
 class ErrorInfo(BaseModel):
-    """The error payload carried in a failed result envelope."""
+    """The error payload carried in a failed result envelope.
 
-    code: str
+    ``code`` is typed as the :class:`~rutherford.domain.error_codes.ErrorCode` enum -- the codes
+    are a closed client contract, so a typoed or ad-hoc string fails at construction here rather
+    than serializing cleanly into a client-visible envelope. (A valid code STRING still coerces;
+    the wire shape is unchanged.)
+    """
+
+    code: ErrorCode
     message: str
     details: dict[str, Any] | None = None
 
@@ -191,6 +198,12 @@ class AdapterCapabilities(BaseModel):
     output_mode: OutputMode = OutputMode.TEXT
     file_context_style: str | None = None
     runtime: Runtime = Runtime.NATIVE
+    #: True when this CLI has no write posture distinct from its permission bypass: ``write`` and
+    #: ``yolo`` map to the same bypass flag (e.g. Antigravity print mode, which has no granular
+    #: approval -- without the bypass, write-mode edits are silently never applied). Surfaced so a
+    #: caller opting into ``write`` can see it is opting into the bypass, and so ``doctor`` says
+    #: so out loud.
+    write_uses_bypass: bool = False
 
 
 class SafetyFlags(BaseModel):

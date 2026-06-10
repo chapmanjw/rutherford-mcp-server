@@ -30,9 +30,11 @@ class ProcessRunner(Protocol):
     ) -> ProcessResult:
         """Execute ``spec``, enforce ``timeout_s``, and return the raw outcome.
 
-        A timeout, a non-zero exit, or a missing binary are normal outcomes returned as a
-        :class:`ProcessResult` -- not raised. On timeout or cancellation the whole process tree
-        is killed.
+        A timeout or a non-zero exit are normal outcomes returned as a :class:`ProcessResult` --
+        not raised. A *spawn* failure (missing binary, exec error) raises ``OSError``; the
+        delegation service normalizes that to a structured ``SPAWN_FAILED`` result, so a direct
+        caller of this interface must handle it. On timeout or cancellation the whole process
+        tree is killed.
         """
         ...
 
@@ -73,7 +75,7 @@ class AsyncProcessRunner:
                 timeout=timeout_s,
             )
         except (TimeoutError, asyncio.CancelledError) as exc:
-            await asyncio.to_thread(_kill_process_tree, process.pid)
+            await asyncio.to_thread(kill_process_tree, process.pid)
             duration = time.monotonic() - start
             if isinstance(exc, asyncio.CancelledError):
                 raise
@@ -97,7 +99,14 @@ class AsyncProcessRunner:
         stdin_bytes: bytes | None,
         on_progress: Callable[[str], None] | None,
     ) -> tuple[bytes, bytes]:
-        """Feed stdin, drain stdout, and tee stderr lines to ``on_progress``."""
+        """Drain stdout/stderr while feeding stdin, teeing stderr lines to ``on_progress``.
+
+        The drains MUST be running before stdin is written: a child that fills its output pipe
+        before consuming a large prompt would otherwise deadlock against a parent blocked in
+        ``stdin.drain()`` on a full stdin pipe -- surfacing as a false timeout on a healthy CLI.
+        (This is the ordering ``Process.communicate()`` itself uses; reimplemented only to tee
+        stderr lines to ``on_progress`` as they arrive.)
+        """
         assert process.stdout is not None
         assert process.stderr is not None
 
@@ -105,31 +114,60 @@ class AsyncProcessRunner:
             return await process.stdout.read()  # type: ignore[union-attr]
 
         async def drain_stderr() -> bytes:
+            # Read in bounded chunks, not readline(): a single stderr line longer than the
+            # StreamReader limit (64 KiB by default) makes readline() raise ValueError, which
+            # would escape the runner as a crash. Lines are re-split here only to feed
+            # on_progress; a pathological never-newline stream just flushes oversized chunks.
             chunks: list[bytes] = []
+            pending = b""
             while True:
-                line = await process.stderr.readline()  # type: ignore[union-attr]
-                if not line:
+                chunk = await process.stderr.read(65536)  # type: ignore[union-attr]
+                if not chunk:
                     break
-                chunks.append(line)
+                chunks.append(chunk)
                 if on_progress is not None:
-                    on_progress(line.decode("utf-8", errors="replace").rstrip("\n"))
+                    pending += chunk
+                    *lines, pending = pending.split(b"\n")
+                    for line in lines:
+                        on_progress(line.decode("utf-8", errors="replace").rstrip("\r"))
+                    if len(pending) > 65536:  # no newline in sight; flush rather than buffer unbounded
+                        on_progress(pending.decode("utf-8", errors="replace"))
+                        pending = b""
+            if on_progress is not None and pending:
+                on_progress(pending.decode("utf-8", errors="replace").rstrip("\r"))
             return b"".join(chunks)
 
-        if stdin_bytes is not None and process.stdin is not None:
-            process.stdin.write(stdin_bytes)
-            await process.stdin.drain()
-            process.stdin.close()
+        async def feed_stdin() -> None:
+            if stdin_bytes is None or process.stdin is None:
+                return
+            try:
+                process.stdin.write(stdin_bytes)
+                await process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the child exited (or closed stdin) before reading everything; its output decides
+            finally:
+                process.stdin.close()
 
-        stdout_b, stderr_b = await asyncio.gather(drain_stdout(), drain_stderr())
+        stdout_b, stderr_b, _ = await asyncio.gather(drain_stdout(), drain_stderr(), feed_stdin())
         await process.wait()
         return stdout_b, stderr_b
 
 
-def _kill_process_tree(pid: int, timeout_s: float = 3.0) -> None:
+def kill_process_tree(pid: int, timeout_s: float = 3.0) -> None:
     """Terminate ``pid`` and all descendants. Best-effort; never raises.
 
+    Public within the runtime layer: the async runner's timeout/cancel path and the synchronous
+    probe's timeout path share this one tree-kill policy, so a Windows ``cmd.exe`` shim that
+    forked the real CLI is reaped the same way on both paths.
+
     Uses ``terminate()`` then ``kill()`` (not raw signals) so it works identically on POSIX and
-    Windows. The official psutil recipe.
+    Windows -- the official psutil recipe, plus a second ``wait_procs`` after the kill pass so
+    cleanup is actually complete (not merely signalled) when this returns.
+
+    Residual risk, accepted: if the direct child has *already exited* by the time this runs, its
+    still-live descendants have been reparented and are no longer discoverable from ``pid`` --
+    they are not killed. Closing that window needs OS process groups / job objects, which is a
+    larger change than this best-effort path warrants today.
     """
     import contextlib
 
@@ -139,9 +177,9 @@ def _kill_process_tree(pid: int, timeout_s: float = 3.0) -> None:
         return
     try:
         parent = psutil.Process(pid)
+        procs = parent.children(recursive=True)
     except psutil.NoSuchProcess:
-        return
-    procs = parent.children(recursive=True)
+        return  # parent already gone; reparented descendants are undiscoverable (see docstring)
     procs.append(parent)
     for proc in procs:
         with contextlib.suppress(psutil.NoSuchProcess):
@@ -150,3 +188,5 @@ def _kill_process_tree(pid: int, timeout_s: float = 3.0) -> None:
     for proc in alive:
         with contextlib.suppress(psutil.NoSuchProcess):
             proc.kill()
+    if alive:  # SIGKILL is not catchable, but wait so the tree is reaped before we report done
+        psutil.wait_procs(alive, timeout=timeout_s)

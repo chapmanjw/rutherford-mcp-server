@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from rutherford.domain.enums import SafetyMode
 from rutherford.domain.error_codes import ALL_ERROR_CODES, ErrorCode, is_error_code
 from rutherford.domain.errors import ConfigError, DepthLimitError, RutherfordError
-from rutherford.domain.models import DelegationRequest, Target
+from rutherford.domain.models import DelegationRequest, ErrorInfo, Target
 
 
 def test_error_codes_are_strings_and_known() -> None:
@@ -90,3 +90,16 @@ def test_rutherford_error_carries_code() -> None:
 def test_config_error_and_depth_error_have_codes() -> None:
     assert ConfigError("bad").code == ErrorCode.INVALID_INPUT
     assert DepthLimitError("deep").code == ErrorCode.MAX_DEPTH_EXCEEDED
+
+
+def test_error_envelope_rejects_a_non_contract_code() -> None:
+    # The error codes are a closed client contract; a typoed or ad-hoc code must fail at
+    # construction -- both on the envelope model and at a RutherfordError raise site -- rather
+    # than serialize cleanly into a client-visible result.
+    with pytest.raises(ValidationError):
+        ErrorInfo(code="INVALID_INPT", message="typo")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="INVALID_INPT"):
+        RutherfordError("INVALID_INPT", "typo")
+    # Valid code strings still coerce -- the ergonomic path is unchanged.
+    assert ErrorInfo(code="TIMEOUT", message="slow").code is ErrorCode.TIMEOUT  # type: ignore[arg-type]
+    assert RutherfordError("TIMEOUT", "slow").code is ErrorCode.TIMEOUT

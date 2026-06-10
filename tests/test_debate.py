@@ -58,6 +58,87 @@ async def test_later_rounds_show_each_voice_the_others() -> None:
     assert any("other participants' latest positions" in prompt for prompt in prompts)
 
 
+async def test_a_raising_seat_becomes_a_failed_contribution_not_a_round_abort() -> None:
+    # The debate shares consensus's partial-failure contract: a seat whose adapter probe RAISES
+    # must be recorded as a failed contribution while the other seat's turn survives and the
+    # debate runs to completion (later rounds proceed with the survivors).
+    class _DetectRaises(FakeAdapter):
+        def detect(self):
+            raise RuntimeError("probe exploded")
+
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b"), _DetectRaises("boom")], runner)
+    result = await service.debate(
+        DebateRequest(
+            targets=[Target(cli="a"), Target(cli="b"), Target(cli="boom")],
+            prompt="q",
+            rounds=2,
+            synthesize=False,
+        )
+    )
+    round_one = {c.label: c for c in result.rounds[0].contributions}
+    assert round_one["a"].ok and round_one["b"].ok
+    assert not round_one["boom"].ok
+    assert round_one["boom"].error is not None
+    assert round_one["boom"].error.code == "INTERNAL"
+    assert len(result.rounds) == 2  # the debate completed with the two surviving seats
+    assert {c.label for c in result.rounds[1].contributions} == {"a", "b"}  # the raiser dropped out
+    assert all(c.ok for c in result.rounds[1].contributions)
+
+
+async def test_a_cancellation_escaping_a_seat_propagates_not_folds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Mirrors the consensus pin: a CancelledError captured by the round's return_exceptions gather
+    # must re-raise, not fold into a failed contribution -- a cancelled debate must not "complete"
+    # with a swallowed cancellation.
+    import asyncio
+
+    from rutherford.domain.models import DelegationRequest
+
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
+    real_delegate = DelegationService.delegate
+
+    async def cancelled(self: DelegationService, req: DelegationRequest, **kwargs: object):
+        if req.target.cli == "b":
+            raise asyncio.CancelledError()
+        return await real_delegate(self, req, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(DelegationService, "delegate", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await service.debate(
+            DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, synthesize=False)
+        )
+
+
+async def test_an_exception_escaping_a_seat_delegation_is_folded_into_the_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Defense in depth behind delegate()'s containment: an exception that still escapes one
+    # seat's delegation becomes that seat's failed contribution, not a lost round.
+    from rutherford.domain.models import DelegationRequest
+
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
+    real_delegate = DelegationService.delegate
+
+    async def explode(self: DelegationService, req: DelegationRequest, **kwargs: object):
+        if req.target.cli == "b":
+            raise RuntimeError("escaped containment")
+        return await real_delegate(self, req, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(DelegationService, "delegate", explode)
+    result = await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, synthesize=False)
+    )
+    contributions = {c.label: c for c in result.rounds[0].contributions}
+    assert contributions["a"].ok
+    assert not contributions["b"].ok
+    assert contributions["b"].error is not None
+    assert contributions["b"].error.code == "INTERNAL"
+
+
 async def test_failed_voice_drops_out_of_later_rounds() -> None:
     runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
     # "b" is not installed: it fails round one and should not appear in round two.

@@ -14,9 +14,9 @@ from .common import (
     ensure_known_cli,
     ensure_known_targets,
     parse_mode,
-    parse_safety_mode,
     parse_stances,
     parse_strategy,
+    resolve_safety_mode,
 )
 from .panels import panel_for_call
 
@@ -35,7 +35,7 @@ async def consensus_tool(
     working_dir: str | None = None,
     files: list[str] | None = None,
     role: str | None = None,
-    safety_mode: str = "read_only",
+    safety_mode: str | None = None,
     synthesize: bool = False,
     timeout_s: float | None = None,
     mode: str = "sync",
@@ -83,7 +83,7 @@ async def consensus_tool(
         working_dir=working_dir,
         files=files or [],
         role=role,
-        safety_mode=parse_safety_mode(safety_mode),
+        safety_mode=resolve_safety_mode(safety_mode, app.config.default_safety_mode),
         synthesize=synthesize,
         timeout_s=timeout_s,
         include_raw=include_raw,

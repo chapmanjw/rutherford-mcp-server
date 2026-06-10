@@ -59,6 +59,24 @@ def skip_unless_available(app: AppContext, cli_id: str) -> None:
         pytest.skip(reason)
 
 
+def skip_unless_runnable(app: AppContext, cli_id: str) -> None:
+    """Like :func:`skip_unless_available`, plus a model requirement for the local adapters.
+
+    Ollama and LM Studio have no built-in default model: a no-model delegation fails immediately
+    with ``INVALID_INPUT`` before any subprocess, which is a configuration gap, not the behavior
+    under test. Skipping names the exact config to set, so the gap is visible in the skip report
+    rather than masked (and the run still FAILS outright when zero CLIs are opted in at all).
+    """
+    skip_unless_available(app, cli_id)
+    adapter = app.registry.get(cli_id)
+    static_models = getattr(adapter, "static_models", ())  # not on the CLIAdapter Protocol
+    if adapter.optional and app.config.default_model_for(cli_id) is None and not static_models:
+        pytest.skip(
+            f"{cli_id} has no default model; set [adapters.{cli_id}] default_model "
+            "(see docs/integration-testing.md) to run its delegation tests"
+        )
+
+
 def available_clis(app: AppContext) -> list[str]:
     """Return the list of CLI ids ready for integration testing."""
     return [cli_id for cli_id in CLI_ENV if is_available(app, cli_id)]

@@ -262,3 +262,83 @@ def test_available_models_queries_cli() -> None:
 def test_available_models_falls_back_on_failure() -> None:
     probe = FakeProbe(default_result=ProcessResult(exit_code=1, stderr="boom"))
     assert OpenCodeAdapter(probe=probe).available_models() == []
+
+
+def test_parse_cumulative_snapshot_stream_returns_the_latest_snapshot() -> None:
+    # The full-codebase panel's MAJOR: a stream whose text events carry cumulative SNAPSHOTS
+    # (each repeating and extending the last) used to be concatenated -- "H"+"He"+"Hel" -- and the
+    # old joined.count(longest) > 1 guard never fired because the longest snapshot appears exactly
+    # once in that concatenation. The prefix chain must be detected and the latest snapshot win.
+    lines = "\n".join(
+        [
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"The answer"}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"The answer is"}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"The answer is 42."}}',
+        ]
+    )
+    result = OpenCodeAdapter().parse_output(ProcessResult(exit_code=0, stdout=lines, duration_s=0.2), _ctx())
+    assert result.ok
+    assert result.text == "The answer is 42."
+
+
+def test_parse_delta_stream_still_concatenates() -> None:
+    # True deltas (no prefix chain) keep concatenating -- the snapshot heuristic must not eat them.
+    lines = "\n".join(
+        [
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"Hel"}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"lo "}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"world"}}',
+        ]
+    )
+    result = OpenCodeAdapter().parse_output(ProcessResult(exit_code=0, stdout=lines, duration_s=0.2), _ctx())
+    assert result.ok
+    assert result.text == "Hello world"
+
+
+def test_parse_multi_part_cumulative_snapshots_resolve_per_part() -> None:
+    # Round-1 review blocker: two INTERLEAVED cumulative streams (distinct part ids) do not form
+    # one prefix chain, so a global-chain check fell back to concatenation and returned doubled
+    # text ("HelloHello worldworld!"). Streams must resolve per part id, then join in order.
+    lines = "\n".join(
+        [
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"Hello"}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p2","text":"world"}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"Hello "}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p2","text":"world!"}}',
+        ]
+    )
+    result = OpenCodeAdapter().parse_output(ProcessResult(exit_code=0, stdout=lines, duration_s=0.2), _ctx())
+    assert result.ok
+    assert result.text == "Hello world!"
+
+
+def test_parse_multi_part_delta_streams_concatenate_per_part() -> None:
+    # Interleaved DELTA streams keep concatenating within each part, joined in part order.
+    lines = "\n".join(
+        [
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"Hel"}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p2","text":" Wor"}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"lo"}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p2","text":"ld"}}',
+        ]
+    )
+    result = OpenCodeAdapter().parse_output(ProcessResult(exit_code=0, stdout=lines, duration_s=0.2), _ctx())
+    assert result.ok
+    assert result.text == "Hello World"
+
+
+def test_parse_repeated_identical_snapshot_resolves_to_one_copy() -> None:
+    # The equal-snapshot guard: a stream that emits the same full text twice (a final snapshot
+    # repeated) fails the strict-increase chain but is caught by the duplicated-longest check.
+    # NOTE the deliberate ambiguity this pins: identical repeated chunks ("Hel","Hel") could in
+    # principle be deltas meaning "HelHel", but on a snapshot-prone stream the repeated-snapshot
+    # reading is the safe one -- this test is the recorded decision.
+    lines = "\n".join(
+        [
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"The answer is 42."}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"The answer is 42."}}',
+        ]
+    )
+    result = OpenCodeAdapter().parse_output(ProcessResult(exit_code=0, stdout=lines, duration_s=0.2), _ctx())
+    assert result.ok
+    assert result.text == "The answer is 42."

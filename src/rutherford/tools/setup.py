@@ -9,6 +9,7 @@ import os
 
 from ..context import AppContext, tool_success
 from ..services.setup import apply_setup_plan, build_setup_plan
+from .common import parse_safety_mode
 from .probing import probe_adapter
 
 
@@ -28,11 +29,15 @@ async def setup_tool(
     (including the exact file contents) is returned so you can review it. Pass ``apply=true`` to write
     the files; an existing file is left untouched unless ``force=true``.
     """
+    # Validate at the MCP boundary like every other tool: an invalid safety_mode must be a clean
+    # INVALID_INPUT here -- never written into config.toml, where it would fail enum validation on
+    # the next load_config() and stop the server from starting.
+    validated_mode = parse_safety_mode(safety_mode)
     statuses = await asyncio.gather(*(asyncio.to_thread(probe_adapter, adapter) for adapter in app.registry.all()))
     plan = build_setup_plan(
         statuses,
         env=os.environ,
-        safety_mode=safety_mode,
+        safety_mode=validated_mode.value,
         trusted_workspaces=trusted_workspaces or [],
         panel_name=panel_name,
     )

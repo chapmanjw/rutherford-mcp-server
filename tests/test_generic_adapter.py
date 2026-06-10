@@ -15,7 +15,15 @@ from rutherford.domain.models import DelegationRequest, InvocationContext, Proce
 
 
 def _cfg(**kwargs: Any) -> GenericAdapterConfig:
-    base: dict[str, Any] = {"id": "mycli", "display_name": "My CLI", "binary": "mycli", "base_args": ["run"]}
+    # natively_read_only satisfies the read-only-posture validation for tests not about safety;
+    # a test exercising the safety mapping overrides `safety` with explicit fragments.
+    base: dict[str, Any] = {
+        "id": "mycli",
+        "display_name": "My CLI",
+        "binary": "mycli",
+        "base_args": ["run"],
+        "natively_read_only": True,
+    }
     base.update(kwargs)
     return GenericAdapterConfig(**base)
 

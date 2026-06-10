@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from rutherford.adapters.antigravity import AntigravityAdapter
 from rutherford.domain.enums import AuthState, SafetyMode
 from rutherford.domain.models import DelegationRequest, InvocationContext, ProcessResult, Target
@@ -209,6 +211,33 @@ def test_parse_completed_but_empty_answer_is_not_a_drift(tmp_path: Path) -> None
     assert result.error.code == "TRANSCRIPT_NOT_FOUND"
 
 
+def test_newest_brain_entry_tolerates_a_dir_vanishing_mid_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """agy rotates brain/ entries live: a dir listed by iterdir() can be gone by the stat() inside
+    max(). That race used to raise OSError out of parse_output (a never-raises contract); the
+    vanished entry must instead drop out of consideration and the survivor win."""
+    root = tmp_path / "agdata"
+    _write_transcript(root, "alive", _LINES)
+    (root / "brain" / "ghost").mkdir(parents=True)
+
+    real_stat = Path.stat
+    real_is_dir = Path.is_dir
+
+    def raising_stat(self: Path, *args: object, **kwargs: object):
+        if self.name == "ghost":
+            raise FileNotFoundError("vanished mid-scan")
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    # is_dir is forced True for the ghost (it would otherwise swallow the patched stat's OSError
+    # and silently filter the entry, never reaching the race window this test pins).
+    monkeypatch.setattr(Path, "is_dir", lambda self: True if self.name == "ghost" else real_is_dir(self))
+    monkeypatch.setattr(Path, "stat", raising_stat)
+
+    adapter = AntigravityAdapter(data_root=root)
+    result = adapter.parse_output(ProcessResult(exit_code=0, stdout=""), _ctx())
+    assert result.ok  # no OSError escaped; the surviving entry was used
+    assert result.session_id == "alive"
+
+
 def test_resume_reads_the_session_id_conversation_not_the_newest(tmp_path: Path) -> None:
     """On a resumed run the explicit session_id (the conversation agy was told to continue) is
     authoritative -- it must be read directly, not re-guessed via the newest-brain heuristic, which
@@ -315,6 +344,24 @@ def test_map_safety() -> None:
     assert adapter.map_safety(SafetyMode.READ_ONLY).args == []
     assert "--dangerously-skip-permissions" in adapter.map_safety(SafetyMode.WRITE).args
     assert "--dangerously-skip-permissions" in adapter.map_safety(SafetyMode.YOLO).args
+
+
+def test_write_equals_yolo_is_surfaced_not_silent() -> None:
+    # agy print mode has no granular approval, so WRITE deliberately uses the same bypass as YOLO.
+    # That equivalence must be VISIBLE everywhere a caller could look: the capability flag, the
+    # SafetyFlags note, and the doctor note -- not a silent surprise.
+    adapter = AntigravityAdapter()
+    assert adapter.capabilities().write_uses_bypass is True
+    assert "write == yolo" in adapter.map_safety(SafetyMode.WRITE).note
+    status = probe_adapter(AntigravityAdapter(probe=_agy_probe("1.0.7")), diagnostic=True)
+    assert any("write and yolo are" in note and "equivalent" in note for note in status.notes)
+
+
+def test_adapters_with_a_distinct_write_posture_do_not_carry_the_bypass_flag() -> None:
+    # The capability defaults False; only an adapter whose write IS the bypass sets it.
+    from rutherford.adapters.claude_code import ClaudeCodeAdapter
+
+    assert ClaudeCodeAdapter().capabilities().write_uses_bypass is False
 
 
 def test_no_models() -> None:

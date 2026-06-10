@@ -13,6 +13,10 @@ last one. The implementation is robust where a hand-rolled brace counter is not:
   is merely an *element* of a trailing array (``... {"verdict":"x"}\\n[{"file":"a"}]``) is not
   mistaken for a top-level object and cannot steal "last object" from the real one. A genuinely
   nested object inside an object's field value is still captured as part of its parent.
+* That suppression survives a TRUNCATED array: when the value at a ``[`` fails to parse (the model
+  cut off mid-array), the parseable elements are consumed and skipped rather than re-scanned, so
+  ``... {"verdict":"x"}\\nRelated: [{"verdict":"ignore"}`` still returns the real verdict. A prose
+  bracket whose contents are not JSON (``see [link]``) falls back to the one-character step.
 
 Pure and dependency-free, in the bottom layer so both the services (consensus strategies) and the
 adapters can use it.
@@ -45,6 +49,16 @@ def iter_json_objects(text: str) -> Iterator[dict[str, Any]]:
         try:
             value, end = _DECODER.raw_decode(text, start)
         except json.JSONDecodeError:
+            if text[start] == "[":
+                # A `[` that fails to parse whole may be a TRUNCATED array. Stepping one character
+                # in would re-find its element objects and yield them as top-level -- letting a
+                # cut-off trailing array steal "last object" from the real answer. Consume the
+                # parseable elements instead, keeping them suppressed exactly as a well-formed
+                # array's elements are.
+                consumed = _skip_truncated_array_elements(text, start)
+                if consumed > start:
+                    index = consumed
+                    continue
             index = start + 1
             continue
         if isinstance(value, dict):
@@ -80,3 +94,32 @@ def _next_value_start(text: str, index: int) -> int:
     if bracket == -1:
         return brace
     return min(brace, bracket)
+
+
+def _skip_truncated_array_elements(text: str, start: int) -> int:
+    """Consume the parseable elements of a malformed/truncated array opening at ``start``.
+
+    Returns the index just past the last consumed element (and past a closing ``]`` if one is
+    reached), or ``start`` when the bracket is not followed by parseable JSON values -- a prose
+    bracket like ``see [link]``, which the caller then steps past one character at a time exactly
+    as before. Best-effort by design: a complete object nested inside a truncated *element* can
+    still surface, but the common failure -- a cut-off trailing array of complete objects -- stays
+    suppressed.
+    """
+    index = start + 1
+    consumed = start
+    length = len(text)
+    while index < length:
+        while index < length and text[index] in " \t\r\n,":
+            index += 1
+        if index >= length:
+            break
+        if text[index] == "]":
+            return index + 1  # the array closed after all; everything inside stays suppressed
+        try:
+            _, end = _DECODER.raw_decode(text, index)
+        except json.JSONDecodeError:
+            break  # the truncation point; stop consuming here
+        index = end
+        consumed = end
+    return consumed if consumed > start else start

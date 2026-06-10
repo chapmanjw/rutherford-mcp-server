@@ -109,7 +109,10 @@ class DelegationService:
         except DepthLimitError as exc:
             return self._error(ctx, exc)
 
-        detected = adapter.detect()
+        try:
+            detected = adapter.detect()
+        except Exception as exc:  # a buggy adapter probe becomes a structured failure, not a panel abort
+            return self._fail(ctx, ErrorCode.INTERNAL, f"{req.target.cli} adapter detect() raised: {exc}")
         if not detected.installed:
             return self._fail(
                 ctx,
@@ -138,8 +141,9 @@ class DelegationService:
 
         result, raw = await self._execute(adapter, req, ctx, base_depth, on_progress)
 
-        if self._should_fallback(adapter, req, result):
-            result, raw = await self._fallback(adapter, req, ctx, base_depth, on_progress)
+        fallback_model = self._model_fallback_for(adapter, req, result)
+        if fallback_model is not None:
+            result, raw = await self._fallback(adapter, req, ctx, base_depth, on_progress, fallback_model)
 
         # Refine a generic non-zero exit into a specific failure category (rate-limit / auth / context
         # overflow / model-unavailable) so a caller -- and the fallback decision below -- can act on it.
@@ -261,18 +265,22 @@ class DelegationService:
             )
         return result, raw
 
-    def _should_fallback(self, adapter: CLIAdapter, req: DelegationRequest, result: DelegationResult) -> bool:
-        """Whether to retry once with the adapter's fallback model.
+    def _model_fallback_for(self, adapter: CLIAdapter, req: DelegationRequest, result: DelegationResult) -> str | None:
+        """The adapter's fallback model to retry once with, or ``None`` when no retry should happen.
 
         Only when the caller allowed it, the run failed on a model-availability error, and the
-        adapter offers a fallback that differs from what was already requested.
+        adapter offers a fallback that differs from what was already requested. The hook is guarded:
+        a buggy ``fallback_model()`` must not abort a delegation that already holds a result.
         """
         if not req.allow_model_fallback or result.ok or result.error is None:
-            return False
+            return None
         if not is_model_unavailable(result.error.message):
-            return False
-        fallback = adapter.fallback_model()
-        return fallback is not None and fallback != req.target.model
+            return None
+        try:
+            fallback = adapter.fallback_model()
+        except Exception:
+            return None
+        return fallback if fallback is not None and fallback != req.target.model else None
 
     async def _fallback(
         self,
@@ -281,10 +289,11 @@ class DelegationService:
         ctx: InvocationContext,
         base_depth: int,
         on_progress: ProgressCallback | None,
+        fallback_model: str,
     ) -> tuple[DelegationResult, ProcessResult | None]:
-        """Re-run the request once with the adapter's fallback model, recording the fallback."""
+        """Re-run the request once with ``fallback_model``, recording the fallback."""
         original_model = req.target.model
-        fb_target = req.target.model_copy(update={"model": adapter.fallback_model()})
+        fb_target = req.target.model_copy(update={"model": fallback_model})
         fb_req = req.model_copy(update={"target": fb_target, "allow_model_fallback": False})
         fb_ctx = ctx.model_copy(update={"target": fb_target})
         result, raw = await self._execute(adapter, fb_req, fb_ctx, base_depth, on_progress)
@@ -389,7 +398,7 @@ class DelegationService:
             return
         refined = classify_failure(result.error.message)
         if refined is not None:
-            result.error.code = str(refined)
+            result.error.code = refined
 
     def _error(self, ctx: InvocationContext, exc: RutherfordError) -> DelegationResult:
         """Build a failed result from a guard exception."""
@@ -414,7 +423,7 @@ class DelegationService:
             ok=False,
             exit_code=raw.exit_code if raw is not None else None,
             duration_s=raw.duration_s if raw is not None else 0.0,
-            error=ErrorInfo(code=str(code), message=message),
+            error=ErrorInfo(code=code, message=message),
             safety_mode=ctx.safety_mode,
         )
 

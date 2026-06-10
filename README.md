@@ -325,15 +325,17 @@ Every delegation runs in one of four safety modes, defaulting to the most restri
 
 | Mode | Meaning |
 | --- | --- |
-| `read_only` (default) | Inspect only. Review, consensus, debate, and plan are read-only by nature. |
+| `read_only` (default) | Inspect only. The `review` and `plan` tools are clamped to this mode. |
 | `propose` | The agent may propose changes (e.g. a diff) but not apply them. |
 | `write` | The agent may modify the workspace, subject to the CLI's own approvals. |
 | `yolo` | The agent may act without approval prompts (the CLI's bypass mode). |
 
-`write` and `yolo` require an explicit argument and a trusted-workspace check: the target directory must be
-on the configured `trusted_workspaces` allowlist, or the call must pass `trust_workspace=true`. No adapter
-ever defaults to its permission-bypass flag, and invocations are always built as an argv list, never a
-shell string. See [docs/security.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/security.md).
+A call that omits `safety_mode` adopts the configured `default_safety_mode` (read_only out of the box);
+an explicit value always wins. `write` and `yolo` -- whether explicit or configured as the default --
+require a trusted workspace: the target directory must be on the configured `trusted_workspaces`
+allowlist, or the call must pass `trust_workspace=true`. No adapter ever defaults to its
+permission-bypass flag, and invocations are always built as an argv list, never a shell string.
+See [docs/security.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/security.md).
 
 ## Configuration
 

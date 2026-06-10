@@ -181,7 +181,7 @@ class JobService:
             self._store.cancel(job_id)
             raise
         except Exception as exc:  # a crashing job body becomes a failed job, not a server crash
-            self._store.fail(job_id, ErrorInfo(code=str(ErrorCode.INTERNAL), message=str(exc)))
+            self._store.fail(job_id, ErrorInfo(code=ErrorCode.INTERNAL, message=str(exc)))
             # Log only the exception TYPE, not str(exc): a crashing body's message could carry prompt
             # or file content. The full message is still on the job's result for job_result to return.
             log_event("job_finished", job_id=job_id, status=JobStatus.FAILED.value, error_type=type(exc).__name__)

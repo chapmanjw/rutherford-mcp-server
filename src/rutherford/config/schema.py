@@ -62,6 +62,29 @@ class GenericAdapterConfig(BaseModel):
     #: provenance ``provider`` (F3). ``None`` leaves the provider to a model-name heuristic, then
     #: "unknown" -- Rutherford cannot otherwise know what an arbitrary configured CLI talks to.
     provider: str | None = None
+    #: Declares that the CLI's NATIVE default posture is read-only (it cannot write or execute
+    #: without extra flags), making an empty ``safety.read_only`` fragment honest. Without this
+    #: opt-in a generic adapter must configure a non-empty ``read_only`` fragment: the safety
+    #: mapping passes fragments through verbatim, so an empty one would run the CLI in its native
+    #: posture while the envelope claims ``safety_mode=read_only`` -- silently voiding the
+    #: default-read-only promise for a write-capable CLI.
+    natively_read_only: bool = False
+
+    @model_validator(mode="after")
+    def _validate_read_only_posture(self) -> GenericAdapterConfig:
+        """Refuse a generic adapter whose read_only mode would be a silent no-op.
+
+        ``map_safety`` passes the configured fragments through verbatim; with the default empty
+        ``read_only`` the CLI runs in its native posture under a ``read_only`` label. Fail at
+        config load with the fix in the message, rather than letting the safety contract lie.
+        """
+        if not self.safety.read_only and not self.natively_read_only:
+            raise ValueError(
+                f"generic adapter {self.id!r}: safety.read_only is empty, so read_only mode would apply "
+                "no restriction. Configure the CLI's read-only/sandbox flags in safety.read_only, or set "
+                "natively_read_only = true to declare the CLI cannot write or execute by default."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_output_mode(self) -> GenericAdapterConfig:

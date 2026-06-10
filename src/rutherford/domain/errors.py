@@ -17,7 +17,12 @@ from .error_codes import ErrorCode
 
 
 class RutherfordError(Exception):
-    """Base Rutherford error carrying a stable error code and optional structured details."""
+    """Base Rutherford error carrying a stable error code and optional structured details.
+
+    ``code`` accepts a string for ergonomics but is validated into the closed
+    :class:`ErrorCode` contract at construction -- a typo raises ``ValueError`` here, at the
+    raise site, instead of serializing an unknown code into a client-visible envelope.
+    """
 
     def __init__(
         self,
@@ -27,7 +32,7 @@ class RutherfordError(Exception):
         details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
-        self.code: str = str(code)
+        self.code: ErrorCode = ErrorCode(code)
         self.message = message
         self.details = details
 

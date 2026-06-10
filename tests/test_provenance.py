@@ -293,14 +293,14 @@ def test_local_adapters_are_local_and_do_not_split_the_org_prefix() -> None:
 
 
 def test_generic_provider_from_config() -> None:
-    cfg = GenericAdapterConfig(id="gen", display_name="Gen", binary="gen", provider="openai")
+    cfg = GenericAdapterConfig(id="gen", display_name="Gen", binary="gen", provider="openai", natively_read_only=True)
     prov = GenericAdapter(cfg, probe=FakeProbe()).provenance(_ctx("gen", "some-model"))
     assert prov.provider == "openai"
     assert prov.confirmed is True
 
 
 def test_generic_without_config_provider_uses_heuristic() -> None:
-    cfg = GenericAdapterConfig(id="gen", display_name="Gen", binary="gen")
+    cfg = GenericAdapterConfig(id="gen", display_name="Gen", binary="gen", natively_read_only=True)
     prov = GenericAdapter(cfg, probe=FakeProbe()).provenance(_ctx("gen", "claude-x"))
     assert prov.provider == "anthropic"
     assert prov.confirmed is False
@@ -506,3 +506,16 @@ async def test_debate_reports_diversity_over_final_round() -> None:
     assert result.diversity is not None
     assert result.diversity.distinct_models == 1
     assert result.diversity.low_diversity is True
+
+
+def test_short_openai_prefixes_do_not_match_unrelated_segments() -> None:
+    # o1/o3/o4 are matched as whole tokens, not bare prefixes: a region, tag, or version segment
+    # that merely BEGINS with those characters must not mis-infer openai (it would inflate the
+    # panel's distinct-provider count with a phantom vendor).
+    assert infer_provider_from_model("custom:o3x-experimental") is None
+    assert infer_provider_from_model("vendor/o1processor") is None
+    assert infer_provider_from_model("foo.o4ward.bar") is None
+    # The real families still resolve, wherever the token sits.
+    assert infer_provider_from_model("o1") == "openai"
+    assert infer_provider_from_model("o3-mini") == "openai"
+    assert infer_provider_from_model("azure/o4-mini-high") == "openai"

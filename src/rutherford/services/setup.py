@@ -135,15 +135,23 @@ def apply_setup_plan(plan: SetupPlan, *, force: bool = False) -> list[str]:
     """Write the plan's files and return the paths written. Skips a file that already exists.
 
     An existing file is left untouched unless ``force`` is set, so setup never clobbers a config or
-    panel you have already edited.
+    panel you have already edited. The non-force write is exclusive-create (``open(..., "x")``),
+    not check-then-write: a file that appears between an existence check and the write -- a
+    concurrent setup, an editor save -- loses the race safely (skipped) instead of being clobbered.
     """
     written: list[str] = []
     for proposed in plan.files:
         path = Path(proposed.path)
-        if path.exists() and not force:
-            continue
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(proposed.content, encoding="utf-8")
+        if force:
+            path.write_text(proposed.content, encoding="utf-8")
+            written.append(proposed.path)
+            continue
+        try:
+            with path.open("x", encoding="utf-8") as handle:
+                handle.write(proposed.content)
+        except FileExistsError:
+            continue
         written.append(proposed.path)
     return written
 

@@ -108,7 +108,7 @@ If a working directory arrives in the wrong form (e.g. a Windows path reaching a
 
 ### `TIMEOUT` -- run exceeded its limit and was killed
 
-**Cause.** `AsyncProcessRunner.run` wraps the subprocess in `asyncio.wait_for` with the configured timeout. On expiry, `_kill_process_tree` terminates the process and all descendants via `psutil` (terminate then kill, with a 3-second grace period). The returned `ProcessResult` has `timed_out=True`, and the adapter maps this to `ErrorCode.TIMEOUT`.
+**Cause.** `AsyncProcessRunner.run` wraps the subprocess in `asyncio.wait_for` with the configured timeout. On expiry, `kill_process_tree` terminates the process and all descendants via `psutil` (terminate then kill, with a 3-second grace period). The returned `ProcessResult` has `timed_out=True`, and the adapter maps this to `ErrorCode.TIMEOUT`.
 
 **Fix.**
 - Raise the per-call `timeout_s` parameter on the `delegate` or `consensus` call.

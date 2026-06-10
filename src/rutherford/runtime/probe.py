@@ -12,12 +12,14 @@ capability by injection, so every adapter's metadata methods are unit-testable w
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import time
 from typing import Protocol, runtime_checkable
 
 from ..domain.models import ProcessResult
 from .launch import merged_env, prepare_argv
+from .process import kill_process_tree
 
 
 @runtime_checkable
@@ -65,26 +67,18 @@ class SystemProbe:
         try:
             # Decode as UTF-8 with replacement rather than the platform locale (cp1252 on
             # Windows), which raises UnicodeDecodeError on a CLI that emits UTF-8 bytes.
-            completed = subprocess.run(
+            # Popen + communicate (not subprocess.run) so the timeout path below can tree-kill.
+            process = subprocess.Popen(
                 launch,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 # Detach the child's stdin from ours. When Rutherford runs as a stdio MCP server
                 # its stdin is the client's pipe; a probed CLI that reads stdin would otherwise
                 # block on it (or steal protocol bytes).
                 stdin=subprocess.DEVNULL,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout_s,
                 env=merged_env(env),
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            return ProcessResult(
-                exit_code=None,
-                stdout=_as_text(exc.stdout),
-                stderr=_as_text(exc.stderr),
-                duration_s=time.monotonic() - start,
-                timed_out=True,
             )
         except (FileNotFoundError, OSError) as exc:
             return ProcessResult(
@@ -93,10 +87,27 @@ class SystemProbe:
                 stderr=str(exc),
                 duration_s=time.monotonic() - start,
             )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            # subprocess.run's own timeout kills only the direct child. A probed command behind a
+            # Windows cmd.exe/.cmd shim (or a node/python wrapper) forks the real CLI, which would
+            # outlive the timeout; use the same tree-kill policy as the async runner.
+            kill_process_tree(process.pid)
+            stdout, stderr = "", ""
+            with contextlib.suppress(Exception):  # drain whatever arrived and reap the child
+                stdout, stderr = process.communicate(timeout=5)
+            return ProcessResult(
+                exit_code=None,
+                stdout=_as_text(stdout),
+                stderr=_as_text(stderr),
+                duration_s=time.monotonic() - start,
+                timed_out=True,
+            )
         return ProcessResult(
-            exit_code=completed.returncode,
-            stdout=completed.stdout or "",
-            stderr=completed.stderr or "",
+            exit_code=process.returncode,
+            stdout=stdout or "",
+            stderr=stderr or "",
             duration_s=time.monotonic() - start,
         )
 

@@ -7,11 +7,11 @@ from __future__ import annotations
 from typing import Any
 
 from ..context import AppContext, tool_success
-from ..domain.enums import Stance
+from ..domain.enums import SafetyMode, Stance
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import ConsensusRequest, Target
-from .common import as_target, ensure_known_targets, parse_safety_mode
+from .common import as_target, ensure_known_targets
 from .panels import panel_for_call
 
 
@@ -25,16 +25,17 @@ async def review_tool(
     diff: str | None = None,
     role: str = "codereviewer",
     working_dir: str | None = None,
-    safety_mode: str = "read_only",
     synthesize: bool = False,
     timeout_s: float | None = None,
 ) -> str:
     """Review a diff or a set of files across one or more targets and return every voice.
 
-    Built on the consensus service with the ``codereviewer`` role; review is read-only by nature.
-    Provide either ``diff`` (a unified diff) or ``paths`` (files for the agents to read), and either a
-    list of ``targets`` or a saved ``panel`` (with optional ``panel_overrides``); panel and targets
-    are mutually exclusive.
+    Built on the consensus service with the ``codereviewer`` role. Review is CLAMPED to
+    ``read_only`` -- it takes no ``safety_mode`` so the tool's name stays honest (an
+    inspection-named tool must not run mutation-capable adapter flags); a mutating run is
+    ``delegate``/``consensus`` by design. Provide either ``diff`` (a unified diff) or ``paths``
+    (files for the agents to read), and either a list of ``targets`` or a saved ``panel`` (with
+    optional ``panel_overrides``); panel and targets are mutually exclusive.
     """
     if not diff and not paths:
         raise RutherfordError(ErrorCode.INVALID_INPUT, "review needs either 'diff' or 'paths'")
@@ -56,7 +57,7 @@ async def review_tool(
         stances=review_stances,
         files=paths or [],
         working_dir=working_dir,
-        safety_mode=parse_safety_mode(safety_mode),
+        safety_mode=SafetyMode.READ_ONLY,
         synthesize=synthesize,
         timeout_s=timeout_s,
         depth=app.base_depth,

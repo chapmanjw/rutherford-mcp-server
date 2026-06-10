@@ -213,6 +213,18 @@ def test_overrides_shallow_merge_over_a_panel(tmp_path: Path) -> None:
     assert [target.cli for target in panel.targets] == ["codex", "kiro"]  # targets untouched
 
 
+def test_overrides_with_a_negative_weight_are_panel_invalid(tmp_path: Path) -> None:
+    # The falsifying test for PanelTarget's ge=0: panel_overrides bypass _parse_target's sign
+    # check entirely (they re-validate through the pydantic model), so without ge=0 a negative
+    # override weight would sail through to Target() and explode mid-call.
+    home = tmp_path / "home"
+    _write_panels(home / ".rutherford", {"duo": {"targets": [{"cli": "codex"}, {"cli": "kiro"}]}})
+    cache = PanelCache(lambda: load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p"))
+    with pytest.raises(RutherfordError) as info:
+        cache.resolve("duo", {"targets": [{"cli": "codex", "weight": -1.0}, {"cli": "kiro"}]})
+    assert info.value.code == "PANEL_INVALID"
+
+
 # --- tool integration: panel= on consensus / debate / review ------------------------------------
 
 
@@ -290,3 +302,19 @@ async def test_panel_strategy_drives_a_parity_pair_escalation() -> None:
     out = await consensus_tool(app, prompt="is this a primitive?", panel="roundtable")
     assert "strategy: parity-pair" in out
     assert "outcome: escalate" in out
+
+
+def test_negative_weight_in_a_panel_file_is_a_load_time_problem(tmp_path: Path) -> None:
+    # The full-codebase panel's MAJOR: weight=-1 used to load cleanly and explode later as a raw
+    # ValidationError inside Panel.to_targets() mid-call. It must be a PANEL_INVALID at load,
+    # naming the file and seat, like every other panel-file problem.
+    home = tmp_path / "home"
+    _write_panels(
+        home / ".rutherford",
+        {"bad": {"targets": [{"cli": "codex", "weight": -1.0}, {"cli": "kiro"}]}},
+    )
+    with pytest.raises(RutherfordError) as info:
+        load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p")
+    assert info.value.code == "PANEL_INVALID"
+    problems = _problems(info.value)
+    assert any(problem.get("target") == 0 and "non-negative" in problem["error"] for problem in problems)

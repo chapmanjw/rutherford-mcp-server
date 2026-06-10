@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 
+from rutherford.config.schema import RutherfordConfig
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import ProcessResult
 from rutherford.tools.plan import plan_tool
@@ -46,3 +47,29 @@ async def test_plan_uses_planner_role() -> None:
     assert "ok: true" in out
     spec, _ = runner.calls[0]
     assert "planning specialist" in spec.argv[2]
+
+
+async def test_review_is_clamped_to_read_only() -> None:
+    # review documents itself read-only and now enforces it: no safety_mode parameter exists, and
+    # the delegations run read_only regardless of any configured default. The config default is
+    # deliberately set to WRITE here -- the clamp's whole claim is that it wins over config, and a
+    # stock read_only default would let a regression through resolve_safety_mode pass unnoticed.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    config = RutherfordConfig(default_safety_mode="write")  # type: ignore[arg-type]
+    app = make_app(adapters=[FakeAdapter("a")], runner=runner, config=config)
+    await review_tool(app, targets=[{"cli": "a"}], diff="- old\n+ new")
+    spec, _ = runner.calls[0]
+    assert "--safety=read_only" in spec.argv  # NOT the configured write default
+    with pytest.raises(TypeError):  # the parameter is gone, not silently accepted
+        await review_tool(app, targets=[{"cli": "a"}], diff="x", safety_mode="write")  # type: ignore[call-arg]
+
+
+async def test_plan_is_clamped_to_read_only() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="plan"))
+    config = RutherfordConfig(default_safety_mode="yolo")  # type: ignore[arg-type]
+    app = make_app(adapters=[FakeAdapter("a")], runner=runner, config=config)
+    await plan_tool(app, cli="a", goal="g")
+    spec, _ = runner.calls[0]
+    assert "--safety=read_only" in spec.argv  # NOT the configured yolo default
+    with pytest.raises(TypeError):
+        await plan_tool(app, cli="a", goal="g", safety_mode="yolo")  # type: ignore[call-arg]

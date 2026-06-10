@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..domain.enums import Stance, Strategy
 from ..domain.error_codes import ErrorCode
@@ -54,7 +54,10 @@ class PanelTarget(BaseModel):
     model: str | None = None
     role: str | None = None
     label: str | None = None
-    weight: float | None = None
+    #: ``ge=0`` mirrors :class:`~rutherford.domain.models.Target` exactly: a negative weight must
+    #: fail HERE, at panel load, as a PANEL_INVALID -- not later as a raw ValidationError when
+    #: ``to_targets()`` builds the Target mid-call.
+    weight: float | None = Field(default=None, ge=0)
     parity: bool | None = None
     stance: Stance | None = None
 
@@ -67,7 +70,8 @@ class Panel(BaseModel):
     name: str
     description: str = ""
     #: How a consensus over this panel is aggregated (``all-voices`` | ``unanimous`` | ``majority`` |
-    #: ``weighted`` | ``parity-pair``); a consensus call using this panel adopts it unless overridden.
+    #: ``plurality`` | ``weighted`` | ``parity-pair``); a consensus call using this panel adopts it
+    #: unless overridden.
     strategy: str = "all-voices"
     targets: list[PanelTarget]
 
@@ -293,6 +297,10 @@ def _parse_target(
     weight = raw.get("weight")
     if weight is not None and not isinstance(weight, (int, float)):
         problems.append({**here, "error": "weight must be a number"})
+    elif isinstance(weight, (int, float)) and weight < 0:
+        # Caught here (and again by PanelTarget's ge=0) so a bad panel file is one aggregated
+        # load-time report naming the file and seat, never an in-flight tool failure.
+        problems.append({**here, "error": "weight must be non-negative"})
 
     parity = raw.get("parity")
     if parity is not None and not isinstance(parity, bool):

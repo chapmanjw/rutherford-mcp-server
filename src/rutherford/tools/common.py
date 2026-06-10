@@ -37,6 +37,20 @@ def parse_safety_mode(value: str | SafetyMode) -> SafetyMode:
         ) from None
 
 
+def resolve_safety_mode(value: str | SafetyMode | None, default: SafetyMode) -> SafetyMode:
+    """The effective safety mode for a call: the explicit value, else the configured default.
+
+    ``None`` means the caller omitted the field -- the one case the configured
+    ``default_safety_mode`` is documented to fill. The ``None`` sentinel (not a ``"read_only"``
+    string default on the tool signature) is what lets the tool layer tell "omitted" apart from
+    "explicitly read_only", so an explicit choice always wins over config. An explicit value still
+    validates through :func:`parse_safety_mode`.
+    """
+    if value is None:
+        return default
+    return parse_safety_mode(value)
+
+
 def parse_mode(value: str | DelegationMode) -> DelegationMode:
     """Coerce a sync/async mode string to :class:`DelegationMode`, or raise ``INVALID_INPUT``."""
     if isinstance(value, DelegationMode):

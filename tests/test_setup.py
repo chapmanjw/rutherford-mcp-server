@@ -12,6 +12,7 @@ import pytest
 from rutherford.config.loader import default_global_config_path
 from rutherford.config.locations import home_dir
 from rutherford.domain.enums import AuthState
+from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import AdapterCapabilities, AdapterStatus, AuthStatus, ProcessResult
 from rutherford.io.serialize import decode
 from rutherford.services.setup import apply_setup_plan, build_setup_plan, format_plan_summary
@@ -139,3 +140,31 @@ async def test_setup_tool_apply_writes_files(tmp_path: Path, monkeypatch: pytest
     assert "applied: true" in out
     assert default_global_config_path(os.environ).exists()
     assert (home_dir(os.environ) / ".rutherford" / "panels.toon").exists()
+
+
+async def test_setup_tool_rejects_an_invalid_safety_mode_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The panel's MAJOR: setup used to persist the raw string into config.toml, where a bogus
+    # value fails enum validation on the next load_config() and stops the server from starting.
+    # It must be a clean INVALID_INPUT at the MCP boundary, with nothing written.
+    _pin_env(monkeypatch, tmp_path)
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+    )
+    with pytest.raises(RutherfordError, match="safety_mode"):
+        await setup_tool(app, apply=True, safety_mode="bogus")
+    assert not default_global_config_path(os.environ).exists()
+
+
+def test_apply_does_not_clobber_a_file_created_after_planning(tmp_path: Path) -> None:
+    # TOCTOU regression: the non-force write is exclusive-create, so a file that appears between
+    # planning and applying (a concurrent setup, an editor save) is skipped, never overwritten.
+    plan = build_setup_plan([_status("a"), _status("b")], env=_env(tmp_path))
+    target = Path(plan.files[0].path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("operator-edited content", encoding="utf-8")
+    written = apply_setup_plan(plan)
+    assert plan.files[0].path not in written  # the racing file was skipped...
+    assert target.read_text(encoding="utf-8") == "operator-edited content"  # ...and survives intact

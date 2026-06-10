@@ -10,6 +10,7 @@ import pytest
 from toon import decode
 
 from rutherford.domain.enums import JobStatus
+from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import DelegationResult, ErrorInfo, Job, Target
 from rutherford.services.jobs import JobService, JobStore
@@ -47,7 +48,7 @@ def test_store_lifecycle() -> None:
 def test_store_fail() -> None:
     store = JobStore()
     job = store.create("delegate")
-    store.fail(job.id, ErrorInfo(code="INTERNAL", message="boom"))
+    store.fail(job.id, ErrorInfo(code=ErrorCode.INTERNAL, message="boom"))
     assert store.get(job.id).status is JobStatus.FAILED
 
 
@@ -145,7 +146,7 @@ def test_a_cancelled_job_is_not_overwritten_by_a_late_completion_or_failure() ->
     store.cancel(job.id)
     store.complete(job.id, _result())
     assert store.get(job.id).status is JobStatus.CANCELLED
-    store.fail(job.id, ErrorInfo(code="INTERNAL", message="late"))
+    store.fail(job.id, ErrorInfo(code=ErrorCode.INTERNAL, message="late"))
     assert store.get(job.id).status is JobStatus.CANCELLED
     store.mark_running(job.id)
     assert store.get(job.id).status is JobStatus.CANCELLED

@@ -68,6 +68,13 @@ def parse_jsonl(stdout: str) -> list[dict[str, Any]]:
     One object per line; a line that does not start with ``{`` or does not parse is ignored, so
     log noise interleaved with the event stream does not break parsing. Used by the line-delimited
     event adapters (Codex, OpenCode).
+
+    Known, accepted tradeoff (panel-reviewed, settled MINOR): the leniency also swallows a
+    *truncated* event line, so a partially corrupt stream whose earlier answer event parsed can
+    still read as success. The agreed future remedy, if a real CLI ever emits that shape, is to
+    split lenient log-scanning from a strict JSONL contract parse (returning invalid-line
+    metadata for ``check_output_contract`` to reject) -- not to fail on every malformed ``{`` line
+    here, which would break the documented log-noise tolerance.
     """
     events: list[dict[str, Any]] = []
     for line in stdout.splitlines():

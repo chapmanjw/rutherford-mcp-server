@@ -66,20 +66,22 @@ class CursorAdapter(BaseCLIAdapter):
         )
 
     def map_safety(self, mode: SafetyMode) -> SafetyFlags:
-        """Map every SafetyMode to a Cursor mode/force flag, defaulting conservatively.
+        """Map every SafetyMode to a Cursor mode/force flag, failing CLOSED on anything unknown.
 
         Cursor's ``-p`` print mode has all tools (including write and shell) enabled by default,
-        so read-only and propose must pin a restrictive mode. read_only uses ``--mode ask``
-        (Q&A, no edits); propose uses ``--mode plan`` (analyze and propose, no edits); write
-        keeps the default print behavior (edit access); yolo uses ``--force`` to run everything.
+        so the permissive postures must be EXPLICIT and the catch-all restrictive: read_only uses
+        ``--mode ask`` (Q&A, no edits); propose uses ``--mode plan`` (analyze and propose, no
+        edits); write keeps the default print behavior (edit access); yolo uses ``--force`` to run
+        everything. A SafetyMode this adapter does not know (a future, likely more-restrictive
+        value) falls through to ``--mode ask`` -- never to Cursor's edit-capable default.
         """
-        if mode is SafetyMode.READ_ONLY:
-            return SafetyFlags(args=["--mode", "ask"], note="ask mode: Q&A, read-only")
-        if mode is SafetyMode.PROPOSE:
-            return SafetyFlags(args=["--mode", "plan"], note="plan mode: analyze and propose, no edits")
+        if mode is SafetyMode.WRITE:
+            return SafetyFlags(args=[], note="default print mode: edit access")
         if mode is SafetyMode.YOLO:
             return SafetyFlags(args=["--force"], note="force: run everything without approval")
-        return SafetyFlags(args=[], note="default print mode: edit access")
+        if mode is SafetyMode.PROPOSE:
+            return SafetyFlags(args=["--mode", "plan"], note="plan mode: analyze and propose, no edits")
+        return SafetyFlags(args=["--mode", "ask"], note="ask mode: Q&A, read-only (fail-closed default)")
 
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
         """Build the ``cursor-agent`` invocation, with the composed prompt fed via stdin.

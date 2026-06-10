@@ -109,6 +109,18 @@ def test_map_safety_covers_every_mode() -> None:
     assert flags[SafetyMode.YOLO].args == ["--force"]
 
 
+def test_map_safety_fails_closed_on_an_unknown_mode() -> None:
+    # Cursor's print default is edit-capable, so the catch-all must be the RESTRICTIVE branch:
+    # a SafetyMode value this adapter does not know (a future, likely more-restrictive mode) gets
+    # --mode ask, never the edit-capable default. Exercised with a stand-in enum member since a
+    # real unknown SafetyMode cannot be constructed today -- the assertion pins the fall-through.
+    class _FutureMode:
+        value = "audit"
+
+    flags = CursorAdapter().map_safety(_FutureMode())  # type: ignore[arg-type]
+    assert flags.args == ["--mode", "ask"]
+
+
 def test_build_invocation_read_only_adds_ask_mode() -> None:
     spec = CursorAdapter().build_invocation(_req(), _ctx(safety=SafetyMode.READ_ONLY))
     assert spec.argv[spec.argv.index("--mode") + 1] == "ask"

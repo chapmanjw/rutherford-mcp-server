@@ -50,6 +50,63 @@ async def test_delegate_tool_bad_safety_mode_raises() -> None:
         await delegate_tool(app, cli="fake", prompt="q", safety_mode="bogus")
 
 
+async def test_omitted_safety_mode_applies_the_configured_default() -> None:
+    # The documented contract for default_safety_mode: it fills the field ONLY when the caller
+    # omits it. propose is non-mutating, so no trusted-workspace gate interferes here.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    config = RutherfordConfig(default_safety_mode="propose")  # type: ignore[arg-type]
+    app = make_app(adapters=[FakeAdapter("fake")], runner=runner, config=config)
+    out = await delegate_tool(app, cli="fake", prompt="q")
+    assert _decode(out)["safety_mode"] == "propose"
+    spec, _ = runner.calls[0]
+    assert "--safety=propose" in spec.argv  # the mode actually reached the adapter
+
+
+async def test_explicit_safety_mode_beats_the_configured_default() -> None:
+    # An explicit read_only is a choice, not an omission -- config must not override it.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    config = RutherfordConfig(default_safety_mode="propose")  # type: ignore[arg-type]
+    app = make_app(adapters=[FakeAdapter("fake")], runner=runner, config=config)
+    out = await delegate_tool(app, cli="fake", prompt="q", safety_mode="read_only")
+    assert _decode(out)["safety_mode"] == "read_only"
+
+
+async def test_consensus_omitted_safety_mode_applies_the_configured_default() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    config = RutherfordConfig(default_safety_mode="propose")  # type: ignore[arg-type]
+    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")], runner=runner, config=config)
+    await consensus_tool(app, targets=["a", "b"], prompt="q")
+    # Every fanned-out delegation carried the configured default to its adapter.
+    assert len(runner.calls) == 2
+    assert all("--safety=propose" in spec.argv for spec, _ in runner.calls)
+
+
+async def test_config_defaulted_write_still_hits_the_trusted_workspace_gate() -> None:
+    # The safety-critical composition: a mutating mode arriving via the CONFIG default (not an
+    # explicit argument) must still be stopped by the trusted-workspace gate. If the resolved
+    # default bypassed the gate, setting default_safety_mode="write" would silently grant every
+    # omitted-mode call write access anywhere.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    config = RutherfordConfig(default_safety_mode="write")  # type: ignore[arg-type]
+    app = make_app(adapters=[FakeAdapter("fake")], runner=runner, config=config)
+    out = await delegate_tool(app, cli="fake", prompt="q", working_dir="/untrusted/dir")
+    data = _decode(out)
+    assert data["ok"] is False
+    assert data["error"]["code"] == "WORKSPACE_NOT_TRUSTED"
+    assert runner.calls == []  # nothing spawned
+
+
+async def test_debate_omitted_safety_mode_applies_the_configured_default() -> None:
+    # The third of the three tools carrying the None sentinel; each resolves independently, so
+    # each needs its own pin (delegate and consensus alone would not catch a debate regression).
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
+    config = RutherfordConfig(default_safety_mode="propose")  # type: ignore[arg-type]
+    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")], runner=runner, config=config)
+    await debate_tool(app, targets=["a", "b"], prompt="q", rounds=1, synthesize=False)
+    assert len(runner.calls) == 2
+    assert all("--safety=propose" in spec.argv for spec, _ in runner.calls)
+
+
 async def test_consensus_tool_unknown_target_is_a_clean_boundary_error() -> None:
     # An unknown CLI in a fan-out tool is one clean UNKNOWN_TARGET, not a buried failed voice.
     app = make_app(adapters=[FakeAdapter("fake")])

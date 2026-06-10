@@ -2,14 +2,24 @@
 # Copyright (c) 2026 John Chapman
 """The Claude Code adapter -- the reference implementation.
 
-Invocation: ``claude -p "<prompt>" --output-format json`` with ``--model``, ``--add-dir``,
-``--append-system-prompt`` (for a role preamble), ``--resume <id>``, and the safety flags below.
+Invocation: ``claude -p --output-format json`` with the composed prompt on **stdin** (``-p`` reads
+stdin when no positional prompt follows), plus ``--model``, ``--add-dir``, ``--resume <id>``, and
+the safety flags below. The prompt rides on stdin -- never as an argv element -- for two reasons:
+Windows caps a process command line at ~32K characters (a debate round carrying two full reviews
+clears that; a ~39KB prompt was verified arriving intact over stdin), and an npm-installed
+``claude`` is a ``.cmd`` shim launched via ``cmd.exe /c``, where a newline in an argv element
+truncates the command at the first line (the hazard documented and worked around in the sibling
+stdin-transport adapters; not directly observed here -- this machine runs the native-exe install).
+The role preamble is multiline by nature, so it is folded into the stdin prompt the way every
+other stdin-transport adapter composes it, rather than riding ``--append-system-prompt`` on argv.
+
 Auth is a subscription/OAuth session or ``ANTHROPIC_API_KEY`` -- or a third-party backend (AWS
 Bedrock / Google Vertex), whose AWS/GCP credential chain a cheap probe cannot verify, so that case
 defers to a live check. The JSON output carries the final ``result`` text, a ``session_id`` for
 resume, and ``total_cost_usd`` / token usage.
 
-Flags verified 2026-05-30 against ``claude --help`` (Claude Code 2.1.158).
+Flags verified 2026-05-30 against ``claude --help`` (Claude Code 2.1.158); the stdin prompt
+transport verified live 2026-06-10 (a multiline stdin prompt arrives intact, native-exe install).
 """
 
 from __future__ import annotations
@@ -90,7 +100,10 @@ class ClaudeCodeAdapter(BaseCLIAdapter):
             supports_working_dir=True,
             supports_file_context=True,
             supports_list_models=False,
-            supports_system_prompt=True,
+            # The CLI has --append-system-prompt, but it is an argv element and the role preamble
+            # is multiline: through an npm .cmd shim (cmd.exe /c) a newline truncates the command.
+            # The preamble is folded into the stdin prompt instead (see build_invocation).
+            supports_system_prompt=False,
             output_mode=OutputMode.JSON,
             file_context_style="add_dir",
         )
@@ -106,13 +119,19 @@ class ClaudeCodeAdapter(BaseCLIAdapter):
         return SafetyFlags(args=[], note="default permissions; edits are not auto-approved in headless mode")
 
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
-        prompt = self._with_files(req.prompt, req.files)
-        argv = [self.binary, "-p", prompt, "--output-format", "json"]
+        """Build the ``claude -p`` invocation with the composed prompt on stdin.
+
+        The prompt (role preamble + task + file list) is multiline and unbounded, so it must not
+        be an argv element: the Windows command line caps at ~32K characters, and an npm-shim
+        install launches through ``cmd.exe /c``, which truncates an argument at its first newline
+        -- silently dropping the rest of a long prompt or most of a role. ``claude -p`` with no
+        positional prompt reads stdin (verified live 2026-06-10).
+        """
+        prompt = self._with_files(self._compose_prompt(req.prompt, ctx.role_preamble), req.files)
+        argv = [self.binary, "-p", "--output-format", "json"]
 
         if req.target.model:
             argv += ["--model", req.target.model]
-        if ctx.role_preamble:
-            argv += ["--append-system-prompt", ctx.role_preamble]
         if req.working_dir:
             argv += ["--add-dir", req.working_dir]
         if req.session_id:
@@ -121,7 +140,7 @@ class ClaudeCodeAdapter(BaseCLIAdapter):
         safety = self.map_safety(ctx.safety_mode)
         argv += safety.args
 
-        return InvocationSpec(argv=argv, env=dict(safety.env), cwd=req.working_dir)
+        return InvocationSpec(argv=argv, env=dict(safety.env), cwd=req.working_dir, stdin=prompt)
 
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         return _PARSER.parse(raw, ctx)

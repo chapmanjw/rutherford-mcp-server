@@ -132,6 +132,40 @@ async def test_missing_binary_does_not_spawn() -> None:
     assert runner.calls == []
 
 
+async def test_a_raising_detect_probe_is_a_structured_internal_failure() -> None:
+    # detect() runs before the guarded build/run/parse pipeline; a buggy adapter probe must
+    # degrade to a structured failure (so a panel folds it as one bad voice), never raise.
+    class _DetectRaises(FakeAdapter):
+        def detect(self):
+            raise RuntimeError("probe exploded")
+
+    runner = FakeProcessRunner()
+    result = await _service([_DetectRaises("fake")], runner).delegate(_req())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "INTERNAL"
+    assert "probe exploded" in result.error.message
+    assert runner.calls == []  # nothing spawned
+
+
+async def test_a_raising_fallback_model_hook_keeps_the_primary_failure() -> None:
+    # The model-fallback hook is best-effort: an adapter whose fallback_model() raises must not
+    # abort a delegation that already holds a (failed) result -- the primary failure is kept.
+    class _FallbackRaises(FakeAdapter):
+        def fallback_model(self) -> str | None:
+            raise RuntimeError("hook exploded")
+
+    runner = FakeProcessRunner(
+        ProcessResult(exit_code=1, stderr="Named models unavailable on your plan. Switch to Auto.")
+    )
+    result = await _service([_FallbackRaises("fake")], runner).delegate(
+        _req(target=Target(cli="fake", model="named-only"))
+    )
+    assert not result.ok
+    assert result.fallback_from is None  # no fallback was attempted
+    assert len(runner.calls) == 1
+
+
 async def test_self_referential_chain_stops_at_max_depth() -> None:
     # The caller-agnostic guarantee in test form: a CLI delegating to its own adapter is bounded.
     runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))

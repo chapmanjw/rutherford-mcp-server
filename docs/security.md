@@ -21,9 +21,13 @@ Every delegation carries a `SafetyMode` from `domain/enums.py`. In ascending per
 | `write`     | The agent may apply changes using the CLI's normal approval flow.               | Yes               |
 | `yolo`      | The agent acts without approval prompts (the CLI's bypass/skip-permissions flag). | Yes              |
 
-`read_only` is the default everywhere. `DelegationRequest.safety_mode` defaults to
-`SafetyMode.READ_ONLY`; `RutherfordConfig.default_safety_mode` defaults to `SafetyMode.READ_ONLY`.
-A caller must explicitly pass `write` or `yolo` to get mutating behavior.
+`read_only` is the default out of the box. `DelegationRequest.safety_mode` defaults to
+`SafetyMode.READ_ONLY`, and `RutherfordConfig.default_safety_mode` defaults to
+`SafetyMode.READ_ONLY` -- and that configured default is honored: a `delegate` / `consensus` /
+`debate` call that omits `safety_mode` adopts it (an explicit value always wins). Configuring a
+mutating default does not bypass anything: `write`/`yolo` still require a trusted workspace,
+however the mode arrived. The `review` and `plan` tools are clamped to `read_only` and take no
+`safety_mode` at all.
 
 `is_mutating()` in `domain/enums.py` classifies `write` and `yolo` as mutating and everything
 else as non-mutating. `DelegationService.delegate` calls it before spawning:
@@ -234,14 +238,14 @@ Keep API keys in environment variables or each CLI's own credential store. Do no
 
 Every run has a timeout (`config.default_timeout_s`, default 300 seconds; overridable per call
 via `DelegationRequest.timeout_s`). On timeout or asyncio cancellation, `AsyncProcessRunner` in
-`runtime/process.py` calls `_kill_process_tree(process.pid)`:
+`runtime/process.py` calls `kill_process_tree(process.pid)`:
 
 ```python
 except (TimeoutError, asyncio.CancelledError) as exc:
-    await asyncio.to_thread(_kill_process_tree, process.pid)
+    await asyncio.to_thread(kill_process_tree, process.pid)
 ```
 
-`_kill_process_tree` uses psutil to collect the direct child and all descendants, then sends
+`kill_process_tree` uses psutil to collect the direct child and all descendants, then sends
 `terminate()` to each, waits up to 3 seconds, and sends `kill()` to any that remain. It uses
 `terminate()` and `kill()` rather than raw signals so the behavior is identical on POSIX and
 Windows. The result is a `ProcessResult` with `timed_out=True` and `exit_code=None`.

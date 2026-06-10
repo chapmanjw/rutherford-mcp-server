@@ -37,7 +37,9 @@ class CachingProbe:
         self._ceiling_s = ceiling_s
         self._clock = clock
         self._which_cache: dict[str, tuple[float, str | None]] = {}
-        self._run_cache: dict[tuple[tuple[str, ...], frozenset[tuple[str, str]]], tuple[float, ProcessResult]] = {}
+        self._run_cache: dict[
+            tuple[tuple[str, ...], frozenset[tuple[str, str]], float], tuple[float, ProcessResult]
+        ] = {}
 
     def which(self, name: str) -> str | None:
         """Resolve ``name`` on PATH, caching the result for the TTL."""
@@ -58,11 +60,16 @@ class CachingProbe:
         timeout_s: float = 10.0,
         env: dict[str, str] | None = None,
     ) -> ProcessResult:
-        """Run ``argv``, capped at the ceiling and cached for the TTL by ``(argv, env)``."""
+        """Run ``argv``, capped at the ceiling and cached for the TTL by ``(argv, env, timeout)``.
+
+        The effective timeout is part of the key so a ``timed_out=True`` produced under a short
+        ceiling is never served to a later same-command call that asked for (and would have
+        succeeded under) a longer one.
+        """
         effective_timeout = min(timeout_s, self._ceiling_s)
         if self._ttl_s <= 0:
             return self._inner.run(argv, timeout_s=effective_timeout, env=env)
-        key = (tuple(argv), frozenset((env or {}).items()))
+        key = (tuple(argv), frozenset((env or {}).items()), effective_timeout)
         now = self._clock()
         cached = self._run_cache.get(key)
         if cached is not None and now - cached[0] <= self._ttl_s:

@@ -23,6 +23,7 @@ from ..domain.models import (
     DelegationRequest,
     DelegationResult,
     DiversityReport,
+    ErrorInfo,
     SkippedTarget,
     StrategyResult,
     Target,
@@ -86,7 +87,18 @@ class ConsensusService:
             )
             for index, target in enumerate(targets)
         ]
-        voices = list(await asyncio.gather(*(one(i, r) for i, r in enumerate(requests))))
+        # return_exceptions: an exception that still escapes one voice's delegate() (a buggy adapter
+        # surface the containment there missed) must become that voice's structured failure, not
+        # abort the gather and discard every healthy sibling -- the panel's headline promise.
+        outcomes = await asyncio.gather(*(one(i, r) for i, r in enumerate(requests)), return_exceptions=True)
+        voices: list[DelegationResult] = []
+        for request, outcome in zip(requests, outcomes, strict=True):
+            if isinstance(outcome, asyncio.CancelledError):  # a real cancellation still propagates
+                raise outcome
+            if isinstance(outcome, BaseException):
+                voices.append(_escaped_voice(request, outcome))
+            else:
+                voices.append(outcome)
 
         if req.strategy is not Strategy.ALL_VOICES:
             return self._aggregate(req, voices, skipped)
@@ -303,3 +315,17 @@ def _apply_stance(prompt: str, stance: Stance | None) -> str:
     if stance is Stance.FOR:
         return f"Argue in favor of the following proposition, making the strongest case for it:\n\n{prompt}"
     return f"Argue against the following proposition, making the strongest case against it:\n\n{prompt}"
+
+
+def _escaped_voice(request: DelegationRequest, exc: BaseException) -> DelegationResult:
+    """Fold an exception that escaped one voice's delegation into that voice's structured failure.
+
+    The last line of the panel's "one bad voice never aborts" defense: ``delegate()`` contains the
+    known failure surfaces, and this catches whatever still gets out.
+    """
+    return DelegationResult(
+        target=request.target,
+        ok=False,
+        error=ErrorInfo(code=ErrorCode.INTERNAL, message=f"voice delegation raised: {exc!r}"),
+        safety_mode=request.safety_mode,
+    )

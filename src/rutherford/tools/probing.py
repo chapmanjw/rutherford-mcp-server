@@ -13,7 +13,7 @@ import re
 
 from ..adapters.base import CLIAdapter
 from ..domain.enums import AuthState
-from ..domain.models import AdapterStatus, AuthStatus
+from ..domain.models import AdapterCapabilities, AdapterStatus, AuthStatus
 
 _SEMVER_RE = re.compile(r"\d+\.\d+\.\d+")
 
@@ -46,7 +46,11 @@ def probe_adapter(adapter: CLIAdapter, *, diagnostic: bool = False) -> AdapterSt
         auth = AuthStatus(state=AuthState.UNKNOWN, detail="not installed")
         models = []
 
-    notes = _diagnose(adapter, detected.installed, detected.version, auth, models, optional) if diagnostic else []
+    notes = (
+        _diagnose(adapter, detected.installed, detected.version, auth, models, optional, capabilities)
+        if diagnostic
+        else []
+    )
     return AdapterStatus(
         id=adapter.id,
         display_name=adapter.display_name,
@@ -69,6 +73,7 @@ def _diagnose(
     auth: AuthStatus,
     models: list[str],
     optional: bool,
+    capabilities: AdapterCapabilities,
 ) -> list[str]:
     """Produce notes for an unavailable, unauthenticated, not-ready, or version-drifted target.
 
@@ -94,6 +99,12 @@ def _diagnose(
         notes.append(
             f"{binary} is at {version}, but its behavior was verified against {verified}; re-verify "
             "and re-pin if results look wrong (the output layout may have changed under an auto-update)"
+        )
+    if capabilities.write_uses_bypass:
+        notes.append(
+            f"{binary} has no write posture distinct from its permission bypass: write and yolo are "
+            "equivalent on this adapter (both use the bypass flag, gated by the trusted-workspace check). "
+            "Request yolo when you intend the bypass; treat write delegations here accordingly."
         )
     if auth.state is AuthState.NEEDS_LOGIN:
         notes.append("not authenticated; run the CLI's own login once (Rutherford never logs in for you)")

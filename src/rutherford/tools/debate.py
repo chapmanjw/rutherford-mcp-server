@@ -9,7 +9,7 @@ from typing import Any
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode, Stance
 from ..domain.models import DebateRequest, Target
-from .common import as_target, ensure_known_cli, ensure_known_targets, parse_mode, parse_safety_mode, parse_stances
+from .common import as_target, ensure_known_cli, ensure_known_targets, parse_mode, parse_stances, resolve_safety_mode
 from .panels import panel_for_call
 
 
@@ -26,7 +26,7 @@ async def debate_tool(
     working_dir: str | None = None,
     files: list[str] | None = None,
     role: str | None = None,
-    safety_mode: str = "read_only",
+    safety_mode: str | None = None,
     synthesize: bool = True,
     timeout_s: float | None = None,
     mode: str = "sync",
@@ -64,7 +64,7 @@ async def debate_tool(
         working_dir=working_dir,
         files=files or [],
         role=role,
-        safety_mode=parse_safety_mode(safety_mode),
+        safety_mode=resolve_safety_mode(safety_mode, app.config.default_safety_mode),
         synthesize=synthesize,
         timeout_s=timeout_s,
         include_raw=include_raw,

@@ -23,7 +23,7 @@ from rutherford.domain.models import (
 )
 from rutherford.tools.probing import version_token
 
-from .helpers import CLI_ENV, available_clis, skip_unless_available
+from .helpers import CLI_ENV, available_clis, skip_unless_available, skip_unless_runnable
 
 pytestmark = pytest.mark.integration
 
@@ -32,7 +32,7 @@ _OK_PROMPT = "Reply with exactly the two characters: ok"
 
 @pytest.mark.parametrize("cli_id", list(CLI_ENV))
 async def test_read_only_delegation_returns_normalized_result(real_app: AppContext, cli_id: str) -> None:
-    skip_unless_available(real_app, cli_id)
+    skip_unless_runnable(real_app, cli_id)
     request = DelegationRequest(target=Target(cli=cli_id), prompt=_OK_PROMPT, timeout_s=180)
     result = await real_app.delegation.delegate(request, base_depth=0)
     assert isinstance(result, DelegationResult)
@@ -47,6 +47,10 @@ async def test_read_only_delegation_returns_normalized_result(real_app: AppConte
 
 @pytest.mark.parametrize("cli_id", list(CLI_ENV))
 async def test_model_selection_is_honored_where_supported(real_app: AppContext, cli_id: str) -> None:
+    # This is the SOLE live guard for model-flag drift: unit tests prove Rutherford constructs the
+    # right argv, but only this proves the real CLI still accepts and honors the selection. The
+    # old isinstance-only assertion was a Secret Catcher (the panel's finding) -- it passed on a
+    # dropped flag or a failed run.
     skip_unless_available(real_app, cli_id)
     adapter = real_app.registry.get(cli_id)
     if not adapter.capabilities().supports_model_selection:
@@ -56,18 +60,27 @@ async def test_model_selection_is_honored_where_supported(real_app: AppContext, 
         pytest.skip(f"{cli_id} reported no selectable models")
     request = DelegationRequest(target=Target(cli=cli_id, model=models[0]), prompt=_OK_PROMPT, timeout_s=180)
     result = await real_app.delegation.delegate(request, base_depth=0)
-    assert isinstance(result, DelegationResult)
+    assert result.ok, f"{cli_id} rejected its own advertised model {models[0]!r}: {result.error}"
+    assert result.target.model == models[0]  # the selection was not silently swapped or dropped
+    # Where the adapter can confirm the served model, the provenance must agree with the request.
+    if result.provenance is not None and result.provenance.confirmed and result.provenance.model:
+        assert models[0].endswith(result.provenance.model) or result.provenance.model in models[0]
 
 
 @pytest.mark.parametrize("cli_id", list(CLI_ENV))
 async def test_timeout_path_is_structured(real_app: AppContext, cli_id: str) -> None:
-    skip_unless_available(real_app, cli_id)
-    # A sub-second timeout forces the timeout path; the result must be structured, not an exception.
-    request = DelegationRequest(target=Target(cli=cli_id), prompt=_OK_PROMPT, timeout_s=0.5)
+    # The SOLE live guard of the timeout contract. The old conditional assertion (only checked
+    # `if not result.ok and result.error is not None`) let a successful or error-less result pass
+    # -- the panel's finding. The budget is 0.2s: below any real CLI's spawn+handshake floor (even
+    # a warm local model cannot answer through process startup that fast), so the run MUST fail,
+    # MUST carry an error, and MUST be a recognized timeout-path code.
+    skip_unless_runnable(real_app, cli_id)
+    request = DelegationRequest(target=Target(cli=cli_id), prompt=_OK_PROMPT, timeout_s=0.2)
     result = await real_app.delegation.delegate(request, base_depth=0)
     assert isinstance(result, DelegationResult)
-    if not result.ok and result.error is not None:
-        assert result.error.code in {"TIMEOUT", "NONZERO_EXIT", "PARSE_ERROR", "TRANSCRIPT_NOT_FOUND"}
+    assert not result.ok, f"{cli_id} claimed success inside a 0.2s budget -- the timeout never fired"
+    assert result.error is not None, "a failed result must carry a structured error"
+    assert result.error.code in {"TIMEOUT", "NONZERO_EXIT", "PARSE_ERROR", "TRANSCRIPT_NOT_FOUND"}
 
 
 async def test_self_invocation_and_depth_guard(real_app: AppContext) -> None:

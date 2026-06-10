@@ -86,3 +86,14 @@ def test_ttl_zero_disables_caching() -> None:
     probe.run(["tool", "--version"])
     probe.run(["tool", "--version"])
     assert len(inner.calls) == 2  # caching off: every call re-probes
+
+
+def test_a_short_timeout_result_is_not_served_to_a_longer_timeout_call() -> None:
+    # The effective timeout is part of the cache key: a timed_out=True cached under a short
+    # ceiling must not answer a later same-command call that asked for a longer budget.
+    inner = FakeProbe(run_fn=lambda argv: ProcessResult(exit_code=None, timed_out=True))
+    probe = CachingProbe(inner, ttl_s=10.0, ceiling_s=30.0, clock=_Clock())
+    assert probe.run(["slow", "--version"], timeout_s=1.0).timed_out
+    probe.run(["slow", "--version"], timeout_s=20.0)
+    assert len(inner.calls) == 2  # the longer-budget call re-probed instead of inheriting the verdict
+    assert inner.timeouts == [1.0, 20.0]

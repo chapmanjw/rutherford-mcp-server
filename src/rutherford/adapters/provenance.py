@@ -37,9 +37,6 @@ _MODEL_PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
     ("claude", ANTHROPIC),
     ("anthropic", ANTHROPIC),
     ("gpt", OPENAI),
-    ("o1", OPENAI),
-    ("o3", OPENAI),
-    ("o4", OPENAI),
     ("openai", OPENAI),
     ("codex", OPENAI),
     ("gemini", GOOGLE),
@@ -78,6 +75,13 @@ def split_namespaced_model(model: str | None) -> tuple[str | None, str | None]:
 #: or after a ``:`` tag. Not split on ``-`` so a family token (``claude-opus``) stays whole.
 _SEGMENT_SPLIT = re.compile(r"[/.:]")
 
+#: The short, collision-prone OpenAI families (o1/o3/o4) matched as WHOLE tokens: a segment must be
+#: the family itself, optionally followed by a ``-variant`` or digits (``o1``, ``o3-mini``,
+#: ``o4-mini-high``). A bare startswith for two-character prefixes would let an unrelated region,
+#: tag, or version segment beginning ``o1``/``o3``/``o4`` mis-infer ``openai`` and skew the panel's
+#: diversity accounting.
+_SHORT_OPENAI_TOKEN = re.compile(r"^o[134](?:$|[-\d])")
+
 
 def infer_provider_from_model(model: str | None) -> str | None:
     """Guess the model's vendor from its id, or ``None`` when unrecognized.
@@ -86,8 +90,9 @@ def infer_provider_from_model(model: str | None) -> str | None:
     unconfigured generic adapter, or a model id behind a serving backend). It matches the known family
     prefixes against each ``/``-, ``.``-, or ``:``-delimited segment, so a vendor token is found even
     when it is preceded by a namespace or a Bedrock region prefix (``us.anthropic.claude-...`` ->
-    ``anthropic``). Returns ``None`` for anything it does not recognize so the caller reports an honest
-    "unknown" instead of a wrong vendor.
+    ``anthropic``). The two-character OpenAI families (o1/o3/o4) are matched as whole tokens, not
+    prefixes -- see :data:`_SHORT_OPENAI_TOKEN`. Returns ``None`` for anything it does not recognize
+    so the caller reports an honest "unknown" instead of a wrong vendor.
     """
     if not model:
         return None
@@ -96,6 +101,8 @@ def infer_provider_from_model(model: str | None) -> str | None:
     for prefix, provider in _MODEL_PROVIDER_PREFIXES:
         if any(segment.startswith(prefix) for segment in segments):
             return provider
+    if any(_SHORT_OPENAI_TOKEN.match(segment) for segment in segments):
+        return OPENAI
     return None
 
 

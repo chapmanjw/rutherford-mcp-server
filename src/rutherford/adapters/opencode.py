@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..domain.enums import AuthState, OutputMode, SafetyMode
+from ..domain.error_codes import ErrorCode
 from ..domain.models import (
     AdapterCapabilities,
     AuthStatus,
@@ -172,13 +173,13 @@ class OpenCodeAdapter(BaseCLIAdapter):
             return error_result(
                 ctx,
                 raw,
-                "PARSE_ERROR",
+                ErrorCode.PARSE_ERROR,
                 "opencode --format json produced no parseable assistant text",
                 text=raw.stdout.strip(),
             )
 
         if raw.exit_code != 0:
-            return error_result(ctx, raw, "NONZERO_EXIT", text, text=text)
+            return error_result(ctx, raw, ErrorCode.NONZERO_EXIT, text, text=text)
 
         return success_result(
             ctx,
@@ -190,28 +191,60 @@ class OpenCodeAdapter(BaseCLIAdapter):
 
 
 def _extract_text(events: list[dict[str, Any]]) -> str:
-    """Collect assistant text from ``type``-bearing text events.
+    """Collect assistant text from ``type``-bearing text events, PER PART, then join the parts.
 
-    Events that carry an incremental text part are concatenated. If any text event instead
-    carries a full snapshot (later events repeat and extend the same text), the longest single
-    snapshot is preferred so duplicated prefixes are not doubled.
+    A message can carry several text parts, each its own stream identified by ``part.id``. The
+    snapshot-vs-delta question is a per-stream property -- two interleaved cumulative streams do
+    not form one prefix chain -- so the events are grouped by part id first and each stream is
+    resolved independently (:func:`_resolve_text_stream`), then joined in first-appearance order.
+    Events without a part id share one stream, preserving the flat-concatenation behavior for
+    streams that do not carry ids.
     """
-    parts: list[str] = []
+    streams: dict[str, list[str]] = {}
+    order: list[str] = []
     for event in events:
         if "text" not in str(event.get("type", "")):
             continue
         part = event.get("part")
-        chunk = part.get("text") if isinstance(part, dict) else event.get("text")
+        if isinstance(part, dict):
+            chunk = part.get("text")
+            raw_id = part.get("id")
+            stream_id = str(raw_id) if isinstance(raw_id, str) and raw_id else "(no-part-id)"
+        else:
+            chunk = event.get("text")
+            stream_id = "(no-part-id)"
         if isinstance(chunk, str) and chunk:
-            parts.append(chunk)
+            if stream_id not in streams:
+                streams[stream_id] = []
+                order.append(stream_id)
+            streams[stream_id].append(chunk)
 
-    if not parts:
+    if not order:
         return ""
+    return "".join(_resolve_text_stream(streams[stream_id]) for stream_id in order).strip()
 
-    joined = "".join(parts).strip()
-    longest = max(parts, key=len).strip()
-    # If the final snapshot already contains the concatenation, the events were cumulative
-    # snapshots rather than deltas; trust the longest single snapshot to avoid doubling.
+
+def _resolve_text_stream(parts: list[str]) -> str:
+    """Resolve one part's chunks to its final text: a snapshot stream's latest, or the delta join.
+
+    Cumulative-snapshot streams repeat-and-extend the same text: each chunk is a strict-prefix
+    extension of the previous (["H", "He", "Hel"]). Concatenating those doubles every prefix
+    ("HHeHel"), and a duplicated-longest check alone cannot catch it -- the longest snapshot
+    appears exactly once in the concatenation -- so the prefix chain is detected directly and the
+    latest snapshot wins.
+
+    Identical repeated chunks (["a", "a"]) are inherently ambiguous: deltas meaning "aa", or the
+    same snapshot emitted twice. The strict length increase keeps them out of the prefix-chain
+    branch, but the duplicated-longest guard below then resolves them as a REPEATED SNAPSHOT
+    (returning "a") -- the deliberate, safer reading for a snapshot-prone stream, pinned by
+    test_parse_repeated_identical_snapshot_resolves_to_one_copy.
+    """
+    if len(parts) > 1 and all(
+        len(parts[i + 1]) > len(parts[i]) and parts[i + 1].startswith(parts[i]) for i in range(len(parts) - 1)
+    ):
+        return parts[-1]
+    joined = "".join(parts)
+    longest = max(parts, key=len)
     if longest and joined.count(longest) > 1:
         return longest
     return joined

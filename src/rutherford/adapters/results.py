@@ -58,7 +58,7 @@ def success_result(
 def error_result(
     ctx: InvocationContext,
     raw: ProcessResult | None,
-    code: ErrorCode | str,
+    code: ErrorCode,
     message: str,
     *,
     text: str = "",
@@ -71,7 +71,7 @@ def error_result(
         exit_code=raw.exit_code if raw is not None else None,
         text=text,
         duration_s=raw.duration_s if raw is not None else 0.0,
-        error=ErrorInfo(code=str(code), message=message, details=details),
+        error=ErrorInfo(code=code, message=message, details=details),
         safety_mode=ctx.safety_mode,
     )
 

@@ -10,7 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from rutherford.config.loader import deep_merge, load_config
-from rutherford.config.schema import AdapterConfig, GenericAdapterConfig, RutherfordConfig
+from rutherford.config.schema import AdapterConfig, GenericAdapterConfig, GenericSafetyConfig, RutherfordConfig
 from rutherford.domain.enums import OutputMode, SafetyMode
 from rutherford.domain.errors import ConfigError
 
@@ -149,16 +149,47 @@ def test_generic_adapter_rejects_unparseable_output_modes() -> None:
     # jsonl/transcript need a code adapter; the generic adapter would dump the raw stream.
     with pytest.raises(ValidationError):
         GenericAdapterConfig(
-            id="x", display_name="X", binary="x", output_mode=OutputMode.JSONL, json_text_path="result"
+            id="x",
+            display_name="X",
+            binary="x",
+            output_mode=OutputMode.JSONL,
+            json_text_path="result",
+            natively_read_only=True,
         )
     with pytest.raises(ValidationError):
-        GenericAdapterConfig(id="x", display_name="X", binary="x", output_mode=OutputMode.TRANSCRIPT)
+        GenericAdapterConfig(
+            id="x", display_name="X", binary="x", output_mode=OutputMode.TRANSCRIPT, natively_read_only=True
+        )
     # json without a path has no way to extract the answer.
     with pytest.raises(ValidationError):
-        GenericAdapterConfig(id="x", display_name="X", binary="x", output_mode=OutputMode.JSON)
+        GenericAdapterConfig(id="x", display_name="X", binary="x", output_mode=OutputMode.JSON, natively_read_only=True)
     # text, and json with a path, are valid.
-    GenericAdapterConfig(id="x", display_name="X", binary="x", output_mode=OutputMode.TEXT)
-    GenericAdapterConfig(id="x", display_name="X", binary="x", output_mode=OutputMode.JSON, json_text_path="result")
+    GenericAdapterConfig(id="x", display_name="X", binary="x", output_mode=OutputMode.TEXT, natively_read_only=True)
+    GenericAdapterConfig(
+        id="x",
+        display_name="X",
+        binary="x",
+        output_mode=OutputMode.JSON,
+        json_text_path="result",
+        natively_read_only=True,
+    )
+
+
+def test_generic_adapter_requires_a_read_only_posture() -> None:
+    # The safety mapping passes fragments through verbatim, so an empty read_only fragment would
+    # run the CLI in its native posture under a read_only label. Config load must refuse that
+    # unless the operator explicitly declares the CLI natively read-only.
+    with pytest.raises(ValidationError, match="read_only"):
+        GenericAdapterConfig(id="x", display_name="X", binary="x")
+    # Either escape hatch makes the posture honest: a real read-only fragment...
+    GenericAdapterConfig(
+        id="x",
+        display_name="X",
+        binary="x",
+        safety=GenericSafetyConfig(read_only=["--sandbox", "read-only"]),
+    )
+    # ...or the explicit declaration that the CLI cannot write/execute by default.
+    GenericAdapterConfig(id="x", display_name="X", binary="x", natively_read_only=True)
 
 
 def test_dirs_resolve_to_absolute_and_a_missing_dir_warns_not_raises(tmp_path: Path) -> None:

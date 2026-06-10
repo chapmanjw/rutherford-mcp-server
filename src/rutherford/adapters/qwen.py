@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..domain.enums import AuthState, OutputMode, SafetyMode
+from ..domain.error_codes import ErrorCode
 from ..domain.models import (
     AdapterCapabilities,
     AuthStatus,
@@ -140,7 +141,7 @@ class QwenAdapter(BaseCLIAdapter):
             return error_result(
                 ctx,
                 raw,
-                "PARSE_ERROR",
+                ErrorCode.PARSE_ERROR,
                 "qwen -o json produced no parseable JSON array",
                 text=raw.stdout.strip(),
             )
@@ -154,7 +155,7 @@ class QwenAdapter(BaseCLIAdapter):
                 message = text or result_event.get("subtype") or "qwen reported an error"
                 if raw.exit_code != 0 and not text:
                     return nonzero_result(ctx, raw, text=text)
-                return error_result(ctx, raw, "NONZERO_EXIT", str(message), text=text)
+                return error_result(ctx, raw, ErrorCode.NONZERO_EXIT, str(message), text=text)
             if not text.strip():
                 fallback = _last_assistant_text(events)
                 if fallback is not None and fallback.strip():
@@ -168,7 +169,7 @@ class QwenAdapter(BaseCLIAdapter):
                 return error_result(
                     ctx,
                     raw,
-                    "PARSE_ERROR",
+                    ErrorCode.PARSE_ERROR,
                     "qwen result event carried no text answer",
                     text=raw.stdout.strip(),
                 )

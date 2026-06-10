@@ -10,6 +10,7 @@ different transport without touching it.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from collections.abc import Awaitable
@@ -43,7 +44,8 @@ mcp: FastMCP = FastMCP(
         "Rutherford orchestrates other agentic coding CLIs. Use `delegate` to hand a task to one "
         "CLI, `consensus` to ask several in parallel, `debate` to have several argue across rounds "
         "(returning the full transcript), and `capabilities`/`doctor` to see which are installed and "
-        "authenticated. Delegations default to read_only; write and yolo are explicit opt-in. Long "
+        "authenticated. Delegations default to the configured default_safety_mode (read_only out of "
+        "the box); write and yolo are explicit opt-in behind a trusted workspace. Long "
         "tasks can run as background jobs (mode=async), enumerated with list_jobs, polled with "
         "job_status / job_result, and cancelled with cancel_job."
     ),
@@ -69,13 +71,20 @@ def get_app() -> AppContext:
 
 
 async def _guarded(coro: Awaitable[str]) -> str:
-    """Await a tool body, mapping Rutherford and unexpected errors to MCP tool errors."""
+    """Await a tool body, mapping Rutherford and unexpected errors to MCP tool errors.
+
+    A :class:`RutherfordError` is structured and client-safe, so its payload passes through. An
+    UNEXPECTED exception is the opposite: its text can carry filesystem paths, command fragments,
+    or raw input, so the client gets a fixed message while the full traceback goes to the
+    server-side log -- the operator keeps the diagnostic, the client does not get the internals.
+    """
     try:
         return await coro
     except RutherfordError as exc:
         raise ToolError(error_payload_from(exc)) from exc
     except Exception as exc:  # never let an unexpected error crash the tool call
-        raise ToolError(tool_error(ErrorCode.INTERNAL, str(exc))) from exc
+        logging.getLogger("rutherford.server").exception("unexpected error in a tool call")
+        raise ToolError(tool_error(ErrorCode.INTERNAL, "internal server error; see the server log")) from exc
 
 
 @mcp.tool
@@ -86,7 +95,7 @@ async def delegate(
     working_dir: str | None = None,
     files: list[str] | None = None,
     role: str | None = None,
-    safety_mode: str = "read_only",
+    safety_mode: str | None = None,
     mode: str = "sync",
     timeout_s: float | None = None,
     session_id: str | None = None,
@@ -97,8 +106,9 @@ async def delegate(
     """Delegate a task to one CLI and return its normalized result.
 
     `cli` is an adapter id (see `capabilities`); `model` is optional (the adapter's default
-    otherwise). `safety_mode` is read_only | propose | write | yolo (default read_only); write and
-    yolo also need a trusted workspace (`trust_workspace=true` or a configured allowlist). With
+    otherwise). `safety_mode` is read_only | propose | write | yolo; when omitted, the configured
+    `default_safety_mode` applies (read_only out of the box). write and yolo also need a trusted
+    workspace (`trust_workspace=true` or a configured allowlist). With
     `mode="async"` a job id is returned; poll `job_status` / `job_result`. `session_id` resumes a
     prior session where the CLI supports it. `fallback` is an ordered list of alternate `cli` /
     `cli:model` targets tried if the primary fails on a retryable category (rate-limit, auth, timeout,
@@ -137,7 +147,7 @@ async def consensus(
     working_dir: str | None = None,
     files: list[str] | None = None,
     role: str | None = None,
-    safety_mode: str = "read_only",
+    safety_mode: str | None = None,
     synthesize: bool = False,
     timeout_s: float | None = None,
     mode: str = "sync",
@@ -193,7 +203,7 @@ async def debate(
     working_dir: str | None = None,
     files: list[str] | None = None,
     role: str | None = None,
-    safety_mode: str = "read_only",
+    safety_mode: str | None = None,
     synthesize: bool = True,
     timeout_s: float | None = None,
     mode: str = "sync",
@@ -266,7 +276,6 @@ async def review(
     diff: str | None = None,
     role: str = "codereviewer",
     working_dir: str | None = None,
-    safety_mode: str = "read_only",
     synthesize: bool = False,
     timeout_s: float | None = None,
 ) -> str:
@@ -285,7 +294,6 @@ async def review(
             diff=diff,
             role=role,
             working_dir=working_dir,
-            safety_mode=safety_mode,
             synthesize=synthesize,
             timeout_s=timeout_s,
         )
@@ -300,10 +308,9 @@ async def plan(
     role: str = "planner",
     working_dir: str | None = None,
     files: list[str] | None = None,
-    safety_mode: str = "read_only",
     timeout_s: float | None = None,
 ) -> str:
-    """Ask one target to produce an ordered implementation plan for a goal (read-only)."""
+    """Ask one target to produce an ordered implementation plan for a goal (always read-only)."""
     return await _guarded(
         plan_tool(
             get_app(),
@@ -313,7 +320,6 @@ async def plan(
             role=role,
             working_dir=working_dir,
             files=files,
-            safety_mode=safety_mode,
             timeout_s=timeout_s,
         )
     )

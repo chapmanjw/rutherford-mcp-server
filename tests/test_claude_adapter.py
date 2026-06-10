@@ -55,10 +55,15 @@ def _clear_backend_switches(monkeypatch: pytest.MonkeyPatch) -> None:
 # --- build_invocation --------------------------------------------------------
 
 
-def test_build_invocation_basic_argv_is_a_list() -> None:
+def test_build_invocation_prompt_rides_on_stdin_not_argv() -> None:
+    # The panel's MAJOR: a prompt on argv hits the ~32K Windows command-line cap on long debate
+    # rounds and the cmd.exe newline truncation through an npm .cmd shim. The prompt must be the
+    # stdin payload, with no positional after -p (which makes claude read stdin).
     spec = ClaudeCodeAdapter().build_invocation(_req(), _ctx())
     assert isinstance(spec.argv, list)
-    assert spec.argv[:5] == ["claude", "-p", "say hi", "--output-format", "json"]
+    assert spec.argv[:4] == ["claude", "-p", "--output-format", "json"]
+    assert spec.stdin == "say hi"
+    assert "say hi" not in spec.argv
     assert "--model" in spec.argv
     assert spec.argv[spec.argv.index("--model") + 1] == "opus"
 
@@ -73,24 +78,36 @@ def test_build_invocation_includes_working_dir_and_resume() -> None:
     assert spec.argv[spec.argv.index("--resume") + 1] == "sess-1"
 
 
-def test_build_invocation_uses_system_prompt_for_role() -> None:
+def test_build_invocation_folds_the_role_preamble_into_the_stdin_prompt() -> None:
+    # The preamble is multiline by nature; --append-system-prompt would put it on argv where a
+    # .cmd-shim launch truncates at the first newline. It composes into the stdin prompt instead,
+    # the same way every other stdin-transport adapter does.
     spec = ClaudeCodeAdapter().build_invocation(_req(), _ctx(preamble="You are a reviewer."))
-    assert "--append-system-prompt" in spec.argv
-    assert spec.argv[spec.argv.index("--append-system-prompt") + 1] == "You are a reviewer."
+    assert "--append-system-prompt" not in spec.argv
+    assert spec.stdin is not None
+    assert spec.stdin.startswith("You are a reviewer.")
+    assert "say hi" in spec.stdin
+
+
+def test_build_invocation_multiline_prompt_never_touches_argv() -> None:
+    multiline = "line one\nline two\n\nline four"
+    spec = ClaudeCodeAdapter().build_invocation(_req(prompt=multiline), _ctx(preamble="role\nwith lines"))
+    assert spec.stdin is not None and multiline in spec.stdin
+    assert all("\n" not in arg for arg in spec.argv)  # nothing newline-bearing rides argv
 
 
 def test_build_invocation_appends_files_to_prompt() -> None:
     spec = ClaudeCodeAdapter().build_invocation(_req(files=["a.py", "b.py"]), _ctx())
-    prompt = spec.argv[2]
-    assert "Files in scope:" in prompt
-    assert "- a.py" in prompt
+    assert spec.stdin is not None
+    assert "Files in scope:" in spec.stdin
+    assert "- a.py" in spec.stdin
 
 
 def test_build_invocation_never_builds_a_shell_string() -> None:
     spec = ClaudeCodeAdapter().build_invocation(_req(prompt="rm -rf / ; echo pwned"), _ctx())
-    # The dangerous text is a single argv element, never concatenated into a command line.
-    assert "rm -rf / ; echo pwned" in spec.argv
-    assert all(";" not in arg or arg == "rm -rf / ; echo pwned" for arg in spec.argv)
+    # The dangerous text rides on stdin, never concatenated into a command line.
+    assert spec.stdin is not None and "rm -rf / ; echo pwned" in spec.stdin
+    assert all(";" not in arg for arg in spec.argv)
 
 
 # --- map_safety --------------------------------------------------------------
@@ -292,3 +309,10 @@ def test_check_auth_parses_pretty_printed_status(monkeypatch: pytest.MonkeyPatch
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     pretty = '{\n  "loggedIn": true,\n  "authMethod": "third_party",\n  "apiProvider": "bedrock"\n}'
     assert ClaudeCodeAdapter(probe=_auth_status_probe(pretty)).check_auth().state is AuthState.UNKNOWN
+
+
+def test_capabilities_no_longer_claim_system_prompt_support() -> None:
+    # Pins the deliberate flip: the role preamble folds into the stdin prompt (the CLI's
+    # --append-system-prompt is an argv element a .cmd-shim launch can truncate at a newline), so
+    # the adapter must not advertise system-prompt support it no longer uses.
+    assert ClaudeCodeAdapter().capabilities().supports_system_prompt is False

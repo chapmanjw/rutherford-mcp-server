@@ -7,7 +7,7 @@ from __future__ import annotations
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode
 from ..domain.models import DelegationRequest, Target
-from .common import as_target, parse_mode, parse_safety_mode
+from .common import as_target, parse_mode, resolve_safety_mode
 
 
 async def delegate_tool(
@@ -19,7 +19,7 @@ async def delegate_tool(
     working_dir: str | None = None,
     files: list[str] | None = None,
     role: str | None = None,
-    safety_mode: str = "read_only",
+    safety_mode: str | None = None,
     mode: str = "sync",
     timeout_s: float | None = None,
     session_id: str | None = None,
@@ -41,7 +41,7 @@ async def delegate_tool(
         working_dir=working_dir,
         files=files or [],
         role=role,
-        safety_mode=parse_safety_mode(safety_mode),
+        safety_mode=resolve_safety_mode(safety_mode, app.config.default_safety_mode),
         mode=parse_mode(mode),
         timeout_s=timeout_s,
         session_id=session_id,

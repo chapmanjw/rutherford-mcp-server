@@ -34,12 +34,17 @@ license-check:
 test:
     uv run pytest
 
-# Run the local-only integration suite (real CLIs; skips those not installed/authenticated).
+# Enforce the per-file coverage floor on adapters/, services/, runtime/ (needs a prior test run).
+coverage-per-file:
+    uv run python scripts/check_per_file_coverage.py
+
+# Run the local-only integration suite (real CLIs; FAILS if zero CLIs are opted in).
 test-integration:
     uv run pytest -m integration
 
-# The full pre-push gate: lint, format check, license header, type check, unit tests.
-check: lint format-check license-check typecheck test
+# The full pre-push gate: lint, format check, license header, type check, unit tests,
+# the per-file coverage floor, and the entrypoint smoke check.
+check: lint format-check license-check typecheck test coverage-per-file smoke
 
 # Smoke-check the stdio server entrypoint (imports + starts FastMCP).
 smoke:

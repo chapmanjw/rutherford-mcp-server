@@ -60,6 +60,70 @@ async def test_one_bad_voice_does_not_abort_the_panel() -> None:
     assert by_cli["b"].error.code == "BINARY_NOT_FOUND"
 
 
+async def test_a_raising_adapter_probe_does_not_abort_the_panel() -> None:
+    # The headline promise under its harshest test: an adapter whose detect() RAISES (not
+    # "returns a failure") must become one structured failed voice while the siblings answer.
+    class _DetectRaises(FakeAdapter):
+        def detect(self):
+            raise RuntimeError("probe exploded")
+
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _consensus([FakeAdapter("a"), _DetectRaises("boom"), FakeAdapter("c")], runner)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="a"), Target(cli="boom"), Target(cli="c")], prompt="q")
+    )
+    assert isinstance(result, ConsensusResult)
+    by_cli = {voice.target.cli: voice for voice in result.voices}
+    assert by_cli["a"].ok and by_cli["c"].ok  # the healthy siblings still answered
+    assert not by_cli["boom"].ok
+    assert by_cli["boom"].error is not None
+    assert by_cli["boom"].error.code == "INTERNAL"
+
+
+async def test_a_cancellation_escaping_a_voice_propagates_not_folds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The flip side of the exception fold: gather(return_exceptions=True) captures CancelledError
+    # too, so without the explicit re-raise a cancelled panel would be SWALLOWED into one INTERNAL
+    # failed voice and the consensus would "complete". Cancellation must stay cancellation.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
+    real_delegate = DelegationService.delegate
+
+    async def cancelled(self: DelegationService, req: DelegationRequest, **kwargs: object):
+        if req.target.cli == "b":
+            raise asyncio.CancelledError()
+        return await real_delegate(self, req, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(DelegationService, "delegate", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await service.consensus(ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
+
+
+async def test_an_exception_escaping_delegate_is_folded_into_a_failed_voice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Defense in depth behind the delegate()-level containment: even if an exception still gets
+    # OUT of delegate(), the fan-out folds it into that voice instead of failing the gather.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
+    real_delegate = DelegationService.delegate
+
+    async def explode(self: DelegationService, req: DelegationRequest, **kwargs: object):
+        if req.target.cli == "b":
+            raise RuntimeError("escaped containment")
+        return await real_delegate(self, req, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(DelegationService, "delegate", explode)
+    result = await service.consensus(ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
+    by_cli = {voice.target.cli: voice for voice in result.voices}
+    assert by_cli["a"].ok
+    assert not by_cli["b"].ok
+    assert by_cli["b"].error is not None
+    assert by_cli["b"].error.code == "INTERNAL"
+    assert "escaped containment" in by_cli["b"].error.message
+
+
 async def test_stances_steer_each_prompt() -> None:
     runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
     service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)

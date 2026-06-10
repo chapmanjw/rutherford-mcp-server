@@ -79,10 +79,13 @@ class FakeProcessRunner:
         result: ProcessResult | None = None,
         results: Sequence[ProcessResult] | None = None,
         run_fn: Callable[[InvocationSpec], ProcessResult] | None = None,
+        *,
+        cycle: bool = False,
     ) -> None:
         self._result = result
         self._results = list(results) if results is not None else None
         self._run_fn = run_fn
+        self._cycle = cycle
         self._index = 0
         self.calls: list[tuple[InvocationSpec, float]] = []
         self.progress: list[str] = []
@@ -102,6 +105,14 @@ class FakeProcessRunner:
             # how the per-target model-fallback path is exercised.
             return self._run_fn(spec)
         if self._results is not None:
+            # Exhausting the canned list is an ERROR unless cycling was explicitly requested: an
+            # extra subprocess call (a fan-out or fallback regression) must fail the test loudly,
+            # not silently re-serve an earlier outcome.
+            if self._index >= len(self._results) and not self._cycle:
+                raise AssertionError(
+                    f"FakeProcessRunner exhausted its {len(self._results)} canned result(s) on call "
+                    f"#{self._index + 1}; pass cycle=True if re-serving results is intended"
+                )
             result = self._results[self._index % len(self._results)]
             self._index += 1
             return result
@@ -186,7 +197,7 @@ class FakeAdapter:
         error = None
         if not ok:
             code = ErrorCode.TIMEOUT if raw.timed_out else ErrorCode.NONZERO_EXIT
-            error = ErrorInfo(code=str(code), message=raw.stderr or "failed")
+            error = ErrorInfo(code=code, message=raw.stderr or "failed")
         return DelegationResult(
             target=ctx.target,
             ok=ok,

@@ -53,3 +53,39 @@ def test_unterminated_object_is_skipped() -> None:
 
 def test_code_fenced_object_is_found() -> None:
     assert last_json_object('```json\n{"verdict": "approve"}\n```') == {"verdict": "approve"}
+
+
+def test_truncated_trailing_array_does_not_steal_the_last_object() -> None:
+    # The full-codebase panel's MAJOR: when the trailing array is CUT OFF (no closing bracket),
+    # the scanner used to step one character in, re-find the inner object, and yield it as
+    # top-level -- overriding the real verdict. Truncated array elements stay suppressed.
+    text = '{"verdict": "block"}\nRelated: [{"verdict": "ignore"}'
+    assert last_json_object(text) == {"verdict": "block"}
+
+
+def test_truncated_array_with_several_elements_stays_suppressed() -> None:
+    text = '{"verdict": "approve"}\nFiles: [{"file": "a.py"}, {"file": "b.py"},'
+    assert last_json_object(text) == {"verdict": "approve"}
+
+
+def test_a_real_object_after_a_prose_bracket_is_still_found() -> None:
+    # A prose bracket is not JSON; the scanner must fall back to the one-character step and still
+    # find the real object after it (the truncated-array suppression must not eat prose).
+    text = 'see [the docs] for details\n{"verdict": "approve"}'
+    assert last_json_object(text) == {"verdict": "approve"}
+
+
+def test_truncated_array_before_a_later_real_object_does_not_hide_it() -> None:
+    # Suppression consumes only the parseable elements; a well-formed object appearing later in
+    # the text is still treated as top-level (the lenient reading -- it cannot be known whether
+    # the unclosed array was meant to contain it).
+    text = 'items: [{"file": "a.py"}, oops\n{"verdict": "approve"}'
+    assert last_json_object(text) == {"verdict": "approve"}
+
+
+def test_malformed_array_that_still_closes_stays_suppressed() -> None:
+    # The closed-bracket branch of the truncated-array walk: the whole-array parse fails (a stray
+    # double comma), but the element walk reaches the closing bracket -- everything inside stays
+    # suppressed and the scan resumes past the bracket, exactly as for a well-formed array.
+    text = '{"verdict": "block"} trailing: [{"verdict": "ignore"},,]'
+    assert last_json_object(text) == {"verdict": "block"}

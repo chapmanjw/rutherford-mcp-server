@@ -29,6 +29,7 @@ from ..domain.models import (
     DelegationRequest,
     DelegationResult,
     DiversityReport,
+    ErrorInfo,
     Target,
 )
 from ..runtime.depth import ensure_within_target_cap
@@ -196,7 +197,24 @@ class DebateService:
             )
             return _to_contribution(voice, round_index, result)
 
-        return list(await asyncio.gather(*(one(voice) for voice in voices)))
+        # return_exceptions: an exception that still escapes one seat's delegate() must become that
+        # seat's failed contribution, not abort the round and discard the other seats' turns.
+        outcomes = await asyncio.gather(*(one(voice) for voice in voices), return_exceptions=True)
+        contributions: list[DebateContribution] = []
+        for voice, outcome in zip(voices, outcomes, strict=True):
+            if isinstance(outcome, asyncio.CancelledError):  # a real cancellation still propagates
+                raise outcome
+            if isinstance(outcome, BaseException):
+                failed = DelegationResult(
+                    target=voice.target,
+                    ok=False,
+                    error=ErrorInfo(code=ErrorCode.INTERNAL, message=f"voice delegation raised: {outcome!r}"),
+                    safety_mode=req.safety_mode,
+                )
+                contributions.append(_to_contribution(voice, round_index, failed))
+            else:
+                contributions.append(outcome)
+        return contributions
 
     def _round_prompt(self, req: DebateRequest, voice: _Voice, previous: DebateRound | None) -> str:
         """Build the prompt for ``voice`` this round: a fresh answer, or a rebuttal of the others."""

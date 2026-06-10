@@ -12,8 +12,6 @@ whose output needs custom parsing (streaming events, transcript files) still nee
 
 from __future__ import annotations
 
-import json
-
 from ..config.schema import GenericAdapterConfig
 from ..domain.enums import AuthState, OutputMode, SafetyMode
 from ..domain.error_codes import ErrorCode
@@ -131,17 +129,16 @@ class GenericAdapter(BaseCLIAdapter):
 
         For a JSON CLI the answer is the last top-level JSON object (via the robust
         :func:`~rutherford.io.jsontext.last_json_object` scanner, which tolerates prose around the
-        object and skips a trailing array), then either the whole object re-serialized or, when a
-        ``json_text_path`` is configured, the scalar leaf at that dotted path. A non-scalar leaf
-        (object/list/bool) or a missing path yields ``None`` -- reported as a parse failure rather
-        than a stringified container. TEXT/JSONL/TRANSCRIPT generic CLIs return stdout verbatim.
+        object and skips a trailing array), then the scalar leaf at the configured
+        ``json_text_path`` -- which schema validation guarantees is set for JSON mode, so there is
+        no whole-object fallback here. A non-scalar leaf (object/list/bool) or a missing path
+        yields ``None`` -- reported as a parse failure rather than a stringified container. TEXT
+        generic CLIs return stdout verbatim.
         """
         if self._config.output_mode is OutputMode.JSON:
             payload = last_json_object(stdout)
             if payload is None:
                 return None
-            if self._config.json_text_path:
-                return as_text(dotted_get(payload, self._config.json_text_path))
-            return json.dumps(payload, ensure_ascii=False)
-        # TEXT, JSONL, and TRANSCRIPT generic CLIs return their stdout verbatim.
+            return as_text(dotted_get(payload, self._config.json_text_path or ""))
+        # TEXT generic CLIs return their stdout verbatim (JSONL/TRANSCRIPT are rejected at load).
         return stdout.strip()

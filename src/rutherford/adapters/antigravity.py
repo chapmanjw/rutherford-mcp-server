@@ -106,15 +106,25 @@ class AntigravityAdapter(BaseCLIAdapter):
             supports_system_prompt=False,
             output_mode=OutputMode.TRANSCRIPT,
             file_context_style="add_dir",
+            write_uses_bypass=True,  # print mode has no granular approval: write IS the bypass here
         )
 
     def map_safety(self, mode: SafetyMode) -> SafetyFlags:
-        # agy print mode has no granular approval. read_only/propose run without a bypass (so any
-        # edit the agent attempts is simply not applied); write and yolo use the bypass flag,
-        # which is the only way to let print mode apply changes.
-        if mode in (SafetyMode.WRITE, SafetyMode.YOLO):
+        # agy print mode has no granular approval -- its permission model is binary. read_only and
+        # propose run without a bypass (any edit the agent attempts is simply not applied). WRITE
+        # has no distinct posture: the bypass flag is the only way print mode applies changes, so
+        # write and yolo are EQUIVALENT on this adapter. That is deliberate and surfaced -- via
+        # ``capabilities().write_uses_bypass``, a doctor note, and the notes below -- rather than
+        # failing write closed, which would make it a silent no-op clone of read_only. Both modes
+        # stay behind the trusted-workspace gate; the defaults never carry the bypass.
+        if mode is SafetyMode.YOLO:
             return SafetyFlags(
                 args=["--dangerously-skip-permissions"], note="bypass approvals (print mode has no granular approval)"
+            )
+        if mode is SafetyMode.WRITE:
+            return SafetyFlags(
+                args=["--dangerously-skip-permissions"],
+                note="bypass approvals -- agy has no distinct write posture, so write == yolo on this adapter",
             )
         return SafetyFlags(args=[], note="default; edits are not applied in print mode without a bypass")
 
@@ -231,14 +241,28 @@ class AntigravityAdapter(BaseCLIAdapter):
         return self._newest_brain_entry()
 
     def _newest_brain_entry(self) -> str | None:
-        """Return the name of the most recently modified ``brain`` subdirectory, if any."""
+        """Return the name of the most recently modified ``brain`` subdirectory, if any.
+
+        agy rotates ``brain/`` entries live, so a directory can vanish between ``iterdir()`` and
+        ``stat()``; a vanished entry simply drops out of consideration rather than raising out of
+        ``parse_output`` (whose contract is never-raises -- the caller degrades to
+        ``TRANSCRIPT_NOT_FOUND``).
+        """
+
+        def mtime_or_gone(child: Path) -> float:
+            try:
+                return child.stat().st_mtime
+            except OSError:
+                return float("-inf")  # removed mid-scan; sorts behind every live entry
+
         brain = self._data_root / "brain"
-        if not brain.is_dir():
-            return None
-        entries = [child for child in brain.iterdir() if child.is_dir()]
+        try:
+            entries = [child for child in brain.iterdir() if child.is_dir()]
+        except OSError:
+            return None  # brain/ itself missing or unreadable
         if not entries:
             return None
-        newest = max(entries, key=lambda child: child.stat().st_mtime)
+        newest = max(entries, key=mtime_or_gone)
         return newest.name
 
     @staticmethod

@@ -140,6 +140,7 @@ it is written to stdin and omitted from the argv.
 | `output_mode` | `string` | `"text"` | How to extract the answer. The generic adapter supports only `text` and `json`; `jsonl` and `transcript` require a code adapter and are rejected at load time. |
 | `json_text_path` | `string` or omitted | none | Dotted key path into the parsed JSON object (e.g. `"message.content"`). Required when `output_mode` is `json`. |
 | `safety` | `GenericSafetyConfig` | all empty lists | Per-safety-mode argv fragments. |
+| `natively_read_only` | `bool` | `false` | Declares the CLI's *native default* posture is read-only (it cannot write or execute without extra flags). Required when `safety.read_only` is empty — see below. |
 | `version_args` | `list[str]` | `["--version"]` | Args passed to probe the binary version. |
 | `static_models` | `list[str]` | `[]` | Hard-coded model list reported by the adapter (no runtime query). |
 | `auth_env` | `list[str]` | `[]` | Environment variable names whose presence signals authentication. |
@@ -155,6 +156,12 @@ Each field is a list of argv fragments injected when that safety mode is active.
 | `propose` | `list[str]` | `[]` |
 | `write` | `list[str]` | `[]` |
 | `yolo` | `list[str]` | `[]` |
+
+The fragments are passed through verbatim, so an empty `read_only` would run the CLI in its
+native posture while the result claims `safety_mode=read_only`. Config load therefore rejects a
+generic adapter whose `safety.read_only` is empty unless `natively_read_only = true` explicitly
+declares the CLI read-only by default. Configure the CLI's real read-only/sandbox flags whenever
+it has them.
 
 ---
 
