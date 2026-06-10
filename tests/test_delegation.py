@@ -12,7 +12,7 @@ from rutherford.adapters.ollama import OllamaAdapter
 from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import AdapterConfig, RutherfordConfig
 from rutherford.domain.enums import SafetyMode
-from rutherford.domain.models import DelegationRequest, ProcessResult, Target
+from rutherford.domain.models import DelegationRequest, InvocationSpec, ProcessResult, Target
 from rutherford.runtime.depth import ENV_DEPTH
 from rutherford.services.delegation import DelegationService
 from rutherford.services.roles import load_roles
@@ -263,3 +263,183 @@ async def test_no_fallback_for_a_non_model_failure() -> None:
     assert not result.ok
     assert result.fallback_from is None  # a real failure is not retried
     assert len(runner.calls) == 1
+
+
+# --- F7: failure refinement, cross-target fallback, cooldown -----------------
+
+
+async def test_nonzero_exit_is_refined_to_a_specific_category() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=1, stderr="Error: 429 too many requests"))
+    result = await _service([FakeAdapter("a")], runner).delegate(_req("a"))
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "RATE_LIMITED"  # refined from the generic NONZERO_EXIT
+
+
+async def test_spawn_failure_is_structured_not_an_exception() -> None:
+    def run_fn(spec: InvocationSpec) -> ProcessResult:
+        raise OSError("exec format error")
+
+    runner = FakeProcessRunner(run_fn=run_fn)
+    result = await _service([FakeAdapter("a")], runner).delegate(_req("a"))
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "SPAWN_FAILED"
+
+
+async def test_cross_target_fallback_recovers_from_a_retryable_primary_failure() -> None:
+    def run_fn(spec: InvocationSpec) -> ProcessResult:
+        cli = spec.argv[0]
+        if cli == "a":
+            return ProcessResult(exit_code=1, stderr="rate limit exceeded (429)")
+        return ProcessResult(exit_code=0, stdout="answer from b")
+
+    runner = FakeProcessRunner(run_fn=run_fn)
+    service = _service([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.delegate(_req("a", fallback=[Target(cli="b")]))
+    assert result.ok
+    assert result.text == "answer from b"
+    assert result.target.cli == "b"  # the alternate that answered
+    assert result.fallback_chain == ["a"]  # the primary that failed first
+
+
+async def test_fallback_chain_exhausted_keeps_the_primary_failure() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=1, stderr="boom"))  # everyone fails
+    service = _service([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.delegate(_req("a", fallback=[Target(cli="b")]))
+    assert not result.ok
+    assert result.target.cli == "a"  # the primary's failure is preserved
+    assert result.fallback_chain is None
+
+
+async def test_no_fallback_chain_when_failure_is_not_retryable() -> None:
+    # WORKSPACE_NOT_TRUSTED (a write to an untrusted dir) is terminal: a different CLI would fail the
+    # same way, so the chain is not attempted.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _service([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.delegate(
+        _req("a", safety_mode=SafetyMode.WRITE, fallback=[Target(cli="b")]),
+    )
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "WORKSPACE_NOT_TRUSTED"
+    assert result.fallback_chain is None
+    assert len(runner.calls) == 0  # nothing ran (the guard fired before any subprocess)
+
+
+async def test_unhealthy_failures_bench_an_adapter_after_threshold() -> None:
+    config = RutherfordConfig(cooldown_threshold=2, cooldown_window_s=100.0, cooldown_duration_s=100.0)
+    runner = FakeProcessRunner(ProcessResult(exit_code=1, stderr="rate limit exceeded"))  # RATE_LIMITED
+    service = _service([FakeAdapter("a")], runner, config)
+    await service.delegate(_req("a"))
+    assert not service.is_benched("a")  # one failure, below the threshold
+    await service.delegate(_req("a"))
+    assert service.is_benched("a")  # the second benches it
+
+
+async def test_a_plain_nonzero_exit_does_not_bench_a_healthy_adapter() -> None:
+    # A non-zero exit from a hard task is not an adapter-health signal, so it never benches -- even
+    # repeatedly. Only typed seat failures (rate-limit, auth, timeout, spawn, drift) count.
+    config = RutherfordConfig(cooldown_threshold=2, cooldown_window_s=100.0)
+    runner = FakeProcessRunner(ProcessResult(exit_code=1, stderr="the task could not be completed"))
+    service = _service([FakeAdapter("a")], runner, config)
+    for _ in range(5):
+        await service.delegate(_req("a"))
+    assert not service.is_benched("a")
+
+
+async def test_a_benched_fallback_target_is_skipped() -> None:
+    config = RutherfordConfig(cooldown_threshold=1)  # one unhealthy failure benches
+    calls: list[str] = []
+
+    def run_fn(spec: InvocationSpec) -> ProcessResult:
+        cli = spec.argv[0]
+        calls.append(cli)
+        if cli == "b":
+            return ProcessResult(exit_code=1, stderr="rate limit exceeded")  # unhealthy -> benches b
+        if cli == "a":
+            return ProcessResult(exit_code=1, stderr="the task failed")  # retryable, triggers fallback
+        return ProcessResult(exit_code=0, stdout="answer from c")
+
+    runner = FakeProcessRunner(run_fn=run_fn)
+    service = _service([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner, config)
+    await service.delegate(_req("b"))  # bench b
+    assert service.is_benched("b")
+    calls.clear()
+    result = await service.delegate(_req("a", fallback=[Target(cli="b"), Target(cli="c")]))
+    assert result.ok
+    assert result.target.cli == "c"
+    assert "b" not in calls  # b was skipped (benched), never invoked
+    assert result.fallback_chain == ["a"]  # only the primary actually failed in the chain
+
+
+async def test_a_successful_delegation_clears_the_cooldown_streak() -> None:
+    config = RutherfordConfig(cooldown_threshold=2, cooldown_window_s=100.0)
+    state = {"fail": True}
+
+    def run_fn(spec: InvocationSpec) -> ProcessResult:
+        if state["fail"]:
+            return ProcessResult(exit_code=1, stderr="rate limit exceeded")  # unhealthy
+        return ProcessResult(exit_code=0, stdout="ok")
+
+    runner = FakeProcessRunner(run_fn=run_fn)
+    service = _service([FakeAdapter("a")], runner, config)
+    await service.delegate(_req("a"))  # 1 failure
+    state["fail"] = False
+    await service.delegate(_req("a"))  # success clears the streak
+    state["fail"] = True
+    await service.delegate(_req("a"))  # 1 failure again
+    assert not service.is_benched("a")  # never reached two consecutive failures
+
+
+async def test_no_cross_target_fallback_in_write_mode() -> None:
+    # Fallback is restricted to non-mutating modes: re-running a write task on a second CLI against the
+    # same (possibly partially-mutated) tree would compound edits. The primary's failure is kept.
+    calls: list[str] = []
+
+    def run_fn(spec: InvocationSpec) -> ProcessResult:
+        calls.append(spec.argv[0])
+        return ProcessResult(exit_code=1, stderr="rate limit exceeded")  # retryable on a
+
+    runner = FakeProcessRunner(run_fn=run_fn)
+    service = _service([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.delegate(
+        _req("a", safety_mode=SafetyMode.WRITE, trust_workspace=True, fallback=[Target(cli="b")]),
+    )
+    assert not result.ok
+    assert result.target.cli == "a"  # the primary's failure is kept
+    assert result.fallback_chain is None
+    assert "b" not in calls  # the alternate was never tried in write mode
+
+
+async def test_contract_mismatch_benches_the_adapter() -> None:
+    # Output drift (CONTRACT_MISMATCH) is an adapter-integration problem, so it counts toward cooldown
+    # end to end: the contract canary fails on an otherwise-ok run, and the adapter is benched.
+    config = RutherfordConfig(cooldown_threshold=1)
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _service([FakeAdapter("a", contract_ok=False)], runner, config)
+    result = await service.delegate(_req("a"))
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "CONTRACT_MISMATCH"
+    assert service.is_benched("a")
+
+
+async def test_fallback_chain_records_the_effective_post_model_fallback_target() -> None:
+    # cursorish:named-only model-falls-back to cursorish:auto (still fails), then b answers. The chain
+    # records the EFFECTIVE failed label (cursorish:auto), not the originally requested named-only.
+    def run_fn(spec: InvocationSpec) -> ProcessResult:
+        if spec.argv[0] == "cursorish":
+            if "named-only" in spec.argv:
+                return ProcessResult(exit_code=1, stderr="Named models unavailable. Switch to Auto.")
+            return ProcessResult(exit_code=1, stderr="rate limit exceeded")  # the auto attempt also fails
+        return ProcessResult(exit_code=0, stdout="answer from b")
+
+    runner = FakeProcessRunner(run_fn=run_fn)
+    service = _service([FakeAdapter("cursorish", fallback_model="auto"), FakeAdapter("b")], runner)
+    result = await service.delegate(
+        _req(target=Target(cli="cursorish", model="named-only"), fallback=[Target(cli="b")]),
+    )
+    assert result.ok
+    assert result.target.cli == "b"
+    assert result.fallback_chain == ["cursorish:auto"]  # the effective failed target, post model-fallback

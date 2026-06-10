@@ -17,6 +17,7 @@ from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import (
     ConsensusRequest,
     ConsensusResult,
+    DelegationRequest,
     InvocationSpec,
     ProcessResult,
     StrategyResult,
@@ -439,3 +440,29 @@ async def test_one_shared_cap_bounds_concurrent_consensus_and_debate() -> None:
         ),
     )
     assert runner.max_active <= 2  # both panels share one cap
+
+
+async def test_expand_all_skips_a_benched_adapter() -> None:
+    # F7: an adapter on cooldown is left out of the auto-expanded panel, with a reason.
+    config = RutherfordConfig(cooldown_threshold=1)  # one unhealthy failure benches
+
+    def run_fn(spec: InvocationSpec) -> ProcessResult:
+        cli = spec.argv[0]
+        if cli == "b":
+            return ProcessResult(exit_code=1, stderr="rate limit exceeded")  # unhealthy -> benches b
+        return ProcessResult(exit_code=0, stdout="ok")
+
+    runner = FakeProcessRunner(run_fn=run_fn)
+    registry = AdapterRegistry([FakeAdapter("a"), FakeAdapter("b")])
+    delegation = DelegationService(registry, runner, config, load_roles())
+    consensus = ConsensusService(delegation, config, registry)
+
+    await delegation.delegate(DelegationRequest(target=Target(cli="b"), prompt="q"))  # bench b
+    assert delegation.is_benched("b")
+
+    result = await consensus.consensus(ConsensusRequest(expand_all=True, prompt="q"))
+    assert isinstance(result, ConsensusResult)
+    included = {voice.target.cli for voice in result.voices}
+    assert "a" in included
+    assert "b" not in included
+    assert any(entry.cli == "b" and "cooldown" in entry.reason for entry in result.skipped)

@@ -7,7 +7,7 @@ from __future__ import annotations
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode
 from ..domain.models import DelegationRequest, Target
-from .common import parse_mode, parse_safety_mode
+from .common import as_target, parse_mode, parse_safety_mode
 
 
 async def delegate_tool(
@@ -25,12 +25,15 @@ async def delegate_tool(
     session_id: str | None = None,
     include_raw: bool = False,
     trust_workspace: bool = False,
+    fallback: list[str] | None = None,
 ) -> str:
     """Delegate ``prompt`` to ``(cli, model)`` and return the normalized result.
 
     With ``mode="async"`` the call returns a job id immediately; poll ``job_status`` /
     ``job_result``. A delegation that fails operationally (missing binary, timeout, non-zero exit)
-    returns a result with ``ok=false`` and an error code, not an exception.
+    returns a result with ``ok=false`` and an error code, not an exception. ``fallback`` is an ordered
+    list of alternate ``cli`` / ``cli:model`` targets to try if the primary fails on a retryable
+    category (F7).
     """
     request = DelegationRequest(
         target=Target(cli=cli, model=model),
@@ -44,6 +47,7 @@ async def delegate_tool(
         session_id=session_id,
         include_raw=include_raw,
         trust_workspace=trust_workspace,
+        fallback=[as_target(entry) for entry in (fallback or [])],
         depth=app.base_depth,
     )
     correlation_id = app.new_correlation_id()

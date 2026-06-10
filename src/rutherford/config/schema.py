@@ -142,6 +142,16 @@ class RutherfordConfig(BaseModel):
     #: validator below), so raising ``max_targets`` does not silently throttle a single auto-panel;
     #: set it explicitly to pin a different cap (e.g. lower on a laptop). Read once at startup.
     max_concurrency: int = Field(default=8, ge=1)
+    #: Cooldown (F7): how many *unhealthy* failures (down / throttled / mis-launching -- not a bad
+    #: prompt) an adapter may have within ``cooldown_window_s`` before it is benched for
+    #: ``cooldown_duration_s``. A benched adapter is left out of an auto-expanded (``expand_all``) panel
+    #: and skipped as a fallback candidate, but an explicit delegation to it still runs. Set to ``0`` to
+    #: disable cooldown entirely. In-memory and process-global; resets on restart.
+    cooldown_threshold: int = Field(default=3, ge=0)
+    #: The sliding window over which ``cooldown_threshold`` failures are counted.
+    cooldown_window_s: float = Field(default=120.0, gt=0)
+    #: How long a benched adapter stays benched before it is tried again.
+    cooldown_duration_s: float = Field(default=60.0, gt=0)
     #: Absolute paths under which write/yolo delegations are permitted.
     trusted_workspaces: list[str] = Field(default_factory=list)
     #: Whether consensus synthesizes server-side by default (off by default per the spec).

@@ -31,6 +31,22 @@ class ErrorCode(StrEnum):
     TIMEOUT = "TIMEOUT"
     #: The CLI exited with a non-zero status.
     NONZERO_EXIT = "NONZERO_EXIT"
+    #: The requested model is not available to this account/plan (a refinement of a non-zero exit;
+    #: the delegation retries once with the adapter's fallback model where one exists).
+    MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
+    #: The provider rate-limited or quota-exhausted the call -- a transient failure worth retrying
+    #: on a different target (a refinement of a non-zero exit).
+    RATE_LIMITED = "RATE_LIMITED"
+    #: The CLI was authenticated enough to start but the call was rejected for auth (a 401/403,
+    #: an expired or invalid credential) -- distinct from BINARY_NOT_FOUND/AUTH_REQUIRED, which are
+    #: pre-run. A different target may still answer.
+    AUTH_FAILED = "AUTH_FAILED"
+    #: The prompt plus context exceeded the model's window. A different target with a larger window
+    #: may still answer (a refinement of a non-zero exit).
+    CONTEXT_OVERFLOW = "CONTEXT_OVERFLOW"
+    #: The subprocess could not be launched (the binary, a shim, or a runtime failed to start),
+    #: distinct from the CLI running and exiting non-zero.
+    SPAWN_FAILED = "SPAWN_FAILED"
     #: The CLI's output could not be parsed into a normalized result.
     PARSE_ERROR = "PARSE_ERROR"
     #: The CLI reported success but its output did not match the adapter's expected machine-readable

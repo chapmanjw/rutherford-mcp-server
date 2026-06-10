@@ -30,7 +30,9 @@ from ..domain.models import (
     ProcessResult,
     Provenance,
 )
+from ..runtime.cooldown import CooldownTracker
 from ..runtime.depth import child_depth_env, ensure_within_depth
+from ..runtime.failures import classify_failure, indicates_unhealthy, is_model_unavailable, is_retryable
 from ..runtime.logging import log_event
 from ..runtime.process import ProcessRunner
 from .roles import RoleStore
@@ -56,6 +58,21 @@ class DelegationService:
         #: (consensus fan-out, debate rounds, nested self-delegation), so panel width does not become
         #: unbounded host process pressure.
         self._semaphore = asyncio.Semaphore(config.max_concurrency)
+        #: Process-global cooldown state (F7): benches a flapping adapter so a panel/fallback stops
+        #: reaching for it. Shared across every panel that uses this service.
+        self._cooldown = CooldownTracker(
+            threshold=config.cooldown_threshold,
+            window_s=config.cooldown_window_s,
+            duration_s=config.cooldown_duration_s,
+        )
+
+    def is_benched(self, cli: str) -> bool:
+        """Whether ``cli`` is currently on cooldown (F7), so a panel/fallback should skip it."""
+        return self._cooldown.is_benched(cli)
+
+    def cooldown_remaining_s(self, cli: str) -> float:
+        """Seconds until ``cli``'s cooldown lifts, for a human-readable skip reason."""
+        return self._cooldown.remaining_s(cli)
 
     async def delegate(
         self,
@@ -123,6 +140,32 @@ class DelegationService:
         if self._should_fallback(adapter, req, result):
             result, raw = await self._fallback(adapter, req, ctx, base_depth, on_progress)
 
+        # Refine a generic non-zero exit into a specific failure category (rate-limit / auth / context
+        # overflow / model-unavailable) so a caller -- and the fallback decision below -- can act on it.
+        self._refine_failure(result)
+        # Feed the cooldown tracker: a success clears this adapter's streak, an unhealthy failure
+        # counts toward benching it. Recorded for the primary here; a fallback target records its own
+        # health inside its own delegation.
+        self._record_health(req.target.cli, result)
+
+        # Cross-target fallback (F7): if the primary failed on a retryable category and a chain was
+        # given, try each alternate in turn. Restricted to non-mutating modes -- retrying a write/yolo
+        # task on a second CLI against the same (possibly partially-mutated) working_dir would compound
+        # two agents' edits; write-mode reliability waits for worktree isolation (F6). A winning
+        # alternate is a fully-processed result (its own provenance, cooldown, logging) that we adopt,
+        # logging the primary's failure first so the "why we fell back" is not lost.
+        if (
+            not result.ok
+            and req.fallback
+            and not is_mutating(req.safety_mode)
+            and result.error is not None
+            and is_retryable(result.error.code)
+        ):
+            recovered = await self._fallback_chain(req, result, correlation_id, base_depth, on_progress)
+            if recovered is not None:
+                self._log_delegation(req, result, correlation_id, base_depth)
+                return recovered
+
         # Check the tree only when the run actually succeeded. A run that already failed (timeout,
         # non-zero exit, parse/contract error) keeps its real error -- overwriting it with
         # READONLY_VIOLATED would hide why it failed, and a partial write from a crashed run is not
@@ -146,6 +189,14 @@ class DelegationService:
         # hook must never fail the delegation, and an all-unknown result keeps provenance absent.
         result.provenance = self._provenance(adapter, ctx, result, detected.version)
         result.raw = _combine_raw(raw) if (req.include_raw and raw is not None) else None
+        self._log_delegation(req, result, correlation_id, base_depth)
+        return result
+
+    def _log_delegation(
+        self, req: DelegationRequest, result: DelegationResult, correlation_id: str, base_depth: int
+    ) -> None:
+        """Emit the structured ``delegate`` log line for a finished result (or a primary that a
+        fallback recovered, so the reason for falling back is recorded)."""
         log_event(
             "delegate",
             correlation_id=correlation_id,
@@ -158,7 +209,6 @@ class DelegationService:
             error_code=result.error.code if result.error else None,
             fallback_from=result.fallback_from,
         )
-        return result
 
     async def _execute(
         self,
@@ -186,8 +236,11 @@ class DelegationService:
         # Gate the actual subprocess on the global concurrency semaphore so a wide panel cannot launch
         # more than ``max_concurrency`` heavy agents at once. Held only around the run, not the
         # pure build/parse, to keep the critical section to the expensive part.
-        async with self._semaphore:
-            raw = await self._runner.run(spec, timeout, on_progress)
+        try:
+            async with self._semaphore:
+                raw = await self._runner.run(spec, timeout, on_progress)
+        except OSError as exc:  # the subprocess could not be launched (a broken shim, a runtime error)
+            return self._fail(ctx, ErrorCode.SPAWN_FAILED, f"failed to launch {req.target.cli}: {exc}"), None
 
         try:
             result = adapter.parse_output(raw, ctx)
@@ -215,7 +268,7 @@ class DelegationService:
         """
         if not req.allow_model_fallback or result.ok or result.error is None:
             return False
-        if not _is_model_unavailable_error(result.error.message):
+        if not is_model_unavailable(result.error.message):
             return False
         fallback = adapter.fallback_model()
         return fallback is not None and fallback != req.target.model
@@ -280,6 +333,62 @@ class DelegationService:
         if prov.provider or prov.backend or prov.model or prov.cli_version:
             return prov
         return None
+
+    async def _fallback_chain(
+        self,
+        req: DelegationRequest,
+        primary: DelegationResult,
+        correlation_id: str,
+        base_depth: int,
+        on_progress: ProgressCallback | None,
+    ) -> DelegationResult | None:
+        """Try each fallback target in order; return the first successful, fully-processed result.
+
+        The failed primary leads the recorded ``fallback_chain`` -- by its *effective* label (the
+        post-model-fallback target that actually failed). A benched (cooled-down) alternate is skipped.
+        Each alternate is delegated fresh with no further fallback (so the chain cannot recurse) and no
+        carried ``session_id`` (a different CLI's resume token does not transfer), at the same depth (a
+        sibling retry, not a deeper delegation). The list is capped at ``max_targets`` so a long chain
+        cannot fan out unbounded. Returns ``None`` when every alternate failed, so the caller keeps the
+        primary's (refined) failure.
+        """
+        failed_labels = [primary.target.display_label]
+        for index, target in enumerate(req.fallback[: self._config.max_targets]):
+            if self._cooldown.is_benched(target.cli):
+                continue
+            fb_req = req.model_copy(update={"target": target, "fallback": [], "session_id": None})
+            recovered = await self.delegate(
+                fb_req,
+                correlation_id=f"{correlation_id}:fb{index}",
+                base_depth=base_depth,
+                on_progress=on_progress,
+            )
+            if recovered.ok:
+                recovered.fallback_chain = failed_labels
+                return recovered
+            failed_labels.append(target.display_label)
+        return None
+
+    def _record_health(self, cli: str, result: DelegationResult) -> None:
+        """Feed the cooldown tracker from a finished result: success clears the streak, an unhealthy
+        failure (down/throttled/mis-launching, not a bad prompt) counts toward benching ``cli``."""
+        if result.ok:
+            self._cooldown.record_success(cli)
+        elif result.error is not None and indicates_unhealthy(result.error.code):
+            self._cooldown.record_failure(cli)
+
+    def _refine_failure(self, result: DelegationResult) -> None:
+        """Refine a generic ``NONZERO_EXIT`` into a specific failure category, in place.
+
+        Only the catch-all ``NONZERO_EXIT`` is refined -- a result that already carries a specific code
+        (timeout, parse error, spawn failure, ...) keeps it. A message the classifier does not recognize
+        is left as ``NONZERO_EXIT``.
+        """
+        if result.ok or result.error is None or result.error.code != ErrorCode.NONZERO_EXIT:
+            return
+        refined = classify_failure(result.error.message)
+        if refined is not None:
+            result.error.code = str(refined)
 
     def _error(self, ctx: InvocationContext, exc: RutherfordError) -> DelegationResult:
         """Build a failed result from a guard exception."""
@@ -381,29 +490,3 @@ def _git_run(working_dir: str, args: list[str]) -> str | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return completed.stdout if completed.returncode == 0 else None
-
-
-#: Substrings that mark a failure as "this model is not available to you" rather than a real
-#: error. Matched case-insensitively against the error message. Kept broad on purpose: the cost
-#: of a false positive is one extra retry on the adapter's default model, which is cheap and safe.
-_MODEL_UNAVAILABLE_MARKERS: tuple[str, ...] = (
-    "named models unavailable",
-    "switch to auto",
-    "only use auto",
-    "model is not available",
-    "model not available",
-    "model unavailable",
-    "model_unavailable",
-    "no access to model",
-    "not available on your plan",
-    "upgrade your plan",
-    "upgrade plans to continue",
-    "unknown model",
-    "invalid model",
-)
-
-
-def _is_model_unavailable_error(message: str) -> bool:
-    """Heuristic: does ``message`` look like a model-availability rejection (vs. a real failure)?"""
-    lowered = message.lower()
-    return any(marker in lowered for marker in _MODEL_UNAVAILABLE_MARKERS)

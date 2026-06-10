@@ -215,6 +215,10 @@ class ConsensusService:
                 reason = auth.detail or f"not authenticated ({auth.state.value})"
                 skipped.append(SkippedTarget(cli=adapter.id, reason=reason))
                 continue
+            if self._delegation.is_benched(adapter.id):
+                remaining = self._delegation.cooldown_remaining_s(adapter.id)
+                skipped.append(SkippedTarget(cli=adapter.id, reason=f"on cooldown ({remaining:.0f}s remaining)"))
+                continue
             if len(included) >= self._config.max_targets:
                 skipped.append(SkippedTarget(cli=adapter.id, reason=f"over max_targets ({self._config.max_targets})"))
                 continue

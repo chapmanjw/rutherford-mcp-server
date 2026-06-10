@@ -60,6 +60,8 @@ def test_to_plain_drops_none_and_serializes_enums() -> None:
     assert "cost" not in plain
     # A pre-F3 result carries no provenance, so the field is absent from the wire (backward-compat).
     assert "provenance" not in plain
+    # Likewise the F7 cross-target fallback chain is absent unless a fallback actually fired.
+    assert "fallback_chain" not in plain
 
 
 def test_to_plain_includes_provenance_when_set() -> None:

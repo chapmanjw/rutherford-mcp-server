@@ -275,6 +275,12 @@ class DelegationRequest(BaseModel):
     trust_workspace: bool = False
     #: When the requested model is unavailable, retry once with the adapter's fallback model.
     allow_model_fallback: bool = True
+    #: An ordered list of alternate targets to try when the primary delegation fails on a retryable
+    #: category (rate-limit, auth, timeout, this CLI being down, ...) -- a cross-CLI fallback chain
+    #: (F7). Empty means no chain. Each alternate is tried in order until one answers; a benched
+    #: (cooled-down) alternate is skipped. The model fallback above runs first (same adapter); this is
+    #: the cross-target layer.
+    fallback: list[Target] = Field(default_factory=list)
 
 
 class DelegationResult(BaseModel):
@@ -300,6 +306,10 @@ class DelegationResult(BaseModel):
     #: adapter's fallback model, this records the model that was requested. ``target.model`` then
     #: holds the model that actually answered. ``None`` means no fallback happened.
     fallback_from: str | None = None
+    #: When a cross-target fallback chain fired (F7), the display labels of the targets that failed
+    #: before the one that answered, in order. ``target`` then holds the target that actually answered.
+    #: ``None`` means no cross-target fallback happened.
+    fallback_chain: list[str] | None = None
     #: The effective provider/model/CLI-version that actually answered (F3). ``None`` when none could
     #: be determined, so the field is absent from the wire rather than reported as a guess.
     provenance: Provenance | None = None
