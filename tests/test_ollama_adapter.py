@@ -42,8 +42,10 @@ def test_adapter_is_optional() -> None:
 def test_build_invocation_runs_named_model_with_prompt_on_stdin() -> None:
     adapter = OllamaAdapter()
     spec = adapter.build_invocation(_req("coder-next", prompt="reverse a string"), _ctx("coder-next"))
-    # --hidethinking keeps a reasoning model's trace out of stdout; the prompt rides on stdin.
-    assert spec.argv == ["ollama", "run", "coder-next", "--hidethinking"]
+    # --hidethinking keeps a reasoning model's trace out of stdout; --nowordwrap disables the
+    # CLI's wrap renderer (it runs even on a pipe and duplicates words at wrap boundaries once
+    # the ANSI cursor-rewind escapes are stripped); the prompt rides on stdin.
+    assert spec.argv == ["ollama", "run", "coder-next", "--hidethinking", "--nowordwrap"]
     assert spec.stdin == "reverse a string"
     assert "reverse a string" not in spec.argv  # never concatenated into the command line
 
@@ -52,7 +54,15 @@ def test_build_invocation_appends_configured_extra_args() -> None:
     # ``[adapters.ollama] extra_args`` the service resolved (e.g. --keepalive) are appended verbatim.
     adapter = OllamaAdapter()
     spec = adapter.build_invocation(_req("coder-next"), _ctx("coder-next", extra_args=["--keepalive", "30s"]))
-    assert spec.argv == ["ollama", "run", "coder-next", "--hidethinking", "--keepalive", "30s"]
+    assert spec.argv == [
+        "ollama",
+        "run",
+        "coder-next",
+        "--hidethinking",
+        "--nowordwrap",
+        "--keepalive",
+        "30s",
+    ]
 
 
 def test_build_invocation_is_pure_no_subprocess_when_model_missing() -> None:
