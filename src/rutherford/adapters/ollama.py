@@ -105,14 +105,20 @@ class OllamaAdapter(BaseCLIAdapter):
         return SafetyFlags(args=[], note="ollama run only generates text; it cannot modify the workspace")
 
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
-        """Build ``ollama run <model> --hidethinking`` with the prompt fed on stdin.
+        """Build ``ollama run <model> --hidethinking --nowordwrap`` with the prompt fed on stdin.
 
         Pure: returns an argv list and an stdin string, never a shell command line and never a
         subprocess. Ollama has no system-prompt flag, so the role preamble is prepended to the
         prompt. ``--hidethinking`` keeps a reasoning model's chain-of-thought out of stdout so the
         answer is clean (the model still reasons internally); on a non-reasoning model it is a
-        no-op. Any ``[adapters.ollama] extra_args`` the service resolved (e.g. ``--keepalive 30s``)
-        are appended. The model is the target's model (the service fills it from
+        no-op. ``--nowordwrap`` disables the CLI's interactive word-wrap renderer, which runs even
+        when stdout is a pipe: at each ~80-col wrap it prints the start of the word, "deletes" it
+        with cursor escapes (``ESC[ND ESC[K``, N = the fragment's length), and reprints the word on
+        the next line — stripping the ANSI then leaves the fragment behind, duplicating words at
+        every wrap boundary (verified against ollama 2026-06; without the flag every long
+        code/comment line corrupts).
+        Any ``[adapters.ollama] extra_args`` the service resolved (e.g. ``--keepalive 30s``) are
+        appended. The model is the target's model (the service fills it from
         ``[adapters.ollama] default_model`` when the call omits one); with no model resolvable,
         raise ``INVALID_INPUT`` rather than guess a model that may not exist.
         """
@@ -125,7 +131,7 @@ class OllamaAdapter(BaseCLIAdapter):
             )
         prompt = self._compose_prompt(req.prompt, ctx.role_preamble)
         return InvocationSpec(
-            argv=[self.binary, "run", model, "--hidethinking", *ctx.extra_args],
+            argv=[self.binary, "run", model, "--hidethinking", "--nowordwrap", *ctx.extra_args],
             cwd=req.working_dir,
             stdin=prompt,
         )

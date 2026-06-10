@@ -60,14 +60,14 @@ async def test_configured_default_model_fills_in_when_call_names_none() -> None:
 async def test_ollama_no_model_uses_configured_default_end_to_end() -> None:
     # The headline behavior, exercised through the real OllamaAdapter and the service together: a
     # no-model call resolves `[adapters.ollama] default_model`, and the adapter builds the right argv
-    # (model + --hidethinking) with the prompt on stdin.
+    # (model + --hidethinking + --nowordwrap) with the prompt on stdin.
     adapter = OllamaAdapter(probe=FakeProbe(which_map={"ollama": "/usr/bin/ollama"}))
     runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="PONG\n"))
     config = RutherfordConfig(adapters={"ollama": AdapterConfig(default_model="m9")})
     result = await _service([adapter], runner, config).delegate(_req("ollama"))
     assert result.ok and result.text == "PONG"
     spec, _ = runner.calls[0]
-    assert spec.argv == ["ollama", "run", "m9", "--hidethinking"]
+    assert spec.argv == ["ollama", "run", "m9", "--hidethinking", "--nowordwrap"]
     assert spec.stdin == "question"
 
 
@@ -78,7 +78,7 @@ async def test_ollama_configured_extra_args_reach_the_invocation() -> None:
     config = RutherfordConfig(adapters={"ollama": AdapterConfig(default_model="m9", extra_args=["--keepalive", "30s"])})
     await _service([adapter], runner, config).delegate(_req("ollama"))
     spec, _ = runner.calls[0]
-    assert spec.argv == ["ollama", "run", "m9", "--hidethinking", "--keepalive", "30s"]
+    assert spec.argv == ["ollama", "run", "m9", "--hidethinking", "--nowordwrap", "--keepalive", "30s"]
 
 
 async def test_per_adapter_timeout_overrides_the_global_default() -> None:
