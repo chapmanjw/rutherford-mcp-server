@@ -64,6 +64,9 @@ class CodexAdapter(BaseCLIAdapter):
     binary = "codex"
     static_models: tuple[str, ...] = ()
     version_args = ("--version",)
+    #: OpenAI's CLI, but it can be pointed at an ``amazon-bedrock`` model provider, so this is the
+    #: best-guess vendor, not a confirmed one (confirming would need a ``codex doctor`` subprocess).
+    provider = "openai"
 
     def __init__(self, probe: CommandProbe | None = None, *, platform: PlatformInfo | None = None) -> None:
         super().__init__(probe)

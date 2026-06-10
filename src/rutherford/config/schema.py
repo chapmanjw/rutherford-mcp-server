@@ -58,6 +58,10 @@ class GenericAdapterConfig(BaseModel):
     static_models: list[str] = Field(default_factory=list)
     auth_env: list[str] = Field(default_factory=list)
     runtime: Runtime = Runtime.NATIVE
+    #: The model vendor this generic CLI fronts (e.g. ``"openai"``, ``"local"``), surfaced as the
+    #: provenance ``provider`` (F3). ``None`` leaves the provider to a model-name heuristic, then
+    #: "unknown" -- Rutherford cannot otherwise know what an arbitrary configured CLI talks to.
+    provider: str | None = None
 
     @model_validator(mode="after")
     def _validate_output_mode(self) -> GenericAdapterConfig:
@@ -125,6 +129,12 @@ class RutherfordConfig(BaseModel):
     #: strategy needs before it will return a decision; below it the outcome is ``no_quorum``. Guards
     #: against certifying an outcome off one surviving voice when the rest failed.
     min_quorum: int = Field(default=1, ge=1)
+    #: The distinct-identity floor below which a consensus/debate panel's answers are flagged
+    #: ``low_diversity`` (F3): when at least two voices resolve but they collapse to fewer than this
+    #: many distinct *models* OR distinct *providers* (vendors), the panel was less independent than
+    #: its CLI count implied. Default 2 (two same-model or same-vendor voices flag); raise it to demand
+    #: wider diversity.
+    min_distinct: int = Field(default=2, ge=1)
     #: Maximum CLI subprocess delegations Rutherford runs at once, across every panel (a global
     #: semaphore in the delegation primitive). Decouples panel width from host process pressure: a
     #: wide consensus or a multi-round debate cannot launch more than this many heavy agent

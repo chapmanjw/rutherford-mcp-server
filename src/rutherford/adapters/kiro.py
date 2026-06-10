@@ -30,6 +30,7 @@ from ..domain.models import (
     InvocationContext,
     InvocationSpec,
     ProcessResult,
+    Provenance,
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
@@ -125,6 +126,12 @@ class KiroAdapter(BaseCLIAdapter):
         exit to ``NONZERO_EXIT`` carrying the cleaned partial output (stderr is the message).
         """
         return _PARSER.parse(raw, ctx)
+
+    def provenance(self, ctx: InvocationContext) -> Provenance:
+        """Kiro fronts (Anthropic) models through AWS. The plain-text answer does not reveal the model
+        vendor, so the honest record is an unknown vendor served on the AWS ``backend`` -- not a
+        confident ``aws`` *provider*, which would collide with the same model reached directly."""
+        return Provenance(provider=None, backend="aws", model=ctx.target.model, confirmed=False)
 
 
 #: Kiro answers in plain text. An empty answer on a clean exit is success; a non-zero exit carries

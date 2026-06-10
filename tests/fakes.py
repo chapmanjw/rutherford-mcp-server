@@ -28,6 +28,7 @@ from rutherford.domain.models import (
     InvocationContext,
     InvocationSpec,
     ProcessResult,
+    Provenance,
     SafetyFlags,
 )
 
@@ -121,6 +122,7 @@ class FakeAdapter:
         fallback_model: str | None = None,
         optional: bool = False,
         contract_ok: bool = True,
+        provider: str | None = None,
     ) -> None:
         self.id = adapter_id
         self.display_name = adapter_id.replace("_", " ").title()
@@ -131,6 +133,7 @@ class FakeAdapter:
         self._supports_resume = supports_resume
         self._fallback_model = fallback_model
         self._contract_ok = contract_ok
+        self._provider = provider
 
     def detect(self) -> DetectResult:
         if not self._installed:
@@ -197,6 +200,9 @@ class FakeAdapter:
 
     def check_output_contract(self, raw: ProcessResult) -> bool:
         return self._contract_ok
+
+    def provenance(self, ctx: InvocationContext) -> Provenance:
+        return Provenance(provider=self._provider, model=ctx.target.model, confirmed=self._provider is not None)
 
 
 def make_app(

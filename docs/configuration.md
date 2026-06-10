@@ -61,6 +61,7 @@ All fields are optional. Unset fields take the listed default.
 | `max_targets` | `int` | `8` | Maximum targets per consensus or debate call (1–32). |
 | `max_debate_rounds` | `int` | `4` | Maximum rounds a single `debate` call may run (1–10). Each round is a full panel pass. |
 | `min_quorum` | `int` | `1` | Minimum parseable voices (with an extracted verdict) an aggregating strategy needs before it will certify an outcome. Below it the outcome is `no_quorum`. Guards against certifying a result off one surviving voice when the rest failed. |
+| `min_distinct` | `int` | `2` | Distinct-identity floor for the `low_diversity` flag on a consensus/debate result. When at least two answering voices resolve but they collapse to fewer than this many distinct models *or* distinct providers (vendors), the panel is flagged as less independent than its CLI count implied. Raise it to demand wider diversity. |
 | `max_concurrency` | `int` | `max_targets` | Global cap on concurrent CLI subprocesses across all panels. Defaults to `max_targets` when not set explicitly. Overrideable via `RUTHERFORD_MAX_CONCURRENCY`. |
 | `trusted_workspaces` | `list[str]` | `[]` | Absolute paths under which `write` and `yolo` delegations are permitted. |
 | `synthesize_default` | `bool` | `false` | Whether consensus synthesizes server-side by default. |

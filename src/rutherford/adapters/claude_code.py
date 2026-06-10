@@ -27,6 +27,7 @@ from ..domain.models import (
     InvocationContext,
     InvocationSpec,
     ProcessResult,
+    Provenance,
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
@@ -40,6 +41,10 @@ class ClaudeCodeAdapter(BaseCLIAdapter):
     display_name = "Claude Code"
     binary = "claude"
     static_models = ("opus", "sonnet", "haiku")
+    #: Anthropic makes the model even when a CLAUDE_CODE_USE_* switch serves it via a cloud backend
+    #: (recorded separately as ``backend`` in :meth:`provenance`).
+    provider = "anthropic"
+    provider_confirmed = True
 
     def check_auth(self) -> AuthStatus:
         """Resolve auth from ``claude auth status``, deferring a third-party backend to a live check.
@@ -128,6 +133,29 @@ class ClaudeCodeAdapter(BaseCLIAdapter):
         but still exits cleanly, this is what catches the silent regression at the delegation layer.
         """
         return _PARSER.contract_ok(raw)
+
+    def provenance(self, ctx: InvocationContext) -> Provenance:
+        """Anthropic's model, plus the serving backend when a CLAUDE_CODE_USE_* switch routes the CLI
+        to a cloud (Bedrock / Vertex / Mantle).
+
+        The model maker is always Anthropic; the same binary can serve through AWS, GCP, or Mantle
+        behind those env switches, recorded as ``backend`` so a Bedrock-served and a direct call are
+        not mistaken for two different providers. The cheap env signal is read here -- no
+        ``claude auth status`` subprocess in the delegation hot path.
+        """
+        base = super().provenance(ctx)
+        backend = self._backend()
+        return base.model_copy(update={"backend": backend}) if backend else base
+
+    def _backend(self) -> str | None:
+        """The cloud backend a CLAUDE_CODE_USE_* switch selects, or ``None`` for a direct Anthropic call."""
+        if self._env_truthy("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_ANTHROPIC_AWS"):
+            return "bedrock"
+        if self._env_truthy("CLAUDE_CODE_USE_VERTEX"):
+            return "vertex"
+        if self._env_truthy("CLAUDE_CODE_USE_MANTLE"):
+            return "mantle"
+        return None
 
 
 #: ``CLAUDE_CODE_USE_*`` switches that route Claude Code to a cloud backend whose credential is an

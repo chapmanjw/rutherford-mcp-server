@@ -32,10 +32,12 @@ from ..domain.models import (
     InvocationContext,
     InvocationSpec,
     ProcessResult,
+    Provenance,
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
 from .parsing import CostSpec, extract_cost, parse_jsonl
+from .provenance import provenance_from_namespace, split_namespaced_model
 from .results import error_result, nonzero_result, success_result, timeout_result
 
 #: Permission payload for read-only / propose: deny edits and shell commands.
@@ -142,6 +144,17 @@ class OpenCodeAdapter(BaseCLIAdapter):
     def check_output_contract(self, raw: ProcessResult) -> bool:
         """A successful opencode run must emit at least one JSONL event (--format json)."""
         return bool(parse_jsonl(raw.stdout))
+
+    def provenance(self, ctx: InvocationContext) -> Provenance:
+        """OpenCode's ``-m`` is a models.dev ``provider/model`` string.
+
+        The prefix is a true vendor (``anthropic/claude-sonnet-4-6`` -> confirmed Anthropic) OR a
+        serving platform (``amazon-bedrock/anthropic.claude-...``, ``openrouter/...`` -> that backend,
+        with the vendor inferred from the model id). An un-prefixed model falls back to the vendor
+        heuristic. The split keeps the bare model id as ``provenance.model``.
+        """
+        namespace, model = split_namespaced_model(ctx.target.model)
+        return provenance_from_namespace(namespace, model)
 
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         """Map the OpenCode NDJSON event stream to the normalized envelope. Never raises."""

@@ -32,9 +32,11 @@ from ..domain.models import (
     InvocationContext,
     InvocationSpec,
     ProcessResult,
+    Provenance,
     SafetyFlags,
 )
 from ..runtime.probe import CommandProbe, SystemProbe
+from .provenance import infer_provider_from_model
 
 
 @runtime_checkable
@@ -79,6 +81,15 @@ class CLIAdapter(Protocol):
         """Map the raw process result to the normalized envelope, including on failure."""
         ...
 
+    def provenance(self, ctx: InvocationContext) -> Provenance:
+        """Best-effort provider/model identity for a delegation to this CLI (F3, without ``cli_version``).
+
+        Returns who served the answer and which model, so the service can stamp it on the result and
+        consensus/debate can report effective diversity. ``cli_version`` is filled in by the service
+        (it has the detected version cheaply); this returns provider/backend/model/confirmed.
+        """
+        ...
+
     def check_output_contract(self, raw: ProcessResult) -> bool:
         """Whether ``raw`` matches this adapter's expected successful-output shape (a drift canary).
 
@@ -108,6 +119,14 @@ class BaseCLIAdapter(ABC):
     #: True for an adapter the user only needs if they opt in (e.g. a local model). Surfaced by
     #: ``capabilities``/``doctor`` so an absent one reads as optional, not as a missing requirement.
     optional: bool = False
+    #: The model vendor this CLI serves when it is a fixed property of the CLI (e.g. ``"openai"`` for
+    #: Codex, ``"local"`` for Ollama). ``None`` means the provider depends on the model or backend and
+    #: the adapter derives it in :meth:`provenance` (or it is unknown). See F3.
+    provider: str | None = None
+    #: Whether :attr:`provider` is a definitive fact (a fixed-vendor CLI, ``True``) or a best-guess
+    #: home-vendor default the actual backend could override (``False``). Surfaced as
+    #: ``Provenance.confirmed`` so a reader can tell a certain provider from an inferred one.
+    provider_confirmed: bool = False
 
     def __init__(self, probe: CommandProbe | None = None) -> None:
         self._probe: CommandProbe = probe if probe is not None else SystemProbe()
@@ -143,6 +162,24 @@ class BaseCLIAdapter(ABC):
         """
         return True
 
+    def provenance(self, ctx: InvocationContext) -> Provenance:
+        """Best-effort provider/model identity (F3): the confirmed :attr:`provider`, else model evidence.
+
+        Resolution order: a *confirmed* fixed vendor wins (a fixed-vendor CLI, ``provider_confirmed``);
+        otherwise a vendor recognized from the model id wins over an unconfirmed home-vendor default
+        (so a Codex run pointed at a ``claude``/``anthropic.`` model is not mislabeled ``openai``);
+        otherwise the unconfirmed home default; otherwise unknown. An adapter whose provider depends on
+        an env switch, a ``provider/model`` namespace, or config overrides this. ``cli_version`` is
+        filled in by the service.
+        """
+        model = ctx.target.model
+        if self.provider is not None and self.provider_confirmed:
+            return Provenance(provider=self.provider, model=model, confirmed=True)
+        inferred = infer_provider_from_model(model)
+        if inferred is not None:
+            return Provenance(provider=inferred, model=model, confirmed=False)
+        return Provenance(provider=self.provider, model=model, confirmed=False)
+
     # --- helpers for subclasses ---------------------------------------------
 
     def _detect_version(self) -> str | None:
@@ -176,6 +213,19 @@ class BaseCLIAdapter(ABC):
         for name in names:
             if os.environ.get(name):
                 return name
+        return None
+
+    @staticmethod
+    def _env_value(*names: str) -> str | None:
+        """Return the first non-empty *value* among ``names`` in the environment, or ``None``.
+
+        Like :meth:`_env_present` but yields the value, not the variable name -- for a config carried
+        in an env var whose content matters (e.g. ``GOOSE_PROVIDER`` naming the provider).
+        """
+        for name in names:
+            value = os.environ.get(name)
+            if value and value.strip():
+                return value.strip()
         return None
 
     @staticmethod

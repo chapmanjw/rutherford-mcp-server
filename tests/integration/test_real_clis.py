@@ -37,6 +37,11 @@ async def test_read_only_delegation_returns_normalized_result(real_app: AppConte
     assert isinstance(result, DelegationResult)
     assert result.ok, f"{cli_id} delegation failed: {result.error}"
     assert result.text.strip()
+    # F3: a real, successful run stamps provenance with at least one resolved axis -- a provider (a
+    # fixed-vendor adapter) and/or the detected CLI version. A BYOK adapter on a no-model default run
+    # may not resolve a provider, which is the honest "unknown" rather than a guess.
+    assert result.provenance is not None, f"{cli_id} produced no provenance"
+    assert result.provenance.provider or result.provenance.cli_version, f"{cli_id} provenance is empty"
 
 
 @pytest.mark.parametrize("cli_id", list(CLI_ENV))

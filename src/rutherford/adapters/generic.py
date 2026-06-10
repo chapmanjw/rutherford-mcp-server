@@ -25,11 +25,13 @@ from ..domain.models import (
     InvocationContext,
     InvocationSpec,
     ProcessResult,
+    Provenance,
     SafetyFlags,
 )
 from ..runtime.probe import CommandProbe
 from .base import BaseCLIAdapter
 from .parsing import as_text, dotted_get, last_json_object
+from .provenance import infer_provider_from_model
 from .results import error_result, nonzero_result, success_result, timeout_result
 
 
@@ -116,6 +118,13 @@ class GenericAdapter(BaseCLIAdapter):
                 text=raw.stdout.strip(),
             )
         return success_result(ctx, raw, text)
+
+    def provenance(self, ctx: InvocationContext) -> Provenance:
+        """Use the configured ``provider`` (confirmed) when the config declares one, else the model
+        heuristic -- Rutherford cannot otherwise know what an arbitrary configured CLI talks to."""
+        if self._config.provider:
+            return Provenance(provider=self._config.provider, model=ctx.target.model, confirmed=True)
+        return Provenance(provider=infer_provider_from_model(ctx.target.model), model=ctx.target.model, confirmed=False)
 
     def _extract_text(self, stdout: str) -> str | None:
         """Extract the final answer per the configured output mode.

@@ -84,6 +84,67 @@ class Cost(BaseModel):
     total_tokens: int | None = None
 
 
+class Provenance(BaseModel):
+    """Which provider / model / CLI build actually produced a voice's answer.
+
+    The effective-identity record, distinct from the requested :class:`Target`: a consensus panel of
+    N CLIs can quietly be one model in N costumes (the roster is largely bring-your-own-model), and
+    this is what makes that falsifiable. Every field is optional and defaults to ``None`` so the whole
+    block is dropped from the wire (``exclude_none``) until something is known -- it degrades to
+    "unknown" rather than guessing.
+
+    * ``provider`` -- the model's vendor: ``anthropic`` / ``openai`` / ``google`` / ``alibaba`` /
+      ``meta`` / ``local`` / etc., or ``None`` when undetermined. A serving platform (AWS, Azure, a
+      gateway) is NOT a vendor -- it goes on ``backend``.
+    * ``backend`` -- the serving platform when it differs from the vendor's own API
+      (``bedrock`` / ``vertex`` / ``aws`` / ``azure`` / ``openrouter`` / ``groq`` / ...); ``None`` for
+      a direct vendor call or a local model. Kept separate from ``provider`` so "the same model served
+      two ways" is not counted as two providers.
+    * ``model`` -- the resolved requested model (the model the CLI was asked to use; for a CLI whose
+      selector namespaces the vendor, e.g. OpenCode, the bare model id). Rutherford does not currently
+      read a CLI-reported resolved id back from the output, so this may be an alias (``opus``) rather
+      than a pinned snapshot id -- which is why two CLIs naming the same model differently read as two
+      distinct models (see :class:`DiversityReport`).
+    * ``cli_version`` -- the CLI build that produced the answer, for drift forensics.
+    * ``confirmed`` -- ``True`` when provider/model came from a definitive signal (the model string the
+      CLI was given and uses, an explicit backend flag, a fixed-vendor CLI); ``False`` when inferred by
+      a fallible heuristic (a model-name pattern, a home-vendor default).
+    """
+
+    provider: str | None = None
+    backend: str | None = None
+    model: str | None = None
+    cli_version: str | None = None
+    confirmed: bool = False
+
+
+class DiversityReport(BaseModel):
+    """How much genuine model/provider diversity a panel's answers actually had.
+
+    Computed from each answering voice's :class:`Provenance`. ``distinct_models`` is the headline
+    ("5 voices -> 3 distinct models"): a panel that is one model in several CLI costumes is made
+    visible instead of passing as N independent opinions. Voices whose model could not be resolved are
+    counted in ``unknown`` and excluded from the distinct tallies (not assumed same or different).
+    ``low_diversity`` flags when, among the resolved voices, the distinct *model* count OR the distinct
+    *provider* (vendor) count collapses below the configured ``min_distinct`` floor -- the vendor axis
+    catches the case the model axis misses (see below).
+
+    The distinct-model count is identity-string level: without a model registry, ``opus`` via one CLI
+    and ``claude-opus-4`` via another read as two models, so model-string diversity can over-report
+    independence. The provider axis is the backstop -- those two still share the vendor ``anthropic``,
+    so a same-vendor panel is flagged even when the model strings differ. It is a labeled heuristic --
+    a strictly better signal than the zero a pre-F3 panel gave -- not a proof of independence.
+    """
+
+    answered_voices: int
+    distinct_models: int
+    distinct_providers: int
+    unknown: int
+    low_diversity: bool
+    models: list[str] = Field(default_factory=list)
+    providers: list[str] = Field(default_factory=list)
+
+
 class Artifact(BaseModel):
     """A file or diff the delegated agent produced or changed."""
 
@@ -239,6 +300,9 @@ class DelegationResult(BaseModel):
     #: adapter's fallback model, this records the model that was requested. ``target.model`` then
     #: holds the model that actually answered. ``None`` means no fallback happened.
     fallback_from: str | None = None
+    #: The effective provider/model/CLI-version that actually answered (F3). ``None`` when none could
+    #: be determined, so the field is absent from the wire rather than reported as a guess.
+    provenance: Provenance | None = None
 
 
 # --- Consensus ---------------------------------------------------------------
@@ -300,6 +364,9 @@ class ConsensusResult(BaseModel):
     #: first successful voice), so a reader can see whether the synthesizer was a panel participant.
     synthesis_by: str | None = None
     skipped: list[SkippedTarget] = Field(default_factory=list)
+    #: Effective model/provider diversity across the answering voices (F3). ``None`` when no voice
+    #: answered (nothing to measure).
+    diversity: DiversityReport | None = None
 
 
 # --- Consensus strategies ----------------------------------------------------
@@ -327,6 +394,9 @@ class VoiceVerdict(BaseModel):
     #: verdict was extracted. Lets a reader tell a mis-parse from an abstention.
     no_verdict_reason: str | None = None
     text: str = ""
+    #: The effective provider/model that answered this seat (F3), carried from the voice's result so a
+    #: strategy reader sees per-voice identity. ``None`` when undetermined.
+    provenance: Provenance | None = None
 
 
 class StrategyResult(BaseModel):
@@ -344,6 +414,8 @@ class StrategyResult(BaseModel):
     decision: str | None = None
     voices: list[VoiceVerdict] = Field(default_factory=list)
     skipped: list[SkippedTarget] = Field(default_factory=list)
+    #: Effective model/provider diversity across the answering voices (F3). ``None`` when none answered.
+    diversity: DiversityReport | None = None
 
 
 # --- Debate ------------------------------------------------------------------
@@ -403,6 +475,9 @@ class DebateContribution(BaseModel):
     duration_s: float = 0.0
     error: ErrorInfo | None = None
     fallback_from: str | None = None
+    #: The effective provider/model that produced this turn (F3), carried from the voice's result.
+    #: ``None`` when undetermined.
+    provenance: Provenance | None = None
 
 
 class DebateRound(BaseModel):
@@ -428,6 +503,9 @@ class DebateResult(BaseModel):
     #: first surviving voice).
     synthesis_by: str | None = None
     skipped: list[SkippedTarget] = Field(default_factory=list)
+    #: Effective model/provider diversity across the final round's answering voices (F3). ``None``
+    #: when no voice survived to the final round.
+    diversity: DiversityReport | None = None
 
 
 # --- Jobs --------------------------------------------------------------------

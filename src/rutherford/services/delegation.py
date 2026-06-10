@@ -28,6 +28,7 @@ from ..domain.models import (
     ErrorInfo,
     InvocationContext,
     ProcessResult,
+    Provenance,
 )
 from ..runtime.depth import child_depth_env, ensure_within_depth
 from ..runtime.logging import log_event
@@ -140,6 +141,10 @@ class DelegationService:
                 )
                 result.fallback_from = fallback_from
 
+        # F3: stamp who actually answered (provider/model/backend from the adapter, CLI version from
+        # the detect() probe already run above -- no extra subprocess). Best-effort: a buggy provenance
+        # hook must never fail the delegation, and an all-unknown result keeps provenance absent.
+        result.provenance = self._provenance(adapter, ctx, result, detected.version)
         result.raw = _combine_raw(raw) if (req.include_raw and raw is not None) else None
         log_event(
             "delegate",
@@ -250,6 +255,31 @@ class DelegationService:
             if target_dir == root or target_dir.is_relative_to(root):
                 return True
         return False
+
+    def _provenance(
+        self,
+        adapter: CLIAdapter,
+        ctx: InvocationContext,
+        result: DelegationResult,
+        version: str | None,
+    ) -> Provenance | None:
+        """Resolve the effective provider/model/CLI-version that answered, or ``None`` when nothing is known.
+
+        Asks the adapter for the semantic identity against the *effective* target (the fallback model
+        when a fallback fired is already on ``result.target``), then fills in the CLI version the
+        delegation already detected. Returns ``None`` when no field is known so the result carries no
+        empty provenance block. A failing hook degrades to unknown rather than raising.
+        """
+        effective_ctx = ctx.model_copy(update={"target": result.target})
+        try:
+            prov = adapter.provenance(effective_ctx)
+        except Exception:
+            prov = Provenance()
+        if version:
+            prov = prov.model_copy(update={"cli_version": version})
+        if prov.provider or prov.backend or prov.model or prov.cli_version:
+            return prov
+        return None
 
     def _error(self, ctx: InvocationContext, exc: RutherfordError) -> DelegationResult:
         """Build a failed result from a guard exception."""

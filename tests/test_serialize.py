@@ -10,7 +10,7 @@ from rutherford.context import error_payload_from, tool_error, tool_success
 from rutherford.domain.enums import SafetyMode
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import DelegationResult, Target
+from rutherford.domain.models import DelegationResult, Provenance, Target
 from rutherford.io.serialize import DecodeError, decode, encode, to_plain
 
 
@@ -58,6 +58,26 @@ def test_to_plain_drops_none_and_serializes_enums() -> None:
     # None fields (error, cost, session_id, raw) are dropped for compactness.
     assert "error" not in plain
     assert "cost" not in plain
+    # A pre-F3 result carries no provenance, so the field is absent from the wire (backward-compat).
+    assert "provenance" not in plain
+
+
+def test_to_plain_includes_provenance_when_set() -> None:
+    # A populated provenance block (F3) serializes; its own None sub-fields drop, confirmed stays.
+    result = DelegationResult(
+        target=Target(cli="claude_code", model="opus"),
+        ok=True,
+        text="done",
+        provenance=Provenance(provider="anthropic", model="opus", cli_version="2.1.0", confirmed=True),
+    )
+    plain = to_plain(result)
+    assert plain["provenance"] == {
+        "provider": "anthropic",
+        "model": "opus",
+        "cli_version": "2.1.0",
+        "confirmed": True,
+    }
+    assert "backend" not in plain["provenance"]  # unset sub-field dropped
 
 
 def test_tool_success_encodes_model() -> None:

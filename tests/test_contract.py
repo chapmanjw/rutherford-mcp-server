@@ -21,6 +21,7 @@ from rutherford.domain.models import (
     InvocationContext,
     InvocationSpec,
     ProcessResult,
+    Provenance,
     SafetyFlags,
     Target,
 )
@@ -94,6 +95,17 @@ def test_parse_output_nonzero_is_failure(adapter: CLIAdapter) -> None:
     result = adapter.parse_output(ProcessResult(exit_code=2, stdout="", stderr="boom"), _ctx(adapter))
     assert not result.ok
     assert result.error is not None
+
+
+@pytest.mark.parametrize("adapter", _ADAPTERS, ids=_IDS)
+def test_provenance_returns_a_block_and_never_raises(adapter: CLIAdapter) -> None:
+    # F3: every adapter yields a Provenance whose provider/model are each present-as-string or a
+    # graceful None, without raising -- the "present-or-unknown" contract. (An adapter with a fixed
+    # model, e.g. Antigravity, legitimately reports its own model rather than the requested one.)
+    prov = adapter.provenance(_ctx(adapter))
+    assert isinstance(prov, Provenance)
+    assert prov.provider is None or (isinstance(prov.provider, str) and prov.provider)
+    assert prov.model is None or (isinstance(prov.model, str) and prov.model)
 
 
 @pytest.mark.parametrize("adapter", _ADAPTERS, ids=_IDS)

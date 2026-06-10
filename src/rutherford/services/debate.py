@@ -28,10 +28,12 @@ from ..domain.models import (
     DebateRound,
     DelegationRequest,
     DelegationResult,
+    DiversityReport,
     Target,
 )
 from ..runtime.depth import ensure_within_target_cap
 from .delegation import DelegationService, ProgressCallback
+from .strategies import effective_diversity
 
 
 @dataclass(frozen=True)
@@ -88,7 +90,22 @@ class DebateService:
             active = [voice for voice in active if voice.seat_id in survivors]
 
         final, synthesis_by = await self._synthesize_final(req, rounds, correlation_id, base_depth, on_progress)
-        return DebateResult(prompt=req.prompt, rounds=rounds, final=final, synthesis_by=synthesis_by)
+        return DebateResult(
+            prompt=req.prompt,
+            rounds=rounds,
+            final=final,
+            synthesis_by=synthesis_by,
+            diversity=self._diversity(rounds),
+        )
+
+    def _diversity(self, rounds: list[DebateRound]) -> DiversityReport | None:
+        """Effective diversity across the final round's answering voices, or ``None`` if none survived."""
+        if not rounds:
+            return None
+        answered = [c.provenance for c in rounds[-1].contributions if c.ok]
+        if not answered:
+            return None
+        return effective_diversity(answered, min_distinct=self._config.min_distinct)
 
     def _resolve_voices(self, req: DebateRequest) -> list[_Voice]:
         """Validate the panel and build the ordered list of debate voices."""
@@ -282,6 +299,7 @@ def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) 
         duration_s=result.duration_s,
         error=result.error,
         fallback_from=result.fallback_from,
+        provenance=result.provenance,
     )
 
 

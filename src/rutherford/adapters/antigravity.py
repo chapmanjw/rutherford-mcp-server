@@ -37,6 +37,7 @@ from ..domain.models import (
     InvocationContext,
     InvocationSpec,
     ProcessResult,
+    Provenance,
     SafetyFlags,
 )
 from ..runtime.probe import CommandProbe
@@ -51,6 +52,9 @@ class AntigravityAdapter(BaseCLIAdapter):
     display_name = "Antigravity"
     binary = "agy"
     static_models = ()
+    #: Google's CLI (the Gemini CLI successor); print mode serves this fixed Gemini model with no
+    #: selector, so :meth:`provenance` can report a known model id instead of "unknown".
+    _PRINT_MODEL = "gemini-3.5-flash"
 
     def __init__(self, probe: CommandProbe | None = None, *, data_root: Path | None = None) -> None:
         super().__init__(probe)
@@ -68,6 +72,12 @@ class AntigravityAdapter(BaseCLIAdapter):
     def available_models(self) -> list[str]:
         # The print-mode model is fixed; do not pretend a selector exists.
         return []
+
+    def provenance(self, ctx: InvocationContext) -> Provenance:
+        """Google's CLI serving a fixed Gemini model. ``agy -p`` has no model selector, so the answer
+        always comes from :attr:`_PRINT_MODEL` regardless of any (ignored) requested model -- report
+        that, so the voice counts toward model diversity and ``confirmed`` is not a false claim."""
+        return Provenance(provider="google", model=self._PRINT_MODEL, confirmed=True)
 
     def capabilities(self) -> AdapterCapabilities:
         return AdapterCapabilities(

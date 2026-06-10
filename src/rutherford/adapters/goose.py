@@ -27,10 +27,12 @@ from ..domain.models import (
     InvocationContext,
     InvocationSpec,
     ProcessResult,
+    Provenance,
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
 from .parsing import TextParser
+from .provenance import provenance_from_namespace
 
 
 class GooseAdapter(BaseCLIAdapter):
@@ -124,6 +126,17 @@ class GooseAdapter(BaseCLIAdapter):
         headless text output, so ``session_id`` is ``None``.
         """
         return _PARSER.parse(raw, ctx)
+
+    def provenance(self, ctx: InvocationContext) -> Provenance:
+        """Goose is bring-your-own-model: the provider comes from ``GOOSE_PROVIDER``.
+
+        ``GOOSE_PROVIDER`` is the id Goose reads to pick a backend; its values mix true vendors
+        (``anthropic`` -> confirmed) with serving platforms (``bedrock``, ``databricks``, ``azure`` ->
+        that backend, vendor inferred from the model). When it is unset (Goose was configured via
+        ``goose configure``, whose provider lives in a config file this adapter does not read) the
+        provider degrades to the model-name heuristic.
+        """
+        return provenance_from_namespace(self._env_value("GOOSE_PROVIDER"), ctx.target.model)
 
 
 #: Goose answers in plain text and treats an empty answer on a clean exit as success.

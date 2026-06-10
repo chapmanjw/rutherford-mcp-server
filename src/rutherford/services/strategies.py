@@ -21,10 +21,11 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from typing import Any
 
 from ..domain.enums import Strategy
-from ..domain.models import VoiceVerdict
+from ..domain.models import DiversityReport, Provenance, VoiceVerdict
 from ..io.jsontext import iter_json_objects
 
 #: Matches a ``VERDICT: <token>`` line anywhere in an answer; the last match wins.
@@ -175,3 +176,61 @@ def _find_proposer(voices: list[VoiceVerdict]) -> VoiceVerdict | None:
 
 def _close(a: float, b: float) -> bool:
     return abs(a - b) <= 1e-9
+
+
+def effective_diversity(provenances: Sequence[Provenance | None], *, min_distinct: int = 2) -> DiversityReport:
+    """Summarize how many distinct models/providers a panel's *answering* voices actually spanned (F3).
+
+    ``provenances`` is the provenance of every voice that produced an answer (failed voices, which
+    contributed no opinion, are excluded by the caller). A voice whose model (or provider) could not be
+    resolved is excluded from that distinct tally rather than assumed same or different; a model that
+    could not be resolved is also counted in ``unknown``.
+
+    ``low_diversity`` flags when, among the voices that resolved, the distinct *model* count OR the
+    distinct *provider* (vendor) count collapses below ``min_distinct`` -- both because F3's load-bearing
+    case is "one model in N CLI costumes", and the costume can be either the same model under different
+    id strings (caught by the vendor axis) or literally the same id (caught by the model axis). An
+    all-unknown panel is unmeasured, not flagged. Distinct providers key on the vendor, not the serving
+    backend, so the same model served two ways is one provider. Pure, so the math is unit-testable.
+    """
+    models: set[str] = set()
+    providers: set[str] = set()
+    unknown = 0
+    known_providers = 0
+    for prov in provenances:
+        model_key = _model_key(prov)
+        if model_key is None:
+            unknown += 1
+        else:
+            models.add(model_key)
+        provider_key = _provider_key(prov)
+        if provider_key is not None:
+            known_providers += 1
+            providers.add(provider_key)
+    known_models = len(provenances) - unknown
+    low_diversity = (known_models >= 2 and len(models) < min_distinct) or (
+        known_providers >= 2 and len(providers) < min_distinct
+    )
+    return DiversityReport(
+        answered_voices=len(provenances),
+        distinct_models=len(models),
+        distinct_providers=len(providers),
+        unknown=unknown,
+        low_diversity=low_diversity,
+        models=sorted(models),
+        providers=sorted(providers),
+    )
+
+
+def _model_key(prov: Provenance | None) -> str | None:
+    """The diversity key for a voice's model: its normalized model id, or ``None`` when unresolved."""
+    if prov is None or not prov.model:
+        return None
+    return prov.model.strip().lower()
+
+
+def _provider_key(prov: Provenance | None) -> str | None:
+    """The diversity key for a voice's provider (the vendor, not the serving backend), or ``None``."""
+    if prov is None or not prov.provider:
+        return None
+    return prov.provider.strip().lower()

@@ -57,6 +57,9 @@ class OllamaAdapter(BaseCLIAdapter):
     version_args = ("--version",)
     #: A local model is opt-in: not everyone runs one, so its absence is never an error.
     optional = True
+    #: A local runtime: the answer was served on this machine, whatever the model's open-weights origin.
+    provider = "local"
+    provider_confirmed = True
 
     def check_auth(self) -> AuthStatus:
         """A local daemon needs no credentials; report authenticated."""

@@ -47,6 +47,9 @@ class QwenAdapter(BaseCLIAdapter):
     binary = "qwen"
     static_models: tuple[str, ...] = ()
     version_args = ("--version",)
+    #: Alibaba's Qwen Code, but it can run against an OpenAI-compatible / DashScope endpoint, so the
+    #: vendor is a best-guess home default rather than confirmed.
+    provider = "alibaba"
 
     def check_auth(self) -> AuthStatus:
         """Report auth from an API-key env var; otherwise UNKNOWN (qwen-oauth has no probe).

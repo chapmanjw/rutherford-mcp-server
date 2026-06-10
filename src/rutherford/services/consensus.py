@@ -22,6 +22,7 @@ from ..domain.models import (
     ConsensusResult,
     DelegationRequest,
     DelegationResult,
+    DiversityReport,
     SkippedTarget,
     StrategyResult,
     Target,
@@ -29,7 +30,7 @@ from ..domain.models import (
 )
 from ..runtime.depth import ensure_within_target_cap
 from .delegation import DelegationService, ProgressCallback
-from .strategies import aggregate, extract_verdict, verdict_instruction
+from .strategies import aggregate, effective_diversity, extract_verdict, verdict_instruction
 
 
 class ConsensusService:
@@ -95,7 +96,20 @@ class ConsensusService:
         if (req.synthesize or self._config.synthesize_default) and voices:
             synthesis, synthesis_by = await self._synthesize(req, voices, correlation_id, base_depth)
 
-        return ConsensusResult(voices=voices, synthesis=synthesis, synthesis_by=synthesis_by, skipped=skipped)
+        return ConsensusResult(
+            voices=voices,
+            synthesis=synthesis,
+            synthesis_by=synthesis_by,
+            skipped=skipped,
+            diversity=self._diversity(voices),
+        )
+
+    def _diversity(self, voices: list[DelegationResult]) -> DiversityReport | None:
+        """Effective model/provider diversity across the voices that answered, or ``None`` if none did."""
+        answered = [voice.provenance for voice in voices if voice.ok]
+        if not answered:
+            return None
+        return effective_diversity(answered, min_distinct=self._config.min_distinct)
 
     def _voice_prompt(self, req: ConsensusRequest, target: Target, index: int) -> str:
         """The prompt for one voice: the question, stance-steered, plus a verdict ask under a strategy."""
@@ -131,11 +145,17 @@ class ConsensusService:
                     verdict=extracted,
                     no_verdict_reason=reason,
                     text=voice.text,
+                    provenance=voice.provenance,
                 )
             )
         outcome, decision = aggregate(req.strategy, verdicts, min_quorum=self._config.min_quorum)
         return StrategyResult(
-            strategy=req.strategy, outcome=outcome, decision=decision, voices=verdicts, skipped=skipped
+            strategy=req.strategy,
+            outcome=outcome,
+            decision=decision,
+            voices=verdicts,
+            skipped=skipped,
+            diversity=self._diversity(voices),
         )
 
     async def _resolve_targets(

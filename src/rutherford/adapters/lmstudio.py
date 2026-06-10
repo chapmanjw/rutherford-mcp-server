@@ -69,6 +69,10 @@ class LMStudioAdapter(BaseCLIAdapter):
     version_args = ("version",)
     #: A local model is opt-in: not everyone runs one, so its absence is never an error.
     optional = True
+    #: A local runtime: served on this machine (or an LM Link peer), whatever the model key's org
+    #: prefix (``google/gemma-...`` is the open-weights origin, not a cloud provider).
+    provider = "local"
+    provider_confirmed = True
 
     def check_auth(self) -> AuthStatus:
         """Local inference needs no credentials; report authenticated.
