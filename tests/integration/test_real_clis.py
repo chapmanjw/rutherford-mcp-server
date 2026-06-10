@@ -157,3 +157,51 @@ async def test_debate_two_same_cli_seats_do_not_collide(real_app: AppContext) ->
     round_one = result.rounds[0].contributions
     assert {c.label for c in round_one} == {cli_id, f"{cli_id}#2"}  # disambiguated, not merged
     assert len({c.seat_id for c in round_one}) == 2  # two distinct identities
+
+
+async def test_consensus_reports_effective_diversity(real_app: AppContext) -> None:
+    # F3: a real multi-CLI panel surfaces a diversity report built from each voice's live provenance,
+    # so distinct providers/models reflect the actual mix that answered.
+    ready = available_clis(real_app)
+    if len(ready) < 2:
+        pytest.skip("need at least two opted-in CLIs for a diversity panel")
+    targets = [Target(cli=cli_id) for cli_id in ready[:3]]
+    result = await real_app.consensus.consensus(
+        ConsensusRequest(targets=targets, prompt=_OK_PROMPT, timeout_s=180),
+        base_depth=0,
+    )
+    assert isinstance(result, ConsensusResult)
+    answered = [voice for voice in result.voices if voice.ok]
+    if not answered:
+        pytest.skip("no voice answered; cannot assert diversity")
+    assert result.diversity is not None
+    assert result.diversity.answered_voices == len(answered)
+    # Real provenance flowed through: at least one provider was resolved across the answering panel.
+    assert result.diversity.distinct_providers >= 1
+    assert result.diversity.providers
+
+
+async def test_cross_target_fallback_recovers_live(real_app: AppContext) -> None:
+    # F7: a real retryable failure recovers via the cross-target chain. The primary is a ready CLI
+    # given a bogus model so the provider rejects it (a retryable failure); it has no same-adapter
+    # model fallback, so the chain reaches a different, working CLI and records the path.
+    ready = available_clis(real_app)
+    if len(ready) < 2:
+        pytest.skip("need at least two opted-in CLIs for a cross-target fallback")
+    # A primary whose adapter offers no model fallback, so a bad model is not rescued in-adapter.
+    primary = next((c for c in ready if real_app.registry.get(c).fallback_model() is None), None)
+    survivor = next((c for c in ready if c != primary), None)
+    if primary is None or survivor is None:
+        pytest.skip("need a no-model-fallback primary and a distinct survivor")
+    result = await real_app.delegation.delegate(
+        DelegationRequest(
+            target=Target(cli=primary, model="rutherford-nonexistent-model-zzz"),
+            prompt=_OK_PROMPT,
+            fallback=[Target(cli=survivor)],
+            timeout_s=180,
+        ),
+        base_depth=0,
+    )
+    assert result.ok, f"cross-target fallback did not recover: {result.error}"
+    assert result.target.cli == survivor  # a different CLI answered
+    assert result.fallback_chain  # the failed primary is recorded in the path
