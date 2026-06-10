@@ -248,6 +248,9 @@ class InvocationContext(BaseModel):
     depth: int = 0
     role_preamble: str | None = None
     transcript_dir: str | None = None
+    #: The resume session id for this call, so a transcript-based adapter (Antigravity) can read the
+    #: exact conversation it told the CLI to resume rather than re-guessing it. ``None`` for a fresh run.
+    session_id: str | None = None
     #: Extra CLI args the service resolved from ``[adapters.<id>] extra_args`` for this target.
     #: An adapter that supports passthrough flags (e.g. Ollama, LM Studio) appends these to its argv.
     extra_args: list[str] = Field(default_factory=list)

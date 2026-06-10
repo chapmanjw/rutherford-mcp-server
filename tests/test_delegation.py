@@ -12,7 +12,7 @@ from rutherford.adapters.ollama import OllamaAdapter
 from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import AdapterConfig, RutherfordConfig
 from rutherford.domain.enums import SafetyMode
-from rutherford.domain.models import DelegationRequest, InvocationSpec, ProcessResult, Target
+from rutherford.domain.models import DelegationRequest, InvocationContext, InvocationSpec, ProcessResult, Target
 from rutherford.runtime.depth import ENV_DEPTH
 from rutherford.services.delegation import DelegationService
 from rutherford.services.roles import load_roles
@@ -209,6 +209,22 @@ async def test_safety_flags_reach_the_invocation() -> None:
     )
     spec, _timeout = runner.calls[0]
     assert "--safety=yolo" in spec.argv
+
+
+async def test_session_id_reaches_the_invocation_context() -> None:
+    # End-to-end thread-through: a request's session_id lands on the InvocationContext the adapter is
+    # built against, so a resume token actually reaches the adapter. This is what lets the antigravity
+    # adapter resolve the right brain/ conversation on a resumed run instead of re-guessing the newest.
+    seen: list[str | None] = []
+
+    class _CapturingAdapter(FakeAdapter):
+        def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
+            seen.append(ctx.session_id)
+            return super().build_invocation(req, ctx)
+
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    await _service([_CapturingAdapter("fake")], runner).delegate(_req(session_id="resume-xyz"))
+    assert seen == ["resume-xyz"]
 
 
 # --- per-target model fallback ------------------------------------------------------------------

@@ -21,6 +21,7 @@ from rutherford.domain.models import (
     StrategyResult,
     Target,
 )
+from rutherford.tools.probing import version_token
 
 from .helpers import CLI_ENV, available_clis, skip_unless_available
 
@@ -205,3 +206,40 @@ async def test_cross_target_fallback_recovers_live(real_app: AppContext) -> None
     assert result.ok, f"cross-target fallback did not recover: {result.error}"
     assert result.target.cli == survivor  # a different CLI answered
     assert result.fallback_chain  # the failed primary is recorded in the path
+
+
+async def test_antigravity_version_matches_the_pin(real_app: AppContext) -> None:
+    # Drift alarm: agy auto-updates, and its transcript layout is reverse-engineered and pinned. When
+    # the running version moves past the pin this fails loudly, prompting a re-verify + re-pin -- far
+    # better than a flood of TRANSCRIPT_NOT_FOUND during the June-18 Gemini -> agy migration wave.
+    skip_unless_available(real_app, "antigravity")
+    adapter = real_app.registry.get("antigravity")
+    version = version_token(adapter.detect().version)
+    pinned = version_token(getattr(adapter, "verified_version", None))
+    assert version == pinned, (
+        f"agy is at {adapter.detect().version} but the antigravity adapter is verified/pinned at "
+        f"{getattr(adapter, 'verified_version', None)} -- re-verify the brain/ transcript layout and "
+        "update verified_version + the docstring"
+    )
+
+
+async def test_antigravity_print_stdout_still_does_not_carry_the_answer(real_app: AppContext) -> None:
+    # Stdout-recovery watch: agy --print emits nothing usable to stdout under a non-TTY pipe (issue
+    # #76), which is why the adapter reads the transcript. The canary answer is the LOWERCASE of an
+    # UPPERCASE token in the prompt, so a prompt echo on stdout/stderr cannot trip it -- only the
+    # model's real answer landing on stdout does. When this FAILS, agy has started carrying the answer
+    # on stdout -- the signal that the transcript archaeology can be retired.
+    skip_unless_available(real_app, "antigravity")
+    request = DelegationRequest(
+        target=Target(cli="antigravity"),
+        prompt="Output only the single token RUTHERFORDCANARY in lowercase, with no other text.",
+        include_raw=True,
+        timeout_s=300,
+    )
+    result = await real_app.delegation.delegate(request, base_depth=0)
+    if not result.ok:
+        pytest.skip(f"antigravity did not answer ({result.error}); cannot check stdout")
+    assert "rutherfordcanary" not in (result.raw or ""), (
+        "agy --print now carries the answer on its stdout/stderr -- issue #76 may be fixed; consider "
+        "switching the antigravity adapter from the transcript read to clean stdout"
+    )

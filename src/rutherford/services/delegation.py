@@ -95,6 +95,7 @@ class DelegationService:
             working_dir=req.working_dir,
             correlation_id=correlation_id,
             depth=base_depth,
+            session_id=req.session_id,
             extra_args=self._config.extra_args_for(req.target.cli),
         )
 
