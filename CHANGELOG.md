@@ -4,6 +4,52 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-06-09
+
+### Added
+
+- Provenance on every result (F3): a `provenance` block records who actually answered -- the model
+  vendor (`provider`), the serving platform when it differs from a direct vendor API (`backend`:
+  bedrock / vertex / aws / openrouter / ...), the resolved model, the CLI version, and a `confirmed`
+  flag marking a definitive signal from a heuristic guess. Each adapter derives its own provider
+  (Claude Code's `CLAUDE_CODE_USE_*` backend, OpenCode's `provider/model` namespace, Goose's
+  `GOOSE_PROVIDER`, the local runtimes, a shared vendor-from-model heuristic), and the delegation
+  service stamps it, reusing the version it already detected. Every field is optional and dropped
+  from the wire when unknown, so the result contract is unchanged for a caller that does not read it.
+- Effective-diversity reporting on consensus and debate (F3): a `diversity` block shows how many
+  distinct models and providers the answering voices actually spanned, with a `low_diversity` flag
+  when the distinct-model *or* distinct-provider count collapses below the new `min_distinct` config
+  floor (default 2). A panel that is one model in several CLI costumes -- increasingly likely as the
+  roster goes bring-your-own-model -- is made visible instead of passing as N independent opinions.
+- Cross-target fallback chains (F7): a `fallback` list of alternate targets on `delegate`. When the
+  primary fails on a retryable category, each alternate is tried in order until one answers, and the
+  result records the path in `fallback_chain`. Restricted to non-mutating modes (read_only / propose),
+  since re-running a write task on a second CLI against the same tree would compound edits.
+- A per-adapter cooldown (F7): after a few *unhealthy* failures (rate-limit, auth, timeout, spawn,
+  output drift -- not a hard-task non-zero exit) within `cooldown_window_s`, an adapter is benched for
+  `cooldown_duration_s`. A benched adapter is left out of an auto-expanded (`expand_all`) panel and
+  skipped as a fallback candidate, but an explicit delegation to it still runs. Configured by
+  `cooldown_threshold` (default 3; `0` disables), `cooldown_window_s`, and `cooldown_duration_s`.
+- A typed failure taxonomy (F7): a generic non-zero exit is refined into a specific, stable error
+  code by matching the error text -- the new `RATE_LIMITED`, `AUTH_FAILED`, `CONTEXT_OVERFLOW`,
+  `MODEL_UNAVAILABLE`, and `SPAWN_FAILED` codes -- so a caller (and the fallback decision) can act on
+  *why* a delegation failed rather than on an opaque `NONZERO_EXIT`.
+
+### Changed
+
+- Adapter output parsing is factored into a shared toolkit (F10): the JSON-object scanner, the JSONL
+  splitter, the token-cost reader, and the stdout cleaners that were copied across every adapter now
+  live in one place (`adapters/parsing.py`), behind two parser strategies (a JSON-envelope parser and
+  a text parser) and a shared finalizer for the event-stream adapters. Behavior is preserved across
+  all adapters; the config-driven generic adapter now uses the robust JSON scanner it had missed, so
+  a prose-wrapped or pretty-printed JSON object is no longer dropped.
+
+### Fixed
+
+- A subprocess that failed to launch (a broken shim, a runtime error) previously propagated an
+  uncaught `OSError` out of the delegation service; it is now a structured `SPAWN_FAILED` result like
+  every other operational failure (F7).
+
 ## [1.1.0] - 2026-06-08
 
 ### Added
