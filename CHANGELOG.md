@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-06-11
+
 ### Breaking
 
 - A config-defined generic adapter must now declare its read-only posture: config load fails unless
