@@ -37,7 +37,6 @@ runtime            src/rutherford/runtime/
                    launch.py      -- cross-platform argv preparation
                    depth.py       -- depth guard + target cap
                    platform.py    -- WSL detection
-                   paths.py       -- path translation
         |
 domain + config    src/rutherford/domain/   models, enums, errors, error_codes
                    src/rutherford/config/   schema, loader
@@ -61,7 +60,7 @@ is imported anywhere outside `registry.py`. The contract has two load-bearing me
 
 - `build_invocation(req, ctx) -> InvocationSpec` -- pure function. Given a normalized
   `DelegationRequest` and an `InvocationContext`, returns an `InvocationSpec` with an `argv`
-  list, an `env` overlay, a `cwd`, and a `runtime` hint. It never builds a shell string.
+  list, an `env` overlay, a `cwd`, and an optional stdin payload. It never builds a shell string.
   Role preamble injection is the adapter's responsibility: use a native system-prompt flag where
   the CLI has one, or call `_compose_prompt` to prepend it to the prompt.
 
@@ -145,7 +144,6 @@ Every adapter's `parse_output` must return a `DelegationResult` regardless of ou
 | `exit_code` | `int \| None` | Raw process exit code; `None` on timeout |
 | `text` | `str` | The clean final answer (empty on failure) |
 | `raw` | `str \| None` | Combined stdout+stderr; only when `include_raw=True` |
-| `artifacts` | `list[Artifact]` | Files the agent reported changing |
 | `duration_s` | `float` | Wall-clock time in seconds |
 | `session_id` | `str \| None` | Opaque; round-trips to the CLI's resume mechanism |
 | `cost` | `Cost \| None` | Token counts and USD cost, where the CLI reports them |

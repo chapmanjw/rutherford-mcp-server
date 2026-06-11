@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from rutherford.adapters.base import CLIAdapter
+from rutherford.adapters.base import BaseCLIAdapter, CLIAdapter
 from rutherford.adapters.registry import build_registry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.domain.enums import SafetyMode
@@ -25,6 +25,7 @@ from rutherford.domain.models import (
     SafetyFlags,
     Target,
 )
+from tests.fakes import FakeProbe
 
 _REGISTRY = build_registry(RutherfordConfig())
 _ADAPTERS = _REGISTRY.all()
@@ -114,6 +115,24 @@ def test_parse_output_timeout_is_timeout_error(adapter: CLIAdapter) -> None:
     assert not result.ok
     assert result.error is not None
     assert result.error.code == "TIMEOUT"
+
+
+@pytest.mark.parametrize("adapter", _ADAPTERS, ids=_IDS)
+def test_detect_reports_installed_and_absent(adapter: CLIAdapter) -> None:
+    # Every registered adapter resolves its binary through the injected probe, so one which-hit /
+    # which-miss pair covers detect() for the whole roster. Version *parsing* stays per-adapter
+    # (ollama / lmstudio reshape their version output and keep their own golden tests).
+    assert isinstance(adapter, BaseCLIAdapter)  # detect() and `binary` are BaseCLIAdapter scaffolding
+    binary = adapter.binary
+    probe = FakeProbe(
+        which_map={binary: f"/usr/bin/{binary}"},
+        run_fn=lambda argv: ProcessResult(exit_code=0, stdout="1.0.0"),
+    )
+    installed = build_registry(RutherfordConfig(), probe=probe).get(adapter.id).detect()
+    assert installed.installed
+    assert installed.path == f"/usr/bin/{binary}"
+    absent = build_registry(RutherfordConfig(), probe=FakeProbe(which_map={})).get(adapter.id).detect()
+    assert not absent.installed
 
 
 def test_registry_has_all_builtins() -> None:

@@ -1,21 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""Shared adapter probing for the ``capabilities`` and ``doctor`` tools.
+"""Adapter probing for the ``capabilities``, ``doctor``, and ``setup`` tools.
 
 Builds an :class:`~rutherford.domain.models.AdapterStatus` for one adapter by running its
 non-destructive metadata methods (``detect``, ``check_auth``, ``available_models``,
-``capabilities``). ``doctor`` additionally asks for human-readable diagnostic notes.
+``capabilities``). ``doctor`` additionally asks for human-readable diagnostic notes and can
+confirm an unprobeable adapter's auth with a minimal live round trip.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
+from collections.abc import Callable
 
 from ..adapters.base import CLIAdapter
+from ..adapters.registry import AdapterRegistry
 from ..domain.enums import AuthState
-from ..domain.models import AdapterCapabilities, AdapterStatus, AuthStatus
+from ..domain.models import AdapterCapabilities, AdapterStatus, AuthStatus, DelegationRequest, Target
+from .delegation import DelegationService
 
 _SEMVER_RE = re.compile(r"\d+\.\d+\.\d+")
+
+#: A tiny read-only prompt used by the live auth check.
+_LIVE_AUTH_PROMPT = "Reply with exactly the two characters: ok"
 
 
 def version_token(text: str | None) -> str | None:
@@ -61,9 +69,75 @@ def probe_adapter(adapter: CLIAdapter, *, diagnostic: bool = False) -> AdapterSt
         auth=auth,
         models=models,
         capabilities=capabilities,
-        runtime=capabilities.runtime,
         notes=notes,
     )
+
+
+async def probe_all(
+    registry: AdapterRegistry,
+    *,
+    diagnostic: bool = False,
+    default_model_for: Callable[[str], str | None] | None = None,
+) -> list[AdapterStatus]:
+    """Probe every registered adapter and return their statuses, ordered by id.
+
+    Probes run in worker threads so the synchronous metadata calls (version, list-models,
+    auth-status) do not block the event loop. ``default_model_for`` (the config lookup) stamps each
+    status with the model a no-model delegation would use.
+    """
+    statuses = list(
+        await asyncio.gather(
+            *(asyncio.to_thread(probe_adapter, adapter, diagnostic=diagnostic) for adapter in registry.all())
+        )
+    )
+    if default_model_for is not None:
+        for status in statuses:
+            status.default_model = default_model_for(status.id)
+    return statuses
+
+
+async def verify_live(
+    delegation: DelegationService,
+    statuses: list[AdapterStatus],
+    *,
+    correlation_id_factory: Callable[[], str],
+    base_depth: int,
+) -> list[AdapterStatus]:
+    """Confirm each installed-but-unknown adapter's auth with a minimal read-only delegation.
+
+    The only trustworthy signal for an adapter with no non-interactive auth check is a real round
+    trip; every other status passes through untouched.
+    """
+    return list(
+        await asyncio.gather(
+            *(
+                _verify_one(delegation, status, correlation_id_factory=correlation_id_factory, base_depth=base_depth)
+                for status in statuses
+            )
+        )
+    )
+
+
+async def _verify_one(
+    delegation: DelegationService,
+    status: AdapterStatus,
+    *,
+    correlation_id_factory: Callable[[], str],
+    base_depth: int,
+) -> AdapterStatus:
+    if not (status.installed and status.auth.state is AuthState.UNKNOWN):
+        return status
+    request = DelegationRequest(target=Target(cli=status.id), prompt=_LIVE_AUTH_PROMPT, timeout_s=60)
+    result = await delegation.delegate(request, correlation_id=correlation_id_factory(), base_depth=base_depth)
+    kept = [note for note in status.notes if "could not be verified" not in note]
+    if result.ok:
+        status.auth = AuthStatus(state=AuthState.AUTHENTICATED, detail="verified by a live round trip")
+        status.notes = [*kept, "auth confirmed by a live invocation"]
+    else:
+        detail = result.error.message if result.error else "live auth check failed"
+        status.auth = AuthStatus(state=AuthState.NEEDS_LOGIN, detail=detail)
+        status.notes = [*kept, "a live auth check failed; sign in to the CLI interactively"]
+    return status
 
 
 def _diagnose(

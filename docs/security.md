@@ -221,7 +221,7 @@ Rutherford never handles a credential value. Specifically:
   printed, or passed to any subprocess. `BaseCLIAdapter._env_present(*names)` calls
   `os.environ.get(name)` and returns the name of the first non-empty variable, not its value.
 - Credential values never appear in `DelegationResult`. The result envelope carries text, cost,
-  artifacts, and error info -- no env-var values.
+  and error info -- no env-var values.
 - No adapter writes a credential to disk or passes it on the argv.
 - The child process inherits the parent environment via `merged_env` in `runtime/launch.py`,
   which overlays only the keys listed in `InvocationSpec.env`. API keys in the environment are

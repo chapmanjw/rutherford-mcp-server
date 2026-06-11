@@ -154,31 +154,7 @@ def test_parse_nonzero_exit() -> None:
     assert "not authenticated" in result.error.message
 
 
-def test_parse_timeout() -> None:
-    raw = ProcessResult(exit_code=None, timed_out=True, duration_s=300.0)
-    result = KiroAdapter().parse_output(raw, _ctx())
-    assert not result.ok
-    assert result.error is not None
-    assert result.error.code == "TIMEOUT"
-
-
 # --- detect / check_auth / available_models ----------------------------------
-
-
-def test_detect_when_installed() -> None:
-    probe = FakeProbe(
-        which_map={"kiro-cli": "/usr/bin/kiro-cli"},
-        run_fn=lambda argv: ProcessResult(exit_code=0, stdout="kiro-cli 2.5.0"),
-    )
-    result = KiroAdapter(probe=probe).detect()
-    assert result.installed
-    assert result.path == "/usr/bin/kiro-cli"
-    assert result.version == "kiro-cli 2.5.0"
-
-
-def test_detect_when_absent() -> None:
-    adapter = KiroAdapter(probe=FakeProbe(which_map={}))
-    assert not adapter.detect().installed
 
 
 def test_check_auth_with_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -8,16 +8,13 @@ import pytest
 from pydantic import ValidationError
 
 from rutherford.domain.enums import SafetyMode
-from rutherford.domain.error_codes import ALL_ERROR_CODES, ErrorCode, is_error_code
+from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import ConfigError, DepthLimitError, RutherfordError
 from rutherford.domain.models import DelegationRequest, ErrorInfo, Target
 
 
 def test_error_codes_are_strings_and_known() -> None:
     assert ErrorCode.BINARY_NOT_FOUND == "BINARY_NOT_FOUND"
-    assert is_error_code("BINARY_NOT_FOUND")
-    assert not is_error_code("NOT_A_REAL_CODE")
-    assert "INTERNAL" in ALL_ERROR_CODES
 
 
 def test_safety_mode_values() -> None:
@@ -78,7 +75,6 @@ def test_delegation_request_defaults_to_read_only_sync() -> None:
     req = DelegationRequest(target=Target(cli="codex"), prompt="hi")
     assert req.safety_mode is SafetyMode.READ_ONLY
     assert req.mode.value == "sync"
-    assert req.depth == 0
 
 
 def test_rutherford_error_carries_code() -> None:

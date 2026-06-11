@@ -180,6 +180,11 @@ class JobService:
             # cancelled. The underlying AsyncProcessRunner already killed the CLI process tree.
             self._store.cancel(job_id)
             raise
+        except RutherfordError as exc:
+            # A typed failure keeps its code and details (the sync tool path already preserves them);
+            # flattening it to INTERNAL would hide e.g. INVALID_INPUT from job_result.
+            self._store.fail(job_id, ErrorInfo(code=exc.code, message=exc.message, details=exc.details))
+            log_event("job_finished", job_id=job_id, status=JobStatus.FAILED.value, error_type=type(exc).__name__)
         except Exception as exc:  # a crashing job body becomes a failed job, not a server crash
             self._store.fail(job_id, ErrorInfo(code=ErrorCode.INTERNAL, message=str(exc)))
             # Log only the exception TYPE, not str(exc): a crashing body's message could carry prompt

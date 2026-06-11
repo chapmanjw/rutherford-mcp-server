@@ -120,10 +120,7 @@ class CursorAdapter(BaseCLIAdapter):
         first `` - `` on each line that contains it; header/tip/blank lines are skipped. Any
         failure returns the static set rather than raising.
         """
-        try:
-            result = self._probe.run([self.binary, "--list-models"], timeout_s=15.0)
-        except Exception:
-            return list(self.static_models)
+        result = self._probe.run([self.binary, "--list-models"], timeout_s=15.0)
         if result.exit_code != 0:
             return list(self.static_models)
 

@@ -29,8 +29,10 @@ def _ctx(
     )
 
 
-def _req(model: str | None = "coder-next", *, prompt: str = "hello") -> DelegationRequest:
-    return DelegationRequest(target=Target(cli="ollama", model=model), prompt=prompt)
+def _req(
+    model: str | None = "coder-next", *, prompt: str = "hello", files: list[str] | None = None
+) -> DelegationRequest:
+    return DelegationRequest(target=Target(cli="ollama", model=model), prompt=prompt, files=files or [])
 
 
 def test_adapter_is_optional() -> None:
@@ -90,6 +92,22 @@ def test_role_preamble_is_prepended_to_the_prompt() -> None:
     assert spec.stdin is not None
     assert spec.stdin.startswith("You are a coder.")
     assert "do X" in spec.stdin
+
+
+def test_build_invocation_folds_files_into_the_stdin_prompt() -> None:
+    # Ollama has no file-attach flag; the in-scope file list folds into the stdin prompt (the
+    # advertised file_context_style="prompt") rather than being silently dropped.
+    spec = OllamaAdapter().build_invocation(_req(prompt="fix it", files=["a.py", "b.py"]), _ctx())
+    assert spec.stdin is not None
+    assert "fix it" in spec.stdin
+    assert "Files in scope:" in spec.stdin
+    assert "- a.py" in spec.stdin
+
+
+def test_capabilities_advertise_prompt_style_file_context() -> None:
+    caps = OllamaAdapter().capabilities()
+    assert caps.supports_file_context is True
+    assert caps.file_context_style == "prompt"
 
 
 def test_map_safety_is_empty_for_every_mode() -> None:

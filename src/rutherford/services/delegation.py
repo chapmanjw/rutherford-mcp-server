@@ -34,10 +34,16 @@ from ..runtime.cooldown import CooldownTracker
 from ..runtime.depth import child_depth_env, ensure_within_depth
 from ..runtime.failures import classify_failure, indicates_unhealthy, is_model_unavailable, is_retryable
 from ..runtime.logging import log_event
+from ..runtime.platform import PlatformInfo, detect_platform
 from ..runtime.process import ProcessRunner
 from .roles import RoleStore
 
 ProgressCallback = Callable[[str], None]
+
+#: Conservative preflight bound for an argv-borne prompt on Windows: ``CreateProcessW`` caps the
+#: command line at 32767 chars, and ``prepare_argv`` may still wrap the argv in a shim, so refuse
+#: a little early rather than surface the cap as an opaque spawn failure.
+_WINDOWS_CMDLINE_LIMIT = 30000
 
 
 class DelegationService:
@@ -49,11 +55,16 @@ class DelegationService:
         runner: ProcessRunner,
         config: RutherfordConfig,
         roles: RoleStore,
+        *,
+        platform: PlatformInfo | None = None,
     ) -> None:
         self._registry = registry
         self._runner = runner
         self._config = config
         self._roles = roles
+        #: Resolved once at construction; injectable so the Windows command-line preflight is
+        #: unit-testable from any host.
+        self._platform = platform if platform is not None else detect_platform()
         #: Bounds how many CLI subprocesses run at once across every panel that shares this service
         #: (consensus fan-out, debate rounds, nested self-delegation), so panel width does not become
         #: unbounded host process pressure.
@@ -94,7 +105,6 @@ class DelegationService:
             safety_mode=req.safety_mode,
             working_dir=req.working_dir,
             correlation_id=correlation_id,
-            depth=base_depth,
             session_id=req.session_id,
             extra_args=self._config.extra_args_for(req.target.cli),
         )
@@ -110,7 +120,8 @@ class DelegationService:
             return self._error(ctx, exc)
 
         try:
-            detected = adapter.detect()
+            # detect() shells out on a probe-cache miss, so run it off-thread to keep the loop free.
+            detected = await asyncio.to_thread(adapter.detect)
         except Exception as exc:  # a buggy adapter probe becomes a structured failure, not a panel abort
             return self._fail(ctx, ErrorCode.INTERNAL, f"{req.target.cli} adapter detect() raised: {exc}")
         if not detected.installed:
@@ -233,6 +244,24 @@ class DelegationService:
             return self._error(ctx, exc), None
         except Exception as exc:  # an adapter bug becomes a structured result, not a server crash
             return self._fail(ctx, ErrorCode.INTERNAL, f"build_invocation failed: {exc}"), None
+
+        # Windows-only preflight: several adapters carry the composed prompt in argv, and a command
+        # line past the ~32K CreateProcessW cap fails opaquely as SPAWN_FAILED -- an unhealthy code
+        # that would wrongly bench the seat. Refuse up front as CONTEXT_OVERFLOW instead, which is
+        # retryable (a fallback chain can recover) but never counts toward cooldown.
+        if spec.stdin is None and self._platform.is_windows:
+            cmdline_len = len(subprocess.list2cmdline(spec.argv))
+            if cmdline_len > _WINDOWS_CMDLINE_LIMIT:
+                return (
+                    self._fail(
+                        ctx,
+                        ErrorCode.CONTEXT_OVERFLOW,
+                        f"composed command line is {cmdline_len} chars, over the ~32K Windows command-line "
+                        "cap; use a CLI that passes the prompt on stdin (claude_code, codex, cursor, "
+                        "opencode, qwen) or shorten the prompt",
+                    ),
+                    None,
+                )
 
         spec = spec.model_copy(update={"env": {**spec.env, **child_depth_env(base_depth)}})
         # Precedence: an explicit per-call timeout, else the per-adapter ``[adapters.<id>]

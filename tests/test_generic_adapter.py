@@ -79,6 +79,23 @@ def test_parse_text_mode() -> None:
     assert result.text == "answer"
 
 
+def test_parse_text_mode_strips_ansi() -> None:
+    adapter = GenericAdapter(_cfg(output_mode=OutputMode.TEXT))
+    result = adapter.parse_output(ProcessResult(exit_code=0, stdout="\x1b[32manswer\x1b[0m\n"), _ctx())
+    assert result.ok
+    assert result.text == "answer"
+
+
+def test_parse_empty_text_output_is_parse_error() -> None:
+    # Empty stdout on exit 0 (a CLI that crashed after fork, or printed nothing) must not become
+    # a successful empty voice; it is a PARSE_ERROR like any other unextractable output.
+    adapter = GenericAdapter(_cfg(output_mode=OutputMode.TEXT))
+    result = adapter.parse_output(ProcessResult(exit_code=0, stdout="  \n"), _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "PARSE_ERROR"
+
+
 def test_parse_json_path() -> None:
     adapter = GenericAdapter(_cfg(output_mode=OutputMode.JSON, json_text_path="result.text"))
     result = adapter.parse_output(ProcessResult(exit_code=0, stdout='{"result":{"text":"hello"}}'), _ctx())
@@ -95,6 +112,7 @@ def test_parse_json_missing_path_is_parse_error() -> None:
 
 
 def test_parse_nonzero_and_timeout() -> None:
+    # GenericAdapter is not in the default registry, so the contract harness never exercises it.
     adapter = GenericAdapter(_cfg())
     nonzero = adapter.parse_output(ProcessResult(exit_code=1, stderr="bad"), _ctx())
     assert nonzero.error is not None and nonzero.error.code == "NONZERO_EXIT"

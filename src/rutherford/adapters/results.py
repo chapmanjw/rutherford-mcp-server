@@ -14,7 +14,6 @@ import re
 
 from ..domain.error_codes import ErrorCode
 from ..domain.models import (
-    Artifact,
     Cost,
     DelegationResult,
     ErrorInfo,
@@ -39,7 +38,6 @@ def success_result(
     *,
     session_id: str | None = None,
     cost: Cost | None = None,
-    artifacts: list[Artifact] | None = None,
 ) -> DelegationResult:
     """Build a successful result with the extracted final text."""
     return DelegationResult(
@@ -47,7 +45,6 @@ def success_result(
         ok=True,
         exit_code=raw.exit_code,
         text=text,
-        artifacts=artifacts or [],
         duration_s=raw.duration_s,
         session_id=session_id,
         cost=cost,

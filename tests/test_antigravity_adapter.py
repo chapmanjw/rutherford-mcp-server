@@ -14,7 +14,7 @@ import pytest
 from rutherford.adapters.antigravity import AntigravityAdapter
 from rutherford.domain.enums import AuthState, SafetyMode
 from rutherford.domain.models import DelegationRequest, InvocationContext, ProcessResult, Target
-from rutherford.tools.probing import probe_adapter
+from rutherford.services.probing import probe_adapter
 from tests.fakes import FakeProbe
 
 
@@ -121,13 +121,6 @@ def test_parse_working_dir_not_in_index_does_not_use_other_conversation(tmp_path
     assert not result.ok
     assert result.error is not None
     assert result.error.code == "TRANSCRIPT_NOT_FOUND"
-
-
-def test_parse_timeout(tmp_path: Path) -> None:
-    adapter = AntigravityAdapter(data_root=tmp_path / "empty")
-    result = adapter.parse_output(ProcessResult(exit_code=None, timed_out=True), _ctx())
-    assert result.error is not None
-    assert result.error.code == "TIMEOUT"
 
 
 def test_parse_transcript_schema_drift_is_contract_mismatch(tmp_path: Path) -> None:
@@ -256,6 +249,49 @@ def test_resume_reads_the_session_id_conversation_not_the_newest(tmp_path: Path)
     assert result.ok
     assert result.text == "THE FINAL ANSWER"
     assert result.session_id == "resume-me"
+
+
+def test_parse_resumed_turn_with_no_answer_does_not_return_the_previous_turns_answer(tmp_path: Path) -> None:
+    """A resumed conversation's transcript still holds the previous turn's PLANNER_RESPONSE. When the
+    NEW turn produced no completed model event, the old whole-file scan reported that stale answer as
+    this run's result (exit 0, stale answer wins); the scan must be scoped to events after the last
+    USER_INPUT, so the run fails as TRANSCRIPT_NOT_FOUND instead."""
+    root = tmp_path / "agdata"
+    two_turns = [
+        {"source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "content": "first question"},
+        {"source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "content": "STALE PREVIOUS ANSWER"},
+        {"source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "content": "second question"},
+        {"source": "MODEL", "type": "PLANNER_RESPONSE", "status": "IN_PROGRESS", "content": "thinking..."},
+    ]
+    _write_transcript(root, "conv-r", two_turns)
+
+    adapter = AntigravityAdapter(data_root=root)
+    result = adapter.parse_output(ProcessResult(exit_code=0, stdout=""), _ctx(session_id="conv-r"))
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "TRANSCRIPT_NOT_FOUND"
+    assert "STALE PREVIOUS ANSWER" not in (result.text or "")
+
+
+def test_parse_resumed_turn_drift_canary_fires_despite_a_previously_successful_turn(tmp_path: Path) -> None:
+    """History must not pre-populate completed_model_types: a prior turn's successful PLANNER_RESPONSE
+    used to satisfy the whole-file scan and permanently disable the CONTRACT_MISMATCH canary on any
+    previously-successful conversation. With the scan scoped to the current turn, a completed model
+    event under a renamed type fires the drift signal again."""
+    root = tmp_path / "agdata"
+    two_turns = [
+        {"source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "content": "first question"},
+        {"source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "content": "OLD GOOD ANSWER"},
+        {"source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "content": "second question"},
+        {"source": "MODEL", "type": "ASSISTANT_MESSAGE", "status": "DONE", "content": "answer in a new shape"},
+    ]
+    _write_transcript(root, "conv-d", two_turns)
+
+    adapter = AntigravityAdapter(data_root=root)
+    result = adapter.parse_output(ProcessResult(exit_code=0, stdout=""), _ctx(session_id="conv-d"))
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "CONTRACT_MISMATCH"
 
 
 def _agy_probe(version: str) -> FakeProbe:

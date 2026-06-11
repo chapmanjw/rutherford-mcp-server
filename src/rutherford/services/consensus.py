@@ -12,16 +12,19 @@ from __future__ import annotations
 
 import asyncio
 
+from ..adapters.base import CLIAdapter
 from ..adapters.registry import AdapterRegistry
 from ..config.schema import RutherfordConfig
 from ..domain.enums import AuthState, SafetyMode, Stance, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import (
+    AuthStatus,
     ConsensusRequest,
     ConsensusResult,
     DelegationRequest,
     DelegationResult,
+    DetectResult,
     DiversityReport,
     ErrorInfo,
     SkippedTarget,
@@ -31,7 +34,7 @@ from ..domain.models import (
 )
 from ..runtime.depth import ensure_within_target_cap
 from .delegation import DelegationService, ProgressCallback
-from .strategies import aggregate, effective_diversity, extract_verdict, verdict_instruction
+from .strategies import aggregate, apply_stance, effective_diversity, extract_verdict, verdict_instruction
 
 
 class ConsensusService:
@@ -83,7 +86,6 @@ class ConsensusService:
                 safety_mode=req.safety_mode,
                 timeout_s=req.timeout_s,
                 include_raw=req.include_raw,
-                depth=base_depth,
             )
             for index, target in enumerate(targets)
         ]
@@ -105,7 +107,10 @@ class ConsensusService:
 
         synthesis: str | None = None
         synthesis_by: str | None = None
-        if (req.synthesize or self._config.synthesize_default) and voices:
+        # None means the caller omitted synthesize, the one case the configured default fills;
+        # an explicit False wins over a synthesize_default=true config.
+        effective_synthesize = req.synthesize if req.synthesize is not None else self._config.synthesize_default
+        if effective_synthesize and voices:
             synthesis, synthesis_by = await self._synthesize(req, voices, correlation_id, base_depth)
 
         return ConsensusResult(
@@ -125,7 +130,7 @@ class ConsensusService:
 
     def _voice_prompt(self, req: ConsensusRequest, target: Target, index: int) -> str:
         """The prompt for one voice: the question, stance-steered, plus a verdict ask under a strategy."""
-        prompt = _apply_stance(req.prompt, _stance_for(target, req.stances, index))
+        prompt = apply_stance(req.prompt, _stance_for(target, req.stances, index))
         if req.strategy is not Strategy.ALL_VOICES:
             prompt = f"{prompt}\n\n{verdict_instruction(req.verdict_schema)}"
         return prompt
@@ -212,18 +217,35 @@ class ConsensusService:
         auto panel** -- they only join when named explicitly, so the opt-in local model never silently
         slows an otherwise-cloud panel. Each included target uses the adapter's default model.
         """
+
+        async def probe(adapter: CLIAdapter) -> tuple[DetectResult, AuthStatus | None]:
+            """One adapter's probes off-thread: detect, then auth only if installed."""
+            detected = await asyncio.to_thread(adapter.detect)
+            if not detected.installed:
+                return detected, None
+            return detected, await asyncio.to_thread(adapter.check_auth)
+
+        # Probes run concurrently: sequentially they cost up to two probe-subprocess latencies per
+        # adapter cold, and one hung shim stalls panel assembly for everyone behind it. Membership
+        # decisions stay a sequential pass in registry order below, so skip ordering and the
+        # max_targets cap behave exactly as before. Optional adapters are never probed -- the
+        # sequential code skipped them before detect, and the auto panel excludes them anyway.
+        adapters = self._registry.all()
+        candidates = [adapter for adapter in adapters if not adapter.optional]
+        outcomes = await asyncio.gather(*(probe(adapter) for adapter in candidates))
+        probed = {adapter.id: outcome for adapter, outcome in zip(candidates, outcomes, strict=True)}
+
         included: list[Target] = []
         skipped: list[SkippedTarget] = []
-        for adapter in self._registry.all():
+        for adapter in adapters:
             if adapter.optional:
                 skipped.append(SkippedTarget(cli=adapter.id, reason="optional; name it explicitly to include"))
                 continue
-            detected = await asyncio.to_thread(adapter.detect)
+            detected, auth = probed[adapter.id]
             if not detected.installed:
                 skipped.append(SkippedTarget(cli=adapter.id, reason="not installed or not on PATH"))
                 continue
-            auth = await asyncio.to_thread(adapter.check_auth)
-            if auth.state in (AuthState.NEEDS_LOGIN, AuthState.API_KEY_MISSING):
+            if auth is not None and auth.state in (AuthState.NEEDS_LOGIN, AuthState.API_KEY_MISSING):
                 reason = auth.detail or f"not authenticated ({auth.state.value})"
                 skipped.append(SkippedTarget(cli=adapter.id, reason=reason))
                 continue
@@ -275,7 +297,6 @@ class ConsensusService:
             working_dir=req.working_dir,
             safety_mode=SafetyMode.READ_ONLY,
             timeout_s=req.timeout_s,
-            depth=base_depth + 1,
         )
         result = await self._delegation.delegate(
             synth_request,
@@ -306,15 +327,6 @@ def _stance_for(target: Target, stances: list[Stance] | None, index: int) -> Sta
     if target.stance is not None:
         return target.stance
     return stances[index] if stances else None
-
-
-def _apply_stance(prompt: str, stance: Stance | None) -> str:
-    """Wrap the prompt to steer a voice for or against the proposition."""
-    if stance is None or stance is Stance.NEUTRAL:
-        return prompt
-    if stance is Stance.FOR:
-        return f"Argue in favor of the following proposition, making the strongest case for it:\n\n{prompt}"
-    return f"Argue against the following proposition, making the strongest case against it:\n\n{prompt}"
 
 
 def _escaped_voice(request: DelegationRequest, exc: BaseException) -> DelegationResult:

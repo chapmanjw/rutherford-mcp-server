@@ -146,14 +146,6 @@ class DiversityReport(BaseModel):
     providers: list[str] = Field(default_factory=list)
 
 
-class Artifact(BaseModel):
-    """A file or diff the delegated agent produced or changed."""
-
-    path: str
-    kind: str = "file"
-    summary: str | None = None
-
-
 class ErrorInfo(BaseModel):
     """The error payload carried in a failed result envelope.
 
@@ -224,13 +216,12 @@ class InvocationSpec(BaseModel):
 
     Produced by ``CLIAdapter.build_invocation`` and consumed by ``ProcessRunner.run``. ``argv``
     is always a list; a shell string is never built. ``env`` is overlaid on the inherited
-    process environment. ``runtime`` tells the runner whether path translation is needed.
+    process environment.
     """
 
     argv: list[str]
     env: dict[str, str] = Field(default_factory=dict)
     cwd: str | None = None
-    runtime: Runtime = Runtime.NATIVE
     stdin: str | None = None
 
 
@@ -248,19 +239,16 @@ class InvocationContext(BaseModel):
     """Context handed to ``build_invocation`` and ``parse_output``.
 
     Carries the resolved target, the chosen safety mode, the working directory, a correlation
-    id, the current delegation depth, an optional role preamble, and (for transcript-based
-    adapters) a hint at where the transcript will land. ``build_invocation`` is responsible for
-    incorporating ``role_preamble`` -- via a native system-prompt flag where the CLI has one,
-    or by prepending it to the prompt otherwise -- so the service never double-injects it.
+    id, and an optional role preamble. ``build_invocation`` is responsible for incorporating
+    ``role_preamble`` -- via a native system-prompt flag where the CLI has one, or by prepending
+    it to the prompt otherwise -- so the service never double-injects it.
     """
 
     target: Target
     safety_mode: SafetyMode = SafetyMode.READ_ONLY
     working_dir: str | None = None
     correlation_id: str = ""
-    depth: int = 0
     role_preamble: str | None = None
-    transcript_dir: str | None = None
     #: The resume session id for this call, so a transcript-based adapter (Antigravity) can read the
     #: exact conversation it told the CLI to resume rather than re-guessing it. ``None`` for a fresh run.
     session_id: str | None = None
@@ -284,7 +272,6 @@ class DelegationRequest(BaseModel):
     mode: DelegationMode = DelegationMode.SYNC
     timeout_s: float | None = None
     session_id: str | None = None
-    depth: int = 0
     include_raw: bool = False
     #: Per-call confirmation that a write/yolo delegation may mutate ``working_dir`` even when
     #: it is not on the configured trusted-workspace allowlist.
@@ -312,7 +299,6 @@ class DelegationResult(BaseModel):
     exit_code: int | None = None
     text: str = ""
     raw: str | None = None
-    artifacts: list[Artifact] = Field(default_factory=list)
     duration_s: float = 0.0
     session_id: str | None = None
     cost: Cost | None = None
@@ -338,8 +324,9 @@ class ConsensusRequest(BaseModel):
     """The same prompt asked of several targets in parallel.
 
     ``stances``, when given, is parallel to ``targets`` and steers each voice. ``synthesize``
-    requests an optional server-side synthesis; it is off by default, so every voice is
-    returned for the orchestrator to synthesize. When ``expand_all`` is set, ``targets`` is
+    requests an optional server-side synthesis; ``None`` means the caller omitted it and the
+    configured ``synthesize_default`` applies (false out of the box), so an explicit ``False``
+    always wins over the config. When ``expand_all`` is set, ``targets`` is
     ignored and the panel is every installed + authenticated adapter (capped at ``max_targets``),
     each at its default model.
     """
@@ -351,9 +338,8 @@ class ConsensusRequest(BaseModel):
     files: list[str] = Field(default_factory=list)
     role: str | None = None
     safety_mode: SafetyMode = SafetyMode.READ_ONLY
-    synthesize: bool = False
+    synthesize: bool | None = None
     timeout_s: float | None = None
-    depth: int = 0
     include_raw: bool = False
     #: Build the panel from every installed + authenticated adapter instead of ``targets``.
     expand_all: bool = False
@@ -469,7 +455,6 @@ class DebateRequest(BaseModel):
     safety_mode: SafetyMode = SafetyMode.READ_ONLY
     synthesize: bool = True
     timeout_s: float | None = None
-    depth: int = 0
     include_raw: bool = False
     #: An optional target to write the closing synthesis. Defaults to the first surviving voice when
     #: unset; pass a distinct CLI for an independent, non-participant judge.
@@ -570,5 +555,4 @@ class AdapterStatus(BaseModel):
     #: a no-model delegation will use. ``None`` when no default is configured for this adapter.
     default_model: str | None = None
     capabilities: AdapterCapabilities
-    runtime: Runtime = Runtime.NATIVE
     notes: list[str] = Field(default_factory=list)

@@ -28,7 +28,7 @@ from ..domain.models import (
 )
 from ..runtime.probe import CommandProbe
 from .base import BaseCLIAdapter
-from .parsing import as_text, dotted_get, last_json_object
+from .parsing import as_text, dotted_get, last_json_object, strip_terminal_noise
 from .provenance import infer_provider_from_model
 from .results import error_result, nonzero_result, success_result, timeout_result
 
@@ -96,7 +96,6 @@ class GenericAdapter(BaseCLIAdapter):
             argv=argv,
             env=dict(safety.env),
             cwd=req.working_dir,
-            runtime=config.runtime,
             stdin=stdin,
         )
 
@@ -133,12 +132,15 @@ class GenericAdapter(BaseCLIAdapter):
         ``json_text_path`` -- which schema validation guarantees is set for JSON mode, so there is
         no whole-object fallback here. A non-scalar leaf (object/list/bool) or a missing path
         yields ``None`` -- reported as a parse failure rather than a stringified container. TEXT
-        generic CLIs return stdout verbatim.
+        generic CLIs return stdout with terminal noise (ANSI, surrounding whitespace) stripped;
+        empty stdout yields ``None`` so a CLI that crashed after fork is a parse failure, not a
+        successful empty voice.
         """
         if self._config.output_mode is OutputMode.JSON:
             payload = last_json_object(stdout)
             if payload is None:
                 return None
             return as_text(dotted_get(payload, self._config.json_text_path or ""))
-        # TEXT generic CLIs return their stdout verbatim (JSONL/TRANSCRIPT are rejected at load).
-        return stdout.strip()
+        # TEXT generic CLIs return cleaned stdout (JSONL/TRANSCRIPT are rejected at load); empty
+        # output must read as a parse failure, never ok=True with an empty answer.
+        return strip_terminal_noise(stdout) or None

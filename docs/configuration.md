@@ -144,7 +144,8 @@ it is written to stdin and omitted from the argv.
 | `version_args` | `list[str]` | `["--version"]` | Args passed to probe the binary version. |
 | `static_models` | `list[str]` | `[]` | Hard-coded model list reported by the adapter (no runtime query). |
 | `auth_env` | `list[str]` | `[]` | Environment variable names whose presence signals authentication. |
-| `runtime` | `string` | `"native"` | Where the binary runs. One of `native`, `wsl_interop`. |
+| `runtime` | `string` | `"native"` | Where the binary runs. Only `native` is accepted: Rutherford launches CLIs natively, so a WSL-runtime CLI is not supported via the generic adapter and any other value is rejected at load time. |
+| `provider` | `string` or omitted | none | The model vendor this CLI fronts (e.g. `"openai"`, `"local"`), surfaced as the provenance `provider` (confirmed) and used for diversity accounting. Omitted falls back to a model-name heuristic, then unknown. |
 
 ### `GenericSafetyConfig` fields (under `safety`)
 

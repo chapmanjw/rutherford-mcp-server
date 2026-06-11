@@ -48,7 +48,6 @@ async def delegate_tool(
         include_raw=include_raw,
         trust_workspace=trust_workspace,
         fallback=[as_target(entry) for entry in (fallback or [])],
-        depth=app.base_depth,
     )
     correlation_id = app.new_correlation_id()
 

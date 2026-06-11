@@ -23,7 +23,6 @@ from __future__ import annotations
 from typing import Any
 
 from ..domain.enums import AuthState, OutputMode, SafetyMode
-from ..domain.error_codes import ErrorCode
 from ..domain.models import (
     AdapterCapabilities,
     AuthStatus,
@@ -37,9 +36,9 @@ from ..domain.models import (
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
-from .parsing import CostSpec, extract_cost, parse_jsonl
+from .parsing import CostSpec, extract_cost, finalize_answer, parse_jsonl
 from .provenance import provenance_from_namespace, split_namespaced_model
-from .results import error_result, nonzero_result, success_result, timeout_result
+from .results import timeout_result
 
 #: Permission payload for read-only / propose: deny edits and shell commands.
 _PERMISSION_DENY = '{"edit":"deny","bash":"deny"}'
@@ -167,24 +166,11 @@ class OpenCodeAdapter(BaseCLIAdapter):
         session_id = _extract_session_id(events)
         cost = _extract_cost(events)
 
-        if not text:
-            if raw.exit_code != 0:
-                return nonzero_result(ctx, raw)
-            return error_result(
-                ctx,
-                raw,
-                ErrorCode.PARSE_ERROR,
-                "opencode --format json produced no parseable assistant text",
-                text=raw.stdout.strip(),
-            )
-
-        if raw.exit_code != 0:
-            return error_result(ctx, raw, ErrorCode.NONZERO_EXIT, text, text=text)
-
-        return success_result(
+        return finalize_answer(
             ctx,
             raw,
-            text,
+            answer=text or None,
+            no_output_message="opencode --format json produced no parseable assistant text",
             session_id=session_id,
             cost=cost,
         )
@@ -229,25 +215,25 @@ def _resolve_text_stream(parts: list[str]) -> str:
 
     Cumulative-snapshot streams repeat-and-extend the same text: each chunk is a strict-prefix
     extension of the previous (["H", "He", "Hel"]). Concatenating those doubles every prefix
-    ("HHeHel"), and a duplicated-longest check alone cannot catch it -- the longest snapshot
-    appears exactly once in the concatenation -- so the prefix chain is detected directly and the
-    latest snapshot wins.
+    ("HHeHel"), so the prefix chain is detected directly and the latest snapshot wins.
 
-    Identical repeated chunks (["a", "a"]) are inherently ambiguous: deltas meaning "aa", or the
-    same snapshot emitted twice. The strict length increase keeps them out of the prefix-chain
-    branch, but the duplicated-longest guard below then resolves them as a REPEATED SNAPSHOT
-    (returning "a") -- the deliberate, safer reading for a snapshot-prone stream, pinned by
-    test_parse_repeated_identical_snapshot_resolves_to_one_copy.
+    A stream that fails the strict chain can still be snapshots with a repeated tail (["Hello",
+    "Hello world", "Hello world"]) or identical repeated chunks (["a", "a"] -- inherently ambiguous
+    between deltas meaning "aa" and one snapshot emitted twice). Both resolve via the prefix rule:
+    when every chunk is a prefix of the longest one, the longest IS the final snapshot -- the
+    deliberate, safer reading for a snapshot-prone stream, pinned by
+    test_parse_repeated_identical_snapshot_resolves_to_one_copy. A genuine delta stream that merely
+    repeats a chunk (["abc", "x", "abc"]) fails the prefix rule and concatenates in full, which the
+    old duplicated-longest guard wrongly collapsed.
     """
     if len(parts) > 1 and all(
         len(parts[i + 1]) > len(parts[i]) and parts[i + 1].startswith(parts[i]) for i in range(len(parts) - 1)
     ):
         return parts[-1]
-    joined = "".join(parts)
     longest = max(parts, key=len)
-    if longest and joined.count(longest) > 1:
+    if all(longest.startswith(p) for p in parts):
         return longest
-    return joined
+    return "".join(parts)
 
 
 def _extract_session_id(events: list[dict[str, Any]]) -> str | None:

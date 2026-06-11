@@ -201,6 +201,27 @@ async def test_synthesize_produces_a_combined_answer() -> None:
     assert len(runner.calls) == 3
 
 
+async def test_explicit_synthesize_false_overrides_synthesize_default() -> None:
+    # F13: synthesize is tri-state. An explicit False must win over synthesize_default=true --
+    # before the fix the gate OR'd the two, so a caller could never turn the configured default off.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner, RutherfordConfig(synthesize_default=True))
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", synthesize=False)
+    )
+    assert result.synthesis is None
+    assert len(runner.calls) == 2  # two voices only; no synthesis delegation ran
+
+
+async def test_omitted_synthesize_defers_to_synthesize_default() -> None:
+    # The None sentinel: an omitted synthesize is the one case the configured default fills.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="combined answer"))
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner, RutherfordConfig(synthesize_default=True))
+    result = await service.consensus(ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
+    assert result.synthesis == "combined answer"
+    assert len(runner.calls) == 3  # two voices plus the synthesis delegation
+
+
 async def test_synthesis_uses_a_named_judge_target() -> None:
     runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
     service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("j")], runner)

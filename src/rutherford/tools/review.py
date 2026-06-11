@@ -25,7 +25,7 @@ async def review_tool(
     diff: str | None = None,
     role: str = "codereviewer",
     working_dir: str | None = None,
-    synthesize: bool = False,
+    synthesize: bool | None = None,
     timeout_s: float | None = None,
 ) -> str:
     """Review a diff or a set of files across one or more targets and return every voice.
@@ -60,7 +60,6 @@ async def review_tool(
         safety_mode=SafetyMode.READ_ONLY,
         synthesize=synthesize,
         timeout_s=timeout_s,
-        depth=app.base_depth,
     )
     result = await app.consensus.consensus(request, correlation_id=app.new_correlation_id(), base_depth=app.base_depth)
     return tool_success(result)

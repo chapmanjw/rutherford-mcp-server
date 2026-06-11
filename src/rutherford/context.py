@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""The result-envelope helpers and the per-call tool context.
+"""The result-envelope helpers and the application context.
 
 Mirrors the owner's ``toolSuccess`` / ``toolError`` pair: one helper to build a success payload
 and one to build an error payload, so every tool returns an identically shaped, TOON-encoded
-result. The :class:`AppContext` holds the long-lived services built once at startup; the
-:class:`ToolContext` carries the per-call correlation id, timeout, and cancellation signal.
+result. The :class:`AppContext` holds the long-lived services built once at startup and mints
+correlation ids (:meth:`AppContext.new_correlation_id`); per-call values -- the correlation id,
+timeout, safety mode -- travel as explicit arguments through the tool and service layers.
 
 These helpers return strings (the TOON text a FastMCP tool returns as a text block). Whether an
 error payload is returned normally or raised as an MCP error is the thin tool layer's decision,

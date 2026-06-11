@@ -92,15 +92,17 @@ class OllamaAdapter(BaseCLIAdapter):
         return None
 
     def capabilities(self) -> AdapterCapabilities:
-        """Advertise Ollama's flags: model selection and list-models, plain text, nothing else."""
+        """Advertise Ollama's flags: model selection, list-models, plain text, prompt-style file
+        context (the in-scope file list folds into the stdin prompt)."""
         return AdapterCapabilities(
             supports_resume=False,
             supports_model_selection=True,
             supports_working_dir=False,
-            supports_file_context=False,
+            supports_file_context=True,
             supports_list_models=True,
             supports_system_prompt=False,
             output_mode=OutputMode.TEXT,
+            file_context_style="prompt",
         )
 
     def map_safety(self, mode: SafetyMode) -> SafetyFlags:
@@ -112,7 +114,8 @@ class OllamaAdapter(BaseCLIAdapter):
 
         Pure: returns an argv list and an stdin string, never a shell command line and never a
         subprocess. Ollama has no system-prompt flag, so the role preamble is prepended to the
-        prompt. ``--hidethinking`` keeps a reasoning model's chain-of-thought out of stdout so the
+        prompt, and no file-attach flag, so the in-scope file list is folded into the prompt.
+        ``--hidethinking`` keeps a reasoning model's chain-of-thought out of stdout so the
         answer is clean (the model still reasons internally); on a non-reasoning model it is a
         no-op. Any ``[adapters.ollama] extra_args`` the service resolved (e.g. ``--keepalive 30s``)
         are appended. The model is the target's model (the service fills it from
@@ -126,7 +129,7 @@ class OllamaAdapter(BaseCLIAdapter):
                 "no Ollama model specified -- pass model= or set [adapters.ollama] default_model "
                 "in your Rutherford config (run `ollama list` to see your installed models).",
             )
-        prompt = self._compose_prompt(req.prompt, ctx.role_preamble)
+        prompt = self._with_files(self._compose_prompt(req.prompt, ctx.role_preamble), req.files)
         return InvocationSpec(
             argv=[self.binary, "run", model, "--hidethinking", *ctx.extra_args],
             cwd=req.working_dir,

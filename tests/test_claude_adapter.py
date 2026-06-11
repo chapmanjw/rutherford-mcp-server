@@ -158,14 +158,6 @@ def test_parse_nonzero_exit_golden() -> None:
     assert "API key" in result.error.message
 
 
-def test_parse_timeout() -> None:
-    raw = ProcessResult(exit_code=None, timed_out=True, duration_s=300.0)
-    result = ClaudeCodeAdapter().parse_output(raw, _ctx())
-    assert not result.ok
-    assert result.error is not None
-    assert result.error.code == "TIMEOUT"
-
-
 def test_parse_garbage_stdout_is_parse_error() -> None:
     raw = ProcessResult(exit_code=0, stdout="not json at all", duration_s=0.1)
     result = ClaudeCodeAdapter().parse_output(raw, _ctx())
@@ -196,22 +188,6 @@ def test_parse_result_absent_is_parse_error() -> None:
 
 
 # --- detect / check_auth / available_models ----------------------------------
-
-
-def test_detect_when_installed() -> None:
-    probe = FakeProbe(
-        which_map={"claude": "/usr/bin/claude"},
-        run_fn=lambda argv: ProcessResult(exit_code=0, stdout="2.1.158 (Claude Code)"),
-    )
-    result = ClaudeCodeAdapter(probe=probe).detect()
-    assert result.installed
-    assert result.path == "/usr/bin/claude"
-    assert result.version == "2.1.158 (Claude Code)"
-
-
-def test_detect_when_absent() -> None:
-    adapter = ClaudeCodeAdapter(probe=FakeProbe(which_map={}))
-    assert not adapter.detect().installed
 
 
 def test_check_auth_with_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

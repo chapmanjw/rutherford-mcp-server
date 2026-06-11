@@ -24,12 +24,25 @@ from collections import Counter, defaultdict
 from collections.abc import Sequence
 from typing import Any
 
-from ..domain.enums import Strategy
+from ..domain.enums import Stance, Strategy
 from ..domain.models import DiversityReport, Provenance, VoiceVerdict
 from ..io.jsontext import iter_json_objects
 
 #: Matches a ``VERDICT: <token>`` line anywhere in an answer; the last match wins.
 _VERDICT_LINE = re.compile(r"^\s*VERDICT:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def apply_stance(prompt: str, stance: Stance | None) -> str:
+    """Wrap the prompt to steer a voice for or against the proposition.
+
+    The one steering wrapper shared by consensus and the opening debate round, so both panels
+    phrase the same stance identically.
+    """
+    if stance is None or stance is Stance.NEUTRAL:
+        return prompt
+    if stance is Stance.FOR:
+        return f"Argue in favor of the following proposition, making the strongest case for it:\n\n{prompt}"
+    return f"Argue against the following proposition, making the strongest case against it:\n\n{prompt}"
 
 
 def verdict_instruction(schema: dict[str, Any] | None) -> str:

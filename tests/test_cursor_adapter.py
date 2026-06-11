@@ -162,14 +162,6 @@ def test_parse_nonzero_exit_golden() -> None:
     assert "authenticated" in result.error.message
 
 
-def test_parse_timeout() -> None:
-    raw = ProcessResult(exit_code=None, timed_out=True, duration_s=300.0)
-    result = CursorAdapter().parse_output(raw, _ctx())
-    assert not result.ok
-    assert result.error is not None
-    assert result.error.code == "TIMEOUT"
-
-
 def test_parse_garbage_stdout_is_parse_error() -> None:
     raw = ProcessResult(exit_code=0, stdout="not json at all", duration_s=0.1)
     result = CursorAdapter().parse_output(raw, _ctx())
@@ -226,22 +218,6 @@ def test_check_output_contract_fails_without_json() -> None:
 
 
 # --- detect / check_auth / available_models ----------------------------------
-
-
-def test_detect_when_installed() -> None:
-    probe = FakeProbe(
-        which_map={"cursor-agent": "/usr/bin/cursor-agent"},
-        run_fn=lambda argv: ProcessResult(exit_code=0, stdout="2026.05.28"),
-    )
-    result = CursorAdapter(probe=probe).detect()
-    assert result.installed
-    assert result.path == "/usr/bin/cursor-agent"
-    assert result.version == "2026.05.28"
-
-
-def test_detect_when_absent() -> None:
-    adapter = CursorAdapter(probe=FakeProbe(which_map={}))
-    assert not adapter.detect().installed
 
 
 def test_check_auth_with_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

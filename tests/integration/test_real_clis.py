@@ -21,7 +21,7 @@ from rutherford.domain.models import (
     StrategyResult,
     Target,
 )
-from rutherford.tools.probing import version_token
+from rutherford.services.probing import version_token
 
 from .helpers import CLI_ENV, available_clis, skip_unless_available, skip_unless_runnable
 

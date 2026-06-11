@@ -52,7 +52,7 @@ from ..domain.models import (
 from ..runtime.platform import PlatformInfo, detect_platform
 from ..runtime.probe import CommandProbe
 from .base import BaseCLIAdapter
-from .parsing import CostSpec, extract_cost, finalize_answer, parse_jsonl
+from .parsing import CostSpec, extract_cost, finalize_answer, last_json_object, parse_jsonl
 from .results import error_result, timeout_result
 
 
@@ -218,6 +218,9 @@ class CodexAdapter(BaseCLIAdapter):
                     answer = text
             elif etype == "turn.completed":
                 cost = extract_cost(event.get("usage"), _COST) or cost
+                # The terminal verdict wins: a turn that completed cleanly clears any transient
+                # `error` event the CLI retried past, so a stale retry message cannot fail the run.
+                failure = None
             elif etype == "turn.failed":
                 err = event.get("error")
                 if isinstance(err, dict):
@@ -283,25 +286,22 @@ def _doctor_auth_ok(stdout: str) -> bool | None:
 
 
 def _parse_doctor_json(stdout: str) -> dict[str, Any] | None:
-    """Return the JSON object from ``codex doctor --json``, tolerating pretty-print or surrounding noise."""
+    """Return the JSON object from ``codex doctor --json``, tolerating pretty-print or surrounding noise.
+
+    Try a whole-output parse first, then fall back to the robust embedded-object scanner: a
+    find/rfind brace slice breaks on brace-bearing log noise around the report, which would
+    silently downgrade a healthy (e.g. Bedrock) auth to NEEDS_LOGIN.
+    """
     text = stdout.strip()
     if not text:
         return None
     try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
+        whole = json.loads(text)
     except json.JSONDecodeError:
-        pass
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
-        try:
-            parsed = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return None
-        if isinstance(parsed, dict):
-            return parsed
-    return None
+        whole = None
+    if isinstance(whole, dict):
+        return whole
+    return last_json_object(stdout)
 
 
 def _resume_safety_args(exec_safety_args: list[str]) -> list[str]:

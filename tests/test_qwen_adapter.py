@@ -71,12 +71,17 @@ def test_build_invocation_includes_working_dir_and_resume() -> None:
     assert spec.argv[spec.argv.index("-r") + 1] == "sess-1"
 
 
-def test_build_invocation_uses_system_prompt_for_role() -> None:
+def test_build_invocation_folds_the_role_preamble_into_the_stdin_prompt() -> None:
+    # The preamble is multiline by nature; --append-system-prompt would put it on argv where the
+    # npm .cmd shim launch truncates at the first newline, silently dropping the rest of the
+    # preamble AND the flags after it. It composes into the stdin prompt instead, the same way
+    # every other stdin-transport adapter does.
     spec = QwenAdapter().build_invocation(_req(), _ctx(preamble="You are a reviewer."))
-    assert "--append-system-prompt" in spec.argv
-    assert spec.argv[spec.argv.index("--append-system-prompt") + 1] == "You are a reviewer."
-    # qwen has a system-prompt flag, so the preamble is never prepended to the stdin prompt.
-    assert spec.stdin == "say hi"
+    assert "--append-system-prompt" not in spec.argv
+    assert spec.stdin is not None
+    assert spec.stdin.startswith("You are a reviewer.")
+    assert "say hi" in spec.stdin
+    assert "You are a reviewer." not in spec.argv
 
 
 def test_build_invocation_appends_files_to_stdin() -> None:
@@ -141,14 +146,6 @@ def test_parse_nonzero_exit_golden() -> None:
     assert "authenticated" in result.error.message
 
 
-def test_parse_timeout() -> None:
-    raw = ProcessResult(exit_code=None, timed_out=True, duration_s=300.0)
-    result = QwenAdapter().parse_output(raw, _ctx())
-    assert not result.ok
-    assert result.error is not None
-    assert result.error.code == "TIMEOUT"
-
-
 def test_parse_garbage_stdout_is_parse_error() -> None:
     raw = ProcessResult(exit_code=0, stdout="not json at all", duration_s=0.1)
     result = QwenAdapter().parse_output(raw, _ctx())
@@ -169,22 +166,6 @@ def test_parse_falls_back_to_assistant_message() -> None:
 
 
 # --- detect / check_auth / available_models ----------------------------------
-
-
-def test_detect_when_installed() -> None:
-    probe = FakeProbe(
-        which_map={"qwen": "/usr/bin/qwen"},
-        run_fn=lambda argv: ProcessResult(exit_code=0, stdout="0.17.0"),
-    )
-    result = QwenAdapter(probe=probe).detect()
-    assert result.installed
-    assert result.path == "/usr/bin/qwen"
-    assert result.version == "0.17.0"
-
-
-def test_detect_when_absent() -> None:
-    adapter = QwenAdapter(probe=FakeProbe(which_map={}))
-    assert not adapter.detect().installed
 
 
 def test_check_auth_with_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

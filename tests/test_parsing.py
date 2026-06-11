@@ -3,14 +3,13 @@
 """Unit tests for the shared adapter parsing toolkit.
 
 These exercise the utilities and parser strategies directly -- the audit edge cases each adapter
-relies on (robust object scanning, the result:null != "None" rule, leading-reasoning anchoring,
-cost-key flexibility, the answer/failure decision) -- so a regression surfaces here against the
-toolkit, not only indirectly through one adapter's golden samples.
+relies on (robust object scanning, the result:null != "None" rule, cost-key flexibility, the
+answer/failure decision) -- so a regression surfaces here against the toolkit, not only
+indirectly through one adapter's golden samples.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 import pytest
@@ -29,7 +28,6 @@ from rutherford.adapters.parsing import (
     parse_jsonl,
     render_terminal,
     str_field,
-    strip_leading_reasoning,
     strip_terminal_noise,
 )
 from rutherford.domain.enums import SafetyMode
@@ -217,6 +215,15 @@ def test_extract_cost_missing_nested_block_is_none() -> None:
     assert extract_cost({"usage": "oops"}, CostSpec(tokens_key="usage")) is None
 
 
+def test_extract_cost_non_numeric_figure_degrades_to_none() -> None:
+    # Raw CLI JSON flows into Cost: a non-numeric figure must yield cost=None instead of raising
+    # ValidationError (which would sink a good answer as PARSE_ERROR). Numeric strings still coerce.
+    assert extract_cost({"cost": "n/a"}, CostSpec(usd_key="cost")) is None
+    coerced = extract_cost({"cost": "0.5"}, CostSpec(usd_key="cost"))
+    assert coerced is not None
+    assert coerced.usd == 0.5
+
+
 # --- text cleaners -----------------------------------------------------------
 
 
@@ -234,17 +241,6 @@ def test_render_terminal_normalizes_crlf_and_strips_ansi() -> None:
     assert render_terminal("\x1b[1mline1\x1b[0m\r\nline2") == "line1\nline2"
 
 
-def test_strip_leading_reasoning_removes_only_a_leading_block() -> None:
-    pattern = re.compile(r"\A\s*<think>.*?</think>\s*", re.DOTALL)
-    assert strip_leading_reasoning("<think>plan</think>answer", pattern) == "answer"
-
-
-def test_strip_leading_reasoning_preserves_a_mid_answer_block() -> None:
-    pattern = re.compile(r"\A\s*<think>.*?</think>\s*", re.DOTALL)
-    text = "Here is a <think>tag</think> in prose"
-    assert strip_leading_reasoning(text, pattern) == text
-
-
 # --- last_json_object re-export ----------------------------------------------
 
 
@@ -257,6 +253,16 @@ def test_last_json_object_skips_a_trailing_array() -> None:
     # A trailing top-level array must not steal "last object" from the real verdict object.
     text = '{"verdict":"x"}\n[{"file":"a"}]'
     assert last_json_object(text) == {"verdict": "x"}
+
+
+def test_scanners_swallow_recursion_from_deep_bracket_runs() -> None:
+    # A ~1000+-deep bracket run overflows json's recursive parser with RecursionError before any
+    # decode error is reported; the never-raises contracts must swallow it like any bad input.
+    deep_object_line = '{"a":' + "[" * 3000 + "]" * 3000 + "}"
+    assert parse_jsonl(deep_object_line + '\n{"ok":true}') == [{"ok": True}]
+    deep_run = "[" * 3000 + '{"verdict":"x"}'
+    assert parse_json_array(deep_run) is None
+    assert last_json_object(deep_run) is None
 
 
 # --- JsonEnvelopeParser ------------------------------------------------------
@@ -341,6 +347,15 @@ def test_envelope_whitespace_result_is_parse_error() -> None:
     result = _envelope_parser().parse(_raw('{"result":"   "}', exit_code=0), _ctx())
     assert result.error is not None
     assert result.error.code == "PARSE_ERROR"
+
+
+def test_envelope_non_numeric_cost_degrades_to_none_and_keeps_the_answer() -> None:
+    # A malformed cost figure in an otherwise good envelope must not sink the answer.
+    stdout = '{"result":"the answer","total_cost_usd":"n/a","usage":{"input_tokens":"lots"}}'
+    result = _envelope_parser().parse(_raw(stdout), _ctx())
+    assert result.ok
+    assert result.text == "the answer"
+    assert result.cost is None
 
 
 def test_envelope_without_is_error_relies_on_exit_code_only() -> None:
@@ -478,6 +493,22 @@ def test_finalize_nonzero_exit_answer_wins_by_default() -> None:
     result = finalize_answer(_ctx(), _raw(exit_code=1), answer="valid answer", no_output_message="none")
     assert result.ok
     assert result.text == "valid answer"
+
+
+def test_finalize_nonzero_exit_with_failure_overrides_an_interim_answer() -> None:
+    # A failed run (turn.failed + non-zero exit) can still have produced interim narration that
+    # parsed as an answer; the in-band failure wins, so the run never reads as success.
+    result = finalize_answer(
+        _ctx(),
+        _raw(exit_code=1, stderr="boom"),
+        answer="interim narration",
+        failure="turn failed",
+        no_output_message="none",
+    )
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "NONZERO_EXIT"
+    assert result.text == "turn failed"
 
 
 def test_finalize_nonzero_exit_no_answer_surfaces_failure_body() -> None:

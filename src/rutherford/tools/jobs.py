@@ -29,6 +29,10 @@ async def job_result_tool(app: AppContext, *, job_id: str) -> str:
         return tool_success({"id": job.id, "status": job.status, "message": "job is still running"})
     if job.error is not None:
         return tool_success({"id": job.id, "status": job.status, "error": job.error})
+    # A cancelled job has neither result nor error; without this branch the tool would serialize
+    # the literal "null" instead of an envelope.
+    if job.status is JobStatus.CANCELLED:
+        return tool_success({"id": job.id, "status": job.status, "message": "job was cancelled"})
     return tool_success(job.result)
 
 

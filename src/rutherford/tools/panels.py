@@ -3,9 +3,10 @@
 """The ``reload_panels`` tool and the shared panel-resolution helper.
 
 Panels are loaded lazily and cached for the server's lifetime. ``reload_panels`` re-reads every
-``panels.toon`` so a user can pick up edits without restarting the server. ``resolve_panel`` is the
-one place the tool layer turns a panel name (plus optional one-off overrides) into a validated
-:class:`~rutherford.config.panels.Panel`, so consensus, debate, and review all behave identically.
+``panels.toon`` so a user can pick up edits without restarting the server. ``panel_for_call`` is
+the one entry point through which the tool layer turns a panel name (plus optional one-off
+overrides) into a validated :class:`~rutherford.config.panels.Panel`: it also enforces the
+``targets``/``stances`` mutual exclusion, so consensus, debate, and review all behave identically.
 """
 
 from __future__ import annotations
@@ -23,11 +24,6 @@ async def reload_panels_tool(app: AppContext) -> str:
     store = app.panels.reload()
     names = store.names()
     return tool_success({"reloaded": True, "count": len(names), "panels": names})
-
-
-def resolve_panel(app: AppContext, name: str, overrides: dict[str, Any] | None) -> Panel:
-    """Resolve a saved panel by name, applying optional one-off overrides."""
-    return app.panels.resolve(name, overrides)
 
 
 def panel_for_call(
@@ -49,4 +45,4 @@ def panel_for_call(
         raise RutherfordError(
             ErrorCode.INVALID_INPUT, "panel and stances are mutually exclusive; set each seat's stance in the panel"
         )
-    return resolve_panel(app, name, overrides)
+    return app.panels.resolve(name, overrides)

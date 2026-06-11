@@ -38,7 +38,7 @@ services (orchestration)      services/   delegation, consensus, jobs, roles
         |
 adapters (CLIAdapter impls)   adapters/   one per CLI, plus a config-driven generic adapter
         |
-runtime                       runtime/    ProcessRunner, platform/WSL detection, path translation
+runtime                       runtime/    ProcessRunner, platform/WSL detection
         |
 domain + config               domain/, config/, io/   models, enums, errors, error codes, config
 ```

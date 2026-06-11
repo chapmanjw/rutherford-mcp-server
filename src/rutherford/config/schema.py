@@ -57,6 +57,8 @@ class GenericAdapterConfig(BaseModel):
     version_args: list[str] = Field(default_factory=lambda: ["--version"])
     static_models: list[str] = Field(default_factory=list)
     auth_env: list[str] = Field(default_factory=list)
+    #: Where the binary runs. Only ``native`` is accepted: Rutherford launches CLIs natively and
+    #: performs no path translation, so a WSL-runtime CLI is not supported via the generic adapter.
     runtime: Runtime = Runtime.NATIVE
     #: The model vendor this generic CLI fronts (e.g. ``"openai"``, ``"local"``), surfaced as the
     #: provenance ``provider`` (F3). ``None`` leaves the provider to a model-name heuristic, then
@@ -83,6 +85,22 @@ class GenericAdapterConfig(BaseModel):
                 f"generic adapter {self.id!r}: safety.read_only is empty, so read_only mode would apply "
                 "no restriction. Configure the CLI's read-only/sandbox flags in safety.read_only, or set "
                 "natively_read_only = true to declare the CLI cannot write or execute by default."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_runtime(self) -> GenericAdapterConfig:
+        """Reject a non-native ``runtime`` for a generic adapter.
+
+        Rutherford launches CLIs natively; nothing in the runner translates paths or wraps the
+        invocation for another runtime, so accepting ``wsl_interop`` here would silently hand a
+        Linux binary Windows paths. The :class:`~rutherford.domain.enums.Runtime` enum keeps its
+        ``WSL_INTEROP`` member for capability reporting; only this config knob is restricted.
+        """
+        if self.runtime is not Runtime.NATIVE:
+            raise ValueError(
+                f"generic adapter {self.id!r}: runtime={self.runtime.value} is not supported; Rutherford "
+                "launches CLIs natively, so a WSL-runtime CLI cannot be driven by the generic adapter"
             )
         return self
 

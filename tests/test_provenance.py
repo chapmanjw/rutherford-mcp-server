@@ -257,13 +257,24 @@ def test_goose_without_env_uses_model_heuristic() -> None:
     assert prov.confirmed is False
 
 
-def test_goose_serving_platform_env_goes_to_backend_axis(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("env_value", "expected_backend", "model", "expected_provider"),
+    [
+        ("bedrock", "bedrock", "claude-sonnet-4", "anthropic"),
+        ("aws_bedrock", "bedrock", "claude-sonnet-4", "anthropic"),  # Goose's snake-case bedrock id
+        ("azure_openai", "azure", "gpt-5", "openai"),  # Goose's real Azure provider id is snake-case
+    ],
+)
+def test_goose_serving_platform_env_goes_to_backend_axis(
+    monkeypatch: pytest.MonkeyPatch, env_value: str, expected_backend: str, model: str, expected_provider: str
+) -> None:
     # GOOSE_PROVIDER values include serving platforms (bedrock, databricks, azure); those are the
-    # backend, with the vendor inferred from the model -- not a confident "bedrock" provider.
-    monkeypatch.setenv("GOOSE_PROVIDER", "bedrock")
-    prov = GooseAdapter(FakeProbe()).provenance(_ctx("goose", "claude-sonnet-4"))
-    assert prov.backend == "bedrock"
-    assert prov.provider == "anthropic"  # inferred from the model id
+    # backend, with the vendor inferred from the model -- not a confirmed model VENDOR (which would
+    # inflate the panel's distinct-provider diversity).
+    monkeypatch.setenv("GOOSE_PROVIDER", env_value)
+    prov = GooseAdapter(FakeProbe()).provenance(_ctx("goose", model))
+    assert prov.backend == expected_backend
+    assert prov.provider == expected_provider  # inferred from the model id
     assert prov.confirmed is False
 
 

@@ -116,6 +116,7 @@ def infer_provider_from_model(model: str | None) -> str | None:
 _BACKEND_ALIASES: dict[str, str] = {
     # cloud model platforms
     "amazon-bedrock": "bedrock",
+    "aws_bedrock": "bedrock",
     "bedrock": "bedrock",
     "google-vertex": "vertex",
     "vertex": "vertex",
@@ -123,6 +124,7 @@ _BACKEND_ALIASES: dict[str, str] = {
     "vertex_ai": "vertex",
     "azure": "azure",
     "azure-openai": "azure",
+    "azure_openai": "azure",
     "databricks": "databricks",
     "sagemaker": "sagemaker",
     "sagemaker_tgi": "sagemaker",

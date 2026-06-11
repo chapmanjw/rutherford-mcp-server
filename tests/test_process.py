@@ -96,6 +96,33 @@ async def test_timeout_kills_the_whole_process_tree(tmp_path: Path) -> None:
     _assert_eventually_dead(child_pid)  # the grandchild is the part a naive kill leaves orphaned
 
 
+async def test_a_raising_on_progress_callback_kills_the_tree_and_reraises(tmp_path: Path) -> None:
+    # Regression (F2): only timeout/cancellation used to trigger the tree kill; any other exception
+    # escaping the wait -- here a raising on_progress callback -- leaked a live child tree. The
+    # catch-all cleanup must kill the whole tree AND re-raise the original exception.
+    tree_with_progress = """
+import subprocess, sys, time, os
+from pathlib import Path
+out = Path({outdir!r})
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+(out / "parent.pid").write_text(str(os.getpid()))
+(out / "child.pid").write_text(str(child.pid))
+sys.stderr.write("tick\\n")
+sys.stderr.flush()
+time.sleep(60)
+"""
+    runner = AsyncProcessRunner()
+
+    def explode(_line: str) -> None:
+        raise RuntimeError("progress callback exploded")
+
+    with pytest.raises(RuntimeError, match="progress callback exploded"):
+        await runner.run(_spec(tree_with_progress.format(outdir=str(tmp_path))), timeout_s=60, on_progress=explode)
+    parent_pid, child_pid = _wait_for_pid_files(tmp_path)
+    _assert_eventually_dead(parent_pid)
+    _assert_eventually_dead(child_pid)
+
+
 async def test_cancellation_kills_the_tree_and_reraises(tmp_path: Path) -> None:
     # The other half of the contract: cancelling an in-flight run (an aborted consensus/debate)
     # kills the tree AND re-raises CancelledError -- swallowing it would corrupt task semantics.

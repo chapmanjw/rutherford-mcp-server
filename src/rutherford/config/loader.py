@@ -44,7 +44,9 @@ def _read_toml(path: Path) -> dict[str, Any]:
     try:
         with path.open("rb") as handle:
             return tomllib.load(handle)
-    except tomllib.TOMLDecodeError as exc:
+    # UnicodeDecodeError: a non-UTF-8 file, e.g. the UTF-16 that Windows PowerShell 5.1
+    # redirection writes by default -- a malformed config, not an internal crash.
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise ConfigError(f"could not parse config at {path}: {exc}") from exc
     except OSError as exc:
         raise ConfigError(f"could not read config at {path}: {exc}") from exc

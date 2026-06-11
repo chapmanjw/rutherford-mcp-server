@@ -236,6 +236,35 @@ def test_parse_turn_failed_golden() -> None:
     assert "rate limit" in result.error.message.lower()
 
 
+def test_parse_transient_error_then_completed_turn_is_success_golden() -> None:
+    # A transient `error` event the CLI retried past must not latch a stale failure onto a run
+    # whose turn then completed cleanly: turn.completed is the terminal verdict.
+    raw = ProcessResult(exit_code=0, stdout=_sample("transient_error_retry.jsonl"), duration_s=3.1)
+    result = CodexAdapter().parse_output(raw, _ctx())
+    assert result.ok
+    assert result.text == "The capital of France is Paris."
+    assert result.cost is not None
+    assert result.cost.input_tokens == 900
+
+
+def test_parse_nonzero_exit_turn_failed_with_interim_narration_is_failure() -> None:
+    # The inverse latch: a turn.failed run whose stream carried interim narration (parsed as an
+    # agent message) must not read as success on a non-zero exit; the in-band failure wins.
+    stdout = "\n".join(
+        [
+            '{"type":"thread.started","thread_id":"th-x"}',
+            '{"type":"item.completed","item":{"type":"agent_message","text":"working on it..."}}',
+            '{"type":"turn.failed","error":{"message":"model returned an error: rate limit exceeded"}}',
+        ]
+    )
+    raw = ProcessResult(exit_code=1, stdout=stdout, stderr="", duration_s=1.0)
+    result = CodexAdapter().parse_output(raw, _ctx())
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "NONZERO_EXIT"
+    assert "rate limit" in result.error.message.lower()
+
+
 def test_parse_nonzero_exit_golden() -> None:
     raw = ProcessResult(exit_code=1, stdout="", stderr="error: not authenticated", duration_s=0.4)
     result = CodexAdapter().parse_output(raw, _ctx())
@@ -243,14 +272,6 @@ def test_parse_nonzero_exit_golden() -> None:
     assert result.error is not None
     assert result.error.code == "NONZERO_EXIT"
     assert "authenticated" in result.error.message
-
-
-def test_parse_timeout() -> None:
-    raw = ProcessResult(exit_code=None, timed_out=True, duration_s=300.0)
-    result = CodexAdapter().parse_output(raw, _ctx())
-    assert not result.ok
-    assert result.error is not None
-    assert result.error.code == "TIMEOUT"
 
 
 def test_parse_no_agent_message_is_parse_error() -> None:
@@ -384,22 +405,6 @@ async def test_delegate_codex_fresh_session_is_unchanged() -> None:
 
 
 # --- detect / check_auth / available_models ----------------------------------
-
-
-def test_detect_when_installed() -> None:
-    probe = FakeProbe(
-        which_map={"codex": "/usr/bin/codex"},
-        run_fn=lambda argv: ProcessResult(exit_code=0, stdout="codex-cli 0.135.0"),
-    )
-    result = CodexAdapter(probe=probe).detect()
-    assert result.installed
-    assert result.path == "/usr/bin/codex"
-    assert result.version == "codex-cli 0.135.0"
-
-
-def test_detect_when_absent() -> None:
-    adapter = CodexAdapter(probe=FakeProbe(which_map={}))
-    assert not adapter.detect().installed
 
 
 def test_check_auth_with_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

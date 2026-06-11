@@ -17,7 +17,8 @@ the cost readers differed only in key names). This module factors that plumbing 
   text adapters (Goose, Kiro, Ollama, LM Studio) collapse to a few lines of configuration each,
   with their genuine differences expressed as constructor arguments, not forked code.
 * **A shared finalizer** (:func:`finalize_answer`) for the event-stream adapters whose
-  event-walking is genuinely bespoke (Codex, Qwen) but whose success/failure decision is not.
+  event-walking is genuinely bespoke (Codex, Qwen, OpenCode) but whose success/failure decision
+  is not.
 
 The intent is composition over inheritance: an adapter selects a strategy or assembles utilities,
 rather than overriding hook methods on a base class. Adapters whose output is genuinely one of a
@@ -28,10 +29,11 @@ and still draw on the utilities here.
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
+
+from pydantic import ValidationError
 
 from ..domain.error_codes import ErrorCode
 from ..domain.models import Cost, DelegationResult, InvocationContext, ProcessResult
@@ -52,7 +54,6 @@ __all__ = [
     "parse_jsonl",
     "render_terminal",
     "str_field",
-    "strip_leading_reasoning",
     "strip_terminal_noise",
 ]
 
@@ -83,7 +84,9 @@ def parse_jsonl(stdout: str) -> list[dict[str, Any]]:
             continue
         try:
             parsed = json.loads(candidate)
-        except json.JSONDecodeError:
+        # RecursionError: a ~1000-deep bracket run overflows json's recursive parser before it can
+        # report a decode error; the never-raises contract treats it as just another bad line.
+        except (json.JSONDecodeError, RecursionError):
             continue
         if isinstance(parsed, dict):
             events.append(parsed)
@@ -102,7 +105,7 @@ def parse_json_array(stdout: str) -> list[dict[str, Any]] | None:
         return None
     try:
         parsed = json.loads(candidate)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(parsed, list):
         return None
@@ -195,7 +198,13 @@ def extract_cost(container: Any, spec: CostSpec) -> Cost | None:
     total_tokens = _first_present(tokens, spec.total_keys)
     if usd is None and input_tokens is None and output_tokens is None and total_tokens is None:
         return None
-    return Cost(usd=usd, input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens)
+    # Raw CLI JSON flows in here; a non-numeric figure (a literal "n/a" cost) must degrade to
+    # cost=None rather than sink a good answer as a PARSE_ERROR. Catching ValidationError instead
+    # of isinstance-checking keeps pydantic's numeric-string coercion working.
+    try:
+        return Cost(usd=usd, input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens)
+    except ValidationError:
+        return None
 
 
 def _first_present(tokens: Mapping[str, Any], keys: tuple[str, ...]) -> Any:
@@ -227,15 +236,6 @@ def render_terminal(stdout: str) -> str:
     """
     text = strip_ansi(stdout).replace("\r\n", "\n")
     return "\n".join(line.rsplit("\r", 1)[-1] for line in text.split("\n"))
-
-
-def strip_leading_reasoning(text: str, pattern: re.Pattern[str]) -> str:
-    """Remove a single leading reasoning block matched by ``pattern`` (anchored at the start).
-
-    ``pattern`` is expected to be anchored to ``\\A`` so only a *leading* block is removed; a
-    matching tag that appears later in the answer (an example, a quoted tag) is left intact.
-    """
-    return pattern.sub("", text)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -389,12 +389,15 @@ def finalize_answer(
 ) -> DelegationResult:
     """Turn an extracted answer (plus optional session/cost/failure) into the normalized result.
 
-    The event-stream adapters (Codex, Qwen) walk genuinely different event shapes, but once they
-    have an ``answer`` and an optional in-band ``failure`` the success/failure decision is the same:
+    The event-stream adapters (Codex, Qwen, OpenCode) walk genuinely different event shapes, but
+    once they have an ``answer`` and an optional in-band ``failure`` the success/failure decision
+    is the same:
 
-    * non-zero exit with an answer present -- the answer is still the result (a CLI can exit non-zero
-      on a sandbox denial yet have produced a valid answer).
-    * non-zero exit with no answer -- ``NONZERO_EXIT`` surfacing stderr (``failure`` as the body).
+    * non-zero exit with an in-band ``failure`` -- ``NONZERO_EXIT`` with ``failure`` as the body:
+      the walker saw the run fail, so interim narration parsed as an answer must not read as success.
+    * non-zero exit with an answer and no failure -- the answer is still the result (a CLI can exit
+      non-zero on a sandbox denial yet have produced a valid answer).
+    * non-zero exit with neither -- ``NONZERO_EXIT`` surfacing stderr.
     * clean exit with an in-band ``failure`` -- ``NONZERO_EXIT`` carrying that message.
     * clean exit with no answer at all -- ``PARSE_ERROR`` (``no_output_message``).
     * otherwise -- success.
@@ -403,9 +406,11 @@ def finalize_answer(
     produced), matching the hand-written walkers.
     """
     if raw.exit_code != 0:
+        if failure is not None:
+            return nonzero_result(ctx, raw, text=failure)
         if answer is not None:
             return success_result(ctx, raw, answer, session_id=session_id, cost=cost)
-        return nonzero_result(ctx, raw, text=failure or "")
+        return nonzero_result(ctx, raw)
     if failure is not None:
         return error_result(ctx, raw, ErrorCode.NONZERO_EXIT, failure, text=answer or "")
     if answer is None:

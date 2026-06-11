@@ -70,23 +70,17 @@ class FakeProcessRunner:
     """A :class:`~rutherford.runtime.process.ProcessRunner` that returns canned results.
 
     Records every ``(spec, timeout_s)`` it is asked to run, so a test can assert the argv,
-    env (including ``RUTHERFORD_DEPTH``), cwd, and stdin an adapter produced. With ``results``
-    set, successive calls return successive results (for consensus fan-out).
+    env (including ``RUTHERFORD_DEPTH``), cwd, and stdin an adapter produced. ``run_fn`` decides
+    the outcome from the spec; ``result`` is a fixed outcome for every call.
     """
 
     def __init__(
         self,
         result: ProcessResult | None = None,
-        results: Sequence[ProcessResult] | None = None,
         run_fn: Callable[[InvocationSpec], ProcessResult] | None = None,
-        *,
-        cycle: bool = False,
     ) -> None:
         self._result = result
-        self._results = list(results) if results is not None else None
         self._run_fn = run_fn
-        self._cycle = cycle
-        self._index = 0
         self.calls: list[tuple[InvocationSpec, float]] = []
         self.progress: list[str] = []
 
@@ -104,18 +98,6 @@ class FakeProcessRunner:
             # argv-aware: lets a test decide the outcome from the model/cli in the spec, which is
             # how the per-target model-fallback path is exercised.
             return self._run_fn(spec)
-        if self._results is not None:
-            # Exhausting the canned list is an ERROR unless cycling was explicitly requested: an
-            # extra subprocess call (a fan-out or fallback regression) must fail the test loudly,
-            # not silently re-serve an earlier outcome.
-            if self._index >= len(self._results) and not self._cycle:
-                raise AssertionError(
-                    f"FakeProcessRunner exhausted its {len(self._results)} canned result(s) on call "
-                    f"#{self._index + 1}; pass cycle=True if re-serving results is intended"
-                )
-            result = self._results[self._index % len(self._results)]
-            self._index += 1
-            return result
         return self._result or ProcessResult(exit_code=0, stdout="ok", stderr="")
 
 
@@ -222,7 +204,6 @@ def make_app(
     runner: FakeProcessRunner | None = None,
     config: RutherfordConfig | None = None,
     panels: PanelCache | None = None,
-    base_depth: int = 0,
 ) -> AppContext:
     """Build an :class:`AppContext` wired to fakes, with no disk or subprocess access.
 
@@ -236,5 +217,7 @@ def make_app(
         runner=runner or FakeProcessRunner(),
         registry=registry,
         panels=panels,
-        base_depth=base_depth,
+        # Pinned explicitly: omitting base_depth would fall back to current_depth(), making these
+        # hermetic fakes sensitive to RUTHERFORD_DEPTH in the developer's environment.
+        base_depth=0,
     )

@@ -4,13 +4,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 
 from ..context import AppContext, tool_success
+from ..services.probing import probe_all
 from ..services.setup import apply_setup_plan, build_setup_plan
 from .common import parse_safety_mode
-from .probing import probe_adapter
 
 
 async def setup_tool(
@@ -33,7 +32,7 @@ async def setup_tool(
     # INVALID_INPUT here -- never written into config.toml, where it would fail enum validation on
     # the next load_config() and stop the server from starting.
     validated_mode = parse_safety_mode(safety_mode)
-    statuses = await asyncio.gather(*(asyncio.to_thread(probe_adapter, adapter) for adapter in app.registry.all()))
+    statuses = await probe_all(app.registry)
     plan = build_setup_plan(
         statuses,
         env=os.environ,

@@ -25,6 +25,7 @@ from .domain.error_codes import ErrorCode
 from .domain.errors import ConfigError, RutherfordError
 from .domain.models import Target
 from .runtime.logging import configure_logging
+from .services.probing import probe_adapter
 from .services.setup import apply_setup_plan, build_setup_plan, format_plan_summary
 from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
@@ -33,7 +34,6 @@ from .tools.delegate import delegate_tool
 from .tools.jobs import cancel_job_tool, job_result_tool, job_status_tool, list_jobs_tool
 from .tools.panels import reload_panels_tool
 from .tools.plan import plan_tool
-from .tools.probing import probe_adapter
 from .tools.review import review_tool
 from .tools.roles import list_roles_tool
 from .tools.setup import setup_tool
@@ -148,7 +148,7 @@ async def consensus(
     files: list[str] | None = None,
     role: str | None = None,
     safety_mode: str | None = None,
-    synthesize: bool = False,
+    synthesize: bool | None = None,
     timeout_s: float | None = None,
     mode: str = "sync",
     include_raw: bool = False,
@@ -162,7 +162,8 @@ async def consensus(
     a saved `panel` (with optional `panel_overrides`) instead of `targets`; the two are mutually
     exclusive. Optional `stances` (parallel to `targets`) steer each voice: for | against | neutral,
     and cannot be combined with the auto-expanded panel. `synthesize=true` adds a server-side combined
-    answer (off by default). A `strategy` (`all-voices` | `unanimous` | `majority` | `plurality` |
+    answer; when omitted it defaults to the configured `synthesize_default` (false out of the box).
+    A `strategy` (`all-voices` | `unanimous` | `majority` | `plurality` |
     `weighted` | `parity-pair`), optionally with a `verdict_schema`, aggregates the voices into an
     `outcome` instead of returning them individually. Optional `judge` names a target (ideally a
     non-participant) that writes the synthesis or closing instead of the first voice; recorded as
@@ -269,20 +270,21 @@ async def cancel_job(job_id: str) -> str:
 
 @mcp.tool
 async def review(
-    targets: list[Target] | None = None,
+    targets: list[Target | str] | None = None,
     panel: str | None = None,
     panel_overrides: dict[str, Any] | None = None,
     paths: list[str] | None = None,
     diff: str | None = None,
     role: str = "codereviewer",
     working_dir: str | None = None,
-    synthesize: bool = False,
+    synthesize: bool | None = None,
     timeout_s: float | None = None,
 ) -> str:
     """Review a diff or a set of files across one or more targets (read-only). Provide diff or paths.
 
-    Name a list of `targets` or a saved `panel` (with optional `panel_overrides`); they are mutually
-    exclusive.
+    `targets` is a list of `{cli, model}` objects (or `cli` / `cli:model` strings). Name a list of
+    `targets` or a saved `panel` (with optional `panel_overrides`); they are mutually exclusive.
+    `synthesize` defaults to the configured `synthesize_default` (false out of the box).
     """
     return await _guarded(
         review_tool(

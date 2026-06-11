@@ -14,6 +14,7 @@ from rutherford.config.schema import AdapterConfig, RutherfordConfig
 from rutherford.domain.enums import SafetyMode
 from rutherford.domain.models import DelegationRequest, InvocationContext, InvocationSpec, ProcessResult, Target
 from rutherford.runtime.depth import ENV_DEPTH
+from rutherford.runtime.platform import OSFamily, PlatformInfo
 from rutherford.services.delegation import DelegationService
 from rutherford.services.roles import load_roles
 from tests.fakes import FakeAdapter, FakeProbe, FakeProcessRunner
@@ -23,12 +24,14 @@ def _service(
     adapters: Sequence[CLIAdapter],
     runner: FakeProcessRunner,
     config: RutherfordConfig | None = None,
+    platform: PlatformInfo | None = None,
 ) -> DelegationService:
     return DelegationService(
         AdapterRegistry(list(adapters)),
         runner,
         config or RutherfordConfig(),
         load_roles(),
+        platform=platform,
     )
 
 
@@ -493,3 +496,73 @@ async def test_fallback_chain_records_the_effective_post_model_fallback_target()
     assert result.ok
     assert result.target.cli == "b"
     assert result.fallback_chain == ["cursorish:auto"]  # the effective failed target, post model-fallback
+
+
+async def test_fallback_chain_is_capped_at_max_targets() -> None:
+    # The documented cap: a fallback list longer than max_targets is sliced, so a long chain cannot
+    # fan out unbounded. With max_targets=2, only the first two alternates run; d is never tried.
+    calls: list[str] = []
+
+    def run_fn(spec: InvocationSpec) -> ProcessResult:
+        calls.append(spec.argv[0])
+        return ProcessResult(exit_code=1, stderr="rate limit exceeded")  # retryable everywhere
+
+    runner = FakeProcessRunner(run_fn=run_fn)
+    config = RutherfordConfig(max_targets=2, cooldown_threshold=10)  # threshold high so nothing benches
+    adapters = [FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c"), FakeAdapter("d")]
+    result = await _service(adapters, runner, config).delegate(
+        _req("a", fallback=[Target(cli="b"), Target(cli="c"), Target(cli="d")]),
+    )
+    assert not result.ok
+    assert calls == ["a", "b", "c"]  # the primary plus at most max_targets alternates
+
+
+async def test_fallback_alternate_does_not_inherit_the_primary_session_id() -> None:
+    # A different CLI's resume token does not transfer: the alternate must be built with
+    # session_id=None, not the primary's token.
+    seen: dict[str, str | None] = {}
+
+    class _CapturingAdapter(FakeAdapter):
+        def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
+            seen[self.id] = ctx.session_id
+            return super().build_invocation(req, ctx)
+
+    def run_fn(spec: InvocationSpec) -> ProcessResult:
+        if spec.argv[0] == "a":
+            return ProcessResult(exit_code=1, stderr="rate limit exceeded")  # retryable, triggers fallback
+        return ProcessResult(exit_code=0, stdout="answer from b")
+
+    runner = FakeProcessRunner(run_fn=run_fn)
+    service = _service([_CapturingAdapter("a"), _CapturingAdapter("b")], runner)
+    result = await service.delegate(_req("a", session_id="resume-abc", fallback=[Target(cli="b")]))
+    assert result.ok
+    assert seen["a"] == "resume-abc"  # the primary carried the caller's token
+    assert seen["b"] is None  # the alternate saw it stripped
+
+
+# --- Windows command-line length preflight --------------------------------------------------------
+
+
+async def test_windows_oversized_argv_prompt_is_refused_as_context_overflow() -> None:
+    # On Windows an argv-borne prompt past the ~32K CreateProcessW cap is refused up front as
+    # CONTEXT_OVERFLOW (retryable, not unhealthy) instead of surfacing as an opaque SPAWN_FAILED
+    # that would wrongly bench the seat. FakeAdapter puts the prompt in argv with stdin=None.
+    runner = FakeProcessRunner()
+    windows = PlatformInfo(os_family=OSFamily.WINDOWS, is_wsl=False)
+    service = _service([FakeAdapter("fake")], runner, platform=windows)
+    result = await service.delegate(_req(prompt="x" * 31_000))
+    assert not result.ok
+    assert result.error is not None
+    assert result.error.code == "CONTEXT_OVERFLOW"
+    assert "32K" in result.error.message and "stdin" in result.error.message
+    assert runner.calls == []  # refused before any subprocess
+    assert not service.is_benched("fake")  # the seat is not benched for a prompt-sized problem
+
+
+async def test_oversized_argv_prompt_passes_through_off_windows() -> None:
+    # The same spec on a non-Windows platform has no command-line cap and runs normally.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    linux = PlatformInfo(os_family=OSFamily.LINUX, is_wsl=False)
+    result = await _service([FakeAdapter("fake")], runner, platform=linux).delegate(_req(prompt="x" * 31_000))
+    assert result.ok
+    assert len(runner.calls) == 1

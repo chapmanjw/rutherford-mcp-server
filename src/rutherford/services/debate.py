@@ -34,7 +34,7 @@ from ..domain.models import (
 )
 from ..runtime.depth import ensure_within_target_cap
 from .delegation import DelegationService, ProgressCallback
-from .strategies import effective_diversity
+from .strategies import apply_stance, effective_diversity
 
 
 @dataclass(frozen=True)
@@ -187,7 +187,6 @@ class DebateService:
                 safety_mode=req.safety_mode,
                 timeout_s=req.timeout_s,
                 include_raw=req.include_raw,
-                depth=base_depth,
             )
             result = await self._delegation.delegate(
                 request,
@@ -219,7 +218,7 @@ class DebateService:
     def _round_prompt(self, req: DebateRequest, voice: _Voice, previous: DebateRound | None) -> str:
         """Build the prompt for ``voice`` this round: a fresh answer, or a rebuttal of the others."""
         if previous is None:
-            return _apply_stance(req.prompt, voice.stance)
+            return apply_stance(req.prompt, voice.stance)
         own = _latest_text(previous, voice.seat_id)
         others = [
             (contribution.label, contribution.text)
@@ -266,7 +265,6 @@ class DebateService:
             working_dir=req.working_dir,
             safety_mode=SafetyMode.READ_ONLY,
             timeout_s=req.timeout_s,
-            depth=base_depth + 1,
         )
         result = await self._delegation.delegate(
             synth_request,
@@ -345,15 +343,6 @@ def _rebuttal_prompt(
     elif stance is Stance.AGAINST:
         parts.append("Keep arguing against the proposition.")
     return "\n\n".join(parts)
-
-
-def _apply_stance(prompt: str, stance: Stance | None) -> str:
-    """Wrap the round-one prompt to steer a voice for or against the proposition."""
-    if stance is None or stance is Stance.NEUTRAL:
-        return prompt
-    if stance is Stance.FOR:
-        return f"Argue in favor of the following proposition, making the strongest case for it:\n\n{prompt}"
-    return f"Argue against the following proposition, making the strongest case against it:\n\n{prompt}"
 
 
 def _announce(on_progress: ProgressCallback | None, message: str) -> None:

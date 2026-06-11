@@ -25,6 +25,29 @@ All notable changes to this project are documented in this file. The format is b
   `false`). This lifts the ~32K Windows command-line ceiling on long prompts and survives the
   npm `.cmd`-shim newline truncation.
 
+### Changed
+
+- On Windows, a delegation whose composed prompt would exceed the ~32K command-line limit on an
+  argv-transport CLI is refused up front as a retryable `CONTEXT_OVERFLOW` (advising a stdin-transport
+  CLI or a shorter prompt) instead of failing opaquely as `SPAWN_FAILED` -- which, being an unhealthy
+  code, also wrongly benched the adapter.
+- `synthesize` on `consensus` and `review` is now tri-state: omitted defers to the configured
+  `synthesize_default` (off out of the box), and an explicit `synthesize=false` overrides a
+  `synthesize_default=true` that previously could not be turned off per call. `debate` is unchanged.
+- The `review` tool accepts `cli` / `cli:model` target strings over MCP, matching `debate` (its body
+  already handled them; only the wrapper signature had rejected them).
+- An auto-expanded (`expand_all`) consensus panel probes its adapters concurrently instead of one at a
+  time, so assembly no longer pays each probe latency in series and one hung CLI shim cannot stall the
+  others; membership, skip ordering, and the `max_targets` cap are unchanged.
+- A saved panel's `strategy` is validated as the typed `Strategy` enum, so `panel_overrides` naming an
+  unknown strategy now fail as `PANEL_INVALID` at resolution instead of sailing through to a
+  context-free error at the call.
+- LM Studio and Ollama advertise prompt-style file context, and Ollama folds in-scope files into the
+  prompt instead of silently dropping them.
+- Adapter probing and diagnosis moved out of the MCP tool layer into a service (`services/probing.py`)
+  behind a single shared fan-out, keeping the tool layer thin; the capabilities/doctor output is
+  unchanged except as noted under Removed.
+
 ### Fixed
 
 - The process runner no longer deadlocks when a CLI fills its output pipes before consuming a large
@@ -58,6 +81,70 @@ All notable changes to this project are documented in this file. The format is b
   probe cache keys results by effective timeout (a short-budget `timed_out` verdict is never served
   to a longer-budget call), and the short OpenAI model families (o1/o3/o4) are matched as whole
   tokens so an unrelated segment cannot mis-infer the provider.
+- An adapter's `detect()` probe ran synchronously inside the async delegation path, so a probe-cache
+  miss (cold start or past the TTL) blocked the event loop -- stalling every concurrent job, consensus
+  voice, and progress stream -- until it returned; it now runs in a worker thread like every other
+  probe call site.
+- An exception other than a timeout or cancellation escaping the subprocess wait (an `OSError` from
+  the stdin feed, a raising progress callback) left the child process alive and untracked; the runner
+  now kills the whole process tree on any such escape before re-raising.
+- Antigravity could return the previous turn's answer as the current run's result on a resumed
+  conversation: the transcript scan was whole-file, so a new turn that produced no fresh answer
+  surfaced the stale one, and prior history disabled the schema-drift canary. The scan is now scoped to
+  events after the last user input, so a resume with no new answer fails as `TRANSCRIPT_NOT_FOUND` and
+  the `CONTRACT_MISMATCH` canary fires again.
+- Codex misreported two real event streams: a transient `error` event (a retried stream hiccup)
+  latched a failure past a successful `turn.completed`, and on a non-zero exit any interim agent
+  narration was treated as the answer even when the turn actually failed. The terminal `turn.completed`
+  now clears a recovered error, and a non-zero exit carrying a failure is reported as a failure.
+- OpenCode collapsed a legitimate delta stream to a single chunk whenever its longest chunk repeated
+  anywhere in the stream; the snapshot-vs-delta resolution now uses a prefix rule, so a delta stream
+  with a repeated line concatenates in full while a cumulative-snapshot stream (including a repeated
+  final snapshot) still resolves to the latest snapshot. OpenCode's success/failure decision is also
+  unified with the shared finalizer: a non-zero exit that still produced an answer is a success
+  (matching Codex), and the full answer is no longer copied uncapped into the error message.
+- Qwen's role preamble was passed as an argv element, which the Windows npm `.cmd` shim truncated at
+  the first newline -- silently dropping the rest of the preamble and the `--add-dir`/`-r` arguments
+  after it. The preamble now folds into the stdin prompt (`supports_system_prompt` is `false`), and the
+  error `subtype` is read with the same string-coercing reader as the result field (a dict subtype
+  could previously reach the user-facing message).
+- A `RutherfordError` raised inside an async (`mode="async"`) job body was flattened to `INTERNAL`,
+  dropping its specific code and details; the async path now preserves the code/message/details like
+  the synchronous path, so an `INVALID_INPUT` stays `INVALID_INPUT`. Separately, `job_result` on a
+  cancelled job returned the literal payload `null` and now returns a structured cancelled notice.
+- A degenerate deeply-nested bracket run in a model's answer raised `RecursionError` (not
+  `JSONDecodeError`) out of the JSON scanners, crashing consensus aggregation; the scanners now treat
+  it as unparseable, honoring their never-raises contract. A malformed cost figure (a non-numeric
+  token) likewise raised a validation error that sank an otherwise-good answer as `PARSE_ERROR`; cost
+  extraction now degrades to no-cost while preserving the answer.
+- The generic adapter's text mode reported empty stdout as a successful empty voice and skipped ANSI
+  stripping; empty output is now a `PARSE_ERROR` and terminal noise is stripped, matching the shared
+  text parser.
+- A non-UTF-8 config or panels file (e.g. UTF-16 from PowerShell redirection) crashed with a raw
+  `UnicodeDecodeError` instead of the structured `ConfigError` / `PANEL_INVALID`.
+- Goose's snake-case serving-platform ids (`azure_openai`, `aws_bedrock`) are classed as serving
+  backends, not model vendors, so they no longer inflate a panel's distinct-provider diversity count;
+  and Codex's `doctor --json` auth parse falls back to the robust embedded-object scanner instead of a
+  brace slice, so brace-bearing log noise no longer downgrades a Bedrock login to `NEEDS_LOGIN`.
+
+### Removed
+
+- The dead WSL path-translation layer (`runtime/paths.py` and `InvocationSpec.runtime`): it had no
+  production caller and the process runner never consumed it, while the docs falsely claimed automatic
+  translation. A config-defined generic adapter that sets a non-native `runtime` now fails at load with
+  that named, since Rutherford launches CLIs natively; the `Runtime` enum and the advertised
+  `capabilities.runtime` reporting are kept.
+- The always-empty `artifacts` field (and the `Artifact` model) from the `DelegationResult` envelope:
+  no adapter ever populated it, so a client reading it as "files changed" was always misled. The wire
+  shape narrows accordingly. The duplicated top-level `runtime` field is likewise dropped from the
+  capabilities/doctor adapter payload (the value remains under `capabilities.runtime`).
+- The unreachable `UNSUPPORTED_SAFETY_MODE` error code and the unused `ALL_ERROR_CODES` /
+  `is_error_code` helpers; `AUTH_REQUIRED` is kept and documented as reserved (pre-run auth gaps
+  surface as panel skip reasons, mid-run rejections as `AUTH_FAILED`).
+- Dead write-only `depth` fields on the request/context models and `InvocationContext.transcript_dir`
+  (depth enforcement uses the `base_depth` parameter and `RUTHERFORD_DEPTH`), the single-consumer
+  `strip_leading_reasoning` parsing helper, and two never-called panel-store methods. No behavior
+  change.
 
 ### Added
 

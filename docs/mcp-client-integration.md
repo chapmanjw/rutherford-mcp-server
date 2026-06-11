@@ -114,8 +114,9 @@ client on the Windows host must reach a Rutherford installed in WSL, launch it t
 }
 ```
 
-Rutherford detects WSL and translates Windows and WSL paths when an adapter's runtime differs from
-the host, so a working directory passed from a Windows client is converted for a Linux CLI.
+Rutherford launches CLIs natively and does not translate paths between Windows and WSL forms, so
+keep Rutherford in the same environment as the CLIs it orchestrates and pass working directories
+in that environment's form (`/mnt/c/...` inside WSL, `C:\...` on the Windows host).
 
 ## Self-invocation
 

@@ -33,7 +33,6 @@ async def plan_tool(
         files=files or [],
         safety_mode=SafetyMode.READ_ONLY,
         timeout_s=timeout_s,
-        depth=app.base_depth,
     )
     result = await app.delegation.delegate(request, correlation_id=app.new_correlation_id(), base_depth=app.base_depth)
     return tool_success(result)

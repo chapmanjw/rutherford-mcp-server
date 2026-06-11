@@ -141,31 +141,7 @@ def test_parse_nonzero_exit_golden() -> None:
     assert "provider" in result.error.message.lower()
 
 
-def test_parse_timeout() -> None:
-    raw = ProcessResult(exit_code=None, timed_out=True, duration_s=300.0)
-    result = GooseAdapter().parse_output(raw, _ctx())
-    assert not result.ok
-    assert result.error is not None
-    assert result.error.code == "TIMEOUT"
-
-
 # --- detect / check_auth / available_models ----------------------------------
-
-
-def test_detect_when_installed() -> None:
-    probe = FakeProbe(
-        which_map={"goose": "/usr/bin/goose"},
-        run_fn=lambda argv: ProcessResult(exit_code=0, stdout="goose 1.0.0"),
-    )
-    result = GooseAdapter(probe=probe).detect()
-    assert result.installed
-    assert result.path == "/usr/bin/goose"
-    assert result.version == "goose 1.0.0"
-
-
-def test_detect_when_absent() -> None:
-    adapter = GooseAdapter(probe=FakeProbe(which_map={}))
-    assert not adapter.detect().installed
 
 
 def test_check_auth_with_provider_and_key(monkeypatch: pytest.MonkeyPatch) -> None:

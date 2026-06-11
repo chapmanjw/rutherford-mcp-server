@@ -19,9 +19,9 @@ class ErrorCode(StrEnum):
     #: The target CLI's binary is not installed or not on PATH.
     BINARY_NOT_FOUND = "BINARY_NOT_FOUND"
     #: The target CLI is installed but not authenticated, and cannot log in non-interactively.
+    #: Reserved (not currently raised): auth failures surface pre-run as panel skip reasons or
+    #: mid-run as AUTH_FAILED, but the code stays in the documented contract.
     AUTH_REQUIRED = "AUTH_REQUIRED"
-    #: The requested SafetyMode is not supported by the target adapter.
-    UNSUPPORTED_SAFETY_MODE = "UNSUPPORTED_SAFETY_MODE"
     #: A write or yolo delegation targeted a workspace that is not on the trusted allowlist.
     WORKSPACE_NOT_TRUSTED = "WORKSPACE_NOT_TRUSTED"
     #: A read_only or propose delegation mutated its git working tree, caught by the optional
@@ -78,12 +78,3 @@ class ErrorCode(StrEnum):
     PANEL_INVALID = "PANEL_INVALID"
     #: An unexpected internal error.
     INTERNAL = "INTERNAL"
-
-
-#: All known error codes, for membership tests.
-ALL_ERROR_CODES: frozenset[str] = frozenset(code.value for code in ErrorCode)
-
-
-def is_error_code(value: str) -> bool:
-    """Return whether ``value`` is a known :class:`ErrorCode`."""
-    return value in ALL_ERROR_CODES

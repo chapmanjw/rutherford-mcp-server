@@ -36,7 +36,7 @@ async def consensus_tool(
     files: list[str] | None = None,
     role: str | None = None,
     safety_mode: str | None = None,
-    synthesize: bool = False,
+    synthesize: bool | None = None,
     timeout_s: float | None = None,
     mode: str = "sync",
     include_raw: bool = False,
@@ -49,8 +49,9 @@ async def consensus_tool(
     explains any adapter left out. Alternatively name a saved ``panel`` (with optional one-off
     ``panel_overrides``) instead of ``targets``; the two are mutually exclusive. Optional ``stances``
     (parallel to ``targets``) steer each voice for/against/neutral and cannot be combined with the
-    auto-expanded panel. Optional ``synthesize`` adds a server-side combined answer; it is off by
-    default. With a ``strategy`` other than ``all-voices`` (optionally with a ``verdict_schema``), the
+    auto-expanded panel. Optional ``synthesize`` adds a server-side combined answer; when omitted it
+    defaults to the configured ``synthesize_default`` (false out of the box), and an explicit value
+    always wins. With a ``strategy`` other than ``all-voices`` (optionally with a ``verdict_schema``), the
     voices are aggregated into an outcome instead of returned individually.
     """
     target_objs: list[Target]
@@ -87,7 +88,6 @@ async def consensus_tool(
         synthesize=synthesize,
         timeout_s=timeout_s,
         include_raw=include_raw,
-        depth=app.base_depth,
         expand_all=expand_all,
         strategy=effective_strategy,
         verdict_schema=verdict_schema,

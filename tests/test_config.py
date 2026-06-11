@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from rutherford.config.loader import deep_merge, load_config
 from rutherford.config.schema import AdapterConfig, GenericAdapterConfig, GenericSafetyConfig, RutherfordConfig
-from rutherford.domain.enums import OutputMode, SafetyMode
+from rutherford.domain.enums import OutputMode, Runtime, SafetyMode
 from rutherford.domain.errors import ConfigError
 
 
@@ -64,6 +64,14 @@ def test_invalid_value_raises_config_error(tmp_path: Path) -> None:
 
 def test_bad_toml_raises_config_error(tmp_path: Path) -> None:
     (tmp_path / "rutherford.toml").write_text("this is not = = toml\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="could not parse"):
+        load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+
+
+def test_utf16_config_raises_config_error(tmp_path: Path) -> None:
+    # Windows PowerShell 5.1 redirection writes UTF-16 by default; such a file must surface as
+    # the structured ConfigError, not a raw UnicodeDecodeError.
+    (tmp_path / "rutherford.toml").write_text("max_depth = 5\n", encoding="utf-16")
     with pytest.raises(ConfigError, match="could not parse"):
         load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
 
@@ -173,6 +181,14 @@ def test_generic_adapter_rejects_unparseable_output_modes() -> None:
         json_text_path="result",
         natively_read_only=True,
     )
+
+
+def test_generic_adapter_rejects_a_non_native_runtime() -> None:
+    # Rutherford launches CLIs natively and nothing translates paths for another runtime, so a
+    # wsl_interop generic adapter would silently hand a Linux binary Windows paths.
+    with pytest.raises(ValidationError, match="runtime"):
+        GenericAdapterConfig(id="x", display_name="X", binary="x", runtime=Runtime.WSL_INTEROP, natively_read_only=True)
+    GenericAdapterConfig(id="x", display_name="X", binary="x", runtime=Runtime.NATIVE, natively_read_only=True)
 
 
 def test_generic_adapter_requires_a_read_only_posture() -> None:

@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from rutherford.config.panels import Panel, PanelCache, PanelStore, PanelTarget, load_panels
-from rutherford.domain.enums import Stance
+from rutherford.domain.enums import Stance, Strategy
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import ProcessResult
 from rutherford.io.serialize import encode
@@ -150,6 +150,20 @@ def test_malformed_toon_is_reported(tmp_path: Path) -> None:
     assert "could not read panels file" in _problems(info.value)[0]["error"]
 
 
+def test_utf16_panels_file_is_reported(tmp_path: Path) -> None:
+    # Windows PowerShell 5.1 redirection writes UTF-16 by default; the file must become one
+    # PANEL_INVALID problems entry, not a raw UnicodeDecodeError past the aggregator.
+    directory = tmp_path / "home" / ".rutherford"
+    directory.mkdir(parents=True)
+    (directory / "panels.toon").write_text(
+        encode({"panels": {"duo": {"targets": [{"cli": "codex"}]}}}), encoding="utf-16"
+    )
+    with pytest.raises(RutherfordError) as info:
+        load_panels(KNOWN, env=_env(tmp_path / "home"), cwd=tmp_path / "p")
+    assert info.value.code == "PANEL_INVALID"
+    assert "could not read panels file" in _problems(info.value)[0]["error"]
+
+
 def test_empty_targets_list_is_rejected(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write_panels(home / ".rutherford", {"empty": {"targets": []}})
@@ -225,6 +239,17 @@ def test_overrides_with_a_negative_weight_are_panel_invalid(tmp_path: Path) -> N
     assert info.value.code == "PANEL_INVALID"
 
 
+def test_overrides_with_an_unknown_strategy_are_panel_invalid(tmp_path: Path) -> None:
+    # F22: strategy is a typed Strategy on the Panel model, so panel_overrides revalidate it like
+    # every other field instead of letting an arbitrary string sail through to the consensus call.
+    home = tmp_path / "home"
+    _write_panels(home / ".rutherford", {"duo": {"targets": [{"cli": "codex"}, {"cli": "kiro"}]}})
+    cache = PanelCache(lambda: load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p"))
+    with pytest.raises(RutherfordError) as info:
+        cache.resolve("duo", {"strategy": "frobnicate"})
+    assert info.value.code == "PANEL_INVALID"
+
+
 # --- tool integration: panel= on consensus / debate / review ------------------------------------
 
 
@@ -287,7 +312,7 @@ async def test_panel_strategy_drives_a_parity_pair_escalation() -> None:
         {
             "roundtable": Panel(
                 name="roundtable",
-                strategy="parity-pair",
+                strategy=Strategy.PARITY_PAIR,
                 targets=[PanelTarget(cli="a", label="proposer"), PanelTarget(cli="b", label="dissenter", parity=True)],
             )
         }

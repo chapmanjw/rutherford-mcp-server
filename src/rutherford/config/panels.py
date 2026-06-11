@@ -69,10 +69,11 @@ class Panel(BaseModel):
 
     name: str
     description: str = ""
-    #: How a consensus over this panel is aggregated (``all-voices`` | ``unanimous`` | ``majority`` |
-    #: ``plurality`` | ``weighted`` | ``parity-pair``); a consensus call using this panel adopts it
-    #: unless overridden.
-    strategy: str = "all-voices"
+    #: How a consensus over this panel is aggregated; a consensus call using this panel adopts it
+    #: unless overridden. Typed as :class:`Strategy` (not a plain ``str``) so ``panel_overrides``,
+    #: which revalidate through this model, reject an unknown strategy like every other field;
+    #: the StrEnum keeps the wire string and ``model_dump`` round-trip intact.
+    strategy: Strategy = Strategy.ALL_VOICES
     targets: list[PanelTarget]
 
     def to_targets(self) -> list[Target]:
@@ -108,10 +109,6 @@ class PanelStore:
                 f"unknown panel {name!r}; available panels: {known}",
                 details={"panel": name, "available": self.names()},
             ) from None
-
-    def has(self, name: str) -> bool:
-        """Return whether a panel named ``name`` is loaded."""
-        return name in self._panels
 
     def names(self) -> list[str]:
         """Return the loaded panel names, sorted."""
@@ -150,10 +147,6 @@ class PanelCache:
     def names(self) -> list[str]:
         """The names of the loaded panels (loading on first use)."""
         return self.store().names()
-
-    def get(self, name: str) -> Panel:
-        """Look up a panel by name (loading on first use)."""
-        return self.store().get(name)
 
     def resolve(self, name: str, overrides: Mapping[str, Any] | None = None) -> Panel:
         """Look up a panel and apply optional one-off ``overrides`` (a shallow merge over its record)."""
@@ -201,7 +194,9 @@ def load_panels(
             continue
         try:
             raw = decode(path.read_text(encoding="utf-8"))
-        except (DecodeError, OSError) as exc:
+        # UnicodeDecodeError: a non-UTF-8 file (e.g. UTF-16 from Windows PowerShell 5.1
+        # redirection) is one more malformed-file problem, not a crash past the aggregator.
+        except (DecodeError, UnicodeDecodeError, OSError) as exc:
             problems.append({"path": str(path), "error": f"could not read panels file: {exc}"})
             continue
         section = raw.get("panels") if isinstance(raw, dict) else None
@@ -259,7 +254,9 @@ def _parse_panel(
     panel = Panel(
         name=name,
         description=str(record.get("description", "")),
-        strategy=str(record.get("strategy", "all-voices")),
+        # The membership check above already vetted the value, so pydantic's str -> Strategy
+        # coercion here cannot fail; an absent (or null) strategy takes the default.
+        strategy=record.get("strategy") or Strategy.ALL_VOICES,
         targets=[PanelTarget(**target) for target in clean_targets],
     )
     return panel, []

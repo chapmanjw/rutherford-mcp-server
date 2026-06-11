@@ -6,7 +6,7 @@ Every CLI implements :class:`CLIAdapter`; the core knows nothing else about any 
 carry the contract that keeps the design clean:
 
 * ``build_invocation`` is **pure** and returns an :class:`InvocationSpec` (an argv list, env,
-  cwd, and runtime hint). It never builds or returns a shell string.
+  cwd, and optional stdin). It never builds or returns a shell string.
 * ``parse_output`` maps the raw process result to the normalized :class:`DelegationResult`
   envelope, and is where every CLI-specific quirk lives (for example, reading a transcript file
   instead of trusting stdout). Quirks must not leak upward.
@@ -70,7 +70,7 @@ class CLIAdapter(Protocol):
         ...
 
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
-        """Pure mapping from a normalized request to an argv list, env, cwd, and runtime hint."""
+        """Pure mapping from a normalized request to an argv list, env, cwd, and optional stdin."""
         ...
 
     def map_safety(self, mode: SafetyMode) -> SafetyFlags:

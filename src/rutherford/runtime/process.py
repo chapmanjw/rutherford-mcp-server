@@ -86,6 +86,12 @@ class AsyncProcessRunner:
                 duration_s=duration,
                 timed_out=True,
             )
+        except BaseException:
+            # Any other escape from the wait (an OSError from the stdin feed beyond the tolerated
+            # pipe errors, a raising on_progress callback) must not leak a live child: kill the
+            # tree (best-effort, a no-op on a dead pid) and let the original exception propagate.
+            await asyncio.to_thread(kill_process_tree, process.pid)
+            raise
         return ProcessResult(
             exit_code=process.returncode,
             stdout=stdout_b.decode("utf-8", errors="replace"),

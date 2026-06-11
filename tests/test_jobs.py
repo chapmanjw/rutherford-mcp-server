@@ -14,7 +14,7 @@ from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import DelegationResult, ErrorInfo, Job, Target
 from rutherford.services.jobs import JobService, JobStore
-from rutherford.tools.jobs import cancel_job_tool, list_jobs_tool
+from rutherford.tools.jobs import cancel_job_tool, job_result_tool, list_jobs_tool
 from tests.fakes import make_app
 
 
@@ -102,6 +102,23 @@ async def test_service_failing_body_marks_failed() -> None:
     assert final.status is JobStatus.FAILED
     assert final.error is not None
     assert "kaboom" in final.error.message
+
+
+async def test_a_rutherford_error_from_a_body_keeps_its_code() -> None:
+    # Regression (F8): a RutherfordError raised inside an async job body used to be flattened to
+    # INTERNAL, dropping its code/details, while the sync tool path preserved them.
+    service = JobService()
+
+    async def body(progress: object) -> DelegationResult:
+        raise RutherfordError(ErrorCode.INVALID_INPUT, "bad arguments", details={"field": "prompt"})
+
+    job = service.submit("delegate", body)
+    final = await _wait_terminal(service, job.id)
+    assert final.status is JobStatus.FAILED
+    assert final.error is not None
+    assert final.error.code == ErrorCode.INVALID_INPUT
+    assert "bad arguments" in final.error.message
+    assert final.error.details == {"field": "prompt"}
 
 
 def test_max_jobs_cap_raises_too_many_jobs() -> None:
@@ -195,3 +212,53 @@ async def test_job_tools_list_and_cancel() -> None:
     cancelled = decode(await cancel_job_tool(app, job_id=job.id))
     assert cancelled["status"] == "cancelled"
     release.set()
+
+
+async def test_job_result_on_a_running_job_is_a_still_running_notice() -> None:
+    app = make_app()
+    release = asyncio.Event()
+
+    async def body(progress: object) -> DelegationResult:
+        await release.wait()
+        return _result()
+
+    job = app.jobs.submit("delegate", body)
+    out = decode(await job_result_tool(app, job_id=job.id))
+    assert out["status"] in ("pending", "running")
+    assert out["message"] == "job is still running"
+    release.set()
+
+
+async def test_job_result_on_a_failed_job_returns_the_error() -> None:
+    app = make_app()
+
+    async def body(progress: object) -> DelegationResult:
+        raise ValueError("kaboom")
+
+    job = app.jobs.submit("delegate", body)
+    await _wait_terminal(app.jobs, job.id)
+    out = decode(await job_result_tool(app, job_id=job.id))
+    assert out["status"] == "failed"
+    assert out["error"]["code"] == "INTERNAL"
+    assert "kaboom" in out["error"]["message"]
+
+
+async def test_job_result_on_a_cancelled_job_is_a_structured_notice_not_null() -> None:
+    # Regression (F16): a cancelled job has result=None and error=None, so the tool used to
+    # serialize the literal "null" instead of an envelope a client can act on.
+    app = make_app()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def body(progress: object) -> DelegationResult:
+        started.set()
+        await release.wait()
+        return _result()
+
+    job = app.jobs.submit("delegate", body)
+    await started.wait()
+    app.jobs.cancel(job.id)
+    await asyncio.sleep(0)  # let the cancellation propagate
+    out = decode(await job_result_tool(app, job_id=job.id))
+    assert out["status"] == "cancelled"
+    assert out["message"] == "job was cancelled"

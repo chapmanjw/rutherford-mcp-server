@@ -68,7 +68,6 @@ async def debate_tool(
         synthesize=synthesize,
         timeout_s=timeout_s,
         include_raw=include_raw,
-        depth=app.base_depth,
         judge=judge_target,
     )
     correlation_id = app.new_correlation_id()

@@ -50,7 +50,7 @@ from ..domain.models import (
     SafetyFlags,
 )
 from .base import BaseCLIAdapter
-from .parsing import TextParser, render_terminal, strip_leading_reasoning
+from .parsing import TextParser, render_terminal
 from .results import strip_ansi
 
 #: A reasoning model's chain-of-thought leading block, which ``lms chat`` prints before the answer.
@@ -103,15 +103,17 @@ class LMStudioAdapter(BaseCLIAdapter):
         return f"commit {match.group(1)}" if match else None
 
     def capabilities(self) -> AdapterCapabilities:
-        """Advertise LM Studio's flags: model selection, list-models, native system prompt, text."""
+        """Advertise LM Studio's flags: model selection, list-models, native system prompt, text,
+        prompt-style file context (the in-scope file list folds into the ``-p`` prompt)."""
         return AdapterCapabilities(
             supports_resume=False,
             supports_model_selection=True,
             supports_working_dir=False,
-            supports_file_context=False,
+            supports_file_context=True,
             supports_list_models=True,
             supports_system_prompt=True,
             output_mode=OutputMode.TEXT,
+            file_context_style="prompt",
         )
 
     def map_safety(self, mode: SafetyMode) -> SafetyFlags:
@@ -154,9 +156,10 @@ def _clean_output(stdout: str) -> str:
     ``lms chat`` writes its model-load progress to stdout as carriage-return overwrites on one line.
     :func:`~rutherford.adapters.parsing.render_terminal` renders that away (collapsing each line to
     what survives the last bare carriage return, after stripping ANSI); then a single *leading*
-    ``<think>...</think>`` reasoning block is removed and the text trimmed.
+    ``<think>...</think>`` reasoning block is removed (``_THINK_RE`` is anchored to ``\\A`` so a
+    tag later in the answer survives) and the text trimmed.
     """
-    return strip_leading_reasoning(render_terminal(stdout), _THINK_RE).strip()
+    return _THINK_RE.sub("", render_terminal(stdout)).strip()
 
 
 def _unterminated_think(text: str) -> str | None:

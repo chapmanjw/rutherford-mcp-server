@@ -4,11 +4,14 @@
 
 Invocation: ``qwen -o json`` with the prompt read from **stdin** (not argv), because on Windows
 ``qwen`` is an npm shim and passing the prompt as an argument invites shell-quoting trouble.
-``-m`` selects a model, ``--append-system-prompt`` carries the role preamble (qwen has a
-system-prompt flag, so the preamble is never folded into the prompt), ``--add-dir`` widens the
-in-scope directory, ``-r <id>`` resumes a session, and ``--approval-mode`` sets the safety
-posture (see :meth:`QwenAdapter.map_safety`). qwen has no working-directory flag, so the working
-dir is set on the spec's ``cwd`` and also passed via ``--add-dir``.
+``-m`` selects a model, ``--add-dir`` widens the in-scope directory, ``-r <id>`` resumes a
+session, and ``--approval-mode`` sets the safety posture (see :meth:`QwenAdapter.map_safety`).
+The CLI has ``--append-system-prompt``, but it is an argv element and the role preamble is
+multiline: through the npm ``.cmd`` shim (``cmd.exe /c``) a newline truncates the command,
+silently dropping the rest of the preamble AND every argument after it (``--add-dir``, ``-r``).
+The preamble is folded into the stdin prompt instead, like the other stdin-transport adapters.
+qwen has no working-directory flag, so the working dir is set on the spec's ``cwd`` and also
+passed via ``--add-dir``.
 
 ``-o json`` emits a JSON **array** of event objects. The final answer is the last element with
 ``"type" == "result"`` (fields ``result``, ``session_id``, ``is_error``, ``usage``); if there is
@@ -68,14 +71,17 @@ class QwenAdapter(BaseCLIAdapter):
         )
 
     def capabilities(self) -> AdapterCapabilities:
-        """Advertise qwen's feature flags (JSON output, resume, model/system-prompt selection)."""
+        """Advertise qwen's feature flags (JSON output, resume, model selection)."""
         return AdapterCapabilities(
             supports_resume=True,
             supports_model_selection=True,
             supports_working_dir=False,
             supports_file_context=True,
             supports_list_models=False,
-            supports_system_prompt=True,
+            # The CLI has --append-system-prompt, but it is an argv element and the role preamble
+            # is multiline: through the npm .cmd shim (cmd.exe /c) a newline truncates the command.
+            # The preamble is folded into the stdin prompt instead (see build_invocation).
+            supports_system_prompt=False,
             output_mode=OutputMode.JSON,
         )
 
@@ -96,11 +102,13 @@ class QwenAdapter(BaseCLIAdapter):
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
         """Build the ``qwen -o json`` invocation, with the composed prompt fed via stdin.
 
-        Pure: returns an argv list and an stdin string, never a shell command line. qwen has a
-        system-prompt flag, so the role preamble rides in ``--append-system-prompt`` and is not
-        prepended to the prompt; only the in-scope file list is folded into the stdin prompt.
+        Pure: returns an argv list and an stdin string, never a shell command line. The role
+        preamble is multiline, and ``--append-system-prompt`` would put it on argv where the npm
+        ``.cmd`` shim truncates at the first newline (dropping the rest of the preamble and the
+        flags after it), so the preamble and the in-scope file list are folded into the stdin
+        prompt instead.
         """
-        prompt = self._with_files(req.prompt, req.files)
+        prompt = self._with_files(self._compose_prompt(req.prompt, ctx.role_preamble), req.files)
 
         argv = [self.binary, "-o", "json"]
 
@@ -109,8 +117,6 @@ class QwenAdapter(BaseCLIAdapter):
 
         if req.target.model:
             argv += ["-m", req.target.model]
-        if ctx.role_preamble:
-            argv += ["--append-system-prompt", ctx.role_preamble]
         if req.working_dir:
             argv += ["--add-dir", req.working_dir]
         if req.session_id:
@@ -151,11 +157,13 @@ class QwenAdapter(BaseCLIAdapter):
             text = str_field(result_event, "result")
             session_id = result_event.get("session_id")
             cost = extract_cost(result_event.get("usage"), _COST)
+            # A complete result envelope makes the exit code authoritative, unlike the cut-short
+            # no-result-event path below, where a partial assistant answer still counts.
             if raw.exit_code != 0 or bool(result_event.get("is_error")):
-                message = text or result_event.get("subtype") or "qwen reported an error"
+                message = text or str_field(result_event, "subtype") or "qwen reported an error"
                 if raw.exit_code != 0 and not text:
                     return nonzero_result(ctx, raw, text=text)
-                return error_result(ctx, raw, ErrorCode.NONZERO_EXIT, str(message), text=text)
+                return error_result(ctx, raw, ErrorCode.NONZERO_EXIT, message, text=text)
             if not text.strip():
                 fallback = _last_assistant_text(events)
                 if fallback is not None and fallback.strip():

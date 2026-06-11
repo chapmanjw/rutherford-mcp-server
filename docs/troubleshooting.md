@@ -19,9 +19,9 @@ Run the `doctor` tool (or `capabilities` for a lighter read) before investigatin
 
 ---
 
-### `AUTH_REQUIRED` / auth note in doctor -- target needs a credential
+### Auth note in doctor -- target needs a credential
 
-**Cause.** Rutherford never performs an interactive login on your behalf. `check_auth` for each adapter is a read-only probe: it looks for an API key env var or a persisted session file. When neither is present the probe returns `AuthState.NEEDS_LOGIN` (or `API_KEY_MISSING`), and `doctor` adds a note.
+**Cause.** Rutherford never performs an interactive login on your behalf. `check_auth` for each adapter is a read-only probe: it looks for an API key env var or a persisted session file. When neither is present the probe returns `AuthState.NEEDS_LOGIN` (or `API_KEY_MISSING`), and `doctor` adds a note. The `AUTH_REQUIRED` error code is reserved and not currently raised: a not-authenticated adapter is left out of an auto-expanded panel with a skip reason, and a mid-run credential rejection surfaces as `AUTH_FAILED`.
 
 The auth mechanism differs per CLI:
 
@@ -94,14 +94,10 @@ With either in play Codex cannot read files or run commands and silently degrade
 
 ### WSL path issues -- wrong working directory passed to a Linux CLI
 
-**Cause.** When a generic adapter has `runtime = "wsl_interop"`, or when a native Windows host invokes a Linux CLI via WSL interop, `runtime/paths.py` translates paths between Windows and WSL forms before building the `InvocationSpec`. `translate_path` converts `C:\Users\x` to `/mnt/c/Users/x` when running on Windows targeting a WSL runtime, and the reverse when running on WSL targeting a native Windows runtime.
-
-If a working directory arrives in the wrong form (e.g. a Windows path reaching a Linux binary), the agent either silently operates from its home directory or exits non-zero.
+**Cause.** Rutherford launches CLIs natively and performs no path translation. A Windows path handed to a Linux binary reached via WSL interop arrives as-is, so the agent either silently operates from its home directory or exits non-zero.
 
 **Fix.**
-- For built-in adapters the translation is automatic.
-- For a `generic_adapters` entry, set `runtime = "wsl_interop"` when the binary runs under WSL. The path translation then applies automatically. Without it, Windows paths are passed as-is to the Linux process.
-- If a CLI you are wrapping is purely native, leave `runtime = "native"` (the default). Explicitly setting `wsl_interop` on a native binary will mistranslate paths.
+- WSL-runtime CLIs are not supported via the generic adapter: config load rejects any `generic_adapters` entry with a `runtime` other than `"native"`. Run Rutherford inside the same WSL distribution as the CLIs it should orchestrate (see `docs/mcp-client-integration.md`), so every launch is native again.
 - WSL detection uses `WSL_DISTRO_NAME` (env var) and `/proc/version` (Microsoft string). If neither is present, the host is treated as non-WSL Linux. Both detection paths are visible in `runtime/platform.py`.
 
 ---
@@ -276,7 +272,7 @@ Read the field path and fix the corresponding key in your `rutherford.toml` or `
 | Error code | Immediate diagnostic |
 |------------|---------------------|
 | `BINARY_NOT_FOUND` | Run `doctor`; install the CLI per `docs/integration-testing.md` |
-| `AUTH_REQUIRED` | Run `doctor`; log in or set the API key env var once |
+| `AUTH_REQUIRED` | Reserved, not currently raised (pre-run auth gaps appear as panel skip reasons; mid-run rejections as `AUTH_FAILED`). Run `doctor`; log in or set the API key env var once |
 | `WORKSPACE_NOT_TRUSTED` | Pass `trust_workspace=true` or add path to `trusted_workspaces` |
 | `READONLY_VIOLATED` | A `read_only`/`propose` delegation modified the git working tree; check the CLI output or disable `verify_read_only` |
 | `CONTRACT_MISMATCH` | An adapter's output did not satisfy the expected contract (e.g. wrong type or missing field); check CLI version against adapter verification date |

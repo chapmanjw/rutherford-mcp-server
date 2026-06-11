@@ -11,7 +11,8 @@ Two quirks are handled entirely inside this adapter so nothing leaks upward:
   transcript.jsonl``; the conversation id is the explicit resume id when one was passed, else resolved
   from the workspace via ``cache/last_conversations.json``, else the most recently modified ``brain``
   entry. The final answer is the last line with ``source=MODEL``, ``status=DONE``,
-  ``type=PLANNER_RESPONSE``, and non-empty content.
+  ``type=PLANNER_RESPONSE``, and non-empty content -- scoped to events after the last user input,
+  so a resumed conversation's earlier turns are never read as this run's answer.
 
 Auth is a Google account flow with no non-interactive ``whoami`` and no reliable, cross-platform
 on-disk marker (the token location varies by OS and install -- native vs WSL, keyring vs file). A
@@ -35,6 +36,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from ..domain.enums import AuthState, OutputMode, SafetyMode
 from ..domain.error_codes import ErrorCode
@@ -267,12 +269,20 @@ class AntigravityAdapter(BaseCLIAdapter):
 
     @staticmethod
     def _extract_final_message(transcript: Path) -> tuple[str | None, list[str]]:
-        """Return ``(last_planner_response, completed_model_types)`` from the transcript.
+        """Return ``(last_planner_response, completed_model_types)`` from the transcript's CURRENT turn.
+
+        A resumed conversation's transcript holds every prior turn, so the scan is scoped to events
+        after the LAST ``type=USER_INPUT`` event: a stale ``PLANNER_RESPONSE`` from an earlier turn
+        must not be reported as this run's answer (exit 0 + no new answer would silently return the
+        previous turn's text), and an earlier turn's completed types must not pre-populate
+        ``completed_model_types`` -- that would permanently disable the ``CONTRACT_MISMATCH`` drift
+        canary on any previously-successful conversation. A transcript with no user-input event keeps
+        the whole-file scan (fresh runs unchanged).
 
         ``last_planner_response`` is the content of the final ``source=MODEL`` / ``status=DONE`` /
-        ``type=PLANNER_RESPONSE`` event, or ``None``. ``completed_model_types`` is the sorted distinct
-        ``type`` values of the *completed* model turns seen (``source=MODEL`` and ``status=DONE``) --
-        empty when the model never finished a turn.
+        ``type=PLANNER_RESPONSE`` event in scope, or ``None``. ``completed_model_types`` is the sorted
+        distinct ``type`` values of the *completed* model turns seen in scope (``source=MODEL`` and
+        ``status=DONE``) -- empty when the model never finished a turn.
 
         The caller uses ``completed_model_types`` to tell a genuine *schema drift* (a model turn
         completed, but under a type other than ``PLANNER_RESPONSE`` -- the answer shape changed) from a
@@ -282,12 +292,11 @@ class AntigravityAdapter(BaseCLIAdapter):
         """
         if not transcript.is_file():
             return None, []
-        final: str | None = None
-        completed_model_types: set[str] = set()
         try:
             content = transcript.read_text(encoding="utf-8")
         except OSError:
             return None, []
+        events: list[dict[str, Any]] = []
         for line in content.splitlines():
             line = line.strip()
             if not line:
@@ -296,8 +305,12 @@ class AntigravityAdapter(BaseCLIAdapter):
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if not isinstance(event, dict):
-                continue
+            if isinstance(event, dict):
+                events.append(event)
+        last_input = next((i for i in range(len(events) - 1, -1, -1) if events[i].get("type") == "USER_INPUT"), -1)
+        final: str | None = None
+        completed_model_types: set[str] = set()
+        for event in events[last_input + 1 :]:
             if event.get("source") == "MODEL" and event.get("status") == "DONE":
                 event_type = event.get("type")
                 if isinstance(event_type, str):

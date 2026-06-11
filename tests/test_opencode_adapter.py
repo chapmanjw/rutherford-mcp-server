@@ -16,7 +16,7 @@ from rutherford.domain.models import (
     ProcessResult,
     Target,
 )
-from rutherford.services.consensus import _apply_stance
+from rutherford.services.strategies import apply_stance
 from tests.fakes import FakeProbe
 
 SAMPLES = Path(__file__).parent / "parsers" / "opencode"
@@ -102,7 +102,7 @@ def test_multiline_stance_prompt_survives_intact_on_stdin() -> None:
     # dropped everything after the first newline through the Windows cmd.exe shim, so OpenCode
     # saw only the stance directive and asked for the proposition.
     claim = 'CLAIM TO DEBATE: "A message queue is overkill for a single-server app."'
-    steered = _apply_stance(claim, Stance.AGAINST)
+    steered = apply_stance(claim, Stance.AGAINST)
     assert "\n" in steered  # the directive and claim are separated by a blank line
 
     spec = OpenCodeAdapter().build_invocation(_req(prompt=steered), _ctx())
@@ -182,14 +182,6 @@ def test_parse_nonzero_exit_with_no_text() -> None:
     assert "command failed" in result.error.message
 
 
-def test_parse_timeout() -> None:
-    raw = ProcessResult(exit_code=None, timed_out=True, duration_s=300.0)
-    result = OpenCodeAdapter().parse_output(raw, _ctx())
-    assert not result.ok
-    assert result.error is not None
-    assert result.error.code == "TIMEOUT"
-
-
 def test_parse_garbage_stdout_is_parse_error() -> None:
     raw = ProcessResult(exit_code=0, stdout="not json at all", duration_s=0.1)
     result = OpenCodeAdapter().parse_output(raw, _ctx())
@@ -198,23 +190,19 @@ def test_parse_garbage_stdout_is_parse_error() -> None:
     assert result.error.code == "PARSE_ERROR"
 
 
+def test_parse_nonzero_exit_with_answer_is_success() -> None:
+    # parse_output defers to the shared finalize_answer, so a non-zero exit with a parsed answer
+    # and no in-band failure is still the answer (a CLI can exit non-zero on a permission denial
+    # yet have produced a valid answer) -- aligned with codex in the same panel.
+    line = '{"type":"text","sessionID":"ses_x1","part":{"id":"p1","text":"the answer"}}'
+    raw = ProcessResult(exit_code=1, stdout=line, stderr="exited after answering", duration_s=0.3)
+    result = OpenCodeAdapter().parse_output(raw, _ctx())
+    assert result.ok
+    assert result.text == "the answer"
+    assert result.session_id == "ses_x1"
+
+
 # --- detect / check_auth / available_models ----------------------------------
-
-
-def test_detect_when_installed() -> None:
-    probe = FakeProbe(
-        which_map={"opencode": "/usr/bin/opencode"},
-        run_fn=lambda argv: ProcessResult(exit_code=0, stdout="opencode 0.4.2"),
-    )
-    result = OpenCodeAdapter(probe=probe).detect()
-    assert result.installed
-    assert result.path == "/usr/bin/opencode"
-    assert result.version == "opencode 0.4.2"
-
-
-def test_detect_when_absent() -> None:
-    adapter = OpenCodeAdapter(probe=FakeProbe(which_map={}))
-    assert not adapter.detect().installed
 
 
 def test_check_auth_with_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -279,6 +267,37 @@ def test_parse_cumulative_snapshot_stream_returns_the_latest_snapshot() -> None:
     result = OpenCodeAdapter().parse_output(ProcessResult(exit_code=0, stdout=lines, duration_s=0.2), _ctx())
     assert result.ok
     assert result.text == "The answer is 42."
+
+
+def test_parse_delta_stream_with_repeated_chunk_concatenates_fully() -> None:
+    # A legitimate delta stream may repeat a chunk (a repeated line in the answer). The old
+    # duplicated-longest guard collapsed the whole stream to that one chunk; the prefix rule
+    # only short-circuits when every chunk is a prefix of the longest, so deltas concatenate.
+    lines = "\n".join(
+        [
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"abc"}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"x"}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"abc"}}',
+        ]
+    )
+    result = OpenCodeAdapter().parse_output(ProcessResult(exit_code=0, stdout=lines, duration_s=0.2), _ctx())
+    assert result.ok
+    assert result.text == "abcxabc"
+
+
+def test_parse_repeated_tail_snapshot_resolves_to_the_tail() -> None:
+    # Snapshots whose final state is emitted twice fail the strict-increase chain, but every
+    # chunk is a prefix of the longest, so the prefix rule resolves to that final snapshot.
+    lines = "\n".join(
+        [
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"Hello"}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"Hello world"}}',
+            '{"type":"text","sessionID":"s1","part":{"id":"p1","text":"Hello world"}}',
+        ]
+    )
+    result = OpenCodeAdapter().parse_output(ProcessResult(exit_code=0, stdout=lines, duration_s=0.2), _ctx())
+    assert result.ok
+    assert result.text == "Hello world"
 
 
 def test_parse_delta_stream_still_concatenates() -> None:

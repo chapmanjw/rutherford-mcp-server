@@ -60,6 +60,14 @@ def test_build_invocation_appends_extra_args_and_file_context() -> None:
     assert "fix it" in prompt and "a.py" in prompt
 
 
+def test_capabilities_advertise_prompt_style_file_context() -> None:
+    # The adapter folds req.files into the prompt, so it must advertise that support rather
+    # than claim supports_file_context=False while quietly consuming the list.
+    caps = LMStudioAdapter().capabilities()
+    assert caps.supports_file_context is True
+    assert caps.file_context_style == "prompt"
+
+
 def test_build_invocation_requires_a_model_without_subprocess() -> None:
     probe = FakeProbe(run_fn=lambda argv: ProcessResult(exit_code=0, stdout="should not be called"))
     adapter = LMStudioAdapter(probe=probe)

@@ -48,7 +48,9 @@ def iter_json_objects(text: str) -> Iterator[dict[str, Any]]:
             return
         try:
             value, end = _DECODER.raw_decode(text, start)
-        except json.JSONDecodeError:
+        # RecursionError: a ~1000-deep bracket run blows the decoder's recursion before it can
+        # report a decode error; the scanner must keep its never-raises posture and step past it.
+        except (json.JSONDecodeError, RecursionError):
             if text[start] == "[":
                 # A `[` that fails to parse whole may be a TRUNCATED array. Stepping one character
                 # in would re-find its element objects and yield them as top-level -- letting a
@@ -118,8 +120,8 @@ def _skip_truncated_array_elements(text: str, start: int) -> int:
             return index + 1  # the array closed after all; everything inside stays suppressed
         try:
             _, end = _DECODER.raw_decode(text, index)
-        except json.JSONDecodeError:
-            break  # the truncation point; stop consuming here
+        except (json.JSONDecodeError, RecursionError):
+            break  # the truncation point (or a too-deep element); stop consuming here
         index = end
         consumed = end
     return consumed if consumed > start else start
