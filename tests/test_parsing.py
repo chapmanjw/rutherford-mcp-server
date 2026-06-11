@@ -255,14 +255,29 @@ def test_last_json_object_skips_a_trailing_array() -> None:
     assert last_json_object(text) == {"verdict": "x"}
 
 
-def test_scanners_swallow_recursion_from_deep_bracket_runs() -> None:
-    # A ~1000+-deep bracket run overflows json's recursive parser with RecursionError before any
-    # decode error is reported; the never-raises contracts must swallow it like any bad input.
-    deep_object_line = '{"a":' + "[" * 3000 + "]" * 3000 + "}"
-    assert parse_jsonl(deep_object_line + '\n{"ok":true}') == [{"ok": True}]
-    deep_run = "[" * 3000 + '{"verdict":"x"}'
-    assert parse_json_array(deep_run) is None
-    assert last_json_object(deep_run) is None
+def test_scanners_swallow_recursion_from_deep_bracket_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A deep-enough bracket run makes json's C parser raise RecursionError (not JSONDecodeError) before
+    # any decode error is reported; the never-raises contracts must swallow it like any bad input. The
+    # overflow depth is platform-dependent (a smaller C stack trips it on Windows where Linux/macOS
+    # still parse, and json ignores sys.setrecursionlimit), so the raise is simulated at the decode
+    # boundary rather than nested to an unportable depth. This pins all four widened except clauses:
+    # parse_jsonl, parse_json_array, and both jsontext decode sites (the main scan and the
+    # truncated-array skip reached from a leading "[").
+    import json
+
+    import rutherford.io.jsontext as jsontext_mod
+
+    def boom(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON value")
+
+    # parse_jsonl / parse_json_array decode via json.loads; iter_json_objects via the shared decoder.
+    monkeypatch.setattr(json, "loads", boom)
+    monkeypatch.setattr(jsontext_mod._DECODER, "raw_decode", boom)
+
+    assert parse_jsonl('{"a":1}\n{"ok":true}') == []  # every line raises -> skipped, never escapes
+    assert parse_json_array('[{"verdict":"x"}]') is None
+    assert last_json_object('{"verdict":"x"}') is None  # object start: the main jsontext decode site
+    assert last_json_object('[{"verdict":"x"}]') is None  # array start: also the truncated-array skip
 
 
 # --- JsonEnvelopeParser ------------------------------------------------------
