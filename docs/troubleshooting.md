@@ -15,7 +15,7 @@ Run the `doctor` tool (or `capabilities` for a lighter read) before investigatin
 **Fix.**
 1. Run the `doctor` tool. The note for any uninstalled adapter reads: `<binary> was not found on PATH; install it (see docs/integration-testing.md)`.
 2. Install the CLI following `docs/integration-testing.md`.
-3. If the CLI is installed but not on `PATH`, either add its directory to `PATH` before starting the Rutherford server process, or specify its full path via a `generic_adapters` entry in your config.
+3. If the CLI is installed but not on `PATH`, add its directory to `PATH` before starting the Rutherford server process.
 
 ---
 
@@ -97,7 +97,7 @@ With either in play Codex cannot read files or run commands and silently degrade
 **Cause.** Rutherford launches CLIs natively and performs no path translation. A Windows path handed to a Linux binary reached via WSL interop arrives as-is, so the agent either silently operates from its home directory or exits non-zero.
 
 **Fix.**
-- WSL-runtime CLIs are not supported via the generic adapter: config load rejects any `generic_adapters` entry with a `runtime` other than `"native"`. Run Rutherford inside the same WSL distribution as the CLIs it should orchestrate (see `docs/mcp-client-integration.md`), so every launch is native again.
+- Rutherford launches CLIs natively and translates no paths between runtimes. Run Rutherford inside the same WSL distribution as the CLIs it should orchestrate (see `docs/mcp-client-integration.md`), so every launch is native.
 - WSL detection uses `WSL_DISTRO_NAME` (env var) and `/proc/version` (Microsoft string). If neither is present, the host is treated as non-WSL Linux. Both detection paths are visible in `runtime/platform.py`.
 
 ---
@@ -263,7 +263,7 @@ Read the field path and fix the corresponding key in your `rutherford.toml` or `
 
 **Cause.** The `cli` field in a `Target` does not match any registered adapter id. The registry is a closed mapping; an unknown id raises `RegistryError` with `ErrorCode.UNKNOWN_TARGET` and lists the known ids.
 
-**Fix.** Use the `capabilities` tool to see every registered adapter id. The built-in ids are: `claude_code`, `codex`, `cursor`, `qwen`, `kiro`, `opencode`, `goose`, `ollama`, `lmstudio`, `antigravity`. Config-defined generic adapters are registered under their configured `id` field. Check spelling -- the id is case-sensitive.
+**Fix.** Use the `capabilities` tool to see every registered adapter id. The built-in ids are: `claude_code`, `codex`, `cursor`, `qwen`, `kiro`, `opencode`, `goose`, `droid`, `vibe`, `copilot`, `ollama`, `lmstudio`, `antigravity`. Check spelling -- the id is case-sensitive.
 
 ---
 

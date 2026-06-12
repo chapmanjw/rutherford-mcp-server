@@ -269,10 +269,6 @@ Before exposing Rutherford to an MCP client:
   right for your environment. Lower values are more conservative.
 - [ ] Keep API keys and session tokens in environment variables or each CLI's own credential
   store. Do not put credentials in `rutherford.toml` or any file in the repository.
-- [ ] If you add a generic adapter via `generic_adapters` in `rutherford.toml`, populate the
-  `safety` section with explicit per-mode argv fragments for all four modes. An empty `yolo`
-  entry means the generic adapter passes no bypass flag in yolo mode -- which may or may not be
-  the right behavior for that CLI.
 - [ ] Set `default_timeout_s` to a value appropriate for your slowest expected workload. The
   default is 300 seconds. Agents that hang (waiting for interactive input, for example) will be
   killed at this deadline.

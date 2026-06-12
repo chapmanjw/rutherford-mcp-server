@@ -94,11 +94,10 @@ def build_registry(
     *,
     probe: CommandProbe | None = None,
 ) -> AdapterRegistry:
-    """Build the registry from config: enabled built-ins plus config-defined generic adapters.
+    """Build the registry from config: the enabled built-in adapters.
 
-    ``enabled_adapters``, when set, restricts the registry to those ids and raises if any names
-    an adapter that is neither a built-in nor a configured generic adapter. A generic adapter
-    whose id collides with a built-in replaces the built-in.
+    ``enabled_adapters``, when set, restricts the registry to those ids and raises if any names an
+    adapter that is not a built-in.
 
     Raises:
         RegistryError: On an unknown id in ``enabled_adapters`` or a duplicate adapter id.
@@ -110,23 +109,6 @@ def build_registry(
         if entry is not None and not entry.enabled:
             continue
         adapters[adapter_id] = _load_factory(module_path, class_name)(probe)
-
-    if config.generic_adapters:
-        generic_module = importlib.import_module("rutherford.adapters.generic")
-        generic_cls = generic_module.GenericAdapter
-        seen_generic_ids: set[str] = set()
-        for generic in config.generic_adapters:
-            # Two generics with the same id would otherwise collapse last-wins in this dict --
-            # silently swapping a binary or safety fragment -- before AdapterRegistry's own
-            # duplicate check could see both. (A generic deliberately REPLACING a built-in is
-            # the documented override and stays allowed.)
-            if generic.id in seen_generic_ids:
-                raise RegistryError(f"duplicate generic adapter id {generic.id!r} in generic_adapters")
-            seen_generic_ids.add(generic.id)
-            entry = config.adapters.get(generic.id)
-            if entry is not None and not entry.enabled:
-                continue  # `[adapters.<id>] enabled = false` disables a generic adapter too
-            adapters[generic.id] = generic_cls(generic, probe=probe)
 
     if config.enabled_adapters is not None:
         allowed = set(config.enabled_adapters)

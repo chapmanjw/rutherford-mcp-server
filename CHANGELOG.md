@@ -6,6 +6,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Removed
+
+- The config-driven generic adapter (`GenericAdapterConfig` / the `generic_adapters` config key, and
+  `GenericSafetyConfig`). Every CLI is now a hand-written code adapter that reuses the shared
+  parsing/result/provenance toolkit. No real coding CLI fit config alone -- each needs custom output
+  parsing, an auth probe, session resume, or cost handling -- so the config-only path was a fiction.
+  A config that defined `generic_adapters` should move those CLIs to code adapters; the key is no
+  longer accepted (config load rejects unknown keys).
+
 ## [1.4.0] - 2026-06-12
 
 ### Added

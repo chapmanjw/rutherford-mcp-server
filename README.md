@@ -290,8 +290,8 @@ CLI-calls-itself chain bounded. Full detail:
 <details>
 <summary><b>The full adapter matrix and the versions each release is confirmed against</b></summary>
 
-Each adapter keeps all of its CLI-specific details in one file, so a change is a one-file edit. Another
-well-behaved CLI can be added without code — see
+Each adapter keeps all of its CLI-specific details in one file, so a change is a one-file edit. Adding a
+CLI is one small code adapter that reuses the shared parsing toolkit — see
 [docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md).
 
 | CLI | Adapter id | How Rutherford runs it | Auth |
@@ -420,7 +420,7 @@ and re-verify after upgrades.
 
 ## Documentation
 
-- [docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md) — config file, panels, custom roles, strategies, generic adapters.
+- [docs/configuration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/configuration.md) — config file, panels, custom roles, strategies.
 - [docs/recipes.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/recipes.md) — the full cookbook of paste-able prompts.
 - [docs/architecture.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/architecture.md) — the layered design and the two core interfaces.
 - [docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md) — the contract and checklist for adding a CLI.

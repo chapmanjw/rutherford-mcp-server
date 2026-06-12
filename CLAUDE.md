@@ -36,7 +36,7 @@ MCP tool layer (FastMCP)      src/rutherford/server.py + tools/   thin wrappers,
         |
 services (orchestration)      services/   delegation, consensus, jobs, roles
         |
-adapters (CLIAdapter impls)   adapters/   one per CLI, plus a config-driven generic adapter
+adapters (CLIAdapter impls)   adapters/   one hand-written code adapter per CLI
         |
 runtime                       runtime/    ProcessRunner, platform/WSL detection
         |
@@ -60,8 +60,8 @@ domain + config               domain/, config/, io/   models, enums, errors, err
   normalized envelope via `toolSuccess` / `toolError`. No orchestration logic lives there.
 - Adapters are registered in `adapters/registry.py`, not imported by the core. The registry is
   a closed mapping that fails fast on an unknown id at startup.
-- Adding a CLI is additive: prefer a config entry for the generic adapter; write a code
-  adapter only when output parsing or auth needs custom handling. See `docs/adding-a-cli.md`.
+- Adding a CLI is a code adapter: subclass `BaseCLIAdapter` and reuse the shared parsing toolkit
+  in `adapters/parsing.py`. There is no config-only path. See `docs/adding-a-cli.md`.
 - Argument arrays, never shell strings. Default `SafetyMode` is `read_only`; write and yolo
   modes are explicit opt-in behind a trusted-workspace check, and no adapter ever defaults to
   its bypass flag.

@@ -86,8 +86,8 @@ _SHORT_OPENAI_TOKEN = re.compile(r"^o[134](?:$|[-\d])")
 def infer_provider_from_model(model: str | None) -> str | None:
     """Guess the model's vendor from its id, or ``None`` when unrecognized.
 
-    A fallible heuristic for CLIs that neither fix a vendor nor namespace their model (Cursor, an
-    unconfigured generic adapter, or a model id behind a serving backend). It matches the known family
+    A fallible heuristic for CLIs that neither fix a vendor nor namespace their model (Cursor, or a
+    model id behind a serving backend). It matches the known family
     prefixes against each ``/``-, ``.``-, or ``:``-delimited segment, so a vendor token is found even
     when it is preceded by a namespace or a Bedrock region prefix (``us.anthropic.claude-...`` ->
     ``anthropic``). The two-character OpenAI families (o1/o3/o4) are matched as whole tokens, not

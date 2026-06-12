@@ -21,18 +21,16 @@ Rutherford target.
 Optional but supported, and worth wiring when present: a model-selection flag, a working-directory
 flag, a file-context mechanism, a resume/session mechanism, and a list-models command.
 
-## 2. Config-only adapter vs code adapter
+## 2. Write a code adapter
 
-Prefer the config-driven generic adapter. If the CLI has clean stdout (plain text or a single JSON
-object) and standard flags, add it as a `GenericAdapterConfig` entry under `generic_adapters` in
-config (see [configuration.md](configuration.md)) -- argv template, model/working-dir flags, output
-mode, and an optional dotted `json_text_path`. No code.
+Every CLI is a hand-written code adapter -- there is no config-only path. No real coding CLI fits config
+alone: each one has at least one irreducible quirk (a streaming event format, an auth trap, a
+session-resume id, a cost field, a stdin/encoding wrinkle) that needs code. The cost is small, though:
+subclass `BaseCLIAdapter` and reuse the shared toolkit in `adapters/parsing.py` (`JsonEnvelopeParser`,
+`TextParser`, the JSONL/array walkers and cost helpers) and `adapters/results.py`, so a straightforward
+adapter is a few dozen lines, not a rewrite.
 
-Write a code adapter only when output parsing or auth needs custom handling: a streaming event
-format, a transcript file, or a credential-store probe. This mirrors the registry's closed-mapping
-philosophy -- adding a member should be adding an entry, not special-casing logic.
-
-## 3. Interface to implement (code adapters)
+## 3. Interface to implement
 
 Subclass `BaseCLIAdapter` (`src/rutherford/adapters/base.py`) and implement the `CLIAdapter`
 interface. Set the class attributes `id`, `display_name`, `binary`, and optionally `static_models`
@@ -90,9 +88,8 @@ Run `just check` (lint, format, license header, mypy strict, unit tests with the
 ## 6. Checklist
 
 - [ ] Hard gate confirmed (headless, no-prompt, capturable output, non-interactive auth).
-- [ ] Config-only vs code decision recorded.
-- [ ] Interface implemented (code) or `GenericAdapterConfig` entry added (config).
-- [ ] Registered: a row in `BUILTIN_ADAPTERS` (code adapters).
+- [ ] Interface implemented (subclass `BaseCLIAdapter`, reusing the shared parsing toolkit).
+- [ ] Registered: a row in `BUILTIN_ADAPTERS`.
 - [ ] Safety mapping defined for all four `SafetyMode` values.
 - [ ] Golden samples added under `tests/parsers/<id>/` (success + error/non-zero).
 - [ ] Unit tests for `detect`/`check_auth`/`available_models` with `FakeProbe`.

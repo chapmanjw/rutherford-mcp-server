@@ -4,8 +4,8 @@
 
 A global config file plus a project-local override that merges over it (see
 :mod:`rutherford.config.loader`). Covers enabled adapters, per-adapter default models, the
-default safety mode and timeout, role directories, the recursion and fan-out guards, the trusted
-workspace allowlist, and config-defined generic adapters. Invalid config raises
+default safety mode and timeout, role directories, the recursion and fan-out guards, and the
+trusted workspace allowlist. Invalid config raises
 :class:`~rutherford.domain.errors.ConfigError`.
 """
 
@@ -17,115 +17,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ..domain.enums import OutputMode, Runtime, SafetyMode
+from ..domain.enums import SafetyMode
 
 _log = logging.getLogger(__name__)
 
 
-class GenericSafetyConfig(BaseModel):
-    """Per-SafetyMode argv fragments for a config-driven generic adapter."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    read_only: list[str] = Field(default_factory=list)
-    propose: list[str] = Field(default_factory=list)
-    write: list[str] = Field(default_factory=list)
-    yolo: list[str] = Field(default_factory=list)
-
-
-class GenericAdapterConfig(BaseModel):
-    """Defines a generic adapter entirely from config -- no code.
-
-    Suitable for a well-behaved CLI with a clean headless invocation. The argv is assembled as
-    ``[binary, *base_args, *safety_args, *model_args, *working_dir_args, *extra_args]`` plus the
-    prompt (as the final positional argument, or on stdin). Never a shell string.
-    """
-
-    model_config = ConfigDict(extra="forbid", protected_namespaces=())
-
-    id: str
-    display_name: str
-    binary: str
-    base_args: list[str] = Field(default_factory=list)
-    prompt_on_stdin: bool = False
-    model_flag: str | None = None
-    working_dir_flag: str | None = None
-    extra_args: list[str] = Field(default_factory=list)
-    output_mode: OutputMode = OutputMode.TEXT
-    json_text_path: str | None = None
-    safety: GenericSafetyConfig = Field(default_factory=GenericSafetyConfig)
-    version_args: list[str] = Field(default_factory=lambda: ["--version"])
-    static_models: list[str] = Field(default_factory=list)
-    auth_env: list[str] = Field(default_factory=list)
-    #: Where the binary runs. Only ``native`` is accepted: Rutherford launches CLIs natively and
-    #: performs no path translation, so a WSL-runtime CLI is not supported via the generic adapter.
-    runtime: Runtime = Runtime.NATIVE
-    #: The model vendor this generic CLI fronts (e.g. ``"openai"``, ``"local"``), surfaced as the
-    #: provenance ``provider`` (F3). ``None`` leaves the provider to a model-name heuristic, then
-    #: "unknown" -- Rutherford cannot otherwise know what an arbitrary configured CLI talks to.
-    provider: str | None = None
-    #: Declares that the CLI's NATIVE default posture is read-only (it cannot write or execute
-    #: without extra flags), making an empty ``safety.read_only`` fragment honest. Without this
-    #: opt-in a generic adapter must configure a non-empty ``read_only`` fragment: the safety
-    #: mapping passes fragments through verbatim, so an empty one would run the CLI in its native
-    #: posture while the envelope claims ``safety_mode=read_only`` -- silently voiding the
-    #: default-read-only promise for a write-capable CLI.
-    natively_read_only: bool = False
-
-    @model_validator(mode="after")
-    def _validate_read_only_posture(self) -> GenericAdapterConfig:
-        """Refuse a generic adapter whose read_only mode would be a silent no-op.
-
-        ``map_safety`` passes the configured fragments through verbatim; with the default empty
-        ``read_only`` the CLI runs in its native posture under a ``read_only`` label. Fail at
-        config load with the fix in the message, rather than letting the safety contract lie.
-        """
-        if not self.safety.read_only and not self.natively_read_only:
-            raise ValueError(
-                f"generic adapter {self.id!r}: safety.read_only is empty, so read_only mode would apply "
-                "no restriction. Configure the CLI's read-only/sandbox flags in safety.read_only, or set "
-                "natively_read_only = true to declare the CLI cannot write or execute by default."
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _validate_runtime(self) -> GenericAdapterConfig:
-        """Reject a non-native ``runtime`` for a generic adapter.
-
-        Rutherford launches CLIs natively; nothing in the runner translates paths or wraps the
-        invocation for another runtime, so accepting ``wsl_interop`` here would silently hand a
-        Linux binary Windows paths. The :class:`~rutherford.domain.enums.Runtime` enum keeps its
-        ``WSL_INTEROP`` member for capability reporting; only this config knob is restricted.
-        """
-        if self.runtime is not Runtime.NATIVE:
-            raise ValueError(
-                f"generic adapter {self.id!r}: runtime={self.runtime.value} is not supported; Rutherford "
-                "launches CLIs natively, so a WSL-runtime CLI cannot be driven by the generic adapter"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def _validate_output_mode(self) -> GenericAdapterConfig:
-        """Constrain the generic adapter's ``output_mode`` to what it can actually parse.
-
-        JSONL (a streaming event protocol) and transcript (an on-disk file) outputs need bespoke
-        parsing the generic adapter does not implement -- it would silently return the raw stream
-        verbatim as the answer -- so they require a code adapter and are rejected at load. JSON needs
-        ``json_text_path`` or the adapter has no way to extract the answer. Caught here as a
-        ``ConfigError`` rather than as a confusing wrong/empty answer at parse time.
-        """
-        if self.output_mode in (OutputMode.JSONL, OutputMode.TRANSCRIPT):
-            raise ValueError(
-                f"generic adapter {self.id!r}: output_mode={self.output_mode.value} needs a code adapter; "
-                "the generic adapter supports only text and json"
-            )
-        if self.output_mode is OutputMode.JSON and not self.json_text_path:
-            raise ValueError(f"generic adapter {self.id!r}: output_mode=json requires json_text_path")
-        return self
-
-
 class AdapterConfig(BaseModel):
-    """Per-adapter overrides applied to a built-in or generic adapter."""
+    """Per-adapter overrides applied to a built-in adapter."""
 
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
@@ -138,8 +36,7 @@ class AdapterConfig(BaseModel):
     timeout_s: float | None = Field(default=None, gt=0)
     #: Extra command-line arguments appended verbatim to the adapter's invocation. Honored by the
     #: local-model adapters -- Ollama (e.g. ``["--keepalive", "30s"]``) and LM Studio (e.g.
-    #: ``["--ttl", "3600"]``); generic adapters carry their own ``extra_args`` in
-    #: :class:`GenericAdapterConfig`.
+    #: ``["--ttl", "3600"]``).
     extra_args: list[str] = Field(default_factory=list)
 
 
@@ -152,8 +49,6 @@ class RutherfordConfig(BaseModel):
     enabled_adapters: list[str] | None = None
     #: Per-adapter overrides keyed by adapter id.
     adapters: dict[str, AdapterConfig] = Field(default_factory=dict)
-    #: Config-defined generic adapters.
-    generic_adapters: list[GenericAdapterConfig] = Field(default_factory=list)
     #: Default safety posture when a caller does not specify one.
     default_safety_mode: SafetyMode = SafetyMode.READ_ONLY
     #: Default per-run timeout in seconds.

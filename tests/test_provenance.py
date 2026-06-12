@@ -15,7 +15,6 @@ from rutherford.adapters.antigravity import AntigravityAdapter
 from rutherford.adapters.claude_code import ClaudeCodeAdapter
 from rutherford.adapters.codex import CodexAdapter
 from rutherford.adapters.cursor import CursorAdapter
-from rutherford.adapters.generic import GenericAdapter
 from rutherford.adapters.goose import GooseAdapter
 from rutherford.adapters.kiro import KiroAdapter
 from rutherford.adapters.lmstudio import LMStudioAdapter
@@ -24,7 +23,7 @@ from rutherford.adapters.opencode import OpenCodeAdapter
 from rutherford.adapters.provenance import infer_provider_from_model, split_namespaced_model
 from rutherford.adapters.qwen import QwenAdapter
 from rutherford.adapters.registry import AdapterRegistry
-from rutherford.config.schema import GenericAdapterConfig, RutherfordConfig
+from rutherford.config.schema import RutherfordConfig
 from rutherford.domain.models import (
     ConsensusRequest,
     DebateRequest,
@@ -301,20 +300,6 @@ def test_local_adapters_are_local_and_do_not_split_the_org_prefix() -> None:
     lms = LMStudioAdapter(FakeProbe()).provenance(_ctx("lmstudio", "google/gemma-4-12b"))
     assert lms.provider == "local"
     assert lms.model == "google/gemma-4-12b"  # kept whole, not split to "google"
-
-
-def test_generic_provider_from_config() -> None:
-    cfg = GenericAdapterConfig(id="gen", display_name="Gen", binary="gen", provider="openai", natively_read_only=True)
-    prov = GenericAdapter(cfg, probe=FakeProbe()).provenance(_ctx("gen", "some-model"))
-    assert prov.provider == "openai"
-    assert prov.confirmed is True
-
-
-def test_generic_without_config_provider_uses_heuristic() -> None:
-    cfg = GenericAdapterConfig(id="gen", display_name="Gen", binary="gen", natively_read_only=True)
-    prov = GenericAdapter(cfg, probe=FakeProbe()).provenance(_ctx("gen", "claude-x"))
-    assert prov.provider == "anthropic"
-    assert prov.confirmed is False
 
 
 # --- service-side stamping ---------------------------------------------------

@@ -106,9 +106,8 @@ class BaseCLIAdapter(ABC):
     Concrete adapters set these as class attributes (``id``, ``display_name``, ``binary``, and
     optionally ``static_models`` / ``version_args``) and implement the genuinely CLI-specific
     methods (``check_auth``, ``capabilities``, ``build_invocation``, ``map_safety``,
-    ``parse_output``). The config-driven generic adapter sets them per instance instead, which is
-    why they are plain attributes rather than ``ClassVar``. A
-    :class:`~rutherford.runtime.probe.CommandProbe` is injected for testability.
+    ``parse_output``). They are plain class attributes (not ``ClassVar``) that each concrete adapter
+    sets directly. A :class:`~rutherford.runtime.probe.CommandProbe` is injected for testability.
     """
 
     id: str

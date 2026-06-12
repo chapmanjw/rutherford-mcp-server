@@ -51,9 +51,8 @@ All fields are optional. Unset fields take the listed default.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled_adapters` | `list[str]` or omitted | all built-ins + all generic adapters | Restrict the registry to these adapter ids. Unknown ids in this list are a startup error. |
+| `enabled_adapters` | `list[str]` or omitted | all built-ins | Restrict the registry to these adapter ids. Unknown ids in this list are a startup error. |
 | `adapters` | `dict[str, AdapterConfig]` | `{}` | Per-adapter overrides keyed by adapter id. |
-| `generic_adapters` | `list[GenericAdapterConfig]` | `[]` | Config-defined adapters with no code module. |
 | `default_safety_mode` | `string` | `"read_only"` | Safety posture applied when a caller omits the field. One of `read_only`, `propose`, `write`, `yolo`. |
 | `default_timeout_s` | `float` | `300.0` | Per-run timeout in seconds (must be > 0). |
 | `role_dirs` | `list[str]` | `[]` | Extra directories to search for custom role files (in addition to the well-known scopes; see Custom roles). Built-in roles always load. |
@@ -86,7 +85,7 @@ Saved panels below) so the main config stays small.
 | `enabled` | `bool` | `true` | Set to `false` to remove this adapter from the registry at startup. |
 | `default_model` | `string` or omitted | none | Model passed when the caller names none. Required to use a local adapter (Ollama or LM Studio) without a per-call `model=`, since neither has a built-in default. |
 | `timeout_s` | `float` or omitted | none | Per-adapter run timeout in seconds. Overrides the global `default_timeout_s` for this adapter when a call names no `timeout_s`. Useful for a slow local model whose cold load can exceed the global budget. |
-| `extra_args` | `list[str]` | `[]` | Extra CLI arguments appended verbatim to the adapter's invocation. Honored by the local-model adapters Ollama (e.g. `["--keepalive", "30s"]`) and LM Studio (e.g. `["--ttl", "3600"]`); the cloud-CLI adapters ignore it, and generic adapters carry their own `extra_args`. |
+| `extra_args` | `list[str]` | `[]` | Extra CLI arguments appended verbatim to the adapter's invocation. Honored by the local-model adapters Ollama (e.g. `["--keepalive", "30s"]`) and LM Studio (e.g. `["--ttl", "3600"]`); the cloud-CLI adapters ignore it. |
 
 ---
 
@@ -110,69 +109,13 @@ entire config.
 
 ---
 
-## Config-defined generic adapters
-
-A generic adapter drives a CLI entirely from config. Use it for CLIs with clean headless
-invocations and deterministic stdout. CLIs that need custom output parsing (streaming events,
-transcript files) still require a code adapter.
-
-The argv is assembled in this order:
-
-```
-[binary, *base_args, *safety_args, *model_args, *working_dir_args, *extra_args, <prompt>]
-```
-
-The prompt is the final positional argument unless `prompt_on_stdin` is true, in which case
-it is written to stdin and omitted from the argv.
-
-### `GenericAdapterConfig` fields
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `id` | `string` | required | Unique adapter id. Collides with a built-in? Replaces it. |
-| `display_name` | `string` | required | Human-readable label. |
-| `binary` | `string` | required | Executable name or absolute path. |
-| `base_args` | `list[str]` | `[]` | Arguments placed immediately after the binary. |
-| `prompt_on_stdin` | `bool` | `false` | Send the prompt on stdin instead of as a positional argument. |
-| `model_flag` | `string` or omitted | none | Flag prefix for model selection (e.g. `"--model"`). Omit if the CLI has no model flag. |
-| `working_dir_flag` | `string` or omitted | none | Flag prefix for working directory (e.g. `"--dir"`). Omit if the CLI uses process cwd only. |
-| `extra_args` | `list[str]` | `[]` | Arguments appended after safety/model/working-dir args, before the prompt. |
-| `output_mode` | `string` | `"text"` | How to extract the answer. The generic adapter supports only `text` and `json`; `jsonl` and `transcript` require a code adapter and are rejected at load time. |
-| `json_text_path` | `string` or omitted | none | Dotted key path into the parsed JSON object (e.g. `"message.content"`). Required when `output_mode` is `json`. |
-| `safety` | `GenericSafetyConfig` | all empty lists | Per-safety-mode argv fragments. |
-| `natively_read_only` | `bool` | `false` | Declares the CLI's *native default* posture is read-only (it cannot write or execute without extra flags). Required when `safety.read_only` is empty — see below. |
-| `version_args` | `list[str]` | `["--version"]` | Args passed to probe the binary version. |
-| `static_models` | `list[str]` | `[]` | Hard-coded model list reported by the adapter (no runtime query). |
-| `auth_env` | `list[str]` | `[]` | Environment variable names whose presence signals authentication. |
-| `runtime` | `string` | `"native"` | Where the binary runs. Only `native` is accepted: Rutherford launches CLIs natively, so a WSL-runtime CLI is not supported via the generic adapter and any other value is rejected at load time. |
-| `provider` | `string` or omitted | none | The model vendor this CLI fronts (e.g. `"openai"`, `"local"`), surfaced as the provenance `provider` (confirmed) and used for diversity accounting. Omitted falls back to a model-name heuristic, then unknown. |
-
-### `GenericSafetyConfig` fields (under `safety`)
-
-Each field is a list of argv fragments injected when that safety mode is active.
-
-| Field | Type | Default |
-|-------|------|---------|
-| `read_only` | `list[str]` | `[]` |
-| `propose` | `list[str]` | `[]` |
-| `write` | `list[str]` | `[]` |
-| `yolo` | `list[str]` | `[]` |
-
-The fragments are passed through verbatim, so an empty `read_only` would run the CLI in its
-native posture while the result claims `safety_mode=read_only`. Config load therefore rejects a
-generic adapter whose `safety.read_only` is empty unless `natively_read_only = true` explicitly
-declares the CLI read-only by default. Configure the CLI's real read-only/sandbox flags whenever
-it has them.
-
----
-
 ## Complete example
 
 ```toml
 # rutherford.toml
 
-# Restrict to three adapters instead of loading all built-ins.
-enabled_adapters = ["claude_code", "codex", "my_internal_tool"]
+# Restrict to two adapters instead of loading all built-ins.
+enabled_adapters = ["claude_code", "codex"]
 
 default_safety_mode = "read_only"
 default_timeout_s   = 120.0
@@ -210,29 +153,6 @@ extra_args    = ["--keepalive", "30s"]
 default_model = "google/gemma-4-12b"
 timeout_s     = 900.0
 extra_args    = ["--ttl", "3600"]
-
-# A config-defined generic adapter -- no code module required.
-[[generic_adapters]]
-id           = "my_internal_tool"
-display_name = "Internal Coding Tool"
-binary       = "internal-tool"
-base_args    = ["--headless", "--json"]
-output_mode  = "json"
-json_text_path = "result.text"
-model_flag   = "--model"
-working_dir_flag = "--dir"
-prompt_on_stdin = false
-extra_args   = ["--no-color"]
-version_args = ["--version"]
-static_models = ["fast", "powerful"]
-auth_env     = ["INTERNAL_TOOL_API_KEY"]
-runtime      = "native"
-
-[generic_adapters.safety]
-read_only = ["--read-only"]
-propose   = ["--propose"]
-write     = []
-yolo      = ["--skip-approvals"]
 ```
 
 ---

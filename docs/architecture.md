@@ -29,7 +29,7 @@ adapters           src/rutherford/adapters/
                    registry.py    -- closed id -> adapter mapping
                    claude_code.py, codex.py, cursor.py, qwen.py,
                    kiro.py, opencode.py, goose.py, ollama.py,
-                   lmstudio.py, antigravity.py, generic.py
+                   lmstudio.py, antigravity.py, droid.py, vibe.py, copilot.py
         |
 runtime            src/rutherford/runtime/
                    process.py     -- ProcessRunner Protocol + AsyncProcessRunner
@@ -178,21 +178,14 @@ one-line addition to `BUILTIN_ADAPTERS`.
 `build_registry(config)` assembles the final mapping:
 
 1. Load enabled built-ins (skipping any with `adapters.<id>.enabled = false` in config).
-2. Instantiate any `generic_adapters` entries as `GenericAdapter` instances.
-3. If `enabled_adapters` is set, restrict to those ids and raise `RegistryError` on any unknown id.
+2. If `enabled_adapters` is set, restrict to those ids and raise `RegistryError` on any unknown id.
 
 A duplicate adapter id or an unknown id in `enabled_adapters` raises `RegistryError` at startup
 (fail-fast). Looking up an unknown id during a tool call also raises `RegistryError`, which
 `DelegationService` converts to a structured failure result.
 
-**The config-driven generic adapter.** `adapters/generic.py:GenericAdapter` is driven entirely
-by a `GenericAdapterConfig` entry in the config file. It handles CLIs with a clean headless
-invocation and deterministic stdout (plain text or a JSON object). The `argv` is assembled as
-`[binary, *base_args, *safety_args, *model_args, *working_dir_args, *extra_args, prompt]` (or
-with prompt on stdin). CLIs whose output requires custom parsing (streaming events, transcript
-files) still need a code adapter.
-
-See [docs/adding-a-cli.md](adding-a-cli.md) for the decision tree and step-by-step instructions.
+Every CLI is a hand-written code adapter; there is no config-only path. See
+[docs/adding-a-cli.md](adding-a-cli.md) for the step-by-step instructions.
 
 ---
 
@@ -214,7 +207,9 @@ The current quirks, by adapter:
 | `qwen` | `qwen` | `-o json` event array; answer from the last `result` event, else the last `assistant` message |
 | `ollama` | `ollama` | Plain text on stdout from `ollama run --hidethinking` (the flag keeps a reasoning model's chain-of-thought out of the answer); empty output is a `PARSE_ERROR` (local model, optional) |
 | `lmstudio` | `lms` | `lms chat <model> -p`; the model-load progress bar prints to stdout as carriage-return overwrites, so `parse_output` renders the CR away and strips a `<think>...</think>` block to leave the answer (local model, optional) |
-| `generic` | configurable | Plain text (default) or last JSON object on stdout, with optional dotted `json_text_path` extraction |
+| `droid` | `droid` | `droid exec --output-format json`; Claude-Code-style envelope, answer from `result`, cost from the nested `usage` block |
+| `vibe` | `vibe` | `--output json` is a top-level array of messages; answer is the last `assistant` message's `content`; forces UTF-8 stdout via the child env |
+| `copilot` | `copilot` | `--output-format json` JSONL; answer from the last non-ephemeral `assistant.message` `data.content`; session from the terminal `result` event |
 
 ### Antigravity transcript quirk
 
@@ -303,5 +298,5 @@ specific to that CLI. Every adapter must return a value for every mode.
 ## Cross-references
 
 - Configuration options and file locations: [docs/configuration.md](configuration.md)
-- Adding a new CLI (decision tree, code adapter vs. generic): [docs/adding-a-cli.md](adding-a-cli.md)
+- Adding a new CLI (code adapter): [docs/adding-a-cli.md](adding-a-cli.md)
 - Trusted-workspace policy, secret handling, argv rules: [docs/security.md](security.md)

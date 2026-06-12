@@ -134,7 +134,7 @@ def str_field(payload: Mapping[str, Any], key: str) -> str:
 def as_text(value: Any) -> str | None:
     """Coerce a scalar leaf to text, or ``None`` for a container/boolean/missing value.
 
-    Used by the generic adapter's dotted-path extraction: a string/number leaf becomes its text,
+    Used for dotted-path extraction into nested JSON: a string/number leaf becomes its text,
     while a ``dict``/``list``/``bool``/``None`` leaf returns ``None`` so a path that lands on a
     non-scalar is reported as a parse failure rather than stringified into ``"{...}"``/``"True"``.
     """
