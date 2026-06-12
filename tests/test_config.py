@@ -87,6 +87,16 @@ def test_unknown_key_rejected(tmp_path: Path) -> None:
         load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
 
 
+def test_generic_adapters_key_is_rejected_after_removal(tmp_path: Path) -> None:
+    # The config-driven generic adapter was removed: a config that still defines `generic_adapters`
+    # must fail loudly at load (unknown keys are forbidden), never be silently ignored.
+    (tmp_path / "rutherford.toml").write_text(
+        '[[generic_adapters]]\nid = "x"\ndisplay_name = "X"\nbinary = "x"\n', encoding="utf-8"
+    )
+    with pytest.raises(ConfigError):
+        load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+
+
 def test_deep_merge_nested() -> None:
     base = {"adapters": {"codex": {"default_model": "a"}}, "max_depth": 1}
     overlay = {"adapters": {"claude_code": {"default_model": "b"}}, "max_depth": 2}
