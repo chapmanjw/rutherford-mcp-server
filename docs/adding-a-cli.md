@@ -112,5 +112,8 @@ Run `just check` (lint, format, license header, mypy strict, unit tests with the
 | Goose | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key | 2026-05-30 (docs) |
 | Cursor | `cursor` | `cursor-agent -p --output-format json --trust` (prompt on stdin) | `cursor-agent login` or `CURSOR_API_KEY` | 2026-05-30 |
 | Qwen Code | `qwen` | `qwen -o json` (prompt on stdin) | `qwen` OAuth or `OPENAI_API_KEY` | 2026-05-30 |
+| Droid (Factory) | `droid` | `droid exec --output-format json` (prompt on stdin) | `FACTORY_API_KEY`/`FACTORY_TOKEN` or `droid` login | 2026-06-12 |
+| Mistral Vibe | `vibe` | `vibe --output json --trust --agent <mode> -p "<prompt>"` | `MISTRAL_API_KEY` or `vibe --setup` | 2026-06-11 |
+| GitHub Copilot CLI | `copilot` | `copilot -p "<prompt>" --output-format json` | fine-grained PAT in `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN`, or `copilot` `/login` | 2026-06-11 |
 | Ollama (local, optional) | `ollama` | `ollama run <model>` (prompt on stdin) | none -- local daemon | 2026-06-08 |
 | LM Studio (local, optional) | `lmstudio` | `lms chat <model> -p "<prompt>"` (`-s` system prompt) | none -- local | 2026-06-08 |

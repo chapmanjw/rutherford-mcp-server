@@ -1,0 +1,1 @@
+{"type":"result","subtype":"error_max_turns","is_error":true,"duration_ms":1200,"num_turns":3,"result":"Reached the maximum number of turns before completing the task.","session_id":"512e2220-3560-47b4-896c-31bd855c6bcb","usage":{"input_tokens":2048,"output_tokens":96,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}

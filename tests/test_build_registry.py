@@ -14,13 +14,16 @@ ALL_BUILTINS = [
     "antigravity",
     "claude_code",
     "codex",
+    "copilot",
     "cursor",
+    "droid",
     "goose",
     "kiro",
     "lmstudio",
     "ollama",
     "opencode",
     "qwen",
+    "vibe",
 ]
 
 

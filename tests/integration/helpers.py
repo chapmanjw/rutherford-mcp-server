@@ -22,6 +22,9 @@ CLI_ENV: dict[str, str] = {
     "goose": "RUTHERFORD_IT_GOOSE",
     "cursor": "RUTHERFORD_IT_CURSOR",
     "qwen": "RUTHERFORD_IT_QWEN",
+    "droid": "RUTHERFORD_IT_DROID",
+    "vibe": "RUTHERFORD_IT_VIBE",
+    "copilot": "RUTHERFORD_IT_COPILOT",
     "ollama": "RUTHERFORD_IT_OLLAMA",
     "lmstudio": "RUTHERFORD_IT_LMSTUDIO",
 }

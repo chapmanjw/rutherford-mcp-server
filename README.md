@@ -28,7 +28,7 @@ never calls a model provider's hosted API, so there are no new keys to manage.
 </p>
 
 <p align="center"><i>Drives:</i>
-Claude Code · Codex · Cursor · Qwen Code · Kiro · OpenCode · Goose · Antigravity · Ollama · LM Studio</p>
+Claude Code · Codex · Cursor · Qwen Code · Kiro · OpenCode · Goose · Droid · Mistral Vibe · GitHub Copilot · Antigravity · Ollama · LM Studio</p>
 
 ```sh
 uv tool install rutherford-mcp-server
@@ -290,8 +290,8 @@ CLI-calls-itself chain bounded. Full detail:
 <details>
 <summary><b>The full adapter matrix and the versions each release is confirmed against</b></summary>
 
-Each adapter keeps all of its CLI-specific details in one file, so a change is a one-file edit. An
-eleventh, well-behaved CLI can be added without code — see
+Each adapter keeps all of its CLI-specific details in one file, so a change is a one-file edit. Another
+well-behaved CLI can be added without code — see
 [docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md).
 
 | CLI | Adapter id | How Rutherford runs it | Auth |
@@ -303,6 +303,9 @@ eleventh, well-behaved CLI can be added without code — see
 | Kiro | `kiro` | `kiro-cli chat --no-interactive "<prompt>"` | `KIRO_API_KEY` or `kiro-cli login` |
 | OpenCode | `opencode` | `opencode run --format json -q "<prompt>"` | provider key or `opencode auth login` |
 | Goose | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key |
+| Droid (Factory) | `droid` | `droid exec --output-format json` (prompt on stdin) | `FACTORY_API_KEY`/`FACTORY_TOKEN` or `droid` login |
+| Mistral Vibe | `vibe` | `vibe --output json --trust --agent <mode> -p "<prompt>"` | `MISTRAL_API_KEY` or `vibe --setup` |
+| GitHub Copilot CLI | `copilot` | `copilot -p "<prompt>" --output-format json` | GitHub PAT (Copilot Requests scope) or `copilot` login |
 | Antigravity | `antigravity` | `agy -p "<prompt>"` (answer from the transcript file) | Google login |
 | Ollama (local) | `ollama` | `ollama run <model>` (prompt on stdin) | none — local daemon |
 | LM Studio (local) | `lmstudio` | `lms chat <model> -p "<prompt>"` | none — local |
@@ -321,6 +324,9 @@ you can.
 | Kiro | 2.6.1 | `kiro-cli --version` |
 | OpenCode | 1.15.13 | `opencode --version` |
 | Goose | 1.36.0 | `goose --version` |
+| Droid (Factory) | 0.144.2 | `droid --version` |
+| Mistral Vibe | 2.14.1 | `vibe --version` |
+| GitHub Copilot CLI | 1.0.61 | `copilot --version` |
 | Antigravity | 1.0.7 | `agy --version` |
 | Ollama | 0.30.6 | `ollama --version` |
 | LM Studio (`lms`) | build efce996 | `lms version` |

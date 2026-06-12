@@ -8,10 +8,12 @@ These exercise the actual CLI subprocesses end to end. Each skips unless its CLI
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from rutherford.context import AppContext
-from rutherford.domain.enums import AuthState, Strategy
+from rutherford.domain.enums import AuthState, SafetyMode, Strategy
 from rutherford.domain.models import (
     ConsensusRequest,
     ConsensusResult,
@@ -116,6 +118,113 @@ async def test_multi_cli_consensus(real_app: AppContext) -> None:
     assert isinstance(result, ConsensusResult)  # no strategy -> the legacy every-voice shape
     assert len(result.voices) == 2
     assert {voice.target.cli for voice in result.voices} == set(ready[:2])
+
+
+_EDIT_PROMPT = (
+    "Use the write_file or edit tool to set the entire contents of the file marker.txt in the current "
+    "working directory to exactly the single word CHANGED (all caps). Then reply with the word done."
+)
+
+
+@pytest.mark.parametrize("cli_id", list(CLI_ENV))
+async def test_write_applies_an_edit_and_read_only_does_not(real_app: AppContext, cli_id: str, tmp_path: Path) -> None:
+    # The sole live proof that the safety ladder actually controls mutation: read_only must leave the
+    # file untouched (the CLI's read-only/deny-write mapping holds), and write must apply the edit (the
+    # write mapping reaches the CLI's edit tool). Unit tests prove the flags; only this proves the CLI
+    # honors them against a real file.
+    skip_unless_runnable(real_app, cli_id)
+    marker = tmp_path / "marker.txt"
+
+    marker.write_text("ORIGINAL\n", encoding="utf-8")
+    read_only = await real_app.delegation.delegate(
+        DelegationRequest(
+            target=Target(cli=cli_id),
+            prompt=_EDIT_PROMPT,
+            working_dir=str(tmp_path),
+            safety_mode=SafetyMode.READ_ONLY,
+            timeout_s=240,
+        ),
+        base_depth=0,
+    )
+    assert "CHANGED" not in marker.read_text(encoding="utf-8"), (
+        f"{cli_id} mutated the file in read_only mode (delegation ok={read_only.ok})"
+    )
+
+    marker.write_text("ORIGINAL\n", encoding="utf-8")
+    write = await real_app.delegation.delegate(
+        DelegationRequest(
+            target=Target(cli=cli_id),
+            prompt=_EDIT_PROMPT,
+            working_dir=str(tmp_path),
+            safety_mode=SafetyMode.WRITE,
+            trust_workspace=True,
+            timeout_s=300,
+        ),
+        base_depth=0,
+    )
+    assert write.ok, f"{cli_id} write delegation failed: {write.error}"
+    assert "CHANGED" in marker.read_text(encoding="utf-8"), (
+        f"{cli_id} did not apply the edit in write mode (ok={write.ok}, text={write.text[:200]!r})"
+    )
+
+
+@pytest.mark.parametrize("cli_id", list(CLI_ENV))
+async def test_resume_round_trip_carries_context(real_app: AppContext, cli_id: str, tmp_path: Path) -> None:
+    # A resumable adapter must round-trip its session id: the second turn, given the first turn's
+    # session_id, must see what the first turn established. Both turns share an isolated working_dir so
+    # the agent answers rather than greeting the ambient repo. Skips when the adapter cannot resume or
+    # produced no id to feed back.
+    skip_unless_runnable(real_app, cli_id)
+    if not real_app.registry.get(cli_id).capabilities().supports_resume:
+        pytest.skip(f"{cli_id} does not support resume")
+    first = await real_app.delegation.delegate(
+        DelegationRequest(
+            target=Target(cli=cli_id),
+            prompt="Remember this secret codeword for later: BANANA42. Just reply with the word ok.",
+            working_dir=str(tmp_path),
+            timeout_s=180,
+        ),
+        base_depth=0,
+    )
+    if not (first.ok and first.session_id):
+        pytest.skip(f"{cli_id} produced no session_id to resume (ok={first.ok})")
+    second = await real_app.delegation.delegate(
+        DelegationRequest(
+            target=Target(cli=cli_id),
+            session_id=first.session_id,
+            prompt="What was the secret codeword I gave you earlier? Reply with only the codeword.",
+            working_dir=str(tmp_path),
+            timeout_s=180,
+        ),
+        base_depth=0,
+    )
+    assert second.ok, f"{cli_id} resume delegation failed: {second.error}"
+    assert "BANANA42" in second.text.upper(), f"{cli_id} resume did not carry context; got {second.text[:200]!r}"
+
+
+@pytest.mark.parametrize("cli_id", list(CLI_ENV))
+async def test_multiline_prompt_is_not_truncated(real_app: AppContext, cli_id: str, tmp_path: Path) -> None:
+    # A multi-line prompt (the shape every role preamble + task takes) must arrive intact. If the first
+    # newline truncated the argv element (the cmd.exe-shim hazard) the CLI would never see the second
+    # line's instruction, so a correct answer proves the whole prompt survived. Runs in an isolated
+    # working_dir so the agent answers the prompt rather than greeting the ambient repo.
+    skip_unless_runnable(real_app, cli_id)
+    # The second line carries a legitimate task (a sum) whose operands appear ONLY on that line, so a
+    # correct answer proves the line survived. (A contrived "say the magic word" instruction is a poor
+    # probe -- some models refuse it as a pointless test, which looks like truncation but is not.)
+    prompt = (
+        "Ignore this first line completely; it is irrelevant filler.\n"
+        "The real task is on this second line: compute 17 + 25 and reply with only the resulting number."
+    )
+    result = await real_app.delegation.delegate(
+        DelegationRequest(target=Target(cli=cli_id), prompt=prompt, working_dir=str(tmp_path), timeout_s=180),
+        base_depth=0,
+    )
+    assert result.ok, f"{cli_id} failed: {result.error}"
+    assert "42" in result.text, (
+        f"{cli_id} did not answer the second line's task -- multi-line prompt may have been truncated: "
+        f"{result.text[:200]!r}"
+    )
 
 
 def test_auth_state_is_reported_not_hung(real_app: AppContext) -> None:
