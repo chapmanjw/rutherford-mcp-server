@@ -6,6 +6,25 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-06-11
+
+Documentation-only release; no code changes. Re-published so the refreshed README and the
+official-MCP-registry ownership marker reach PyPI.
+
+### Added
+
+- `docs/recipes.md`: a task-oriented cookbook of paste-able prompts (the how-to guides moved
+  out of the README).
+
+### Changed
+
+- Restructured the README around a proof-first masthead (PyPI/Python/MIT/CI badges, one-click
+  Cursor and VS Code install links, the install one-liner), the real debate transcript, and a
+  five-minute quickstart with `doctor` as the pre-flight gate and a keyless local-model lane.
+  The adapter matrix, strategies, and saved panels moved under collapsible sections. Added a
+  per-CLI confirmed-version table (versions verified for 1.3.0) and an `mcp-name` marker for the
+  official MCP registry.
+
 ## [1.3.0] - 2026-06-11
 
 ### Breaking
