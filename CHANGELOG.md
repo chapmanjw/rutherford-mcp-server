@@ -6,6 +6,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-06-12
+
+### Added
+
+- Three new built-in CLI adapters, bringing the roster to thirteen, each built and verified against
+  the live binary:
+  - **Droid** (Factory, `droid`): `droid exec --output-format json` (Claude-Code-style JSON
+    envelope), `--auto low` / `--skip-permissions-unsafe` write tiers, auth via `FACTORY_API_KEY` /
+    `FACTORY_TOKEN` or a persisted `~/.factory` login.
+  - **Mistral Vibe** (`vibe`): `vibe --output json --agent <mode> -p`, the only adapter that adds a
+    first-party Mistral/Devstral provider. Model selection via the `VIBE_ACTIVE_MODEL` env override
+    (Vibe has no `--model` flag); auth via `MISTRAL_API_KEY` or a persisted `~/.vibe/.env`. The
+    adapter forces `PYTHONIOENCODING=utf-8` so Vibe does not crash on non-cp1252 output on Windows,
+    and relies on the runner's `DEVNULL` stdin for the EOF `vibe -p` waits on.
+  - **GitHub Copilot CLI** (`copilot`): `copilot -p --output-format json` (JSONL), session resume,
+    auth via a fine-grained GitHub PAT (`COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`) or a
+    persisted `copilot` login. `--no-auto-update` is pinned, and only the documented `auto` model
+    sentinel is advertised because Copilot rotates its concrete model ids.
+- Gated real-CLI integration tests covering the safety ladder (write applies an edit, `read_only`
+  does not), session-resume round-trips, and multi-line prompt integrity, parametrized over the
+  whole roster.
+
+### Changed
+
+- The supported-CLIs tables (README and `docs/adding-a-cli.md`) and the confirmed-version table now
+  include Droid, Mistral Vibe, and GitHub Copilot.
+
 ## [1.3.1] - 2026-06-11
 
 Documentation-only release; no code changes. Re-published so the refreshed README and the

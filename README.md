@@ -315,7 +315,7 @@ third-party tools whose headless flags and output formats change between release
 release records the CLI versions it was last verified against. Re-check after a CLI upgrade, and pin if
 you can.
 
-| CLI | Confirmed with Rutherford 1.3.0 | Check yours |
+| CLI | Confirmed with Rutherford 1.4.0 | Check yours |
 | --- | --- | --- |
 | Claude Code | 2.1.172 | `claude --version` |
 | Codex | 0.135.0 | `codex --version` |
