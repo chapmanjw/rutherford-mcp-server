@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from rutherford.config.loader import default_global_config_path
+from rutherford.config.loader import default_global_config_path, load_config
 from rutherford.config.locations import home_dir
 from rutherford.domain.enums import AuthState
 from rutherford.domain.errors import RutherfordError
@@ -112,6 +112,39 @@ def test_default_persistence_is_omitted_when_not_chosen(tmp_path: Path) -> None:
     assert "default_persistence" not in config.content  # not forced when the caller did not answer
 
 
+def test_project_scope_writes_under_the_workspace_rutherford_dir(tmp_path: Path) -> None:
+    # scope=project lands config + panels under <cwd>/.rutherford/, the same dir jobs use, so the
+    # workspace-keyed first-run hint is answered for THIS workspace (decision 1-I).
+    plan = build_setup_plan(
+        [_status("a"), _status("b")],
+        env=_env(tmp_path / "elsewhere"),  # global root points away, to prove project paths are used
+        default_persistence="job",
+        scope="project",
+        cwd=tmp_path,
+    )
+    config = next(f for f in plan.files if f.kind == "config")
+    assert config.path == str(tmp_path / ".rutherford" / "config.toml")
+    assert "default_persistence = 'job'" in config.content
+    panels = next(f for f in plan.files if f.kind == "panels")
+    assert panels.path == str(tmp_path / ".rutherford" / "panels.toon")
+
+
+def test_project_setup_then_load_applies_the_workspace_persistence_default(tmp_path: Path) -> None:
+    # The full loop: setup (project scope) writes the default, and load_config reads it back for that
+    # workspace -- the path the first-run hint actually directs the agent to.
+    plan = build_setup_plan(
+        [_status("a"), _status("b")],
+        env=_env(tmp_path / "elsewhere"),
+        default_persistence="job",
+        scope="project",
+        cwd=tmp_path,
+    )
+    apply_setup_plan(plan)
+    assert (tmp_path / ".rutherford" / "config.toml").is_file()  # the .rutherford dir now exists too
+    config = load_config(env=_env(tmp_path / "elsewhere"), cwd=tmp_path)
+    assert config.default_persistence == "job"
+
+
 def test_apply_writes_new_files_and_skips_existing(tmp_path: Path) -> None:
     plan = build_setup_plan([_status("a"), _status("b")], env=_env(tmp_path))
     written = apply_setup_plan(plan)
@@ -183,6 +216,17 @@ async def test_setup_tool_rejects_an_invalid_default_persistence_and_writes_noth
     )
     with pytest.raises(RutherfordError, match="default_persistence"):
         await setup_tool(app, apply=True, default_persistence="sometimes")
+    assert not default_global_config_path(os.environ).exists()
+
+
+async def test_setup_tool_rejects_an_invalid_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _pin_env(monkeypatch, tmp_path)
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+    )
+    with pytest.raises(RutherfordError, match="scope"):
+        await setup_tool(app, apply=True, scope="planet")
     assert not default_global_config_path(os.environ).exists()
 
 

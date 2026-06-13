@@ -34,6 +34,26 @@ def test_project_override(tmp_path: Path) -> None:
     assert config.max_depth == 5
 
 
+def test_project_dot_rutherford_config_is_loaded(tmp_path: Path) -> None:
+    # setup ... scope=project writes <cwd>/.rutherford/config.toml; the loader must read it so a
+    # workspace persistence default actually takes effect (F2, decision 1-I).
+    cfg_dir = tmp_path / ".rutherford"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.toml").write_text("default_persistence = 'job'\n", encoding="utf-8")
+    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+    assert config.default_persistence == "job"
+
+
+def test_top_level_rutherford_toml_wins_over_dot_rutherford_config(tmp_path: Path) -> None:
+    # First-found wins: an explicit top-level rutherford.toml takes precedence over .rutherford/config.toml.
+    (tmp_path / "rutherford.toml").write_text("max_depth = 5\n", encoding="utf-8")
+    cfg_dir = tmp_path / ".rutherford"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.toml").write_text("max_depth = 9\n", encoding="utf-8")
+    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+    assert config.max_depth == 5
+
+
 def test_global_and_project_merge(tmp_path: Path) -> None:
     global_root = tmp_path / "globalroot"
     global_dir = global_root / "rutherford"

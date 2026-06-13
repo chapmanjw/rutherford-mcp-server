@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -161,6 +163,29 @@ async def test_pre_existing_dirty_file_is_not_attributed_to_the_run(
         _req(persist=True, safety_mode=SafetyMode.WRITE, working_dir=str(tmp_path), trust_workspace=True)
     )
     assert result.changed_files == ["bar.py"]
+
+
+def test_git_diff_includes_created_untracked_file_contents(tmp_path: Path) -> None:
+    # Real-git (not mocked): git diff HEAD omits untracked/created files, but a write run that CREATES a
+    # file must capture its contents in diff.md (1-E). This would fail with the old plain `git diff HEAD`.
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True, text=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "Test")
+    (tmp_path / "tracked.txt").write_text("original\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-q", "-m", "init")
+    (tmp_path / "tracked.txt").write_text("original\nmodified\n", encoding="utf-8")  # modify a tracked file
+    (tmp_path / "created.py").write_text("print('a created file')\n", encoding="utf-8")  # create a new file
+    diff = delegation_module._git_diff(str(tmp_path))
+    assert diff is not None
+    assert "modified" in diff  # the tracked change (git diff HEAD)
+    assert "created.py" in diff and "print('a created file')" in diff  # the created file's contents (the fix)
 
 
 def test_git_changed_files_parses_porcelain(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -371,6 +396,15 @@ def test_first_run_hint_fires_once_per_session(tmp_path: Path, monkeypatch: pyte
     app = make_app()
     first = app.persistence_notice(persisted=True, complex_run=False, external_tracking=False)
     assert first is not None and "ephemeral by default" in first
+    assert app.persistence_notice(persisted=True, complex_run=False, external_tracking=False) is None
+
+
+def test_first_run_hint_suppressed_once_workspace_configured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The loop closes: once a workspace .rutherford/ exists (setup scope=project wrote config there, or a
+    # job was persisted), the first-run hint no longer fires.
+    (tmp_path / ".rutherford").mkdir()
+    monkeypatch.chdir(tmp_path)
+    app = make_app()
     assert app.persistence_notice(persisted=True, complex_run=False, external_tracking=False) is None
 
 

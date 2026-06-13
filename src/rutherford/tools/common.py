@@ -74,6 +74,13 @@ def parse_persistence(value: str) -> str:
     )
 
 
+def parse_scope(value: str) -> str:
+    """Validate a setup ``scope`` (``global`` | ``project``), or raise ``INVALID_INPUT``."""
+    if value in ("global", "project"):
+        return value
+    raise RutherfordError(ErrorCode.INVALID_INPUT, f"unknown scope {value!r}; choose one of: global, project")
+
+
 def resolve_safety_mode(value: str | SafetyMode | None, default: SafetyMode) -> SafetyMode:
     """The effective safety mode for a call: the explicit value, else the configured default.
 

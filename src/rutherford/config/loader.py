@@ -21,8 +21,10 @@ from pydantic import ValidationError
 from ..domain.errors import ConfigError
 from .schema import RutherfordConfig
 
-#: Project-local config filenames searched in the working directory, in order.
-PROJECT_CONFIG_NAMES = ("rutherford.toml", ".rutherford.toml")
+#: Project-local config filenames searched in the working directory, in order (first found wins). The
+#: ``.rutherford/config.toml`` form lives under the same project ``.rutherford/`` dir as jobs and panels
+#: and is what ``setup ... scope=project`` writes, so a workspace persistence default takes effect there.
+PROJECT_CONFIG_NAMES = ("rutherford.toml", ".rutherford.toml", ".rutherford/config.toml")
 
 
 def default_global_config_path(env: Mapping[str, str] | None = None) -> Path:

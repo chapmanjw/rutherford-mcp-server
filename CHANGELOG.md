@@ -25,13 +25,15 @@ All notable changes to this project are documented in this file. The format is b
     explains itself even when no child records remain.
   - A persisted write run records its own `changed_files` delta -- the files it dirtied, minus those
     already dirty before it ran -- with the jobs directory excluded so a run never reports Rutherford's
-    own bookkeeping as a change to the user's code.
+    own bookkeeping as a change to the user's code. The saved `diff.md` captures both tracked-file
+    changes and the full contents of files the run *created* (plain `git diff` omits untracked files).
   - The first time a workspace is used, Rutherford notes once that runs are ephemeral by default and
     how to keep one; for an unpersisted complex run (a panel, or a mutating delegation) it suggests
     `persist=true`. The notice rides both the sync result and the `mode=async` submit envelope. The
-    `setup` tool now takes a `default_persistence` (`ephemeral` | `job`) so the first-run choice is a
-    one-step config write. `external_tracking=true` on `delegate` / `consensus` / `debate` silences both
-    hints when a workflow already tracks run state.
+    `setup` tool takes a `default_persistence` (`ephemeral` | `job`) and a `scope` (`global` |
+    `project`); `scope=project` writes the choice to the workspace's `.rutherford/config.toml` (now a
+    loaded config location), answering the first-run hint for that workspace. `external_tracking=true`
+    on `delegate` / `consensus` / `debate` silences both hints when a workflow already tracks run state.
   - Persistence is best-effort: a filesystem failure never fails a run that already produced an answer,
     it runs off the event loop, and it never persists the child process environment (it can carry
     secrets). Note: `state.toon` is written for a human or LLM to re-read; machine round-trip via the

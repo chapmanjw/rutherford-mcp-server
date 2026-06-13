@@ -64,6 +64,8 @@ def build_setup_plan(
     trusted_workspaces: Iterable[str] = (),
     panel_name: str = "default",
     default_persistence: str | None = None,
+    scope: str = "global",
+    cwd: Path | None = None,
 ) -> SetupPlan:
     """Build a :class:`SetupPlan` from probed adapter statuses, without touching disk.
 
@@ -72,7 +74,20 @@ def build_setup_plan(
     when at least two are ready -- an opt-in local model is never auto-added to it. The config carries
     the chosen default safety mode, any trusted workspaces, and -- when the caller answers the
     first-run persistence question (F2, decision 1-I) -- the chosen ``default_persistence``.
+
+    ``scope`` selects where the files land: ``global`` (the per-user config, the default) or ``project``
+    -- the working directory's ``.rutherford/config.toml`` + ``.rutherford/panels.toon``, the same
+    ``.rutherford/`` dir jobs use. A project write is how the first-run hint is answered *for that
+    workspace*: it both takes effect there (the loader reads ``.rutherford/config.toml``) and creates the
+    ``.rutherford/`` dir, so the workspace-keyed hint stops firing.
     """
+    working_dir = Path.cwd() if cwd is None else Path(cwd)
+    if scope == "project":
+        config_path = working_dir / CONFIG_DIRNAME / "config.toml"
+        panels_path = working_dir / CONFIG_DIRNAME / "panels.toon"
+    else:
+        config_path = default_global_config_path(env)
+        panels_path = home_dir(env) / CONFIG_DIRNAME / "panels.toon"
     detected: list[DetectedCli] = []
     ready: list[str] = []
     panel_eligible: list[str] = []  # ready and not optional -- an opt-in local model is not auto-added
@@ -93,7 +108,6 @@ def build_setup_plan(
     workspaces = [path for path in trusted_workspaces if path]
     if workspaces:
         config["trusted_workspaces"] = workspaces
-    config_path = default_global_config_path(env)
 
     files.append(
         ProposedFile(
@@ -116,7 +130,6 @@ def build_setup_plan(
                 }
             }
         }
-        panels_path = home_dir(env) / CONFIG_DIRNAME / "panels.toon"
         files.append(
             ProposedFile(
                 path=str(panels_path),

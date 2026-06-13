@@ -96,8 +96,9 @@ class AppContext:
         if not self.setup_hint_emitted and not (Path.cwd() / CONFIG_DIRNAME).exists():
             notices.append(
                 "No Rutherford config in this workspace yet: runs are ephemeral by default (nothing is "
-                "kept on disk). To keep runs as durable jobs under .rutherford/jobs/, set the default with "
-                "the setup tool (setup default_persistence=job, apply=true) or pass persist=true per call."
+                "kept on disk). To keep runs as durable jobs under .rutherford/jobs/, set the default for "
+                "this workspace with the setup tool (setup default_persistence=job, scope=project, "
+                "apply=true) or pass persist=true per call."
             )
             self.setup_hint_emitted = True
         if complex_run and not persisted and not external_tracking and self.config.default_persistence == "ephemeral":

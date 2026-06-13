@@ -515,7 +515,7 @@ class DelegationService:
                 result.changed_files = (
                     after if before_changed is None else [name for name in after if name not in before_changed]
                 )
-                diff = _git_run(wd, ["diff", "HEAD", "--", ".", *exclude]) or None
+                diff = _git_diff(wd, exclude)
 
         record = RunRecord(
             run_id=uuid.uuid4().hex,
@@ -682,6 +682,54 @@ def _git_changed_files(working_dir: str, exclude: list[str] | None = None) -> li
         if path:
             files.append(path)
     return files
+
+
+#: A created file larger than this is noted but not embedded in diff.md, to keep the artifact sane.
+_MAX_NEW_FILE_DIFF_BYTES = 200_000
+
+
+def _git_diff(working_dir: str, exclude: list[str] | None = None) -> str | None:
+    """A write run's diff: tracked changes (``git diff HEAD``) PLUS the full contents of created files (1-E).
+
+    ``git diff HEAD`` shows only tracked files, so a run that *creates* a file -- the common codegen
+    case -- would be listed in ``changed_files`` (from ``git status``) yet absent from the diff. Each
+    untracked, non-ignored file (``git ls-files --others --exclude-standard`` -- the same set ``status``
+    reports as ``??``) is appended as a synthetic ``new file`` section so ``diff.md`` reflects what the
+    run actually wrote. ``None`` when git is unavailable or the dir is not a repo (matching the rest of
+    the git machinery); an all-empty result collapses to ``None`` so no empty ``diff.md`` is written.
+    """
+    exclude = exclude or []
+    tracked = _git_run(working_dir, ["diff", "HEAD", "--", ".", *exclude])
+    if tracked is None:
+        return None
+    sections: list[str] = [tracked] if tracked.strip() else []
+    others = _git_run(working_dir, ["ls-files", "--others", "--exclude-standard", "--", ".", *exclude])
+    for line in (others or "").splitlines():
+        rel = line.strip().strip('"')
+        if rel:
+            sections.append(_render_new_file_diff(Path(working_dir) / rel, rel))
+    combined = "\n".join(sections)
+    return combined or None
+
+
+def _render_new_file_diff(path: Path, rel: str) -> str:
+    """Render a created (untracked) file as a synthetic ``new file`` diff section for ``diff.md``.
+
+    Reads bytes first so a binary or oversize file is noted rather than dumped; a text file is emitted
+    as added (``+``-prefixed) lines so the section reads as a real new-file diff.
+    """
+    header = f"diff --git a/{rel} b/{rel}\nnew file\n--- /dev/null\n+++ b/{rel}\n"
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return f"{header}(unreadable)\n"
+    if len(raw) > _MAX_NEW_FILE_DIFF_BYTES:
+        return f"{header}(new file omitted: {len(raw)} bytes)\n"
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"{header}(binary file: {len(raw)} bytes)\n"
+    return header + "".join(f"+{line}\n" for line in content.splitlines())
 
 
 def _git_run(working_dir: str, args: list[str]) -> str | None:
