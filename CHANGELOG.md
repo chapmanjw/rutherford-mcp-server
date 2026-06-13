@@ -6,6 +6,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-06-13
+
+Purely additive: the supported roster grows from 13 to 22 CLIs and there are no breaking changes
+(strict SemVer would make this 1.8.0; 2.0.0 marks the roster milestone). Each new adapter was verified
+live end to end before release.
+
 ### Added
 
 - Nine new CLI adapters: Amp, Cline, Continue, Hermes Agent, Junie, Kilo Code, Kimi Code, OpenHands, and
