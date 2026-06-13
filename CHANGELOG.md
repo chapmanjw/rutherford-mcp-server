@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-06-13
+
 ### Added
 
 - Time budget + effort (F8a). Three previously-conflated concerns are now separate knobs:

@@ -703,11 +703,13 @@ async def test_on_budget_continue_detaches_publishing_an_interim_then_the_full_s
     # the best-effort answered-so-far set and keeps the stragglers running, returning the full set when they
     # land. Nothing is cut: the final has every voice and is not flagged as a budget harvest.
     interims: list[ConsensusResult | StrategyResult] = []
-    runner = _BudgetRunner({"fast": 0.0, "slow": 0.3})
+    # Generous gap (fast finishes ~instantly, well under the 0.3s budget; slow's 1.0s far exceeds it) so the
+    # deadline reliably fires with the slow voice still pending even on a loaded CI runner.
+    runner = _BudgetRunner({"fast": 0.0, "slow": 1.0})
     service = _budget_consensus(runner)
     result = await service.consensus(
         ConsensusRequest(
-            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.1, on_budget="continue"
+            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3, on_budget="continue"
         ),
         on_interim_result=interims.append,
     )
