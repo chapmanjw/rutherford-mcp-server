@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-06-13
+
 ### Added
 
 - Durable run persistence (F2), opt-in. A run can be kept as a job on disk: `persist=true` (or
@@ -59,6 +61,14 @@ All notable changes to this project are documented in this file. The format is b
   renderer printed the start of a word, erased the fragment with cursor escapes (`ESC[ND ESC[K`), and
   reprinted the whole word on the next line; stripping the ANSI afterwards left the orphaned fragment
   behind, corrupting any output line longer than ~75 characters. Thanks to @arondee for the fix.
+- Antigravity adapter: re-verified against agy 1.0.8 and re-pinned the transcript layout. **Known
+  limitation:** agy 1.0.8's print mode applies file edits even without the bypass flag and offers no
+  read-only/deny flag (`--sandbox` restricts only the terminal), so `read_only` / `propose` are now
+  *best-effort* on this adapter rather than guaranteed -- an agent that chooses to edit in a non-mutating
+  mode will modify the workspace. Enable the optional `verify_read_only` git guard (it fails such a run
+  `READONLY_VIOLATED` after the fact) for git workspaces where agy runs non-mutating, or use agy in
+  `write` / `yolo` behind a trusted workspace, or name it explicitly rather than in the default
+  read-only fan-out. Pending agy restoring a read-only print mode.
 
 ## [1.4.0] - 2026-06-12
 
