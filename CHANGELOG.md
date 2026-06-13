@@ -6,23 +6,26 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-06-13
+
 ### Added
 
 - Topology observation and live transparency (N1). Rutherford now observes how wide a run actually
-  fans out, and surfaces in-flight work both by polling and by push, all fed from one structured
-  activity-event stream.
+  fans out and surfaces in-flight work two ways, both fed from one structured activity-event stream.
   - Process topology: the runner samples each subprocess's local descendant count with psutil on a
     coarse timer and reports the peak. A consensus/debate result (and its persisted record) carries a
-    `Topology` — `declared` (the intended width), `realized_delegations` (the delegations Rutherford
-    launched; a debate counts every turn across rounds), and `observed_peak_agents` (the local
+    `Topology` — `declared` (the intended width), `realized_delegations` (Rutherford's own delegations
+    including fallback re-runs, summed across the voices or turns), and `observed_peak_agents` (the local
     descendant high-water mark, a floor — a CLI's remote agents are invisible). A single persisted
     delegation records its width-1 topology too, filling the slot the F2 record reserved from day one.
-  - A new `activity` tool: a live snapshot of the background jobs running right now (tool, elapsed,
-    progress-line count, latest line), distinct from `list_jobs` (which lists every job, terminal ones
-    included). Watch it while panels run; pass a row's `job_id` to `cancel_job`.
-  - MCP progress push: a synchronous `delegate` / `consensus` / `debate` call now reports live progress
-    to the caller (voices finished over the declared width) via `report_progress`, gated on a
-    client-supplied `progressToken` and silent otherwise. An async job is polled via `activity`, not pushed.
+  - A new `activity` tool: a structured, per-voice snapshot of in-flight work across the running
+    background jobs — job, tool, cli, model, role, status, elapsed, observed agents, budget left — read
+    from the same activity stream. Distinct from `list_jobs` (which lists every job record); pass a row's
+    `job_id` to `cancel_job`.
+  - One activity stream, two sinks that never diverge: an async job buffers the structured events (and
+    projects them into `job.progress` for the existing poll), while a synchronous `delegate` / `consensus`
+    / `debate` call pushes them to the caller as MCP progress notifications (`report_progress`), gated on a
+    client-supplied `progressToken` and silent otherwise.
   - An optional advisory aggregate-agent cap: `max_agents_advisory` flags a panel that fans out wider
     than the cap (`Topology.over_cap`) and logs a warning without blocking it; `enforce_agent_cap=true`
     refuses such a panel up front with the new `AGENT_CAP_EXCEEDED` code. Off by default — observe first.
