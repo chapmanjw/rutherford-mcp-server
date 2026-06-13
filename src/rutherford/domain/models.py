@@ -532,6 +532,9 @@ class DebateContribution(BaseModel):
     #: The cost this turn reported, carried from the voice's result, so a persisted debate's parent can
     #: roll up panel cost into ``state.toon`` (decision 1-D). ``None`` when the CLI reported none.
     cost: Cost | None = None
+    #: The files this turn changed (a write-mode debate), carried from the voice's result so the parent
+    #: rolls up the panel's changed-file union (decision 1-D), mirroring consensus. Empty for a read run.
+    changed_files: list[str] = Field(default_factory=list)
     #: The directory this turn was persisted to when the debate was kept as a job (the child record of
     #: the panel parent). ``None`` for an ephemeral debate.
     run_dir: str | None = None

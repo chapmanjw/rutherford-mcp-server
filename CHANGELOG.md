@@ -19,8 +19,9 @@ All notable changes to this project are documented in this file. The format is b
     debate) that links each voice by `run_id`, and every voice is a leaf record carrying its
     `parent_run_id`, so a reader can open the parent and walk to each voice. The parent's status is
     derived from the voices (succeeded when any voice answered, failed when none did) and it rolls up
-    the panel's duration, safety mode, files, role, the union of the voices' changed files, and the
-    summed cost. A consensus adds one `artifacts/voices/voice-N.md` per voice (plus a `voices/skipped.md`
+    the panel's duration, safety mode, working directory, files, role, the union of the voices' changed
+    files (consensus and debate alike), and the summed cost. A consensus adds one
+    `artifacts/voices/voice-N.md` per voice (plus a `voices/skipped.md`
     naming any auto-panel adapters left out and why); a debate adds a `transcript.md` -- so the parent
     explains itself even when no child records remain.
   - A persisted write run records its own `changed_files` delta -- the files it dirtied, minus those

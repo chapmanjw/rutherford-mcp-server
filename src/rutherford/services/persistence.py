@@ -56,6 +56,7 @@ def write_panel_record(
     created_at: float,
     finished_at: float,
     safety_mode: SafetyMode = SafetyMode.READ_ONLY,
+    cwd: str | None = None,
     files: list[str] | None = None,
     role: str | None = None,
     extra_artifacts: dict[str, str] | None = None,
@@ -66,8 +67,8 @@ def write_panel_record(
     produced an answer. ``clis`` are the distinct voice CLIs (a readable panel label); ``voices`` are the
     per-voice outcomes in panel order -- their ``run_id``s become the parent's ``child_run_ids``, their
     ``ok`` flags decide the parent ``status`` (succeeded when any voice answered, else failed), and their
-    ``cost`` / ``changed_files`` roll up onto the parent. ``safety_mode`` / ``files`` / ``role`` are the
-    panel request's, captured so the parent record is replay-complete (decision 1-D). ``extra_artifacts``
+    ``cost`` / ``changed_files`` roll up onto the parent. ``safety_mode`` / ``cwd`` / ``files`` / ``role``
+    are the panel request's, captured so the parent record is replay-complete (decision 1-D). ``extra_artifacts``
     carries the parent's audit artifacts -- a consensus passes its ``voices/voice-N.md`` set (see
     :func:`render_panel_voice_files`), a debate passes its ``transcript.md``.
     """
@@ -82,6 +83,7 @@ def write_panel_record(
         child_run_ids=[voice.run_id for voice in voices if voice.run_id],
         cli=",".join(clis) if clis else kind,
         safety_mode=safety_mode,
+        cwd=cwd,
         role=role,
         files=list(files or []),
         prompt=prompt,

@@ -38,7 +38,7 @@ def async_job_envelope(
     run *will* persist (``persist``, else the configured ``default_persistence``). ``None`` notice is
     omitted so the envelope stays minimal when there is nothing to say.
     """
-    would_persist = persist if persist is not None else (app.config.default_persistence == "job")
+    would_persist = app.config.wants_persist(persist)
     notice = app.persistence_notice(
         persisted=would_persist, complex_run=complex_run, external_tracking=external_tracking
     )

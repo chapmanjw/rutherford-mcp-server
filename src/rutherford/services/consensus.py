@@ -79,7 +79,7 @@ class ConsensusService:
         legacy :class:`ConsensusResult` (every voice, plus optional synthesis) is returned unchanged.
         """
         created_at = self._clock()
-        persist = req.persist if req.persist is not None else (self._config.default_persistence == "job")
+        persist = self._config.wants_persist(req.persist)
         parent_run_id = uuid.uuid4().hex if persist and self._ledger is not None else None
         targets, skipped = await self._resolve_targets(req, on_progress)
 
@@ -162,6 +162,7 @@ class ConsensusService:
                 created_at=created_at,
                 finished_at=self._clock(),
                 safety_mode=req.safety_mode,
+                cwd=req.working_dir,
                 files=req.files,
                 role=req.role,
                 extra_artifacts=render_panel_voice_files(panel_voices, skipped_pairs),

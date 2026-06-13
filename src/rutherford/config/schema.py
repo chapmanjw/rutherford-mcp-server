@@ -163,6 +163,15 @@ class RutherfordConfig(BaseModel):
         self.role_dirs = [_resolve_dir("role_dirs", p) for p in self.role_dirs]
         return self
 
+    def wants_persist(self, persist: bool | None) -> bool:
+        """Resolve whether a run should be kept as a durable job (F2): explicit ``persist`` wins, else
+        the configured ``default_persistence`` (Model A: ``ephemeral`` out of the box).
+
+        The single source of truth for the persistence axis, shared by the delegation/consensus/debate
+        services and the async-submit envelope so the sync and async paths can never silently diverge.
+        """
+        return persist if persist is not None else (self.default_persistence == "job")
+
     def default_model_for(self, adapter_id: str) -> str | None:
         """Return the configured default model for ``adapter_id``, if any."""
         entry = self.adapters.get(adapter_id)

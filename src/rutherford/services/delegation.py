@@ -457,9 +457,8 @@ class DelegationService:
             result.error.code = refined
 
     def _should_persist(self, req: DelegationRequest) -> bool:
-        """Whether this run should be kept as a durable job (F2): explicit ``persist`` wins, else the
-        configured ``default_persistence`` (Model A: ``ephemeral`` out of the box)."""
-        return req.persist if req.persist is not None else (self._config.default_persistence == "job")
+        """Whether this run should be kept as a durable job (F2); see ``RutherfordConfig.wants_persist``."""
+        return self._config.wants_persist(req.persist)
 
     async def _snapshot_changed_files(self, req: DelegationRequest) -> set[str] | None:
         """Off-thread before-snapshot of the working tree's changed files, for a mutating persisted run.

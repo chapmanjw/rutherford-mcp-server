@@ -91,7 +91,7 @@ class DebateService:
         voices = self._resolve_voices(req)
         rounds_cap = self._resolve_rounds(req)
         created_at = self._clock()
-        persist = req.persist if req.persist is not None else (self._config.default_persistence == "job")
+        persist = self._config.wants_persist(req.persist)
         parent_run_id = uuid.uuid4().hex if persist and self._ledger is not None else None
 
         rounds: list[DebateRound] = []
@@ -135,6 +135,7 @@ class DebateService:
                 created_at=created_at,
                 finished_at=self._clock(),
                 safety_mode=req.safety_mode,
+                cwd=req.working_dir,
                 files=req.files,
                 role=req.role,
                 extra_artifacts={"transcript.md": _render_transcript(req.prompt, rounds)},
@@ -364,6 +365,7 @@ def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) 
         fallback_from=result.fallback_from,
         provenance=result.provenance,
         cost=result.cost,
+        changed_files=list(result.changed_files or []),
         run_dir=result.run_dir,
     )
 
@@ -377,6 +379,7 @@ def _panel_voice(contribution: DebateContribution) -> PanelVoice:
         text=contribution.text,
         error=contribution.error.message if contribution.error else None,
         cost=contribution.cost,
+        changed_files=tuple(contribution.changed_files),
     )
 
 

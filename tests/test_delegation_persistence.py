@@ -18,6 +18,7 @@ from rutherford.domain.models import (
     Cost,
     DebateRequest,
     DelegationRequest,
+    DelegationResult,
     InvocationContext,
     InvocationSpec,
     ProcessResult,
@@ -25,6 +26,7 @@ from rutherford.domain.models import (
     Target,
 )
 from rutherford.io.ledger import RunLedger
+from rutherford.services import debate as debate_module
 from rutherford.services import delegation as delegation_module
 from rutherford.services.delegation import DelegationService
 from rutherford.services.persistence import PanelVoice, render_panel_voice_files, write_panel_record
@@ -358,6 +360,17 @@ async def test_expand_all_with_everything_skipped_persists_an_auditable_failed_p
     assert children == []  # no voice ran, so the parent links no children
 
 
+def test_debate_changed_files_flow_to_the_panel_parent(tmp_path: Path) -> None:
+    # 1-D: a write-mode debate's parent must roll up the turns' changed files (like consensus). Guard the
+    # full chain result -> contribution -> PanelVoice; before the fix DebateContribution dropped them, so
+    # the debate parent's changed-file union was always empty.
+    voice = debate_module._Voice(index=0, target=Target(cli="a"), label="a", seat_id="0:a", stance=None, role=None)
+    result = DelegationResult(target=Target(cli="a"), ok=True, text="done", changed_files=["src/new.py"])
+    contribution = debate_module._to_contribution(voice, 1, result)
+    assert contribution.changed_files == ["src/new.py"]  # carried from the result
+    assert debate_module._panel_voice(contribution).changed_files == ("src/new.py",)  # and into the rollup input
+
+
 async def test_debate_persists_a_parent_with_transcript_and_children(tmp_path: Path) -> None:
     app = make_app(
         adapters=[FakeAdapter("a"), FakeAdapter("b")],
@@ -495,6 +508,7 @@ def test_panel_parent_rolls_up_cost_files_and_request_metadata(tmp_path: Path) -
         created_at=1000.0,
         finished_at=1002.5,
         safety_mode=SafetyMode.WRITE,
+        cwd="/work/repo",
         files=["in.py"],
         role="reviewer",
         extra_artifacts=render_panel_voice_files(voices),
@@ -502,6 +516,7 @@ def test_panel_parent_rolls_up_cost_files_and_request_metadata(tmp_path: Path) -
     assert out is not None
     state = (Path(out) / "state.toon").read_text(encoding="utf-8")
     assert "role: reviewer" in state
+    assert "cwd: /work/repo" in state  # the parent captures cwd for replay (1-D)
     assert "safety_mode: write" in state
     assert "status: succeeded" in state  # any voice ok -> succeeded
     assert "duration_s: 2.5" in state
