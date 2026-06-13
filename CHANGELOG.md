@@ -6,6 +6,40 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Nine new CLI adapters: Amp, Cline, Continue, Hermes Agent, Junie, Kilo Code, Kimi Code, OpenHands, and
+  pi. Each is a hand-written code adapter reusing the shared parsing toolkit, with golden parse tests,
+  unit tests, a shared-contract pass, and an opt-in live integration entry (`RUTHERFORD_IT_<CLI>`).
+  - Genuine read-only sandboxes, verified live to leave a file untouched: Continue (`--readonly`), pi
+    (`--tools read,grep,find,ls`), and Cline (`--plan --auto-approve false` — plan mode alone still applies
+    an edit).
+  - Best-effort read-only, the Antigravity case: Amp, Hermes, Junie, Kilo, Kimi, and OpenHands are
+    autonomous agents that auto-run their tools with no per-call deny flag, so `read_only` cannot be
+    guaranteed (verified live that each applies an edit in read_only mode). Each sets
+    `write_uses_bypass`, documents the caveat, and relies on the optional `verify_read_only` git guard as
+    the post-hoc backstop.
+  - Reasoning-effort knobs where the CLI exposes one: Cline and pi map effort to `--thinking` (through
+    `xhigh`); Junie maps it to `--effort`.
+- `scripts/update-clis.ps1` and `scripts/update-clis.sh`: update each installed supported CLI via its
+  native updater (or the npm / uv command that owns it) and report a before→after version table. A CLI
+  with no safe non-interactive updater is reported version-only with a manual hint; nothing is ever
+  force-updated blindly.
+- `docs/cli-maintenance.md`: a per-CLI status, known-issues, and re-verify playbook for keeping the
+  version-sensitive integrations working as the third-party CLIs evolve.
+
+### Changed
+
+- Windows launch: `prepare_argv` now prefers an npm shim's sibling `.ps1` (run via `powershell -File`)
+  over `cmd.exe /c`. `cmd.exe` truncates an argv element at its first newline, so a multi-line role
+  preamble lost everything after line one, and it does not forward a programmatic stdin pipe to some node
+  shims; the `.ps1` preserves both. The sibling is resolved by the resolved shim's full path (same
+  directory), never by bare name, so a same-named `.ps1` elsewhere on `PATH` is never substituted. This
+  also fixes the latent multi-line truncation for the existing npm-shim adapters.
+- The README, `docs/adding-a-cli.md`, and `docs/integration-testing.md` now list the nine new adapters,
+  carry a repository or project link for every supported CLI, and record the confirmed CLI versions for
+  this release.
+
 ## [1.7.0] - 2026-06-13
 
 ### Added

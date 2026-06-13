@@ -112,5 +112,14 @@ Run `just check` (lint, format, license header, mypy strict, unit tests with the
 | Droid (Factory) | `droid` | `droid exec --output-format json` (prompt on stdin) | `FACTORY_API_KEY`/`FACTORY_TOKEN` or `droid` login | 2026-06-12 |
 | Mistral Vibe | `vibe` | `vibe --output json --trust --agent <mode> -p "<prompt>"` | `MISTRAL_API_KEY` or `vibe --setup` | 2026-06-11 |
 | GitHub Copilot CLI | `copilot` | `copilot -p "<prompt>" --output-format json` | fine-grained PAT in `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN`, or `copilot` `/login` | 2026-06-11 |
+| Amp | `amp` | `amp -x "<prompt>" --stream-json` | `AMP_API_KEY` or `amp login` (checked with `amp usage`) | 2026-06-13 |
+| Cline | `cline` | `cline --json --plan "<prompt>"` (positional) | `cline auth` (configured provider; auth `unknown`, verified by `doctor`) | 2026-06-13 |
+| Continue | `cn` | `cn -p --readonly --silent "<prompt>"` (positional, plain text) | `cn login` (auth `unknown`, verified by `doctor`) | 2026-06-13 |
+| Hermes Agent | `hermes` | `hermes -z "<prompt>"` (plain-text one-shot) | pooled credentials (`hermes auth list`) | 2026-06-13 |
+| Junie | `junie` | `junie --input-format text --output-format json --skip-update-check` (prompt on **stdin**, required) | JetBrains token or BYOK key (auth `unknown`, verified by `doctor`) | 2026-06-13 |
+| Kilo Code | `kilo` | `kilo run --format json "<prompt>"` (positional) | `kilo auth` (configured provider) | 2026-06-13 |
+| Kimi Code | `kimi` | `kimi -p "<prompt>" --output-format stream-json` | `kimi login` or `KIMI_API_KEY`/`MOONSHOT_API_KEY` | 2026-06-13 |
+| OpenHands | `openhands` | `openhands --headless --json -t "<prompt>"` (env `PYTHONIOENCODING=utf-8` required) | OpenHands Cloud login or stored LLM key (auth `unknown`, verified by `doctor`) | 2026-06-13 |
+| pi | `pi` | `pi -p --mode json --tools read,grep,find,ls "<prompt>"` (positional) | configured provider key (`pi --list-models`) | 2026-06-13 |
 | Ollama (local, optional) | `ollama` | `ollama run <model>` (prompt on stdin) | none -- local daemon | 2026-06-08 |
 | LM Studio (local, optional) | `lmstudio` | `lms chat <model> -p "<prompt>"` (`-s` system prompt) | none -- local | 2026-06-08 |

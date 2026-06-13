@@ -41,6 +41,15 @@ BUILTIN_ADAPTERS: tuple[tuple[str, str, str], ...] = (
     ("ollama", "rutherford.adapters.ollama", "OllamaAdapter"),
     ("lmstudio", "rutherford.adapters.lmstudio", "LMStudioAdapter"),
     ("antigravity", "rutherford.adapters.antigravity", "AntigravityAdapter"),
+    ("amp", "rutherford.adapters.amp", "AmpAdapter"),
+    ("cline", "rutherford.adapters.cline", "ClineAdapter"),
+    ("cn", "rutherford.adapters.cn", "ContinueAdapter"),
+    ("hermes", "rutherford.adapters.hermes", "HermesAdapter"),
+    ("junie", "rutherford.adapters.junie", "JunieAdapter"),
+    ("kilo", "rutherford.adapters.kilo", "KiloAdapter"),
+    ("kimi", "rutherford.adapters.kimi", "KimiAdapter"),
+    ("openhands", "rutherford.adapters.openhands", "OpenHandsAdapter"),
+    ("pi", "rutherford.adapters.pi", "PiAdapter"),
 )
 
 

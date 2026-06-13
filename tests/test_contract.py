@@ -137,17 +137,26 @@ def test_detect_reports_installed_and_absent(adapter: CLIAdapter) -> None:
 
 def test_registry_has_all_builtins() -> None:
     assert _IDS == [
+        "amp",
         "antigravity",
         "claude_code",
+        "cline",
+        "cn",
         "codex",
         "copilot",
         "cursor",
         "droid",
         "goose",
+        "hermes",
+        "junie",
+        "kilo",
+        "kimi",
         "kiro",
         "lmstudio",
         "ollama",
         "opencode",
+        "openhands",
+        "pi",
         "qwen",
         "vibe",
     ]

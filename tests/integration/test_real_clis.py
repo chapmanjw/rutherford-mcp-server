@@ -32,6 +32,25 @@ pytestmark = pytest.mark.integration
 
 _OK_PROMPT = "Reply with exactly the two characters: ok"
 
+#: Phrases a CLI emits when a model exists and the flag was accepted, but THIS account is not entitled to
+#: it (a paid plan / separate gateway sign-in). Distinct from a flag-drift error ("unknown argument",
+#: "model not found"), so model-selection can skip on access while still catching real drift.
+_MODEL_ACCESS_DENIED_MARKERS = (
+    "paid_model",
+    "auth_required",
+    "unauthorized",
+    "not authorized",
+    "sign in to use",
+    "requires a subscription",
+    "upgrade your plan",
+)
+
+
+def _is_model_access_error(message: str) -> bool:
+    """Whether a failed delegation's message indicates the account lacks access to the model (not drift)."""
+    lowered = message.lower()
+    return any(marker in lowered for marker in _MODEL_ACCESS_DENIED_MARKERS)
+
 
 @pytest.mark.parametrize("cli_id", ["codex", "cursor"])
 async def test_effort_flag_is_accepted_by_the_cli(real_app: AppContext, cli_id: str) -> None:
@@ -148,6 +167,12 @@ async def test_model_selection_is_honored_where_supported(real_app: AppContext, 
         pytest.skip(f"{cli_id} reported no selectable models")
     request = DelegationRequest(target=Target(cli=cli_id, model=models[0]), prompt=_OK_PROMPT, timeout_s=180)
     result = await real_app.delegation.delegate(request, base_depth=0)
+    # This test guards model-FLAG DRIFT (the CLI no longer accepting the selection), not whether THIS
+    # account is entitled to the model. A CLI that lists models behind a paid plan or a separate gateway
+    # sign-in (e.g. kilo's `kilo models` lists paid-gateway models its default-provider run does not need)
+    # accepted the flag fine; the failure is account access, orthogonal to drift -- so skip, don't fail.
+    if not result.ok and result.error is not None and _is_model_access_error(result.error.message):
+        pytest.skip(f"{cli_id} model {models[0]!r} needs account access this run lacks: {result.error.message[:100]}")
     assert result.ok, f"{cli_id} rejected its own advertised model {models[0]!r}: {result.error}"
     assert result.target.model == models[0]  # the selection was not silently swapped or dropped
     # Where the adapter can confirm the served model, the provenance must agree with the request.
@@ -215,7 +240,14 @@ _EDIT_PROMPT = (
 #: apply edits (a documented per-adapter limitation). The read_only-does-not-mutate half of the safety
 #: test is skipped for these (verify_read_only is the post-hoc backstop); the write half still runs.
 #: antigravity: agy >= 1.0.8 print mode applies edits with no deny flag -- see the adapter's SAFETY CAVEAT.
-_READ_ONLY_BEST_EFFORT: frozenset[str] = frozenset({"antigravity"})
+#: junie / hermes / openhands: autonomous agents with no headless read-only flag that auto-approve actions.
+#: amp / kimi / kilo: a headless posture that auto-runs tools with no per-call deny flag. For all of these
+#: read_only cannot be guaranteed (verify_read_only is the post-hoc backstop -- see each adapter docstring);
+#: verified live that each applies an edit in read_only mode. (cline IS genuine: read_only adds
+#: --plan --auto-approve false, verified live to leave the file untouched.)
+_READ_ONLY_BEST_EFFORT: frozenset[str] = frozenset(
+    {"antigravity", "junie", "hermes", "openhands", "amp", "kimi", "kilo"}
+)
 
 #: CLIs whose default model is unreliable at tool use, so the live "write applied the edit" half is
 #: model-dependent and skipped (the write mapping itself is covered by that adapter's unit tests). Not a

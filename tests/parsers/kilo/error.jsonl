@@ -1,0 +1,2 @@
+{"type":"step_start","timestamp":1781386212410,"sessionID":"ses_err","part":{"type":"step-start"}}
+{"type":"error","timestamp":1781386212454,"sessionID":"ses_err","error":{"name":"APIError","data":{"message":"provider request failed: rate limit exceeded","statusCode":429}}}

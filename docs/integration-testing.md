@@ -20,6 +20,18 @@ not installed, or not authenticated is skipped with a clear reason rather than f
 | Goose | `RUTHERFORD_IT_GOOSE` |
 | Cursor | `RUTHERFORD_IT_CURSOR` |
 | Qwen Code | `RUTHERFORD_IT_QWEN` |
+| Droid (Factory) | `RUTHERFORD_IT_DROID` |
+| Mistral Vibe | `RUTHERFORD_IT_VIBE` |
+| GitHub Copilot CLI | `RUTHERFORD_IT_COPILOT` |
+| Amp | `RUTHERFORD_IT_AMP` |
+| Cline | `RUTHERFORD_IT_CLINE` |
+| Continue | `RUTHERFORD_IT_CN` |
+| Hermes Agent | `RUTHERFORD_IT_HERMES` |
+| Junie | `RUTHERFORD_IT_JUNIE` |
+| Kilo Code | `RUTHERFORD_IT_KILO` |
+| Kimi Code | `RUTHERFORD_IT_KIMI` |
+| OpenHands | `RUTHERFORD_IT_OPENHANDS` |
+| pi | `RUTHERFORD_IT_PI` |
 | Ollama (local, optional) | `RUTHERFORD_IT_OLLAMA` |
 | LM Studio (local, optional) | `RUTHERFORD_IT_LMSTUDIO` |
 
@@ -28,8 +40,10 @@ A contributor with only Codex and Claude Code installed sets `RUTHERFORD_IT_CLAU
 
 ## Per-CLI setup
 
-Commands are current best knowledge as of 2026-05-30; verify against each CLI's own docs and
-re-check after upgrades. Rutherford never logs in for you -- do the one-time interactive login (or
+Commands are current best knowledge as of 2026-05-30 (2026-06-13 for the v2.0.0 additions: Amp, Cline,
+Continue, Hermes, Junie, Kilo, Kimi, OpenHands, pi); verify against each CLI's own docs and re-check
+after upgrades. The bundled `scripts/update-clis.ps1` / `scripts/update-clis.sh` update the installed
+CLIs and report versions; see [cli-maintenance.md](cli-maintenance.md) for per-CLI status and known issues. Rutherford never logs in for you -- do the one-time interactive login (or
 set the API key) yourself, so the headless runner can reuse the session.
 
 ### Claude Code
@@ -95,6 +109,83 @@ set the API key) yourself, so the headless runner can reuse the session.
   (`OPENAI_API_KEY` with `--auth-type openai`, or `DASHSCOPE_API_KEY`). Qwen OAuth has no
   non-interactive check, so `capabilities` shows `unknown` and `doctor` verifies it live.
 - Smoke: `qwen -o json "say ok"`
+
+### Amp (`amp`)
+
+- Install: per [ampcode.com](https://ampcode.com) (a native binary). `amp update` self-updates.
+- Authenticate: `amp login`, or set `AMP_API_KEY`. Check with `amp usage` (it prints the signed-in account
+  and credit balance — Amp is metered). read_only is best-effort (Amp's permission switches are
+  settings-file values, not per-call flags).
+- Smoke: `amp -x "say ok" --stream-json`
+
+### Cline (`cline`)
+
+- Install: `npm i -g cline` (see [github.com/cline/cline](https://github.com/cline/cline)). `cline update` self-updates.
+- Authenticate: `cline auth` (configures the provider/model). There is no non-interactive auth check, so
+  `capabilities` shows `unknown` and `doctor` verifies it live.
+- Smoke: `cline --json --plan "say ok"`
+
+### Continue (`cn`)
+
+- Install: `npm i -g @continuedev/cli` (see [github.com/continuedev/continue](https://github.com/continuedev/continue)).
+- Authenticate: `cn login`. No non-interactive check (`cn config` needs a TTY), so auth shows `unknown`
+  and `doctor` verifies it live. The adapter reads plain text (`-p --silent`) rather than `--format
+  json`, whose envelope is unreliable (it passes a model's own JSON through unwrapped).
+- Smoke: `cn -p --readonly --silent "say ok"`
+
+### Hermes Agent (`hermes`)
+
+- Install: per [github.com/NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). `hermes update` self-updates.
+- Authenticate: `hermes setup` / `hermes login` (a Nous Portal device-code, a provider key, or a copilot
+  token); check with `hermes auth list`. One-shot mode (`-z`) auto-bypasses approvals, so read_only is
+  best-effort.
+- Smoke: `hermes -z "say ok"`
+
+### Junie (`junie`)
+
+- Install: per [jetbrains.com/junie](https://www.jetbrains.com/junie/) (a JetBrains CLI that auto-updates on launch).
+- Authenticate: a JetBrains token (`junie.jetbrains.com/cli`) or a BYOK key (`--openai-api-key` etc.) under
+  `~/.junie`. No non-interactive check, so auth shows `unknown` and `doctor` verifies it live.
+- Junie **requires a real stdin handle**: launched with stdin detached it fails with "Incorrect function".
+  Rutherford feeds the prompt on stdin, which satisfies this. Junie is slow (tens of seconds) — set a
+  generous `[adapters.junie] timeout_s`. read_only is best-effort (no headless read-only flag).
+- Smoke: `printf 'say ok' | junie --input-format text --output-format json --skip-update-check`
+
+### Kilo Code (`kilo`)
+
+- Install: `npm i -g @kilocode/cli` (see [github.com/Kilo-Org/kilocode](https://github.com/Kilo-Org/kilocode)). `kilo upgrade` self-updates.
+- Authenticate: `kilo auth login` to configure a provider (a delegation needs provider creds, distinct
+  from a Kilo Gateway login). Check with `kilo auth list`. Kilo spins a local server per run, so it is
+  slow — set a generous `[adapters.kilo] timeout_s`. read_only is best-effort.
+- Smoke: `kilo run --format json "say ok"`
+
+### Kimi Code (`kimi`)
+
+- Install: per [github.com/MoonshotAI/kimi-code](https://github.com/MoonshotAI/kimi-code) (Moonshot's `kimi-code`,
+  **not** the legacy `kimi-cli`). `kimi upgrade` self-updates.
+- Authenticate: `kimi login` (device code) or a provider via `kimi provider`; or set `KIMI_API_KEY` /
+  `MOONSHOT_API_KEY`. Headless `-p` has one fixed permission posture (`--plan`/`--auto`/`-y` are
+  interactive-only), so read_only is best-effort and write/yolo cannot escalate.
+- Smoke: `kimi -p "say ok" --output-format stream-json`
+
+### OpenHands (`openhands`)
+
+- Install: per [github.com/All-Hands-AI/OpenHands](https://github.com/All-Hands-AI/OpenHands) (a `uv` tool;
+  `uv tool upgrade openhands`).
+- Authenticate: `openhands login` (OpenHands Cloud) or a stored LLM key. No non-interactive check, so auth
+  shows `unknown` and `doctor` verifies it live. The adapter always sets `PYTHONIOENCODING=utf-8` — without
+  it OpenHands crashes printing glyphs to a Windows cp1252 pipe. `--headless` auto-approves, so read_only
+  is best-effort.
+- Smoke: `set OPENHANDS_SUPPRESS_BANNER=1 && openhands --headless --json -t "say ok"` (with UTF-8 stdio)
+
+### pi (`pi`)
+
+- Install: `npm i -g @earendil-works/pi-coding-agent`, or the installer at [pi.dev](https://pi.dev)
+  ([github.com/badlogic/pi-mono](https://github.com/badlogic/pi-mono)). `pi update self` self-updates.
+- Authenticate: set the provider key for your configured provider (default `google` → `GEMINI_API_KEY`; on
+  a free account a HuggingFace or other provider key). `pi --list-models` confirms a provider is
+  configured. read_only is genuine (the `--tools read,grep,find,ls` allowlist removes edit/write/bash).
+- Smoke: `pi -p --mode json --tools read,grep,find,ls "say ok"`
 
 ### Ollama (`ollama`) — optional, local
 

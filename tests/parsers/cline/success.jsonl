@@ -1,0 +1,3 @@
+{"ts":"2026-06-13T21:28:13.319Z","type":"hook_event","hookEventName":"agent_start","agentId":"agent_1","taskId":"conv_1781386093304_t1s21tl","parentAgentId":null}
+{"ts":"2026-06-13T21:28:20.262Z","type":"agent_event","event":{"type":"done","reason":"completed","text":"The capital of France is Paris.","iterations":2}}
+{"ts":"2026-06-13T21:28:20.320Z","type":"run_result","finishReason":"completed","iterations":2,"usage":{"inputTokens":5751,"outputTokens":122,"cacheReadTokens":2560,"totalCost":0.0104475},"durationMs":6957,"text":"The capital of France is Paris.","model":{"id":"gpt-5.4","provider":"openai-codex"}}

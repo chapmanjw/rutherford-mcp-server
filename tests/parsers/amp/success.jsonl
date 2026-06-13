@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","cwd":"/tmp/work","session_id":"T-019ec2e1-e12b-7198-9944-fee3b9644d25","tools":["Bash","create_file","edit_file"],"agent_mode":"smart","reasoning_effort":"high"}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"What is the capital of France?"}]},"session_id":"T-019ec2e1-e12b-7198-9944-fee3b9644d25"}
+{"type":"assistant","message":{"type":"message","role":"assistant","content":[{"type":"text","text":"The capital of France is Paris."}],"stop_reason":"end_turn","usage":{"input_tokens":12,"cache_creation_input_tokens":27747,"cache_read_input_tokens":0,"output_tokens":8}},"session_id":"T-019ec2e1-e12b-7198-9944-fee3b9644d25"}
+{"type":"result","subtype":"success","duration_ms":3847,"is_error":false,"num_turns":1,"result":"The capital of France is Paris.","session_id":"T-019ec2e1-e12b-7198-9944-fee3b9644d25"}

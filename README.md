@@ -10,7 +10,7 @@
 
 <p align="center">
 A CLI-only MCP server that drives the coding agents you already run — Claude Code, Codex, Cursor,<br>
-and seven more — to delegate work, debate, and reach consensus. It reuses each CLI's own login and<br>
+and nineteen more — to delegate work, debate, and reach consensus. It reuses each CLI's own login and<br>
 never calls a model provider's hosted API, so there are no new keys to manage.
 </p>
 
@@ -29,7 +29,7 @@ never calls a model provider's hosted API, so there are no new keys to manage.
 </p>
 
 <p align="center"><i>Drives:</i>
-Claude Code · Codex · Cursor · Qwen Code · Kiro · OpenCode · Goose · Droid · Mistral Vibe · GitHub Copilot · Antigravity · Ollama · LM Studio</p>
+Claude Code · Codex · Cursor · Qwen Code · Kiro · OpenCode · Goose · Droid · Mistral Vibe · GitHub Copilot · Amp · Cline · Continue · Hermes · Junie · Kilo · Kimi · OpenHands · pi · Antigravity · Ollama · LM Studio</p>
 
 ```sh
 uv tool install rutherford-mcp-server
@@ -207,7 +207,7 @@ running right now (a synchronous call instead pushes live progress over MCP). `s
         +--> claude -p "..." --output-format json
         +--> codex exec --json
         +--> cursor-agent -p --output-format json
-        +--> ... seven more, each behind one adapter file
+        +--> ... nineteen more, each behind one adapter file
 ```
 
 A CLI that errors or isn't installed comes back as one failed voice without sinking the rest of a panel.
@@ -298,37 +298,55 @@ CLI is one small code adapter that reuses the shared parsing toolkit — see
 
 | CLI | Adapter id | How Rutherford runs it | Auth |
 | --- | --- | --- | --- |
-| Claude Code | `claude_code` | `claude -p "<prompt>" --output-format json` | subscription/OAuth or `ANTHROPIC_API_KEY` |
-| Codex | `codex` | `codex exec --json` (prompt on stdin) | ChatGPT login or `OPENAI_API_KEY` |
-| Cursor | `cursor` | `cursor-agent -p --output-format json` | `cursor-agent login` or `CURSOR_API_KEY` |
-| Qwen Code | `qwen` | `qwen -o json` (prompt on stdin) | `qwen` OAuth or `OPENAI_API_KEY` |
-| Kiro | `kiro` | `kiro-cli chat --no-interactive "<prompt>"` | `KIRO_API_KEY` or `kiro-cli login` |
-| OpenCode | `opencode` | `opencode run --format json -q "<prompt>"` | provider key or `opencode auth login` |
-| Goose | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key |
-| Droid (Factory) | `droid` | `droid exec --output-format json` (prompt on stdin) | `FACTORY_API_KEY`/`FACTORY_TOKEN` or `droid` login |
-| Mistral Vibe | `vibe` | `vibe --output json --trust --agent <mode> -p "<prompt>"` | `MISTRAL_API_KEY` or `vibe --setup` |
-| GitHub Copilot CLI | `copilot` | `copilot -p "<prompt>" --output-format json` | GitHub PAT (Copilot Requests scope) or `copilot` login |
-| Antigravity | `antigravity` | `agy -p "<prompt>"` (answer from the transcript file) | Google login |
-| Ollama (local) | `ollama` | `ollama run <model>` (prompt on stdin) | none — local daemon |
-| LM Studio (local) | `lmstudio` | `lms chat <model> -p "<prompt>"` | none — local |
+| [Claude Code](https://github.com/anthropics/claude-code) | `claude_code` | `claude -p "<prompt>" --output-format json` | subscription/OAuth or `ANTHROPIC_API_KEY` |
+| [Codex](https://github.com/openai/codex) | `codex` | `codex exec --json` (prompt on stdin) | ChatGPT login or `OPENAI_API_KEY` |
+| [Cursor](https://docs.cursor.com/en/cli/overview) | `cursor` | `cursor-agent -p --output-format json` | `cursor-agent login` or `CURSOR_API_KEY` |
+| [Qwen Code](https://github.com/QwenLM/qwen-code) | `qwen` | `qwen -o json` (prompt on stdin) | `qwen` OAuth or `OPENAI_API_KEY` |
+| [Kiro](https://kiro.dev) | `kiro` | `kiro-cli chat --no-interactive "<prompt>"` | `KIRO_API_KEY` or `kiro-cli login` |
+| [OpenCode](https://github.com/sst/opencode) | `opencode` | `opencode run --format json -q "<prompt>"` | provider key or `opencode auth login` |
+| [Goose](https://github.com/block/goose) | `goose` | `goose run -q -t "<prompt>" --no-session` | `GOOSE_PROVIDER` + provider key |
+| [Droid (Factory)](https://docs.factory.ai) | `droid` | `droid exec --output-format json` (prompt on stdin) | `FACTORY_API_KEY`/`FACTORY_TOKEN` or `droid` login |
+| [Mistral Vibe](https://github.com/mistralai/mistral-vibe) | `vibe` | `vibe --output json --trust --agent <mode> -p "<prompt>"` | `MISTRAL_API_KEY` or `vibe --setup` |
+| [GitHub Copilot CLI](https://github.com/github/copilot-cli) | `copilot` | `copilot -p "<prompt>" --output-format json` | GitHub PAT (Copilot Requests scope) or `copilot` login |
+| [Amp](https://ampcode.com) | `amp` | `amp -x "<prompt>" --stream-json` | `AMP_API_KEY` or `amp login` |
+| [Cline](https://github.com/cline/cline) | `cline` | `cline --json --plan "<prompt>"` | `cline auth` (configured provider) |
+| [Continue](https://github.com/continuedev/continue) | `cn` | `cn -p --readonly --silent "<prompt>"` | `cn login` |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | `hermes` | `hermes -z "<prompt>"` | `hermes auth` (pooled credentials) |
+| [Junie](https://www.jetbrains.com/junie/) | `junie` | `junie --input-format text --output-format json` (prompt on stdin) | JetBrains token or BYOK key |
+| [Kilo Code](https://github.com/Kilo-Org/kilocode) | `kilo` | `kilo run --format json "<prompt>"` | `kilo auth` (configured provider) |
+| [Kimi Code](https://github.com/MoonshotAI/kimi-code) | `kimi` | `kimi -p "<prompt>" --output-format stream-json` | `kimi login` or `KIMI_API_KEY` |
+| [OpenHands](https://github.com/All-Hands-AI/OpenHands) | `openhands` | `openhands --headless --json -t "<prompt>"` | OpenHands Cloud login or LLM key |
+| [pi](https://github.com/badlogic/pi-mono) | `pi` | `pi -p --mode json --tools read,grep,find,ls "<prompt>"` | configured provider key |
+| [Antigravity](https://antigravity.google) | `antigravity` | `agy -p "<prompt>"` (answer from the transcript file) | Google login |
+| [Ollama (local)](https://github.com/ollama/ollama) | `ollama` | `ollama run <model>` (prompt on stdin) | none — local daemon |
+| [LM Studio (local)](https://lmstudio.ai) | `lmstudio` | `lms chat <model> -p "<prompt>"` | none — local |
 
 **Confirmed CLI versions.** Rutherford's own code is production-stable; its CLI integrations target
 third-party tools whose headless flags and output formats change between releases. Each Rutherford
 release records the CLI versions it was last verified against. Re-check after a CLI upgrade, and pin if
 you can.
 
-| CLI | Confirmed with Rutherford 1.7.0 | Check yours |
+| CLI | Confirmed with Rutherford 2.0.0 | Check yours |
 | --- | --- | --- |
-| Claude Code | 2.1.176 | `claude --version` |
-| Codex | 0.135.0 | `codex --version` |
+| Claude Code | 2.1.177 | `claude --version` |
+| Codex | 0.139.0 | `codex --version` |
 | Cursor | 2026.05.28 | `cursor-agent --version` |
 | Qwen Code | 0.17.0 | `qwen --version` |
 | Kiro | 2.7.0 | `kiro-cli --version` |
-| OpenCode | 1.15.13 | `opencode --version` |
+| OpenCode | 1.17.5 | `opencode --version` |
 | Goose | 1.36.0 | `goose --version` |
 | Droid (Factory) | 0.144.2 | `droid --version` |
 | Mistral Vibe | 2.14.1 | `vibe --version` |
-| GitHub Copilot CLI | 1.0.61 | `copilot --version` |
+| GitHub Copilot CLI | 1.0.62 | `copilot --version` |
+| Amp | 0.0.1781384294 | `amp --version` |
+| Cline | 3.0.24 | `cline --version` |
+| Continue | 1.5.45 | `cn --version` |
+| Hermes Agent | 0.16.0 | `hermes --version` |
+| Junie | 26.6.8 (1892.26) | `junie --version` |
+| Kilo Code | 7.3.45 | `kilo --version` |
+| Kimi Code | 0.14.2 | `kimi --version` |
+| OpenHands | 1.16.0 (SDK 1.21.0) | `openhands --version` |
+| pi | 0.79.3 | `pi --version` |
 | Antigravity | 1.0.8 | `agy --version` |
 | Ollama | 0.30.6 | `ollama --version` |
 | LM Studio (`lms`) | build efce996 | `lms version` |
@@ -426,6 +444,7 @@ and re-verify after upgrades.
 - [docs/recipes.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/recipes.md) — the full cookbook of paste-able prompts.
 - [docs/architecture.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/architecture.md) — the layered design and the two core interfaces.
 - [docs/adding-a-cli.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/adding-a-cli.md) — the contract and checklist for adding a CLI.
+- [docs/cli-maintenance.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/cli-maintenance.md) — per-CLI status, known issues, and the update/re-verify loop.
 - [docs/mcp-client-integration.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/mcp-client-integration.md) — registration for many clients.
 - [docs/integration-testing.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/integration-testing.md) — installing and authenticating each CLI.
 - [docs/security.md](https://github.com/chapmanjw/rutherford-mcp-server/blob/main/docs/security.md) — the security model in depth.

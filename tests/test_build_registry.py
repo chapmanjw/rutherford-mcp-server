@@ -11,17 +11,26 @@ from rutherford.config.schema import AdapterConfig, RutherfordConfig
 from rutherford.domain.errors import RegistryError
 
 ALL_BUILTINS = [
+    "amp",
     "antigravity",
     "claude_code",
+    "cline",
+    "cn",
     "codex",
     "copilot",
     "cursor",
     "droid",
     "goose",
+    "hermes",
+    "junie",
+    "kilo",
+    "kimi",
     "kiro",
     "lmstudio",
     "ollama",
     "opencode",
+    "openhands",
+    "pi",
     "qwen",
     "vibe",
 ]

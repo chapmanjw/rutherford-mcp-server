@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"T-err","agent_mode":"smart"}
+{"type":"result","subtype":"error_during_execution","duration_ms":1200,"is_error":true,"result":"the agent could not complete the task","session_id":"T-err"}
