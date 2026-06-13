@@ -316,19 +316,19 @@ third-party tools whose headless flags and output formats change between release
 release records the CLI versions it was last verified against. Re-check after a CLI upgrade, and pin if
 you can.
 
-| CLI | Confirmed with Rutherford 1.4.0 | Check yours |
+| CLI | Confirmed with Rutherford 1.5.0 | Check yours |
 | --- | --- | --- |
-| Claude Code | 2.1.172 | `claude --version` |
+| Claude Code | 2.1.176 | `claude --version` |
 | Codex | 0.135.0 | `codex --version` |
 | Cursor | 2026.05.28 | `cursor-agent --version` |
 | Qwen Code | 0.17.0 | `qwen --version` |
-| Kiro | 2.6.1 | `kiro-cli --version` |
+| Kiro | 2.7.0 | `kiro-cli --version` |
 | OpenCode | 1.15.13 | `opencode --version` |
 | Goose | 1.36.0 | `goose --version` |
 | Droid (Factory) | 0.144.2 | `droid --version` |
 | Mistral Vibe | 2.14.1 | `vibe --version` |
 | GitHub Copilot CLI | 1.0.61 | `copilot --version` |
-| Antigravity | 1.0.7 | `agy --version` |
+| Antigravity | 1.0.8 | `agy --version` |
 | Ollama | 0.30.6 | `ollama --version` |
 | LM Studio (`lms`) | build efce996 | `lms version` |
 
