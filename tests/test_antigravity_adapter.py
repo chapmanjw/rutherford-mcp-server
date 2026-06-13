@@ -305,23 +305,23 @@ def test_doctor_flags_agy_version_drift() -> None:
     # agy auto-updates; when the running version is past the verified pin, doctor surfaces a note.
     status = probe_adapter(AntigravityAdapter(probe=_agy_probe("1.0.9")), diagnostic=True)
     assert status.version == "1.0.9"
-    assert any("verified against 1.0.7" in note for note in status.notes)
+    assert any("verified against 1.0.8" in note for note in status.notes)
 
 
 def test_doctor_no_drift_note_when_version_matches_the_pin() -> None:
-    status = probe_adapter(AntigravityAdapter(probe=_agy_probe("1.0.7")), diagnostic=True)
+    status = probe_adapter(AntigravityAdapter(probe=_agy_probe("1.0.8")), diagnostic=True)
     assert not any("verified against" in note for note in status.notes)
 
 
 def test_doctor_version_drift_compares_the_semver_token_not_the_raw_line() -> None:
     # agy --version may carry extra text; a bump is detected from the extracted semver token.
     status = probe_adapter(AntigravityAdapter(probe=_agy_probe("agy version 1.0.9 (build abc123)")), diagnostic=True)
-    assert any("verified against 1.0.7" in note for note in status.notes)
+    assert any("verified against 1.0.8" in note for note in status.notes)
 
 
 def test_doctor_no_drift_when_only_the_version_string_format_changed() -> None:
-    # A format change with the SAME semver (e.g. "agy 1.0.7 (stable)") must not read as a version bump.
-    status = probe_adapter(AntigravityAdapter(probe=_agy_probe("agy 1.0.7 (stable)")), diagnostic=True)
+    # A format change with the SAME semver (e.g. "agy 1.0.8 (stable)") must not read as a version bump.
+    status = probe_adapter(AntigravityAdapter(probe=_agy_probe("agy 1.0.8 (stable)")), diagnostic=True)
     assert not any("verified against" in note for note in status.notes)
 
 
@@ -389,7 +389,7 @@ def test_write_equals_yolo_is_surfaced_not_silent() -> None:
     adapter = AntigravityAdapter()
     assert adapter.capabilities().write_uses_bypass is True
     assert "write == yolo" in adapter.map_safety(SafetyMode.WRITE).note
-    status = probe_adapter(AntigravityAdapter(probe=_agy_probe("1.0.7")), diagnostic=True)
+    status = probe_adapter(AntigravityAdapter(probe=_agy_probe("1.0.8")), diagnostic=True)
     assert any("write and yolo are" in note and "equivalent" in note for note in status.notes)
 
 

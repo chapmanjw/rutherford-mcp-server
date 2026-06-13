@@ -19,13 +19,25 @@ on-disk marker (the token location varies by OS and install -- native vs WSL, ke
 cheap probe therefore cannot determine auth state, so ``check_auth`` returns ``unknown``; the
 ``doctor`` tool resolves that with a live round trip (the only trustworthy signal).
 
-Flags and transcript layout verified 2026-06-10 (agy 1.0.7). The transcript schema is community
+Flags and transcript layout verified 2026-06-13 (agy 1.0.8). The transcript schema is community
 reverse-engineered, so it is pinned (:attr:`AntigravityAdapter.verified_version`): ``doctor`` flags a
 running agy whose version differs from the pin, and a transcript with a *completed* model turn that no
 longer carries a ``PLANNER_RESPONSE`` answer is failed loudly as ``CONTRACT_MISMATCH`` (a drift signal,
 distinct from a missing or in-progress transcript).
 
-The headline, re-verified 2026-06-10 against agy 1.0.7: ``agy --print`` (``-p`` is its alias) still
+SAFETY CAVEAT (read_only is best-effort, agy >= 1.0.8). Through agy 1.0.7 print mode did not apply file
+edits without the bypass flag, so ``read_only`` / ``propose`` were genuinely non-mutating. agy 1.0.8
+changed this: ``agy -p`` now applies edits even without ``--dangerously-skip-permissions``, and exposes
+no deny / plan / read-only flag to stop it (``--sandbox`` restricts the terminal only -- verified
+2026-06-13 that it still applies a file edit). So on this adapter ``read_only`` / ``propose`` are
+**best-effort, not guaranteed**: an agent that chooses to edit in a non-mutating mode will mutate the
+workspace. The backstop is the optional ``verify_read_only`` git guard, which fails such a run
+``READONLY_VIOLATED`` *after the fact* (detection, not prevention) -- enable it for git workspaces where
+agy is used non-mutating. Tracked as a known issue pending agy restoring a read-only print mode; this is
+why the adapter is best used in ``write``/``yolo`` behind a trusted workspace, or as an explicitly-named
+voice rather than in the default read-only fan-out.
+
+The headline, re-verified 2026-06-13 against agy 1.0.8: ``agy --print`` (``-p`` is its alias) still
 emits nothing to stdout under a non-TTY pipe (the answer only ever lands in the transcript), so the
 transcript read remains the only working capture path -- do not switch to reading ``--print`` stdout
 until a stdout-recovery canary shows it carries the answer. Note: print mode is slow, so a generous
@@ -66,7 +78,7 @@ class AntigravityAdapter(BaseCLIAdapter):
     #: The agy version the flags and reverse-engineered transcript layout were last verified against.
     #: agy auto-updates, so ``doctor`` surfaces a note when the running version differs -- a prompt to
     #: re-verify the ``brain/`` layout and re-pin before the drift becomes a flood of failures.
-    verified_version = "1.0.7"
+    verified_version = "1.0.8"
     #: Google's CLI (the Gemini CLI successor); print mode serves this fixed Gemini model with no
     #: selector, so :meth:`provenance` can report a known model id instead of "unknown".
     _PRINT_MODEL = "gemini-3.5-flash"
@@ -112,13 +124,14 @@ class AntigravityAdapter(BaseCLIAdapter):
         )
 
     def map_safety(self, mode: SafetyMode) -> SafetyFlags:
-        # agy print mode has no granular approval -- its permission model is binary. read_only and
-        # propose run without a bypass (any edit the agent attempts is simply not applied). WRITE
-        # has no distinct posture: the bypass flag is the only way print mode applies changes, so
-        # write and yolo are EQUIVALENT on this adapter. That is deliberate and surfaced -- via
-        # ``capabilities().write_uses_bypass``, a doctor note, and the notes below -- rather than
-        # failing write closed, which would make it a silent no-op clone of read_only. Both modes
-        # stay behind the trusted-workspace gate; the defaults never carry the bypass.
+        # SAFETY CAVEAT (agy >= 1.0.8): print mode now APPLIES file edits even without the bypass flag,
+        # and agy exposes no deny / plan / read-only flag to stop it (``--sandbox`` restricts only the
+        # terminal -- verified it still applies a file edit). So read_only / propose are BEST-EFFORT on
+        # this adapter, not guaranteed: there is no flag to pass that prevents an edit. The backstop is
+        # the optional ``verify_read_only`` git guard (post-hoc ``READONLY_VIOLATED`` detection). WRITE
+        # uses the bypass; agy has no distinct write posture, so write == yolo here. Both bypass modes
+        # stay behind the trusted-workspace gate; the non-mutating modes carry no flag (there is none).
+        # See the module docstring's SAFETY CAVEAT and ``capabilities().write_uses_bypass``.
         if mode is SafetyMode.YOLO:
             return SafetyFlags(
                 args=["--dangerously-skip-permissions"], note="bypass approvals (print mode has no granular approval)"
@@ -128,7 +141,11 @@ class AntigravityAdapter(BaseCLIAdapter):
                 args=["--dangerously-skip-permissions"],
                 note="bypass approvals -- agy has no distinct write posture, so write == yolo on this adapter",
             )
-        return SafetyFlags(args=[], note="default; edits are not applied in print mode without a bypass")
+        return SafetyFlags(
+            args=[],
+            note="best-effort: agy >=1.0.8 print mode may apply edits in read_only (no deny flag); "
+            "verify_read_only is the post-hoc backstop",
+        )
 
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
         prompt = self._with_files(self._compose_prompt(req.prompt, ctx.role_preamble), req.files)
