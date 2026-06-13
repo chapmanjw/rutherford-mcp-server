@@ -125,15 +125,16 @@ class ConsensusService:
 
         result: ConsensusResult | StrategyResult
         answer: str
+        # None means the caller omitted synthesize, the one case the configured default fills; an explicit
+        # False wins over a synthesize_default=true config. Resolved here so the panel record snapshots the
+        # *resolved* value (decision 1-D), not the unresolved request.
+        effective_synthesize = req.synthesize if req.synthesize is not None else self._config.synthesize_default
         if req.strategy is not Strategy.ALL_VOICES:
             result = self._aggregate(req, voices, skipped)
             answer = result.decision or result.outcome
         else:
             synthesis: str | None = None
             synthesis_by: str | None = None
-            # None means the caller omitted synthesize, the one case the configured default fills;
-            # an explicit False wins over a synthesize_default=true config.
-            effective_synthesize = req.synthesize if req.synthesize is not None else self._config.synthesize_default
             if effective_synthesize and voices:
                 synthesis, synthesis_by = await self._synthesize(req, voices, correlation_id, base_depth)
             result = ConsensusResult(
@@ -154,11 +155,17 @@ class ConsensusService:
             skipped_pairs = [(entry.cli, entry.reason) for entry in skipped]
             panel_inputs = PanelInputs(
                 targets=[
-                    PanelTarget(cli=voice.target.cli, model=voice.target.model, stance=voice.target.stance)
-                    for voice in voices
+                    PanelTarget(
+                        cli=voice.target.cli,
+                        model=voice.target.model,
+                        # The effective per-seat stance: the target's own, else the parallel stances entry
+                        # (mirrors _voice_prompt), so a parallel-stances panel records who argued which side.
+                        stance=_stance_for(voice.target, req.stances, index),
+                    )
+                    for index, voice in enumerate(voices)
                 ],
                 strategy=req.strategy.value,
-                synthesize=req.synthesize,
+                synthesize=effective_synthesize,
                 judge=req.judge.display_label if req.judge else None,
             )
             result.run_dir = await asyncio.to_thread(

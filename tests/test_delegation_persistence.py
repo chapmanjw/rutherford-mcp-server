@@ -12,7 +12,7 @@ import pytest
 
 from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import RutherfordConfig
-from rutherford.domain.enums import JobStatus, SafetyMode, Strategy
+from rutherford.domain.enums import JobStatus, SafetyMode, Stance, Strategy
 from rutherford.domain.models import (
     ConsensusRequest,
     Cost,
@@ -303,7 +303,46 @@ async def test_consensus_parent_records_the_panel_orchestration_config(tmp_path:
     state = (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
     assert "panel:" in state
     assert "strategy: majority" in state
-    assert "cli: b" in state and "m1" in state  # the resolved roster incl. the per-target model
+    assert "m1" in state  # the per-target model is captured in the resolved roster
+
+
+async def test_consensus_parent_snapshots_the_resolved_synthesize(tmp_path: Path) -> None:
+    # 1-D: the panel config snapshot must be the RESOLVED orchestration config. With synthesize_default=true
+    # and the request omitting synthesize, the parent must record synthesize=true (the resolved behavior),
+    # not the unresolved request value.
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+        config=RutherfordConfig(jobs_dir=str(tmp_path / "jobs"), synthesize_default=True),
+    )
+    result = await app.consensus.consensus(  # synthesize omitted -> resolves to the config default (true)
+        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", persist=True)
+    )
+    assert result.run_dir is not None
+    assert "synthesize: true" in (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
+
+
+async def test_consensus_parent_roster_records_parallel_stances(tmp_path: Path) -> None:
+    # The roster must capture per-seat steering supplied via the parallel stances array, not only via a
+    # Target.stance, so a stance-steered panel replays who argued which side from the parent (1-D).
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+        config=RutherfordConfig(jobs_dir=str(tmp_path / "jobs")),
+    )
+    result = await app.consensus.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="a"), Target(cli="b")],
+            prompt="q",
+            stances=[Stance.FOR, Stance.AGAINST],
+            persist=True,
+        )
+    )
+    assert result.run_dir is not None
+    state = (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
+    # The roster is a TOON table (targets[..]{cli,stance}: rows), so the stances appear as table rows.
+    assert "stance" in state  # the roster column header
+    assert "a,for" in state and "b,against" in state  # each seat's resolved stance, in order
 
 
 async def test_debate_parent_records_rounds_in_the_panel_config(tmp_path: Path) -> None:
