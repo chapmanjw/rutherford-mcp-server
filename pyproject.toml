@@ -63,7 +63,7 @@ dev = [
 packages = ["src/rutherford"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/rutherford", "roles", "README.md", "CHANGELOG.md", "LICENSE"]
+include = ["src/rutherford", "README.md", "CHANGELOG.md", "LICENSE"]
 
 # --- Lint and format (ruff is the single Python equivalent of the siblings'
 # ESLint/Prettier and Spotless/Checkstyle; 120-char lines match the Java
