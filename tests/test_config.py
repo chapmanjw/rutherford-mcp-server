@@ -147,6 +147,28 @@ def test_max_concurrency_env_override(tmp_path: Path) -> None:
     assert config.max_concurrency == 3
 
 
+def test_persistence_defaults_to_ephemeral(tmp_path: Path) -> None:
+    # Model A: durability is opt-in, so nothing is persisted out of the box and no jobs dir is set.
+    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+    assert config.default_persistence == "ephemeral"
+    assert config.jobs_dir is None
+
+
+def test_default_persistence_and_jobs_dir_can_be_set(tmp_path: Path) -> None:
+    (tmp_path / "rutherford.toml").write_text(
+        'default_persistence = "job"\njobs_dir = "/var/rutherford/jobs"\n', encoding="utf-8"
+    )
+    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+    assert config.default_persistence == "job"
+    assert config.jobs_dir == "/var/rutherford/jobs"
+
+
+def test_invalid_default_persistence_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "rutherford.toml").write_text('default_persistence = "sometimes"\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="invalid configuration"):
+        load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

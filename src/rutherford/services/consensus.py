@@ -86,6 +86,9 @@ class ConsensusService:
                 safety_mode=req.safety_mode,
                 timeout_s=req.timeout_s,
                 include_raw=req.include_raw,
+                # A panel voice never self-persists (F2): with default_persistence="job" this would
+                # scatter orphan per-voice records with no parent linkage. Panel records ship next slice.
+                persist=False,
             )
             for index, target in enumerate(targets)
         ]
@@ -297,6 +300,7 @@ class ConsensusService:
             working_dir=req.working_dir,
             safety_mode=SafetyMode.READ_ONLY,
             timeout_s=req.timeout_s,
+            persist=False,  # the synthesis pass is internal; it never becomes its own job record (F2)
         )
         result = await self._delegation.delegate(
             synth_request,

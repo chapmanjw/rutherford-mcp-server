@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from rutherford.context import AppContext
+from rutherford.config.schema import AdapterConfig, RutherfordConfig
+from rutherford.context import AppContext, build_app_context
 from rutherford.domain.enums import AuthState, SafetyMode, Strategy
 from rutherford.domain.models import (
     ConsensusRequest,
@@ -45,6 +46,46 @@ async def test_read_only_delegation_returns_normalized_result(real_app: AppConte
     # may not resolve a provider, which is the honest "unknown" rather than a guess.
     assert result.provenance is not None, f"{cli_id} produced no provenance"
     assert result.provenance.provider or result.provenance.cli_version, f"{cli_id} provenance is empty"
+
+
+async def test_persist_writes_a_durable_job_to_disk(real_app: AppContext, tmp_path: Path) -> None:
+    # F2 live: a real delegation with persist=true must land a state.toon + a Markdown answer on disk,
+    # with the real CLI's pinned argv captured for replay. The SOLE live guard that durable
+    # persistence works end to end through an actual subprocess, not just the fakes.
+    ready = available_clis(real_app)
+    if not ready:
+        pytest.skip("no CLI opted in for integration testing")
+    non_optional = [cli for cli in ready if not real_app.registry.get(cli).optional]
+    cli_id = non_optional[0] if non_optional else ready[0]
+    # A dedicated app pointed at a temp jobs dir so the test never writes into the repo, reusing the
+    # already-probed real registry and a fresh real subprocess runner. Runnability is checked against
+    # this app so a local-model default (set here) counts.
+    app = build_app_context(
+        config=RutherfordConfig(
+            jobs_dir=str(tmp_path / "jobs"),
+            adapters={"ollama": AdapterConfig(default_model="gemma3:12b")},
+        ),
+        registry=real_app.registry,
+        base_depth=0,
+    )
+    skip_unless_runnable(app, cli_id)
+    request = DelegationRequest(target=Target(cli=cli_id), prompt=_OK_PROMPT, timeout_s=180, persist=True)
+    result = await app.delegation.delegate(request, base_depth=0)
+    assert result.ok, f"{cli_id} delegation failed: {result.error}"
+    assert result.run_dir is not None, "a persisted run must report its run_dir"
+    run_dir = Path(result.run_dir)
+    assert (run_dir / "state.toon").is_file()
+    assert (run_dir / "artifacts" / "answer.md").read_text(encoding="utf-8").strip()
+    # Assert the persisted TOON as text: python-toon 0.1.3 cannot round-trip a quoted inline array
+    # (a real argv has colon-bearing elements), so verify the literal record that landed on disk.
+    state = (run_dir / "state.toon").read_text(encoding="utf-8")
+    assert "kind: delegate" in state
+    assert f"cli: {cli_id}" in state
+    assert "ok: true" in state
+    assert "argv[" in state, "the real pinned invocation must be recorded for replay"
+    assert "schema_version: 1" in state
+    assert "created_at: " in state
+    assert "env:" not in state  # the child env (secrets) must never be persisted
 
 
 @pytest.mark.parametrize("cli_id", list(CLI_ENV))

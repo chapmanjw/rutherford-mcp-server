@@ -273,6 +273,10 @@ class DelegationRequest(BaseModel):
     timeout_s: float | None = None
     session_id: str | None = None
     include_raw: bool = False
+    #: Persist this run as a durable job under ``<jobs_dir>/<run_id>/`` (Model A: durability is
+    #: opt-in; an ephemeral run leaves nothing on disk). ``None`` follows the configured
+    #: ``default_persistence``; ``True`` / ``False`` force it for this one call.
+    persist: bool | None = None
     #: Per-call confirmation that a write/yolo delegation may mutate ``working_dir`` even when
     #: it is not on the configured trusted-workspace allowlist.
     trust_workspace: bool = False
@@ -315,6 +319,15 @@ class DelegationResult(BaseModel):
     #: The effective provider/model/CLI-version that actually answered (F3). ``None`` when none could
     #: be determined, so the field is absent from the wire rather than reported as a guess.
     provenance: Provenance | None = None
+    #: The git working-tree changes under ``working_dir`` captured *after* a mutating (write/yolo) run,
+    #: best-effort and only when the run is **persisted** (it feeds the run record). The jobs directory
+    #: is excluded. ``None`` when not captured (read-only run, ephemeral run, not a git repo, or git
+    #: unavailable). Caveat: in a tree that was already dirty before the run, this reflects the current
+    #: worktree state, not strictly this run's delta -- it is "what changed", not a proven attribution.
+    changed_files: list[str] | None = None
+    #: The directory this run was persisted to when it was run as a durable job
+    #: (``<jobs_dir>/<run_id>``). ``None`` for an ephemeral run (Model A: nothing on disk unless asked).
+    run_dir: str | None = None
 
 
 # --- Consensus ---------------------------------------------------------------
@@ -533,6 +546,63 @@ class Job(BaseModel):
     created_at: float = 0.0
     updated_at: float = 0.0
     progress: list[str] = Field(default_factory=list)
+
+
+# --- Durable run records (F2) ------------------------------------------------
+
+
+class RunRecord(BaseModel):
+    """A durable, replay-complete record of one run, persisted as a job (F2).
+
+    Written to ``<jobs_dir>/<run_id>/state.toon`` when a call opts into persistence -- Model A:
+    durability is opt-in, an ephemeral run leaves nothing on disk, so the corpus is the runs you
+    chose to keep. Distinct from the in-memory, mutable, TTL-evicted :class:`Job`: a ``RunRecord``
+    is an immutable audit/replay entry. ``schema_version`` is pinned from day one so records written
+    under one version stay readable as later fields are added (a reader checks it before trusting a
+    field's presence).
+
+    Replay-completeness, deliberately bounded: ``argv``, ``cwd``, the ``prompt``, ``role``, ``files``,
+    the resolved ``model`` / ``adapter_version`` / ``provenance``, and the outcome are captured so the
+    run can be re-issued and audited. Two things are *recomposed*, not stored verbatim: the child
+    process ``env`` is **never** persisted (it can carry API keys and other secrets that must not hit
+    disk -- replay reconstructs it from config), and a stdin-based adapter's composed stdin payload is
+    rebuilt from ``prompt`` + ``role`` + ``files`` rather than captured, so ``argv`` may hold only the
+    flags. A reader must recompose, not assume ``argv`` alone is the whole input.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    #: Bumped when the persisted shape changes; a reader checks it before trusting a field.
+    schema_version: int = 1
+    run_id: str
+    #: ``delegate`` | ``consensus`` | ``debate`` -- which tool produced this run.
+    kind: str
+    status: JobStatus = JobStatus.SUCCEEDED
+    #: Wall-clock epoch seconds (not the monotonic ``duration_s``), so a record has a real timestamp.
+    created_at: float = 0.0
+    finished_at: float = 0.0
+    duration_s: float = 0.0
+    #: A parent run's id when this record is a child of a panel (consensus/debate); ``None`` at top level.
+    parent_run_id: str | None = None
+    # --- what produced the answer ---
+    cli: str
+    model: str | None = None
+    adapter_version: str | None = None
+    provenance: Provenance | None = None
+    safety_mode: SafetyMode = SafetyMode.READ_ONLY
+    # --- the pinned invocation (replay-complete; no env -- it can hold secrets) ---
+    argv: list[str] = Field(default_factory=list)
+    cwd: str | None = None
+    # --- inputs (the stdin payload is recomposed from these, not stored) ---
+    prompt: str = ""
+    #: The role persona this run argued under, part of the recomposable input. ``None`` when unset.
+    role: str | None = None
+    files: list[str] = Field(default_factory=list)
+    # --- outputs ---
+    ok: bool = True
+    error_code: ErrorCode | None = None
+    changed_files: list[str] = Field(default_factory=list)
+    cost: Cost | None = None
 
 
 # --- Health / capability reporting ------------------------------------------

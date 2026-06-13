@@ -127,7 +127,7 @@ async def _verify_one(
 ) -> AdapterStatus:
     if not (status.installed and status.auth.state is AuthState.UNKNOWN):
         return status
-    request = DelegationRequest(target=Target(cli=status.id), prompt=_LIVE_AUTH_PROMPT, timeout_s=60)
+    request = DelegationRequest(target=Target(cli=status.id), prompt=_LIVE_AUTH_PROMPT, timeout_s=60, persist=False)
     result = await delegation.delegate(request, correlation_id=correlation_id_factory(), base_depth=base_depth)
     kept = [note for note in status.notes if "could not be verified" not in note]
     if result.ok:

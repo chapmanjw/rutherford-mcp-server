@@ -120,6 +120,16 @@ class RutherfordConfig(BaseModel):
     #: Maximum number of background jobs retained at once; creating one past the cap (after evicting
     #: expired jobs) fails with ``TOO_MANY_JOBS``.
     max_jobs: int = Field(default=100, ge=1)
+    #: Whether a run is persisted to disk as a durable job by default (F2, Model A: durability is
+    #: opt-in). ``ephemeral`` (the default) leaves nothing on disk unless a call passes
+    #: ``persist=true``; ``job`` persists every run unless a call passes ``persist=false``. A persisted
+    #: run is written under :attr:`jobs_dir` as ``<run_id>/state.toon`` (TOON) plus Markdown artifacts.
+    default_persistence: Literal["ephemeral", "job"] = "ephemeral"
+    #: Where durable jobs are written. ``None`` (the default) means ``<cwd>/.rutherford/jobs`` -- the
+    #: workspace the server runs in -- so jobs live with the project, not the user's home. Set an
+    #: absolute path to relocate them. Rutherford writes its own job state here regardless of a
+    #: delegation's safety mode (this is the server's bookkeeping, not an edit to the user's code).
+    jobs_dir: str | None = None
     #: Structured-log verbosity (stderr, JSON lines). ``debug`` | ``info`` | ``warning`` | ``error``.
     log_level: Literal["debug", "info", "warning", "error"] = "info"
     #: Structured-log format: ``json`` (one JSON object per line, to stderr) or ``off`` to silence it.

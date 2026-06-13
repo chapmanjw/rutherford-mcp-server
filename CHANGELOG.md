@@ -6,6 +6,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Durable run persistence (F2), opt-in. A delegation can be kept as a job on disk: `persist=true` (or
+  `default_persistence = "job"` in config) writes the run under `<jobs_dir>/<run_id>/` as `state.toon`
+  -- a structured, versioned `RunRecord` (pinned argv, resolved model, provenance, role, timing, and
+  outcome) -- plus a Markdown `artifacts/answer.md` (and a `diff.md` for a write run). `jobs_dir`
+  defaults to the workspace's `.rutherford/jobs`, so a kept run lives with the project. Durability is
+  opt-in (Model A): an ephemeral run leaves nothing on disk, and the run's directory is returned as
+  `run_dir` on the result. Persistence is best-effort (a filesystem failure never fails a delegation
+  that already produced an answer), runs off the event loop, never persists the child process
+  environment (it can carry secrets), and excludes its own jobs directory from a write run's captured
+  `changed_files`. Panel voices (consensus/debate) do not self-persist; panel-level records are a
+  later slice. Note: `state.toon` is written for a human/LLM to re-read; machine round-trip via the
+  current TOON codec is a known limitation tracked for the reader-side roadmap items.
+
 ### Removed
 
 - The config-driven generic adapter (`GenericAdapterConfig` / the `generic_adapters` config key, and

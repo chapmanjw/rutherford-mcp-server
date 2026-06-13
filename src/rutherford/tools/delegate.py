@@ -25,6 +25,7 @@ async def delegate_tool(
     session_id: str | None = None,
     include_raw: bool = False,
     trust_workspace: bool = False,
+    persist: bool | None = None,
     fallback: list[str] | None = None,
 ) -> str:
     """Delegate ``prompt`` to ``(cli, model)`` and return the normalized result.
@@ -33,7 +34,8 @@ async def delegate_tool(
     ``job_result``. A delegation that fails operationally (missing binary, timeout, non-zero exit)
     returns a result with ``ok=false`` and an error code, not an exception. ``fallback`` is an ordered
     list of alternate ``cli`` / ``cli:model`` targets to try if the primary fails on a retryable
-    category (F7).
+    category (F7). ``persist`` keeps the run as a durable job under ``.rutherford/jobs/<id>/`` (its
+    ``run_dir`` is returned on the result); ``None`` follows the configured ``default_persistence``.
     """
     request = DelegationRequest(
         target=Target(cli=cli, model=model),
@@ -47,6 +49,7 @@ async def delegate_tool(
         session_id=session_id,
         include_raw=include_raw,
         trust_workspace=trust_workspace,
+        persist=persist,
         fallback=[as_target(entry) for entry in (fallback or [])],
     )
     correlation_id = app.new_correlation_id()

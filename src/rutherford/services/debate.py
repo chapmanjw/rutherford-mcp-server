@@ -187,6 +187,8 @@ class DebateService:
                 safety_mode=req.safety_mode,
                 timeout_s=req.timeout_s,
                 include_raw=req.include_raw,
+                # A debate turn never self-persists (F2): panel-level records ship next slice.
+                persist=False,
             )
             result = await self._delegation.delegate(
                 request,
@@ -265,6 +267,7 @@ class DebateService:
             working_dir=req.working_dir,
             safety_mode=SafetyMode.READ_ONLY,
             timeout_s=req.timeout_s,
+            persist=False,  # the closing synthesis is internal; not its own job record (F2)
         )
         result = await self._delegation.delegate(
             synth_request,

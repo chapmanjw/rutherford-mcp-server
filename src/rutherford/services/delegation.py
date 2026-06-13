@@ -13,13 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
 from ..adapters.base import CLIAdapter
 from ..adapters.registry import AdapterRegistry
 from ..config.schema import RutherfordConfig
-from ..domain.enums import is_mutating
+from ..domain.enums import JobStatus, is_mutating
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import DepthLimitError, RegistryError, RutherfordError
 from ..domain.models import (
@@ -27,9 +29,12 @@ from ..domain.models import (
     DelegationResult,
     ErrorInfo,
     InvocationContext,
+    InvocationSpec,
     ProcessResult,
     Provenance,
+    RunRecord,
 )
+from ..io.ledger import RunLedger
 from ..runtime.cooldown import CooldownTracker
 from ..runtime.depth import child_depth_env, ensure_within_depth
 from ..runtime.failures import classify_failure, indicates_unhealthy, is_model_unavailable, is_retryable
@@ -57,6 +62,8 @@ class DelegationService:
         roles: RoleStore,
         *,
         platform: PlatformInfo | None = None,
+        ledger: RunLedger | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._registry = registry
         self._runner = runner
@@ -65,6 +72,11 @@ class DelegationService:
         #: Resolved once at construction; injectable so the Windows command-line preflight is
         #: unit-testable from any host.
         self._platform = platform if platform is not None else detect_platform()
+        #: The durable run ledger (F2). ``None`` disables persistence entirely (e.g. a test with no
+        #: jobs dir); when set, a run opting into persistence is written under its root.
+        self._ledger = ledger
+        #: Wall-clock source for run-record timestamps, injectable so persistence is testable.
+        self._clock = clock
         #: Bounds how many CLI subprocesses run at once across every panel that shares this service
         #: (consensus fan-out, debate rounds, nested self-delegation), so panel width does not become
         #: unbounded host process pressure.
@@ -94,6 +106,7 @@ class DelegationService:
         on_progress: ProgressCallback | None = None,
     ) -> DelegationResult:
         """Run ``req`` against its target CLI and return the normalized result."""
+        created_at = self._clock()
         # Fill in the per-adapter configured default model when the call names none, so
         # ``[adapters.<id>] default_model`` is honored before the adapter ever sees the request.
         if req.target.model is None:
@@ -150,11 +163,11 @@ class DelegationService:
         verify = self._config.verify_read_only and not is_mutating(req.safety_mode) and bool(req.working_dir)
         before = await asyncio.to_thread(_git_fingerprint, req.working_dir) if verify and req.working_dir else None
 
-        result, raw = await self._execute(adapter, req, ctx, base_depth, on_progress)
+        result, raw, spec = await self._execute(adapter, req, ctx, base_depth, on_progress)
 
         fallback_model = self._model_fallback_for(adapter, req, result)
         if fallback_model is not None:
-            result, raw = await self._fallback(adapter, req, ctx, base_depth, on_progress, fallback_model)
+            result, raw, spec = await self._fallback(adapter, req, ctx, base_depth, on_progress, fallback_model)
 
         # Refine a generic non-zero exit into a specific failure category (rate-limit / auth / context
         # overflow / model-unavailable) so a caller -- and the fallback decision below -- can act on it.
@@ -206,6 +219,10 @@ class DelegationService:
         result.provenance = self._provenance(adapter, ctx, result, detected.version)
         result.raw = _combine_raw(raw) if (req.include_raw and raw is not None) else None
         self._log_delegation(req, result, correlation_id, base_depth)
+        # Off-thread: persistence runs blocking git subprocesses + file I/O, and delegate() is the
+        # convergence point shared by concurrent panel voices -- keep the event loop free, matching
+        # how _git_fingerprint and adapter.detect are already offloaded above.
+        await asyncio.to_thread(self._maybe_persist, req, result, spec, detected.version, created_at)
         return result
 
     def _log_delegation(
@@ -233,17 +250,18 @@ class DelegationService:
         ctx: InvocationContext,
         base_depth: int,
         on_progress: ProgressCallback | None,
-    ) -> tuple[DelegationResult, ProcessResult | None]:
-        """Build, run, and parse one invocation. Returns the result and its raw process output.
+    ) -> tuple[DelegationResult, ProcessResult | None, InvocationSpec | None]:
+        """Build, run, and parse one invocation. Returns the result, its raw process output, and the spec.
 
-        Raw is ``None`` only when ``build_invocation`` itself failed (nothing ran).
+        Raw and spec are ``None`` only when ``build_invocation`` itself failed (nothing ran). The spec
+        is returned so the delegation can pin its ``argv`` into a durable run record (F2).
         """
         try:
             spec = adapter.build_invocation(req, ctx)
         except RutherfordError as exc:  # a validation error (e.g. no model) keeps its own code
-            return self._error(ctx, exc), None
+            return self._error(ctx, exc), None, None
         except Exception as exc:  # an adapter bug becomes a structured result, not a server crash
-            return self._fail(ctx, ErrorCode.INTERNAL, f"build_invocation failed: {exc}"), None
+            return self._fail(ctx, ErrorCode.INTERNAL, f"build_invocation failed: {exc}"), None, None
 
         # Windows-only preflight: several adapters carry the composed prompt in argv, and a command
         # line past the ~32K CreateProcessW cap fails opaquely as SPAWN_FAILED -- an unhealthy code
@@ -261,6 +279,7 @@ class DelegationService:
                         "opencode, qwen) or shorten the prompt",
                     ),
                     None,
+                    spec,
                 )
 
         spec = spec.model_copy(update={"env": {**spec.env, **child_depth_env(base_depth)}})
@@ -274,7 +293,7 @@ class DelegationService:
             async with self._semaphore:
                 raw = await self._runner.run(spec, timeout, on_progress)
         except OSError as exc:  # the subprocess could not be launched (a broken shim, a runtime error)
-            return self._fail(ctx, ErrorCode.SPAWN_FAILED, f"failed to launch {req.target.cli}: {exc}"), None
+            return self._fail(ctx, ErrorCode.SPAWN_FAILED, f"failed to launch {req.target.cli}: {exc}"), None, spec
 
         try:
             result = adapter.parse_output(raw, ctx)
@@ -292,7 +311,7 @@ class DelegationService:
                 "for this adapter -- the CLI's machine-readable output format may have changed",
                 raw=raw,
             )
-        return result, raw
+        return result, raw, spec
 
     def _model_fallback_for(self, adapter: CLIAdapter, req: DelegationRequest, result: DelegationResult) -> str | None:
         """The adapter's fallback model to retry once with, or ``None`` when no retry should happen.
@@ -319,15 +338,15 @@ class DelegationService:
         base_depth: int,
         on_progress: ProgressCallback | None,
         fallback_model: str,
-    ) -> tuple[DelegationResult, ProcessResult | None]:
+    ) -> tuple[DelegationResult, ProcessResult | None, InvocationSpec | None]:
         """Re-run the request once with ``fallback_model``, recording the fallback."""
         original_model = req.target.model
         fb_target = req.target.model_copy(update={"model": fallback_model})
         fb_req = req.model_copy(update={"target": fb_target, "allow_model_fallback": False})
         fb_ctx = ctx.model_copy(update={"target": fb_target})
-        result, raw = await self._execute(adapter, fb_req, fb_ctx, base_depth, on_progress)
+        result, raw, spec = await self._execute(adapter, fb_req, fb_ctx, base_depth, on_progress)
         result.fallback_from = original_model or "(default)"
-        return result, raw
+        return result, raw, spec
 
     def _workspace_trusted(self, req: DelegationRequest) -> bool:
         """Return whether a mutating delegation is permitted for ``req``'s working directory."""
@@ -429,6 +448,77 @@ class DelegationService:
         if refined is not None:
             result.error.code = refined
 
+    def _maybe_persist(
+        self,
+        req: DelegationRequest,
+        result: DelegationResult,
+        spec: InvocationSpec | None,
+        adapter_version: str | None,
+        created_at: float,
+    ) -> None:
+        """Persist this run as a durable job (F2) when the call opts in -- best-effort, in place.
+
+        Resolution: an explicit ``req.persist`` wins; ``None`` follows the configured
+        ``default_persistence`` (Model A: ``ephemeral`` out of the box, so nothing is written unless
+        asked). Nothing happens when persistence is off or no ledger is wired.
+
+        Boundary: only a run that reached execution is recorded here. A run refused by an up-front guard
+        (unknown target, depth, missing binary, untrusted workspace, role lookup) returns before this
+        hook and is *not* persisted -- the corpus is post-launch outcomes (success and runtime failure),
+        not pre-flight refusals. For a mutating run in a git tree the changed files and a HEAD diff are
+        captured, with the jobs directory excluded so a run never reports Rutherford's own bookkeeping;
+        in an already-dirty tree these reflect the current worktree, not a proven per-run delta. A
+        filesystem failure is swallowed -- a run that already produced an answer must never fail because
+        its record could not be written -- leaving the result without ``run_dir``.
+        """
+        persist = req.persist if req.persist is not None else (self._config.default_persistence == "job")
+        if not persist or self._ledger is None:
+            return
+
+        diff: str | None = None
+        if is_mutating(req.safety_mode) and req.working_dir:
+            # Resolve the working dir once so the exclude-pathspec offset and git's ``-C`` dir share a
+            # single canonicalization -- a working_dir with ``..`` or a symlinked segment would
+            # otherwise misalign the relative offset against git's literal view.
+            try:
+                wd = str(Path(req.working_dir).resolve())
+            except OSError:
+                wd = req.working_dir
+            exclude = _exclude_pathspec(wd, self._ledger.root)
+            changed = _git_changed_files(wd, exclude)
+            if changed is not None:
+                result.changed_files = changed
+                diff = _git_run(wd, ["diff", "HEAD", "--", ".", *exclude]) or None
+
+        record = RunRecord(
+            run_id=uuid.uuid4().hex,
+            kind="delegate",
+            status=JobStatus.SUCCEEDED if result.ok else JobStatus.FAILED,
+            created_at=created_at,
+            finished_at=self._clock(),
+            duration_s=result.duration_s,
+            cli=req.target.cli,
+            model=result.target.model,
+            adapter_version=adapter_version,
+            provenance=result.provenance,
+            safety_mode=req.safety_mode,
+            argv=list(spec.argv) if spec is not None else [],
+            cwd=spec.cwd if spec is not None else req.working_dir,
+            prompt=req.prompt,
+            role=req.role,
+            files=list(req.files),
+            ok=result.ok,
+            error_code=result.error.code if result.error is not None else None,
+            changed_files=result.changed_files or [],
+            cost=result.cost,
+        )
+        try:
+            run_dir = self._ledger.write(record, answer=result.text, diff=diff)
+        except OSError as exc:  # persistence is best-effort; never fail a produced answer over a bad write
+            log_event("run_persist_failed", run_id=record.run_id, error_type=type(exc).__name__)
+            return
+        result.run_dir = str(run_dir)
+
     def _error(self, ctx: InvocationContext, exc: RutherfordError) -> DelegationResult:
         """Build a failed result from a guard exception."""
         return DelegationResult(
@@ -510,6 +600,48 @@ def _git_fingerprint(working_dir: str) -> str | None:
             return None
         parts.append(section)
     return "\x1e".join(parts)
+
+
+def _exclude_pathspec(working_dir: str, jobs_root: Path) -> list[str]:
+    """Return a git pathspec excluding the jobs directory, when it sits under ``working_dir`` (F2).
+
+    A persisted run writes its artifacts under the jobs root; if that root is inside the run's working
+    tree (the default ``<cwd>/.rutherford/jobs``), an unscoped ``git status`` would then report a
+    *previous* job's files as changed by *this* run. Excluding that subtree keeps ``changed_files`` and
+    the diff about the user's code. Empty when the jobs root is outside the working tree.
+    """
+    try:
+        wd = Path(working_dir).resolve()
+        root = jobs_root.resolve()
+    except OSError:
+        return []
+    if wd in root.parents:  # the jobs root sits strictly under the working tree
+        return [f":(exclude){root.relative_to(wd).as_posix()}"]
+    return []
+
+
+def _git_changed_files(working_dir: str, exclude: list[str] | None = None) -> list[str] | None:
+    """Return the paths git reports changed under ``working_dir`` (best-effort), or ``None`` (F2).
+
+    Parses ``git status --porcelain`` scoped to the subtree (with any ``exclude`` pathspecs appended,
+    e.g. the jobs dir): each line is ``XY <path>`` (two status columns, a space, then the path), or
+    ``XY <old> -> <new>`` for a rename, where the new path is kept. Quoting of paths with special
+    characters is stripped. ``None`` means the directory is not a git repo or git is unavailable, so
+    the run records *no* changed-file list rather than a false empty one (distinct from a clean tree,
+    which records ``[]``).
+    """
+    out = _git_run(working_dir, ["status", "--porcelain", "--", ".", *(exclude or [])])
+    if out is None:
+        return None
+    files: list[str] = []
+    for line in out.splitlines():
+        path = line[3:] if len(line) > 3 else ""
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        path = path.strip().strip('"')
+        if path:
+            files.append(path)
+    return files
 
 
 def _git_run(working_dir: str, args: list[str]) -> str | None:

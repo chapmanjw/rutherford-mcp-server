@@ -101,6 +101,7 @@ async def delegate(
     session_id: str | None = None,
     include_raw: bool = False,
     trust_workspace: bool = False,
+    persist: bool | None = None,
     fallback: list[str] | None = None,
 ) -> str:
     """Delegate a task to one CLI and return its normalized result.
@@ -110,7 +111,9 @@ async def delegate(
     `default_safety_mode` applies (read_only out of the box). write and yolo also need a trusted
     workspace (`trust_workspace=true` or a configured allowlist). With
     `mode="async"` a job id is returned; poll `job_status` / `job_result`. `session_id` resumes a
-    prior session where the CLI supports it. `fallback` is an ordered list of alternate `cli` /
+    prior session where the CLI supports it. `persist=true` keeps the run as a durable job under
+    `.rutherford/jobs/<id>/` (state.toon + a Markdown answer); `None` follows `default_persistence`,
+    and the kept run's `run_dir` is on the result. `fallback` is an ordered list of alternate `cli` /
     `cli:model` targets tried if the primary fails on a retryable category (rate-limit, auth, timeout,
     a down CLI); the result's `target` is whoever answered and `fallback_chain` records the path.
     """
@@ -129,6 +132,7 @@ async def delegate(
             session_id=session_id,
             include_raw=include_raw,
             trust_workspace=trust_workspace,
+            persist=persist,
             fallback=fallback,
         )
     )

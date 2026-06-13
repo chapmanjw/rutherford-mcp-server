@@ -17,14 +17,17 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .adapters.registry import AdapterRegistry, build_registry
 from .config.loader import load_config
+from .config.locations import CONFIG_DIRNAME
 from .config.panels import PanelCache, load_panels
 from .config.schema import RutherfordConfig
 from .domain.error_codes import ErrorCode
 from .domain.errors import RutherfordError
+from .io.ledger import RunLedger
 from .io.serialize import encode
 from .runtime.depth import current_depth
 from .runtime.probe import SystemProbe
@@ -109,7 +112,11 @@ def build_app_context(
         resolved_registry = build_registry(resolved_config, probe=probe_cache)
     resolved_roles = roles if roles is not None else load_roles(resolved_config.role_dirs)
     resolved_panels = panels if panels is not None else PanelCache(lambda: load_panels(resolved_registry.ids()))
-    delegation = DelegationService(resolved_registry, resolved_runner, resolved_config, resolved_roles)
+    # The durable run ledger (F2): persisted jobs land under the configured ``jobs_dir``, or the
+    # workspace's ``.rutherford/jobs`` by default, so a kept run lives with the project it ran in.
+    jobs_root = Path(resolved_config.jobs_dir) if resolved_config.jobs_dir else Path.cwd() / CONFIG_DIRNAME / "jobs"
+    ledger = RunLedger(jobs_root)
+    delegation = DelegationService(resolved_registry, resolved_runner, resolved_config, resolved_roles, ledger=ledger)
     consensus = ConsensusService(delegation, resolved_config, resolved_registry)
     debate = DebateService(delegation, resolved_config)
     jobs = JobService(JobStore(ttl_s=resolved_config.job_ttl_s, max_jobs=resolved_config.max_jobs))
