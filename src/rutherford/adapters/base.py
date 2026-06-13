@@ -22,13 +22,14 @@ import os
 from abc import ABC, abstractmethod
 from typing import Protocol, runtime_checkable
 
-from ..domain.enums import AuthState, SafetyMode
+from ..domain.enums import EFFORT_ORDER, AuthState, Effort, SafetyMode
 from ..domain.models import (
     AdapterCapabilities,
     AuthStatus,
     DelegationRequest,
     DelegationResult,
     DetectResult,
+    EffortFlags,
     InvocationContext,
     InvocationSpec,
     ProcessResult,
@@ -75,6 +76,10 @@ class CLIAdapter(Protocol):
 
     def map_safety(self, mode: SafetyMode) -> SafetyFlags:
         """Translate the universal SafetyMode to this CLI's approval/sandbox flags."""
+        ...
+
+    def map_effort(self, effort: Effort) -> EffortFlags:
+        """Translate the universal Effort tier to this CLI's native knob (flags + the applied tier)."""
         ...
 
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
@@ -150,6 +155,23 @@ class BaseCLIAdapter(ABC):
         rejects named models) overrides this to return an always-available model id (``"auto"``).
         """
         return None
+
+    def map_effort(self, effort: Effort) -> EffortFlags:
+        """No effort knob by default: report the no-op rather than silently dropping the request (2-L-map).
+
+        Most CLIs expose no reasoning-effort flag, so the default is a concrete no-op (unlike the abstract
+        ``map_safety``) -- forcing 13 adapters to write an identical no-op would be noise. An adapter with
+        a real knob (Codex's ``-c model_reasoning_effort``, Cursor's model-id suffix) overrides this and
+        returns ``applied`` set to the clamped tier. ``applied=None`` here marks "ignored".
+        """
+        return EffortFlags(note=f"effort '{effort.value}' is not supported by {self.id}; ignored")
+
+    @staticmethod
+    def _clamp_effort(effort: Effort, ceiling: Effort) -> Effort:
+        """Clamp ``effort`` down to ``ceiling`` when the CLI tops out below the requested tier (2-L-map)."""
+        if EFFORT_ORDER.index(effort) <= EFFORT_ORDER.index(ceiling):
+            return effort
+        return ceiling
 
     def check_output_contract(self, raw: ProcessResult) -> bool:
         """Assume the output contract holds. Adapters with a known machine-readable shape override.

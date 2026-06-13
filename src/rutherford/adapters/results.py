@@ -60,8 +60,17 @@ def error_result(
     *,
     text: str = "",
     details: dict[str, object] | None = None,
+    partial: str | None = None,
+    session_id: str | None = None,
 ) -> DelegationResult:
-    """Build a failed result carrying a stable error code."""
+    """Build a failed result carrying a stable error code.
+
+    ``partial`` preserves the stdout the child wrote before it was cut, when the caller wants it kept on
+    the envelope (the timeout path passes it). It is never the answer ``text`` -- only a preserved trace
+    of in-flight work (F8a, 2-F: capture always, never surface a fault's bytes as a candidate answer).
+    ``session_id`` is carried even on a failure when the output established a resumable session before it
+    failed -- so a cut voice whose partial held a session but no answer yet can still be resumed (F8a, 2-I).
+    """
     return DelegationResult(
         target=ctx.target,
         ok=False,
@@ -70,16 +79,26 @@ def error_result(
         duration_s=raw.duration_s if raw is not None else 0.0,
         error=ErrorInfo(code=code, message=message, details=details),
         safety_mode=ctx.safety_mode,
+        partial=partial,
+        session_id=session_id,
     )
 
 
 def timeout_result(ctx: InvocationContext, raw: ProcessResult) -> DelegationResult:
-    """Build the result for a run that exceeded its timeout."""
+    """Build the result for a run that exceeded its timeout, preserving any pre-deadline stdout.
+
+    A single delegation is the degenerate time-budget case (F8a, 2-behavior): there is no panel to
+    harvest across, so a timeout "collapses toward timeout" but still keeps the partial stdout the CLI
+    streamed before the deadline on ``partial`` (captured by the runner in :attr:`ProcessResult.partial`),
+    rather than discarding the work. It stays a ``TIMEOUT`` fault -- the partial is a preserved trace, not
+    the answer.
+    """
     return error_result(
         ctx,
         raw,
         ErrorCode.TIMEOUT,
         f"{ctx.target.cli} timed out",
+        partial=raw.partial,
     )
 
 

@@ -21,9 +21,12 @@ from ..domain.errors import RutherfordError
 from ..domain.models import ConsensusResult, DebateResult, DelegationResult, ErrorInfo, Job, StrategyResult
 from ..runtime.logging import log_event
 
-#: A job body: given a progress callback, produces a delegation, consensus, debate, or strategy result.
+#: A job body: given a progress callback and an interim-result sink, produces a delegation, consensus,
+#: debate, or strategy result. The interim sink (F8a, 2-M ``on_budget=continue``) lets a long body publish
+#: a best-effort result while it keeps running -- so a poller sees the harvested-so-far set before the
+#: stragglers finish; a body that has no interim to publish simply never calls it.
 JobResult = DelegationResult | ConsensusResult | DebateResult | StrategyResult
-JobBody = Callable[[Callable[[str], None]], Awaitable[JobResult]]
+JobBody = Callable[[Callable[[str], None], Callable[[JobResult], None]], Awaitable[JobResult]]
 
 #: Job states past which nothing more happens: eligible for TTL eviction and not cancellable.
 _TERMINAL_STATUSES = frozenset({JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED})
@@ -94,6 +97,18 @@ class JobStore:
         job = self._jobs.get(job_id)
         if job is not None:
             job.progress.append(line)
+            job.updated_at = self._clock()
+
+    def set_interim_result(self, job_id: str, result: JobResult) -> None:
+        """Publish a best-effort interim result for a still-running job (F8a, 2-M ``on_budget=continue``).
+
+        Sets ``result`` while the job stays ``RUNNING`` (status unchanged), so ``job_result`` can return the
+        harvested-so-far set before the body finishes the stragglers. A no-op once the job is terminal, so a
+        late interim cannot resurrect a cancelled/finished job. The final :meth:`complete` overwrites it.
+        """
+        job = self._jobs.get(job_id)
+        if job is not None and job.status not in _TERMINAL_STATUSES:
+            job.result = result
             job.updated_at = self._clock()
 
     def complete(self, job_id: str, result: JobResult) -> None:
@@ -172,7 +187,10 @@ class JobService:
     async def _run(self, job_id: str, body: JobBody) -> None:
         self._store.mark_running(job_id)
         try:
-            result = await body(lambda line: self._store.append_progress(job_id, line))
+            result = await body(
+                lambda line: self._store.append_progress(job_id, line),
+                lambda interim: self._store.set_interim_result(job_id, interim),
+            )
             self._store.complete(job_id, result)
             log_event("job_finished", job_id=job_id, status=JobStatus.SUCCEEDED.value)
         except asyncio.CancelledError:

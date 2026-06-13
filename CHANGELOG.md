@@ -6,6 +6,50 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Time budget + effort (F8a). Three previously-conflated concerns are now separate knobs:
+  - `timeout_s` (unchanged) stays the per-call unresponsiveness fault: a stuck child has its process
+    tree killed and the run fails retryably with `TIMEOUT`.
+  - `time_budget_s` is a new wall-clock harvest deadline for a whole panel (`consensus` / `debate`),
+    distinct from each voice's `timeout_s`. Consensus runs the voices under the deadline and, when it is
+    reached, keeps the answered voices and cuts the in-flight ones, then aggregates/synthesizes over the
+    harvested set as long as `min_quorum` usable voices remain; a debate runs each round under the
+    remaining budget (an `asyncio.wait` deadline), cutting a round's in-flight turns and finalizing the
+    transcript-so-far over the turns that completed. A harvest is a success: the result carries
+    `stop_reason="budget"` and a `RunRollup` (issued / answered / cut / usable counts, quorum, elapsed,
+    and the effort applied). A harvest that leaves fewer than `min_quorum` usable results is the one
+    genuine failure, the new `BUDGET_EXHAUSTED` code (not retryable, not a health signal). `on_budget`
+    picks the disposition: `harvest` (default, cut the stragglers), `continue` (the budget is advisory —
+    run everything; an async-job consensus *detaches* at the deadline, publishing the best-effort
+    answered-so-far set as an interim result a poller can read while the stragglers keep running, then the
+    full set when they land), or `resume` (cut the stragglers, intending a later deliberate come-back that
+    rides the forthcoming job-continuation work — today equivalent to `harvest`, with the cut voice's resume
+    handle recorded in the parent `state.toon`).
+  - `effort` is a new producer "how hard may it think" hint with universal tiers `low` | `medium` |
+    `high` | `xhigh`, mapped per adapter to that CLI's native knob (`map_effort`), clamped to the nearest
+    supported tier, and reported as `effort_applied` so a budget that did nothing is never silent. Codex
+    wires `-c model_reasoning_effort=<tier>` (on both the fresh and resume paths); Cursor rewrites the
+    model id with its `-<tier>` reasoning suffix; CLIs with no effort knob report a no-op. Defaults come
+    from `default_effort` / `default_time_budget_s` / `default_on_budget` in config (global or per-adapter
+    `effort`). `effort` is available on `delegate`, `consensus`, and `debate`; the time budget on the two
+    panel tools. The leaf and panel run records capture the requested and applied effort and the rollup.
+  - In-flight work is no longer discarded on a cut. The process runner accumulates stdout in bounded
+    chunks (teed on a new `on_stdout` channel, separate from stderr `on_progress`, and flushed even when
+    a cut delivers no trailing newline) and returns what the child wrote before a deadline on
+    `ProcessResult.partial`. A consensus voice cut at the deadline has that partial harvested *through the
+    adapter's own parser* (gated by `AdapterCapabilities.supports_partial_output`, derived from
+    `output_mode`): a JSONL/text voice yields a usable candidate answer that counts toward quorum and feeds
+    the aggregation/synthesis (and any resume session handle is recovered for a later continuation), while
+    a single-envelope voice (whose answer arrives only at the end) keeps its partial as a trace. A debate
+    turn cut mid-flight keeps its streamed stdout as a trace too (never promoted to a stance). The harvested
+    partial — answer or trace — is written into the voice's `artifacts/voices/voice-N.md`, with a cut
+    voice's resume handle recorded alongside, so a kept job loses nothing. A persisted panel also tees each
+    voice's stdout into a live `artifacts/voices/voice-N.live.md` *as it arrives* (off-thread, jobs only),
+    so the in-flight stream survives a crash, not just a graceful finalization. A single delegation has no
+    panel to harvest across (the degenerate case that "collapses toward timeout"), so a single run that
+    hits its `timeout_s` keeps its pre-deadline stdout on the result's `partial` rather than dropping it.
+
 ## [1.5.0] - 2026-06-13
 
 ### Added

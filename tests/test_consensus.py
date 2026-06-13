@@ -486,7 +486,11 @@ class _ConcurrencyRunner:
         self.max_active = 0
 
     async def run(
-        self, spec: InvocationSpec, timeout_s: float, on_progress: Callable[[str], None] | None = None
+        self,
+        spec: InvocationSpec,
+        timeout_s: float,
+        on_progress: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
     ) -> ProcessResult:
         self.active += 1
         self.max_active = max(self.max_active, self.active)
@@ -525,6 +529,406 @@ async def test_one_shared_cap_bounds_concurrent_consensus_and_debate() -> None:
         ),
     )
     assert runner.max_active <= 2  # both panels share one cap
+
+
+# --- (e) F8a: time-budget harvest + effort ------------------------------------------------------
+
+
+class _BudgetRunner:
+    """A runner with per-cli delays that streams optional partial lines before its delay.
+
+    Drives the time-budget harvest deterministically: a zero-delay voice finishes within any budget;
+    a long-delay voice is still in-flight at the deadline and gets cut. Partial lines are teed to
+    ``on_stdout`` *before* the delay, so a cut voice has accumulated a partial answer at the cut.
+    """
+
+    def __init__(self, delays: dict[str, float], partials: dict[str, list[str]] | None = None) -> None:
+        self.delays = delays
+        self.partials = partials or {}
+
+    async def run(
+        self,
+        spec: InvocationSpec,
+        timeout_s: float,
+        on_progress: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+    ) -> ProcessResult:
+        cli = spec.argv[0]
+        for line in self.partials.get(cli, []):
+            if on_stdout is not None:
+                on_stdout(line)
+        await asyncio.sleep(self.delays.get(cli, 0.0))
+        return ProcessResult(exit_code=0, stdout=f"{cli} answered")
+
+
+def _budget_consensus(runner: object, config: RutherfordConfig | None = None) -> ConsensusService:
+    cfg = config or RutherfordConfig()
+    registry = AdapterRegistry([FakeAdapter("fast"), FakeAdapter("slow"), FakeAdapter("slow2")])
+    delegation = DelegationService(registry, runner, cfg, load_roles())  # type: ignore[arg-type]
+    return ConsensusService(delegation, cfg, registry)
+
+
+async def test_time_budget_harvests_fast_voices_and_cuts_slow_ones() -> None:
+    # The headline F8a behavior (2-behavior): at the deadline the answered voices are kept and the
+    # in-flight ones are cut, with the panel still returning a result.
+    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0})
+    service = _budget_consensus(runner)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
+    )
+    assert isinstance(result, ConsensusResult)
+    by_cli = {voice.target.cli: voice for voice in result.voices}
+    assert by_cli["fast"].ok and by_cli["fast"].text == "fast answered"
+    assert not by_cli["slow"].ok  # cut at the deadline
+    assert by_cli["slow"].error is not None
+    assert by_cli["slow"].error.code == "BUDGET_EXHAUSTED"
+    assert by_cli["slow"].stop_reason == "budget"
+    assert result.stop_reason == "budget"
+
+
+async def test_budget_harvest_promotes_a_partial_to_a_usable_candidate_answer() -> None:
+    # 2-F/2-H: a cut voice on a supports_partial_output adapter (FakeAdapter is TEXT) has the stdout it
+    # streamed before the cut harvested through the adapter's parser into a usable candidate answer -- so
+    # the in-flight work is not wasted: it is ``ok``, counts toward quorum, and feeds aggregation/synthesis.
+    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0}, partials={"slow": ["draft line 1", "draft line 2"]})
+    service = _budget_consensus(runner)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
+    )
+    assert isinstance(result, ConsensusResult)
+    slow = next(voice for voice in result.voices if voice.target.cli == "slow")
+    assert slow.ok  # the streamed partial became a usable candidate answer
+    assert slow.stop_reason == "budget"  # ...but flagged as a budget harvest, not a clean finish
+    assert "draft line 1" in slow.text and "draft line 2" in slow.text  # the partial is the answer
+    assert slow.partial is not None and "draft line 1" in slow.partial  # raw bytes preserved too
+    assert result.rollup is not None and result.rollup.usable == 2  # both voices count toward quorum
+
+
+async def test_harvested_partial_reports_the_resolved_default_effort() -> None:
+    # The harvested partial must report the effort the subprocess actually ran with -- which, when the call
+    # named none, is the configured default_effort (resolved like the delegation service does), not None.
+    from rutherford.domain.enums import Effort
+
+    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0}, partials={"slow": ["partial draft"]})
+    registry = AdapterRegistry([FakeAdapter("fast"), FakeAdapter("slow")])
+    cfg = RutherfordConfig(default_effort=Effort.HIGH)  # the call names no effort; the default fills it
+    service = ConsensusService(DelegationService(registry, runner, cfg, load_roles()), cfg, registry)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
+    )
+    assert isinstance(result, ConsensusResult)
+    slow = next(voice for voice in result.voices if voice.target.cli == "slow")
+    assert slow.ok  # the partial was harvested into a usable answer
+    assert slow.effort == Effort.HIGH and slow.effort_applied == Effort.HIGH  # the resolved default, not None
+
+
+async def test_budget_cut_on_a_single_envelope_adapter_is_a_trace_not_an_answer() -> None:
+    # 2-H: a single-envelope adapter (JSON/TRANSCRIPT) emits its answer once, at the end, so a cut yields
+    # only a partial TRACE, never a usable answer. Such a cut voice stays a BUDGET_EXHAUSTED failure with
+    # the raw bytes preserved on ``partial`` -- it must NOT be promoted to a usable answer.
+    from rutherford.domain.enums import OutputMode
+    from rutherford.domain.models import AdapterCapabilities
+
+    class _SingleEnvelopeAdapter(FakeAdapter):
+        def capabilities(self) -> AdapterCapabilities:
+            return AdapterCapabilities(output_mode=OutputMode.JSON)  # supports_partial_output -> False
+
+    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0}, partials={"slow": ["incomplete trace"]})
+    registry = AdapterRegistry([FakeAdapter("fast"), _SingleEnvelopeAdapter("slow")])
+    cfg = RutherfordConfig()
+    service = ConsensusService(DelegationService(registry, runner, cfg, load_roles()), cfg, registry)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
+    )
+    assert isinstance(result, ConsensusResult)
+    slow = next(voice for voice in result.voices if voice.target.cli == "slow")
+    assert not slow.ok  # a single-envelope cut is a trace, never a usable answer
+    assert slow.error is not None and slow.error.code == "BUDGET_EXHAUSTED"
+    assert slow.partial is not None and "incomplete trace" in slow.partial  # kept as a trace
+    assert result.rollup is not None and result.rollup.usable == 1  # only the fast voice counts
+
+
+async def test_budget_below_quorum_raises_budget_exhausted() -> None:
+    # 2-E': a harvest that left fewer than min_quorum usable voices is a genuine failure raised before
+    # any result is returned -- the zero/under-yield edge BUDGET_EXHAUSTED is reserved for.
+    runner = _BudgetRunner({"slow": 5.0, "slow2": 5.0})
+    service = _budget_consensus(runner, RutherfordConfig(min_quorum=2))
+    with pytest.raises(RutherfordError) as info:
+        await service.consensus(
+            ConsensusRequest(targets=[Target(cli="slow"), Target(cli="slow2")], prompt="q", time_budget_s=0.3)
+        )
+    assert info.value.code == "BUDGET_EXHAUSTED"
+    assert "min_quorum" in info.value.message
+
+
+async def test_on_budget_continue_runs_every_voice_to_completion() -> None:
+    # 2-M: with on_budget="continue" the budget is advisory -- every voice runs to completion and none
+    # is cut, even one slower than the budget. The rollup still records the run, with no harvest.
+    runner = _BudgetRunner({"fast": 0.0, "slow": 0.2})
+    service = _budget_consensus(runner)
+    result = await service.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.05, on_budget="continue"
+        )
+    )
+    assert all(voice.ok for voice in result.voices)  # nothing cut despite the slow voice exceeding 0.05s
+    assert result.stop_reason is None
+    assert result.rollup is not None
+    assert result.rollup.stop_reason == "ok"
+    assert result.rollup.cut == 0
+
+
+async def test_on_budget_resume_cuts_the_straggler_like_harvest_today() -> None:
+    # 2-M: ``resume`` cuts the stragglers at the deadline like ``harvest`` and intends a later deliberate
+    # come-back to them. Today that come-back rides the item-9 continuation primitive and a mid-run-cut
+    # voice has no established session to record, so ``resume`` is harvest-equivalent -- pinned here so a
+    # future item-9 change that diverges them is a deliberate, visible edit.
+    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0})
+    service = _budget_consensus(runner)
+    result = await service.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3, on_budget="resume"
+        )
+    )
+    assert isinstance(result, ConsensusResult)
+    by_cli = {voice.target.cli: voice for voice in result.voices}
+    assert by_cli["fast"].ok
+    assert not by_cli["slow"].ok and by_cli["slow"].error is not None
+    assert by_cli["slow"].error.code == "BUDGET_EXHAUSTED"  # cut at the deadline, exactly like harvest
+    assert result.stop_reason == "budget"
+
+
+async def test_on_budget_continue_detaches_publishing_an_interim_then_the_full_set() -> None:
+    # 2-M: on_budget=continue with an interim sink (an async job) detaches at the deadline -- it publishes
+    # the best-effort answered-so-far set and keeps the stragglers running, returning the full set when they
+    # land. Nothing is cut: the final has every voice and is not flagged as a budget harvest.
+    interims: list[ConsensusResult | StrategyResult] = []
+    runner = _BudgetRunner({"fast": 0.0, "slow": 0.3})
+    service = _budget_consensus(runner)
+    result = await service.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.1, on_budget="continue"
+        ),
+        on_interim_result=interims.append,
+    )
+    assert interims, "an interim best-effort result must be published at the deadline"
+    first = interims[0]
+    assert isinstance(first, ConsensusResult)
+    assert {voice.target.cli for voice in first.voices} == {"fast"}  # only the answered-so-far voice
+    assert first.notice is not None and "still running" in first.notice
+    assert isinstance(result, ConsensusResult)
+    assert {voice.target.cli for voice in result.voices} == {"fast", "slow"}  # the full set at the end
+    assert all(voice.ok for voice in result.voices)
+    assert result.stop_reason is None  # continue never cuts -- not a harvest
+
+
+async def test_on_budget_continue_without_an_interim_sink_runs_all_to_completion() -> None:
+    # The sync path: with no interim sink, continue cannot detach -- it just runs every voice to completion
+    # and returns the full set (no interim emitted, nothing cut).
+    runner = _BudgetRunner({"fast": 0.0, "slow": 0.2})
+    service = _budget_consensus(runner)
+    result = await service.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.05, on_budget="continue"
+        )
+    )
+    assert isinstance(result, ConsensusResult)
+    assert all(voice.ok for voice in result.voices) and len(result.voices) == 2
+    assert result.stop_reason is None
+
+
+async def test_strategy_carries_per_voice_effort_applied() -> None:
+    # 2-L: the applied-effort reporting surface must survive the strategy aggregation -- each VoiceVerdict
+    # carries the tier its voice actually applied, not just the all-voices result.
+    from rutherford.domain.enums import Effort
+
+    runner = _verdict_runner({"a": "approve", "b": "approve"})
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="a"), Target(cli="b")], prompt="q", strategy=Strategy.MAJORITY, effort=Effort.HIGH
+        )
+    )
+    assert isinstance(result, StrategyResult)
+    assert result.voices and all(verdict.effort_applied == Effort.HIGH for verdict in result.voices)
+
+
+async def test_rollup_effort_requested_reflects_the_resolved_default() -> None:
+    # 2-L-map: a budget that defaulted the effort must not report None for requested -- the rollup records
+    # the resolved tier (the configured default the voices actually ran with).
+    from rutherford.domain.enums import Effort
+
+    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0})
+    service = _budget_consensus(runner, RutherfordConfig(default_effort=Effort.HIGH))
+    result = await service.consensus(  # effort omitted -> resolves to default_effort=high
+        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
+    )
+    assert result.rollup is not None
+    assert result.rollup.effort_requested == Effort.HIGH
+
+
+async def test_default_on_budget_continue_is_honored_when_the_call_omits_it() -> None:
+    # 2-M (per-call param + workspace default): an omitted on_budget follows the configured
+    # default_on_budget. With default_on_budget="continue", a slow voice that exceeds the budget is NOT
+    # cut (the budget is advisory) -- proving the config default reached the service, not a hard "harvest".
+    runner = _BudgetRunner({"fast": 0.0, "slow": 0.2})
+    service = _budget_consensus(runner, RutherfordConfig(default_on_budget="continue"))
+    result = await service.consensus(  # on_budget omitted -> resolves to the config default (continue)
+        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.05)
+    )
+    assert isinstance(result, ConsensusResult)
+    assert all(voice.ok for voice in result.voices)  # nothing cut despite the slow voice exceeding 0.05s
+    assert result.stop_reason is None
+
+
+async def test_no_budget_means_no_rollup_and_no_stop_reason() -> None:
+    # The default path: no time budget -> the run completes normally, with no rollup and no stop_reason,
+    # so the F8a fields stay absent from the wire for the common case.
+    runner = _BudgetRunner({"fast": 0.0, "slow": 0.0})
+    service = _budget_consensus(runner)
+    result = await service.consensus(ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q"))
+    assert result.stop_reason is None
+    assert result.rollup is None
+
+
+async def test_budget_rollup_reports_counts_and_effort() -> None:
+    # The rollup is the F8a audit surface: who was issued, who answered, who was cut, quorum, and the
+    # effort actually applied (the FakeAdapter echoes the requested tier as applied).
+    from rutherford.domain.enums import Effort
+
+    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0})
+    service = _budget_consensus(runner)
+    result = await service.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3, effort=Effort.HIGH
+        )
+    )
+    rollup = result.rollup
+    assert rollup is not None
+    assert rollup.stop_reason == "budget"
+    assert rollup.requested == 2
+    assert rollup.answered == 1 and rollup.cut == 1
+    assert rollup.usable == 1 and rollup.quorum_met is True
+    assert rollup.time_budget_s == 0.3
+    assert rollup.effort_requested == Effort.HIGH
+    assert rollup.effort_applied == Effort.HIGH  # the fake "supports" the tier, so applied == requested
+    assert rollup.elapsed_s >= 0.0
+
+
+class _HarvestRunner:
+    """A runner where the slow voice streams a partial then overruns, and the harvest_partial follow-up
+    (its prompt contains "out of time") returns a clean best answer fast -- so a test can drive 2-I."""
+
+    async def run(
+        self,
+        spec: InvocationSpec,
+        timeout_s: float,
+        on_progress: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+    ) -> ProcessResult:
+        prompt = spec.argv[2] if len(spec.argv) > 2 else ""
+        if "out of time" in prompt:  # the 2-I active harvest follow-up against the recovered session
+            return ProcessResult(exit_code=0, stdout="clean best answer")
+        cli = spec.argv[0]
+        if cli == "slow":
+            if on_stdout is not None:
+                on_stdout("raw partial draft")  # streamed before the cut -> recovers a session
+            await asyncio.sleep(5.0)
+            return ProcessResult(exit_code=0, stdout="slow answered")
+        return ProcessResult(exit_code=0, stdout=f"{cli} answered")
+
+
+async def test_harvest_partial_reprompts_a_cut_voice_for_a_clean_best_answer() -> None:
+    # 2-I active: harvest_partial=true re-prompts a cut voice whose session was recovered (from its streamed
+    # partial) for a clean best answer, which replaces the raw partial.
+    runner = _HarvestRunner()
+    service = _budget_consensus(runner)
+    result = await service.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3, harvest_partial=True
+        )
+    )
+    assert isinstance(result, ConsensusResult)
+    slow = next(voice for voice in result.voices if voice.target.cli == "slow")
+    assert slow.ok
+    assert slow.text == "clean best answer"  # the re-prompt replaced the raw partial
+    assert slow.stop_reason == "budget"  # still flagged as a (post-deadline) harvest
+
+
+async def test_cut_voice_records_a_recovered_session_even_without_an_answer() -> None:
+    # 2-I passive: a voice cut mid-run whose partial established a session but no usable answer yet must
+    # still record that session handle, so a later resume/harvest can use it.
+    from rutherford.domain.enums import OutputMode
+    from rutherford.domain.error_codes import ErrorCode
+    from rutherford.domain.models import AdapterCapabilities, DelegationResult, ErrorInfo, InvocationContext
+
+    class _SessionNoAnswerAdapter(FakeAdapter):
+        def capabilities(self) -> AdapterCapabilities:
+            return AdapterCapabilities(supports_resume=True, output_mode=OutputMode.JSONL)  # partial-output
+
+        def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
+            # The partial established a session but carries no answer yet -> a failed parse with the session.
+            return DelegationResult(
+                target=ctx.target,
+                ok=False,
+                error=ErrorInfo(code=ErrorCode.PARSE_ERROR, message="no answer yet"),
+                session_id="recovered-sess",
+                safety_mode=ctx.safety_mode,
+            )
+
+    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0}, partials={"slow": ["session established, still thinking"]})
+    registry = AdapterRegistry([FakeAdapter("fast"), _SessionNoAnswerAdapter("slow")])
+    cfg = RutherfordConfig()
+    service = ConsensusService(DelegationService(registry, runner, cfg, load_roles()), cfg, registry)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
+    )
+    assert isinstance(result, ConsensusResult)
+    slow = next(voice for voice in result.voices if voice.target.cli == "slow")
+    assert not slow.ok  # no usable answer -> a trace cut
+    assert slow.session_id == "recovered-sess"  # ...but the session is recorded for a later resume (2-I)
+
+
+async def test_harvest_partial_off_leaves_the_raw_partial() -> None:
+    # Without harvest_partial, the cut voice keeps its raw harvested partial (no follow-up re-prompt).
+    runner = _HarvestRunner()
+    service = _budget_consensus(runner)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
+    )
+    assert isinstance(result, ConsensusResult)
+    slow = next(voice for voice in result.voices if voice.target.cli == "slow")
+    assert slow.text == "raw partial draft"  # the raw streamed partial, not a re-prompted answer
+
+
+async def test_outer_cancellation_during_harvest_propagates_and_drains() -> None:
+    # An external cancel of the whole panel (e.g. cancel_job) while voices are in flight must propagate
+    # as CancelledError, not be folded into a budget-cut voice. The slow voices are cancel-drained.
+    runner = _BudgetRunner({"slow": 5.0, "slow2": 5.0})
+    service = _budget_consensus(runner)
+    task = asyncio.ensure_future(
+        service.consensus(ConsensusRequest(targets=[Target(cli="slow"), Target(cli="slow2")], prompt="q"))
+    )
+    await asyncio.sleep(0.05)  # let the voices start
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_effort_flows_to_every_voice_and_is_reported_applied() -> None:
+    # 2-L: the panel's effort cap reaches each voice, and the applied tier is reported back per voice
+    # (the FakeAdapter maps every tier as supported, echoing it as applied).
+    from rutherford.domain.enums import Effort
+
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", effort=Effort.MEDIUM)
+    )
+    assert all(voice.effort == Effort.MEDIUM for voice in result.voices)
+    assert all(voice.effort_applied == Effort.MEDIUM for voice in result.voices)
+    # The fake adapter encodes the effort flag into the argv, so it reached the invocation.
+    assert all("--effort=medium" in spec.argv for spec, _ in runner.calls)
 
 
 async def test_expand_all_skips_a_benched_adapter() -> None:

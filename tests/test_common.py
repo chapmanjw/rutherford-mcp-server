@@ -7,14 +7,16 @@ from __future__ import annotations
 import pytest
 
 from rutherford.adapters.registry import AdapterRegistry
-from rutherford.domain.enums import DelegationMode, SafetyMode, Stance, Strategy
+from rutherford.domain.enums import DelegationMode, Effort, SafetyMode, Stance, Strategy
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import Target
 from rutherford.tools.common import (
     as_target,
     ensure_known_cli,
     ensure_known_targets,
+    parse_effort,
     parse_mode,
+    parse_on_budget,
     parse_safety_mode,
     parse_stances,
     parse_strategy,
@@ -69,6 +71,27 @@ def test_parse_strategy() -> None:
     assert parse_strategy("plurality") is Strategy.PLURALITY
     with pytest.raises(RutherfordError, match="strategy"):
         parse_strategy("bogus-strategy")
+
+
+def test_parse_effort() -> None:
+    # F8a: a valid tier coerces, an enum passes through, None (omitted) passes through for the service to
+    # fill from default_effort, and an unknown tier is a clean tool-boundary error.
+    assert parse_effort("high") is Effort.HIGH
+    assert parse_effort(Effort.XHIGH) is Effort.XHIGH
+    assert parse_effort(None) is None
+    with pytest.raises(RutherfordError, match="effort"):
+        parse_effort("turbo")
+
+
+def test_parse_on_budget() -> None:
+    # F8a 2-M: None (omitted) passes through so the service fills it from default_on_budget; the three
+    # dispositions validate; anything else is a clean error.
+    assert parse_on_budget(None) is None
+    assert parse_on_budget("harvest") == "harvest"
+    assert parse_on_budget("continue") == "continue"
+    assert parse_on_budget("resume") == "resume"
+    with pytest.raises(RutherfordError, match="on_budget"):
+        parse_on_budget("abandon")
 
 
 def test_as_target_variants() -> None:

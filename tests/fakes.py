@@ -16,7 +16,7 @@ from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.panels import PanelCache
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import AppContext, build_app_context
-from rutherford.domain.enums import AuthState, OutputMode, SafetyMode
+from rutherford.domain.enums import AuthState, Effort, OutputMode, SafetyMode
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.models import (
     AdapterCapabilities,
@@ -24,6 +24,7 @@ from rutherford.domain.models import (
     DelegationRequest,
     DelegationResult,
     DetectResult,
+    EffortFlags,
     ErrorInfo,
     InvocationContext,
     InvocationSpec,
@@ -89,16 +90,23 @@ class FakeProcessRunner:
         spec: InvocationSpec,
         timeout_s: float,
         on_progress: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
     ) -> ProcessResult:
         self.calls.append((spec, timeout_s))
         if on_progress is not None:
             on_progress("working")
             self.progress.append("working")
-        if self._run_fn is not None:
-            # argv-aware: lets a test decide the outcome from the model/cli in the spec, which is
-            # how the per-target model-fallback path is exercised.
-            return self._run_fn(spec)
-        return self._result or ProcessResult(exit_code=0, stdout="ok", stderr="")
+        result = (
+            self._run_fn(spec)
+            if self._run_fn is not None
+            else (self._result or ProcessResult(exit_code=0, stdout="ok", stderr=""))
+        )
+        # Tee the canned stdout to on_stdout (mirrors the real runner), so a harvest test can observe
+        # a cut voice's partial accumulate through the on_stdout channel.
+        if on_stdout is not None and result.stdout:
+            for line in result.stdout.splitlines():
+                on_stdout(line)
+        return result
 
 
 class FakeAdapter:
@@ -157,6 +165,10 @@ class FakeAdapter:
             argv += ["--model", req.target.model]
         safety = self.map_safety(ctx.safety_mode)
         argv += safety.args
+        # Mirror an effort-supporting adapter (codex/cursor): apply the resolved effort to the argv via
+        # map_effort when one was requested, so a test can assert the effort tier reached the invocation.
+        if ctx.effort is not None:
+            argv += self.map_effort(ctx.effort).args
         # Note: RUTHERFORD_DEPTH is overlaid by the delegation service, not by the adapter.
         return InvocationSpec(argv=argv, env=dict(safety.env), cwd=req.working_dir)
 
@@ -173,6 +185,10 @@ class FakeAdapter:
 
     def map_safety(self, mode: SafetyMode) -> SafetyFlags:
         return SafetyFlags(args=[f"--safety={mode.value}"], note=mode.value)
+
+    def map_effort(self, effort: Effort) -> EffortFlags:
+        # The fake "supports" every tier, echoing it as applied so effort flows end to end in tests.
+        return EffortFlags(args=[f"--effort={effort.value}"], note=effort.value, applied=effort)
 
     def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
         ok = raw.exit_code == 0 and not raw.timed_out

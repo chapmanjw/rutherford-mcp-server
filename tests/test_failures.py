@@ -72,6 +72,7 @@ def test_is_model_unavailable() -> None:
         (ErrorCode.WORKSPACE_NOT_TRUSTED, False),
         (ErrorCode.MAX_DEPTH_EXCEEDED, False),
         (ErrorCode.READONLY_VIOLATED, False),
+        (ErrorCode.BUDGET_EXHAUSTED, False),  # F8a: a zero-yield harvest is a result, not a retry signal
     ],
 )
 def test_is_retryable(code: ErrorCode, retryable: bool) -> None:
@@ -94,7 +95,14 @@ def test_is_retryable(code: ErrorCode, retryable: bool) -> None:
         (ErrorCode.MODEL_UNAVAILABLE, False),  # the model's fault
         (ErrorCode.PARSE_ERROR, False),  # likely a one-off mis-parse, not a down seat
         (ErrorCode.INVALID_INPUT, False),
+        (ErrorCode.BUDGET_EXHAUSTED, False),  # F8a: the budget was too tight, not the adapter being down
     ],
 )
 def test_indicates_unhealthy(code: ErrorCode, unhealthy: bool) -> None:
     assert indicates_unhealthy(code) is unhealthy
+
+
+def test_budget_exhausted_is_a_known_error_code() -> None:
+    # F8a appended BUDGET_EXHAUSTED for the zero-yield harvest edge; it must be a real member with a
+    # stable wire value, and (asserted above) neither retryable nor unhealthy.
+    assert ErrorCode.BUDGET_EXHAUSTED.value == "BUDGET_EXHAUSTED"

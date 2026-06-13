@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ from toon import decode
 from rutherford.config.schema import RutherfordConfig
 from rutherford.domain.enums import AuthState
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import ProcessResult
+from rutherford.domain.models import InvocationSpec, ProcessResult
 from rutherford.tools.consensus import consensus_tool
 from rutherford.tools.debate import debate_tool
 from rutherford.tools.delegate import delegate_tool
@@ -70,6 +71,55 @@ async def test_explicit_safety_mode_beats_the_configured_default() -> None:
     app = make_app(adapters=[FakeAdapter("fake")], runner=runner, config=config)
     out = await delegate_tool(app, cli="fake", prompt="q", safety_mode="read_only")
     assert _decode(out)["safety_mode"] == "read_only"
+
+
+async def test_delegate_tool_effort_reaches_the_invocation() -> None:
+    # F8a: the tool-level effort string is parsed to the Effort tier, resolved, and applied -- it must
+    # reach the adapter's argv and be reported as applied on the result.
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    app = make_app(adapters=[FakeAdapter("fake")], runner=runner)
+    out = await delegate_tool(app, cli="fake", prompt="q", effort="high")
+    assert _decode(out)["effort_applied"] == "high"
+    spec, _ = runner.calls[0]
+    assert "--effort=high" in spec.argv
+
+
+async def test_delegate_tool_bad_effort_raises() -> None:
+    app = make_app(adapters=[FakeAdapter("fake")])
+    with pytest.raises(RutherfordError, match="effort"):
+        await delegate_tool(app, cli="fake", prompt="q", effort="turbo")
+
+
+async def test_consensus_tool_bad_on_budget_raises() -> None:
+    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")])
+    with pytest.raises(RutherfordError, match="on_budget"):
+        await consensus_tool(app, targets=["a", "b"], prompt="q", on_budget="abandon")
+
+
+class _SlowToolRunner:
+    """A runner that sleeps per cli, so a tool-level time budget can harvest the fast voice."""
+
+    async def run(
+        self,
+        spec: InvocationSpec,
+        timeout_s: float,
+        on_progress: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+    ) -> ProcessResult:
+        cli = spec.argv[0]
+        await asyncio.sleep(0.0 if cli == "a" else 5.0)
+        return ProcessResult(exit_code=0, stdout=f"{cli} answered")
+
+
+async def test_consensus_tool_threads_the_time_budget_into_a_harvest() -> None:
+    # The tool plumbs time_budget_s into the request: a slow voice is cut at the deadline and the result
+    # is flagged as a budget harvest. (Asserted on the raw TOON: the `toon` strict decoder cannot
+    # round-trip a heterogeneous ok/failed voice array -- a pre-existing quirk, not an item-2 regression.)
+    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")], runner=_SlowToolRunner())  # type: ignore[arg-type]
+    out = await consensus_tool(app, targets=["a", "b"], prompt="q", time_budget_s=0.3)
+    assert "stop_reason: budget" in out  # the harvest reached the result, so time_budget_s was threaded
+    assert "BUDGET_EXHAUSTED" in out  # the slow voice was cut at the deadline
+    assert "rollup:" in out  # the budget rollup is surfaced on the result
 
 
 async def test_consensus_omitted_safety_mode_applies_the_configured_default() -> None:

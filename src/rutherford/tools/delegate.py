@@ -7,7 +7,7 @@ from __future__ import annotations
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode, is_mutating
 from ..domain.models import DelegationRequest, Target
-from .common import as_target, async_job_envelope, parse_mode, resolve_safety_mode
+from .common import as_target, async_job_envelope, parse_effort, parse_mode, resolve_safety_mode
 
 
 async def delegate_tool(
@@ -22,6 +22,7 @@ async def delegate_tool(
     safety_mode: str | None = None,
     mode: str = "sync",
     timeout_s: float | None = None,
+    effort: str | None = None,
     session_id: str | None = None,
     include_raw: bool = False,
     trust_workspace: bool = False,
@@ -37,6 +38,13 @@ async def delegate_tool(
     list of alternate ``cli`` / ``cli:model`` targets to try if the primary fails on a retryable
     category (F7). ``persist`` keeps the run as a durable job under ``.rutherford/jobs/<id>/`` (its
     ``run_dir`` is returned on the result); ``None`` follows the configured ``default_persistence``.
+    ``effort`` (``low`` | ``medium`` | ``high`` | ``xhigh``) is the producer "how hard may it think" hint,
+    mapped to the CLI's native knob and reported as ``effort_applied`` (F8a); omit it to follow the
+    configured ``default_effort``. The wall-clock ``time_budget_s`` harvest is a panel feature (see
+    ``consensus`` / ``debate``): a single delegation has no fan-out to harvest, so it is the degenerate
+    case that "collapses toward timeout" (F8a, 2-behavior) -- ``timeout_s`` is the per-call bound, and a
+    run that hits it keeps the stdout it streamed before the cut on the result's ``partial`` rather than
+    discarding it.
     """
     request = DelegationRequest(
         target=Target(cli=cli, model=model),
@@ -47,6 +55,7 @@ async def delegate_tool(
         safety_mode=resolve_safety_mode(safety_mode, app.config.default_safety_mode),
         mode=parse_mode(mode),
         timeout_s=timeout_s,
+        effort=parse_effort(effort),
         session_id=session_id,
         include_raw=include_raw,
         trust_workspace=trust_workspace,
@@ -61,7 +70,9 @@ async def delegate_tool(
     if request.mode is DelegationMode.ASYNC:
         job = app.jobs.submit(
             "delegate",
-            lambda progress: app.delegation.delegate(
+            # A single delegation has no fan-out to harvest, so it publishes no interim result (the second
+            # body arg is unused); time-budget continue/harvest is a panel feature.
+            lambda progress, _set_interim: app.delegation.delegate(
                 request,
                 correlation_id=correlation_id,
                 base_depth=app.base_depth,

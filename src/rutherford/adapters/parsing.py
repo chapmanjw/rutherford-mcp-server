@@ -412,7 +412,11 @@ def finalize_answer(
             return success_result(ctx, raw, answer, session_id=session_id, cost=cost)
         return nonzero_result(ctx, raw)
     if failure is not None:
-        return error_result(ctx, raw, ErrorCode.NONZERO_EXIT, failure, text=answer or "")
+        return error_result(ctx, raw, ErrorCode.NONZERO_EXIT, failure, text=answer or "", session_id=session_id)
     if answer is None:
-        return error_result(ctx, raw, ErrorCode.PARSE_ERROR, no_output_message, text=raw.stdout.strip())
+        # No answer yet -- but carry any session the stream established, so a cut voice whose partial held a
+        # session but not the final answer can still be resumed (F8a, 2-I passive harvest).
+        return error_result(
+            ctx, raw, ErrorCode.PARSE_ERROR, no_output_message, text=raw.stdout.strip(), session_id=session_id
+        )
     return success_result(ctx, raw, answer, session_id=session_id, cost=cost)

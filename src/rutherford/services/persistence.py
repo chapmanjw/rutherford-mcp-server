@@ -18,12 +18,51 @@ files, and the summed cost -- rather than leaving the parent a thin link record.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 from ..domain.enums import JobStatus, SafetyMode
-from ..domain.models import Cost, PanelInputs, RunRecord
+from ..domain.models import Cost, PanelInputs, RunRecord, RunRollup
 from ..io.ledger import RunLedger
 from ..runtime.logging import log_event
+
+
+async def live_tee(ledger: RunLedger, run_id: str, prefix: str, partials: list[list[str]], stop: asyncio.Event) -> None:
+    """Periodically tee ``partials`` (per-voice line lists) to the job's live artifacts (F8a, 2-G).
+
+    Shared by the consensus panel and each debate round. Snapshots ``partials`` in THIS (event-loop)
+    thread -- so the join never races the ``on_stdout`` appends, which also run in the loop thread -- then
+    writes off-thread. Stopped by SETTING ``stop`` (never by cancelling the task): on stop it writes one
+    final snapshot then returns, so this is the only writer and its writes are strictly sequential -- no
+    stale worker write can land after, and overwrite, the final snapshot. A coarse 0.5s tick keeps the I/O
+    cost negligible. ``prefix`` namespaces the live files (``voice`` / ``round-<n>-voice``).
+    """
+    while True:
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=0.5)
+            stopping = True
+        except TimeoutError:
+            stopping = False  # a 0.5s tick, not a stop
+        snapshot = ["\n".join(lines) for lines in partials]
+        await asyncio.to_thread(_write_live_safe, ledger, run_id, prefix, snapshot)
+        if stopping:
+            return  # the write above is the final snapshot
+
+
+async def stop_live_tee(tee_task: asyncio.Task[None] | None, stop: asyncio.Event) -> None:
+    """Signal the live-tee loop to write its final snapshot and exit, then await it (see :func:`live_tee`)."""
+    if tee_task is None:
+        return
+    stop.set()
+    await asyncio.gather(tee_task, return_exceptions=True)
+
+
+def _write_live_safe(ledger: RunLedger, run_id: str, prefix: str, voices: list[str]) -> None:
+    """Best-effort live-tee write -- a failed tee must never fail the panel it is mirroring (2-G)."""
+    try:
+        ledger.write_live_voices(run_id, voices, prefix=prefix)
+    except OSError:
+        return
 
 
 @dataclass(frozen=True)
@@ -32,7 +71,9 @@ class PanelVoice:
 
     ``run_id`` is the voice's child-record id (the basename of its run dir), or ``None`` when that voice
     did not persist. ``text`` and ``error`` feed the per-voice ``voices/voice-N.md`` artifact; ``cost`` and
-    ``changed_files`` feed the parent's rollup (decision 1-D).
+    ``changed_files`` feed the parent's rollup (decision 1-D). ``partial`` is the stdout a voice streamed
+    before a time-budget cut (F8a, 2-G): a cut voice has no ``text``, but its partial is persisted into the
+    voice artifact so the in-flight work is not lost. ``None`` for a voice that finished cleanly.
     """
 
     label: str
@@ -42,6 +83,11 @@ class PanelVoice:
     error: str | None = None
     cost: Cost | None = None
     changed_files: tuple[str, ...] = field(default_factory=tuple)
+    partial: str | None = None
+    #: The voice's resume session handle, recorded so a budget-cut voice can be resumed later (F8a, 2-I).
+    #: A completed voice keeps its own child record, so this matters most for a cut voice (which has none):
+    #: its handle, recovered from the harvested partial, lands in the voice artifact. ``None`` when unknown.
+    session_id: str | None = None
 
 
 def write_panel_record(
@@ -60,6 +106,8 @@ def write_panel_record(
     files: list[str] | None = None,
     role: str | None = None,
     panel: PanelInputs | None = None,
+    stop_reason: str | None = None,
+    rollup: RunRollup | None = None,
     extra_artifacts: dict[str, str] | None = None,
 ) -> str | None:
     """Write a panel's parent :class:`RunRecord` linking its child voice records; return its run_dir.
@@ -70,9 +118,11 @@ def write_panel_record(
     ``ok`` flags decide the parent ``status`` (succeeded when any voice answered, else failed), and their
     ``cost`` / ``changed_files`` roll up onto the parent. ``safety_mode`` / ``cwd`` / ``files`` / ``role`` /
     ``panel`` are the panel request's (``panel`` is the resolved orchestration config -- roster, strategy,
-    rounds, ...), captured so the parent record is replay-complete (decision 1-D). ``extra_artifacts``
-    carries the parent's audit artifacts -- a consensus passes its ``voices/voice-N.md`` set (see
-    :func:`render_panel_voice_files`), a debate passes its ``transcript.md``.
+    rounds, ...), captured so the parent record is replay-complete (decision 1-D). ``stop_reason`` /
+    ``rollup`` record a time-budget harvest (F8a): ``"budget"`` and the per-run rollup when a budget cut the
+    panel, both ``None`` on a normal completion. ``extra_artifacts`` carries the parent's audit artifacts --
+    a consensus passes its ``voices/voice-N.md`` set (see :func:`render_panel_voice_files`), a debate passes
+    its ``transcript.md``.
     """
     status = JobStatus.SUCCEEDED if any(voice.ok for voice in voices) else JobStatus.FAILED
     record = RunRecord(
@@ -95,6 +145,12 @@ def write_panel_record(
         prompt=prompt,
         changed_files=_union_changed_files(voices),
         cost=_rollup_cost(voices),
+        stop_reason=stop_reason,
+        rollup=rollup,
+        # Mirror the rollup's effort onto the record's own effort fields so the parent agrees with its
+        # rollup (and a reader scanning records by effort sees the panel, not just its leaves).
+        requested_effort=rollup.effort_requested if rollup else None,
+        effort_applied=rollup.effort_applied if rollup else None,
     )
     try:
         run_dir = ledger.write(record, answer=answer or "(no synthesis)", extra_artifacts=extra_artifacts)
@@ -117,8 +173,19 @@ def render_panel_voice_files(voices: list[PanelVoice], skipped: list[tuple[str, 
     artifacts: dict[str, str] = {}
     for index, voice in enumerate(voices, start=1):
         status = "" if voice.ok else " (failed)"
-        body = voice.text.strip() if voice.ok and voice.text.strip() else (voice.error or "(no answer)")
+        if voice.ok and voice.text.strip():
+            body = voice.text.strip()
+        elif voice.partial and voice.partial.strip():
+            # A voice cut at the time-budget deadline: no final answer, but the partial it streamed before
+            # the cut is preserved here so the in-flight work lands in the job artifacts (F8a, 2-G).
+            reason = voice.error or "(cut at the time-budget deadline)"
+            body = f"{reason}\n\n## Partial output (harvested at the cut)\n\n{voice.partial.strip()}"
+        else:
+            body = voice.error or "(no answer)"
         ref = f"\n\n_run: {voice.run_id}_" if voice.run_id else ""
+        # Record the resume handle for a cut voice (which has no child record of its own), so a later
+        # continuation can resume the session it was cut from (F8a, 2-I).
+        ref += f"\n\n_session: {voice.session_id}_" if voice.session_id and not voice.run_id else ""
         artifacts[f"voices/voice-{index}.md"] = f"# {voice.label}{status}\n\n{body}{ref}\n"
     if skipped:
         lines = ["# Skipped adapters\n\n"]

@@ -14,7 +14,7 @@ import pytest
 
 from rutherford.config.schema import AdapterConfig, RutherfordConfig
 from rutherford.context import AppContext, build_app_context
-from rutherford.domain.enums import AuthState, SafetyMode, Strategy
+from rutherford.domain.enums import AuthState, Effort, SafetyMode, Strategy
 from rutherford.domain.models import (
     ConsensusRequest,
     ConsensusResult,
@@ -31,6 +31,21 @@ from .helpers import CLI_ENV, available_clis, skip_unless_available, skip_unless
 pytestmark = pytest.mark.integration
 
 _OK_PROMPT = "Reply with exactly the two characters: ok"
+
+
+@pytest.mark.parametrize("cli_id", ["codex", "cursor"])
+async def test_effort_flag_is_accepted_by_the_cli(real_app: AppContext, cli_id: str) -> None:
+    # F8a (2-L-cov) live: the effort knob must reach the real CLI's wire and be accepted, not just unit-pass.
+    # codex maps it to `-c model_reasoning_effort=high`; cursor folds it into the model id. The run must
+    # still answer (so the flag/model is valid) and report the applied tier. Verified live for codex
+    # 0.135.0 on 2026-06-13; cursor is auto-only on this account, so its named-model path may fall back.
+    skip_unless_runnable(real_app, cli_id)
+    request = DelegationRequest(target=Target(cli=cli_id), prompt=_OK_PROMPT, effort=Effort.HIGH, timeout_s=180)
+    result = await real_app.delegation.delegate(request, base_depth=0)
+    assert isinstance(result, DelegationResult)
+    assert result.ok, f"{cli_id} rejected the effort knob: {result.error}"
+    assert result.text.strip()
+    assert result.effort is Effort.HIGH  # the resolved effort is reported back
 
 
 @pytest.mark.parametrize("cli_id", list(CLI_ENV))

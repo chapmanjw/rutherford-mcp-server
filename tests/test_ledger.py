@@ -19,6 +19,20 @@ def _record(**kwargs: object) -> RunRecord:
     return RunRecord(**base)  # type: ignore[arg-type]
 
 
+def test_write_live_voices_writes_a_live_file_per_nonempty_voice(tmp_path: Path) -> None:
+    # F8a 2-G: the incremental tee writes each voice's accumulated stdout to voices/voice-N.live.md while
+    # the panel runs. An empty voice (nothing streamed yet) leaves no file; a rewrite is idempotent.
+    ledger = RunLedger(tmp_path / "jobs")
+    ledger.write_live_voices("p1", ["voice one so far", "", "voice three so far"])
+    voices = tmp_path / "jobs" / "p1" / "artifacts" / "voices"
+    assert (voices / "voice-1.live.md").read_text(encoding="utf-8") == "voice one so far"
+    assert not (voices / "voice-2.live.md").exists()  # empty voice -> no file
+    assert (voices / "voice-3.live.md").read_text(encoding="utf-8") == "voice three so far"
+    # A later snapshot overwrites with the fuller accumulation (idempotent, crash-safe).
+    ledger.write_live_voices("p1", ["voice one so far, and more", "", "voice three so far"])
+    assert (voices / "voice-1.live.md").read_text(encoding="utf-8") == "voice one so far, and more"
+
+
 def test_write_creates_state_and_answer(tmp_path: Path) -> None:
     ledger = RunLedger(tmp_path / "jobs")
     run_dir = ledger.write(_record(argv=["fake", "run", "gemma3:12b"]), answer="hello world")

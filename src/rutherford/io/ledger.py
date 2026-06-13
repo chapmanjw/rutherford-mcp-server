@@ -73,3 +73,22 @@ class RunLedger:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content if content.strip() else "(empty)", encoding="utf-8")
         return run_dir
+
+    def write_live_voices(self, run_id: str, voices: list[str], *, prefix: str = "voice") -> None:
+        """Tee each voice's partial output so far to a live ``artifacts/voices/{prefix}-N.live.md`` (F8a, 2-G).
+
+        Called incrementally WHILE a persisted panel runs (off the event loop), so a kept job preserves the
+        in-flight stdout up to a crash or a cut, not just what survives to finalization. Each call rewrites
+        the file with the full accumulation to date (idempotent and crash-safe: the file always holds
+        everything streamed so far). Empty entries are skipped, so a voice that has not streamed yet leaves
+        no file. ``prefix`` namespaces the files: ``voice`` for a consensus panel; a debate passes
+        ``round-<n>-voice`` so each round's turns get their own live files. The final ``voice-N.md`` /
+        ``transcript.md`` (written at finalization) is the clean result; these ``.live.md`` files are the
+        raw, as-it-arrived stream. Best-effort by contract -- a write failure must not fail the panel -- so
+        the caller swallows ``OSError``.
+        """
+        voices_dir = self._root / run_id / "artifacts" / "voices"
+        voices_dir.mkdir(parents=True, exist_ok=True)
+        for index, content in enumerate(voices, start=1):
+            if content.strip():
+                (voices_dir / f"{prefix}-{index}.live.md").write_text(content, encoding="utf-8")

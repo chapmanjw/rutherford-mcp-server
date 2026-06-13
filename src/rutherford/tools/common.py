@@ -15,10 +15,13 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from ..adapters.registry import AdapterRegistry
-from ..domain.enums import DelegationMode, SafetyMode, Stance, Strategy
+from ..domain.enums import DelegationMode, Effort, SafetyMode, Stance, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
-from ..domain.models import Target
+from ..domain.models import OnBudget, Target
+
+#: The valid ``on_budget`` dispositions (kept in sync with the :data:`OnBudget` literal).
+_ON_BUDGET_CHOICES = ("harvest", "continue", "resume")
 
 if TYPE_CHECKING:
     from ..context import AppContext
@@ -116,6 +119,36 @@ def parse_strategy(value: str | Strategy) -> Strategy:
         raise RutherfordError(
             ErrorCode.INVALID_INPUT, f"unknown strategy {value!r}; choose one of: {options}"
         ) from None
+
+
+def parse_effort(value: str | Effort | None) -> Effort | None:
+    """Coerce a reasoning-effort string to :class:`Effort` (F8a, 2-L), or raise ``INVALID_INPUT``.
+
+    ``None`` means the caller omitted it -- the one case the configured ``default_effort`` is documented to
+    fill -- so it passes through unchanged for the service to resolve. An explicit value always wins.
+    """
+    if value is None or isinstance(value, Effort):
+        return value
+    try:
+        return Effort(value)
+    except ValueError:
+        options = ", ".join(effort.value for effort in Effort)
+        raise RutherfordError(ErrorCode.INVALID_INPUT, f"unknown effort {value!r}; choose one of: {options}") from None
+
+
+def parse_on_budget(value: str | None) -> OnBudget | None:
+    """Validate an ``on_budget`` disposition (F8a, 2-M), or ``None`` when the caller omitted it.
+
+    Kept as a string (the field is a ``Literal``, not an enum) but validated at the tool boundary so an
+    invalid value is a clean error here. ``None`` passes through unchanged so the service fills it from the
+    configured ``default_on_budget`` -- the one case the workspace default applies; an explicit value wins.
+    """
+    if value is None:
+        return None
+    if value in _ON_BUDGET_CHOICES:
+        return value  # type: ignore[return-value]  # narrowed to the OnBudget literal by the membership check
+    options = ", ".join(_ON_BUDGET_CHOICES)
+    raise RutherfordError(ErrorCode.INVALID_INPUT, f"unknown on_budget {value!r}; choose one of: {options}") from None
 
 
 def parse_stances(values: list[str] | None) -> list[Stance] | None:

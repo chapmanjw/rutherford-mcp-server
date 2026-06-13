@@ -31,7 +31,11 @@ class _Runner:
         self._exit_code = exit_code
 
     async def run(
-        self, spec: InvocationSpec, timeout_s: float, on_progress: Callable[[str], None] | None = None
+        self,
+        spec: InvocationSpec,
+        timeout_s: float,
+        on_progress: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
     ) -> ProcessResult:
         if self._side_effect is not None and spec.cwd:
             self._side_effect(Path(spec.cwd))

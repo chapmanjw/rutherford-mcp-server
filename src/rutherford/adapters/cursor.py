@@ -24,12 +24,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from ..domain.enums import OutputMode, SafetyMode
+from ..domain.enums import EFFORT_ORDER, Effort, OutputMode, SafetyMode
 from ..domain.models import (
     AdapterCapabilities,
     AuthStatus,
     DelegationRequest,
     DelegationResult,
+    EffortFlags,
     InvocationContext,
     InvocationSpec,
     ProcessResult,
@@ -83,13 +84,56 @@ class CursorAdapter(BaseCLIAdapter):
             return SafetyFlags(args=["--mode", "plan"], note="plan mode: analyze and propose, no edits")
         return SafetyFlags(args=["--mode", "ask"], note="ask mode: Q&A, read-only (fail-closed default)")
 
+    def map_effort(self, effort: Effort) -> EffortFlags:
+        """Cursor selects reasoning effort via the MODEL ID, not a flag (F8a, 2-L-cov).
+
+        Cursor encodes the tier in the model id as a plain ``-<tier>`` suffix (``gpt-5.2-high``,
+        ``claude-opus-4-8-high``), so there is no free-standing flag to add --
+        :meth:`build_invocation` rewrites ``--model`` to carry the suffix instead. Tops out at
+        ``high`` (``xhigh`` clamps). Reported here as ``applied`` for the run record; the actual
+        rewrite (and its ``auto`` / already-tiered guards) is in the build path, which knows the model.
+
+        Suffix convention confirmed against ``cursor-agent --list-models`` on this machine
+        (2026-06-13): every family exposes ``<model>-<tier>`` (e.g. ``gpt-5.2-high``,
+        ``claude-opus-4-8-high``), while ``-thinking-<tier>`` is a *separate* extended-thinking axis
+        that exists only for the Claude families -- so a plain ``-<tier>`` is the correct, cross-family
+        effort suffix. A live round trip of a named tier was not possible (this account is auto-only:
+        every named model returns MODEL_UNAVAILABLE), so a model whose family has no tiered variant
+        relies on Cursor's ``auto`` model-fallback to recover rather than failing.
+        """
+        applied = self._clamp_effort(effort, Effort.HIGH)
+        note = f"reasoning effort via the model-id '-{applied.value}' suffix"
+        if applied is not effort:
+            note += f" (clamped from {effort.value})"
+        return EffortFlags(note=note, applied=applied)
+
+    @staticmethod
+    def _model_with_effort(model: str, effort: Effort) -> str:
+        """Append Cursor's ``-<tier>`` reasoning suffix to a bare model id, or leave it unchanged.
+
+        Left unchanged for ``auto`` (the universal fallback, which has no tiered variant) and for any
+        model that already encodes an effort or serving choice -- a ``thinking`` segment, a trailing
+        ``-fast`` serving variant (a ``-fast`` model already names its tier, e.g. ``gpt-5.2-high-fast``,
+        or has none, e.g. ``composer-2.5-fast``, where appending a tier *after* ``-fast`` would only
+        invent an invalid id), or a trailing ``-<tier>`` -- so an explicit user choice is respected and
+        an effort request never double-suffixes a valid id into one Cursor would reject. Tops out at
+        ``high`` (``xhigh`` clamps). A bare model whose family has no ``-<tier>`` variant produces an
+        unknown id that Cursor's ``auto`` model-fallback then recovers (see :meth:`map_effort`).
+        """
+        lowered = model.lower()
+        if model == "auto" or "thinking" in lowered or lowered.endswith("-fast"):
+            return model
+        if any(lowered.endswith(f"-{tier.value}") for tier in EFFORT_ORDER):
+            return model  # already carries an explicit reasoning tier -- respect the user's choice
+        return f"{model}-{BaseCLIAdapter._clamp_effort(effort, Effort.HIGH).value}"
+
     def build_invocation(self, req: DelegationRequest, ctx: InvocationContext) -> InvocationSpec:
         """Build the ``cursor-agent`` invocation, with the composed prompt fed via stdin.
 
         Pure: returns an argv list and an stdin string, never a shell command line. ``--trust``
         is always present so headless mode does not block on a workspace-trust prompt. The
         prompt carries the role preamble (Cursor has no system-prompt flag) and any in-scope
-        files.
+        files. A reasoning ``effort`` is folded into the ``--model`` id (Cursor's convention).
         """
         prompt = self._with_files(self._compose_prompt(req.prompt, ctx.role_preamble), req.files)
 
@@ -98,7 +142,8 @@ class CursorAdapter(BaseCLIAdapter):
         if req.working_dir:
             argv += ["--workspace", req.working_dir]
         if req.target.model:
-            argv += ["--model", req.target.model]
+            model = self._model_with_effort(req.target.model, ctx.effort) if ctx.effort else req.target.model
+            argv += ["--model", model]
         if req.session_id:
             argv += ["--resume", req.session_id]
 

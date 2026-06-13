@@ -4,13 +4,16 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
+
 import pytest
 
 from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.domain.enums import Stance
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import DebateRequest, ProcessResult, Target
+from rutherford.domain.models import DebateRequest, InvocationSpec, ProcessResult, Target
 from rutherford.services.debate import DebateService
 from rutherford.services.delegation import DelegationService
 from rutherford.services.roles import load_roles
@@ -322,3 +325,221 @@ async def test_closing_with_a_failing_judge_records_no_author() -> None:
     )
     assert result.final is None
     assert result.synthesis_by is None
+
+
+# --- F8a: time-budget harvest (round-boundary) + effort -----------------------------------------
+
+
+class _RoundAwareRunner:
+    """A runner where round 1 (the bare question) is instant but a rebuttal round (``Critique`` in the
+    prompt) sleeps ``slow_s``. Drives the F8a deadline deterministically: round 1 completes within any
+    budget, and a later round's turns overrun a small budget and are cut by ``asyncio.wait``.
+    """
+
+    def __init__(self, slow_s: float) -> None:
+        self.slow_s = slow_s
+
+    async def run(
+        self,
+        spec: InvocationSpec,
+        timeout_s: float,
+        on_progress: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+    ) -> ProcessResult:
+        prompt = spec.argv[2] if len(spec.argv) > 2 else ""
+        await asyncio.sleep(self.slow_s if "Critique" in prompt else 0.0)  # rebuttal rounds are the slow ones
+        return ProcessResult(exit_code=0, stdout=f"{spec.argv[0]} position")
+
+
+class _PerCliDelayRunner:
+    """A runner with per-cli delays (and optional per-cli partial lines streamed before the delay), so
+    within one round a fast turn finishes while a slow one is cut -- and the cut one can have streamed a
+    partial first."""
+
+    def __init__(self, delays: dict[str, float], partials: dict[str, list[str]] | None = None) -> None:
+        self.delays = delays
+        self.partials = partials or {}
+
+    async def run(
+        self,
+        spec: InvocationSpec,
+        timeout_s: float,
+        on_progress: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+    ) -> ProcessResult:
+        cli = spec.argv[0]
+        for line in self.partials.get(cli, []):
+            if on_stdout is not None:
+                on_stdout(line)
+        await asyncio.sleep(self.delays.get(cli, 0.0))
+        return ProcessResult(exit_code=0, stdout=f"{cli} position")
+
+
+def _delay_debate(runner: object, config: RutherfordConfig | None = None, clis: tuple[str, ...] = ("a", "b")):
+    cfg = config or RutherfordConfig()
+    registry = AdapterRegistry([FakeAdapter(cli) for cli in clis])
+    delegation = DelegationService(registry, runner, cfg, load_roles())  # type: ignore[arg-type]
+    return DebateService(delegation, cfg)
+
+
+async def test_time_budget_finalizes_after_a_completed_round_when_the_next_is_cut() -> None:
+    # 2-where/2-behavior: round 1 (instant) completes within the budget; round 2 (a rebuttal, slow) overruns
+    # the remaining budget and its turns are cut by asyncio.wait. The fully-cut round 2 is KEPT (its turns
+    # carry recovered sessions/traces, 2-I/2-F), but the closing + quorum run over the last USABLE round
+    # (round 1). The requested 3 rounds do not all run.
+    runner = _RoundAwareRunner(5.0)
+    service = _delay_debate(runner)
+    result = await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=3, time_budget_s=0.3)
+    )
+    assert len(result.rounds) == 2  # round 1 (complete) + the kept fully-cut round 2; round 3 never ran
+    assert all(c.ok for c in result.rounds[0].contributions)  # round 1 completed in full
+    assert all(
+        not c.ok and c.error is not None and c.error.code == "BUDGET_EXHAUSTED" for c in result.rounds[1].contributions
+    )
+    assert result.stop_reason == "budget"
+    assert result.rollup is not None
+    assert result.rollup.stop_reason == "budget"
+    # answered/usable are over the last usable round (round 1); cut counts round 2's cancelled turns.
+    assert result.rollup.requested == 2 and result.rollup.answered == 2 and result.rollup.usable == 2
+    assert result.rollup.cut == 2 and result.rollup.quorum_met is True
+
+
+async def test_a_partially_cut_round_keeps_the_turns_that_finished() -> None:
+    # 2-where: within a round the budget cuts only the in-flight turns. A fast voice finishes and is kept;
+    # a slow one is cut (BUDGET_EXHAUSTED) -- the round is finalized with the turn that completed.
+    runner = _PerCliDelayRunner({"a": 0.0, "b": 5.0})
+    service = _delay_debate(runner)
+    result = await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.3)
+    )
+    assert len(result.rounds) == 1
+    by_label = {c.label: c for c in result.rounds[0].contributions}
+    assert by_label["a"].ok  # the fast turn finished and is kept
+    assert not by_label["b"].ok and by_label["b"].error is not None
+    assert by_label["b"].error.code == "BUDGET_EXHAUSTED"  # the in-flight turn was cut at the deadline
+    assert result.stop_reason == "budget"
+    assert result.rollup is not None
+    assert result.rollup.answered == 1 and result.rollup.cut == 1 and result.rollup.usable == 1
+
+
+async def test_a_cut_debate_turn_preserves_its_streamed_partial_as_a_trace() -> None:
+    # 2-F (capture always): a turn cut at the deadline is a failed contribution, but the stdout it streamed
+    # before the cut is preserved on the contribution's ``partial`` (a trace, never promoted to ``text``).
+    runner = _PerCliDelayRunner({"a": 0.0, "b": 5.0}, partials={"b": ["b half-formed rebuttal"]})
+    service = _delay_debate(runner)
+    result = await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.3)
+    )
+    cut = next(c for c in result.rounds[0].contributions if c.label == "b")
+    assert not cut.ok
+    assert cut.partial is not None and "b half-formed rebuttal" in cut.partial
+    assert "b half-formed rebuttal" not in cut.text  # a cut turn's partial is a trace, not its position
+
+
+class _RoundAwarePartialRunner:
+    """Round 1 (the bare question) is instant; a rebuttal round (``Critique`` in the prompt) streams a
+    partial then overruns ``slow_s`` -- so a whole later round can be cut while each turn streamed a
+    session-bearing partial first."""
+
+    def __init__(self, slow_s: float, partial: str) -> None:
+        self.slow_s = slow_s
+        self.partial = partial
+
+    async def run(
+        self,
+        spec: InvocationSpec,
+        timeout_s: float,
+        on_progress: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+    ) -> ProcessResult:
+        prompt = spec.argv[2] if len(spec.argv) > 2 else ""
+        if "Critique" in prompt:  # a rebuttal round -- stream a partial, then overrun the budget
+            if on_stdout is not None:
+                on_stdout(self.partial)
+            await asyncio.sleep(self.slow_s)
+        return ProcessResult(exit_code=0, stdout=f"{spec.argv[0]} position")
+
+
+async def test_a_fully_cut_round_is_kept_with_its_recovered_sessions() -> None:
+    # 2-I/2-F edge: when an ENTIRE later round is cut (no turn finished) but each turn streamed a
+    # session-bearing partial, the round is kept (not dropped) so its recovered resume handles and traces
+    # survive into the result; the debate still finalizes over the last usable round (round 1).
+    runner = _RoundAwarePartialRunner(5.0, "rebuttal streamed a session then was cut")
+    service = _delay_debate(runner)
+    result = await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=3, time_budget_s=0.3)
+    )
+    assert len(result.rounds) == 2  # round 1 (usable) + the kept fully-cut round 2
+    round_two = result.rounds[1].contributions
+    assert all(not c.ok for c in round_two)  # the whole round was cut
+    assert all(c.session_id == "fake-session" for c in round_two)  # ...but every handle is recovered (2-I)
+    assert all(c.partial and "streamed a session" in c.partial for c in round_two)  # ...and the trace kept (2-F)
+
+
+async def test_a_cut_debate_turn_recovers_its_resume_session_from_the_partial() -> None:
+    # 2-I passive (debate): a turn cut mid-stream whose partial established a session records that handle on
+    # its contribution (the FakeAdapter is TEXT/partial-output and parses a session), so the parent roster
+    # can preserve it for a later continuation -- even though the cut turn is a trace, not a stance.
+    runner = _PerCliDelayRunner({"a": 0.0, "b": 5.0}, partials={"b": ["b streamed a session then was cut"]})
+    service = _delay_debate(runner)
+    result = await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.3)
+    )
+    cut = next(c for c in result.rounds[0].contributions if c.label == "b")
+    assert not cut.ok  # a trace cut, no usable stance
+    assert cut.session_id == "fake-session"  # ...but the resume handle is recovered from the partial (2-I)
+
+
+async def test_on_budget_continue_runs_every_round() -> None:
+    # 2-M: with on_budget="continue" the budget is advisory -- every requested round runs to completion
+    # even though a rebuttal round outlasts the budget, and the run is not flagged as a harvest.
+    runner = _RoundAwareRunner(0.1)
+    service = _delay_debate(runner)
+    result = await service.debate(
+        DebateRequest(
+            targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.01, on_budget="continue"
+        )
+    )
+    assert len(result.rounds) == 2  # both rounds ran; the budget did not cut the debate short
+    assert all(c.ok for round_ in result.rounds for c in round_.contributions)
+    assert result.stop_reason is None
+    assert result.rollup is not None and result.rollup.stop_reason == "ok"
+
+
+async def test_debate_budget_below_quorum_raises_budget_exhausted() -> None:
+    # 2-E': when even round 1 is cut so the debate yields no usable position (here both turns are slow and
+    # cut at the deadline), it is a genuine BUDGET_EXHAUSTED failure raised before any result.
+    runner = _PerCliDelayRunner({"a": 5.0, "b": 5.0})
+    service = _delay_debate(runner)
+    with pytest.raises(RutherfordError) as info:
+        await service.debate(
+            DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.3)
+        )
+    assert info.value.code == "BUDGET_EXHAUSTED"
+
+
+async def test_no_budget_means_no_rollup_for_a_debate() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, synthesize=False)
+    )
+    assert result.stop_reason is None
+    assert result.rollup is None
+
+
+async def test_effort_flows_to_every_debate_turn() -> None:
+    # 2-L: the debate's effort cap reaches every turn and is reported per contribution.
+    from rutherford.domain.enums import Effort
+
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.debate(
+        DebateRequest(
+            targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, synthesize=False, effort=Effort.HIGH
+        )
+    )
+    contributions = [c for round_ in result.rounds for c in round_.contributions]
+    assert contributions and all(c.effort_applied == Effort.HIGH for c in contributions)
+    assert all("--effort=high" in spec.argv for spec, _ in runner.calls)

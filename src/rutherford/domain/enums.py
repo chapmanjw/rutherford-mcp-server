@@ -125,3 +125,21 @@ class Strategy(StrEnum):
     WEIGHTED = "weighted"
     #: Compare the proposer's verdict against the parity counterweights; disagreement escalates.
     PARITY_PAIR = "parity-pair"
+
+
+class Effort(StrEnum):
+    """The universal reasoning-effort tier a caller can ask a CLI to spend (F8a, decision 2-L).
+
+    Maps per adapter to that CLI's native knob (``map_effort``), clamped to the nearest tier the CLI
+    supports and reported as ``effort_applied``. Ordered least to most. The ``-fast`` serving-latency
+    variants are deliberately excluded -- they are orthogonal to thinking depth, not an effort tier.
+    """
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+
+
+#: The canonical effort order, least to most, for clamp-to-nearest in ``map_effort``.
+EFFORT_ORDER: tuple[Effort, ...] = (Effort.LOW, Effort.MEDIUM, Effort.HIGH, Effort.XHIGH)

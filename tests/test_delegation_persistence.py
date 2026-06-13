@@ -4,15 +4,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import RutherfordConfig
-from rutherford.domain.enums import JobStatus, SafetyMode, Stance, Strategy
+from rutherford.domain.enums import Effort, JobStatus, SafetyMode, Stance, Strategy
 from rutherford.domain.models import (
     ConsensusRequest,
     Cost,
@@ -23,6 +25,7 @@ from rutherford.domain.models import (
     InvocationSpec,
     ProcessResult,
     RunRecord,
+    RunRollup,
     Target,
 )
 from rutherford.io.ledger import RunLedger
@@ -357,6 +360,9 @@ async def test_debate_parent_records_rounds_in_the_panel_config(tmp_path: Path) 
     assert result.run_dir is not None
     state = (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
     assert "panel:" in state and "rounds: 2" in state
+    # 2-I: each seat's resume handle is recorded in the parent roster (state.toon), matching consensus,
+    # so a later continuation can resume the debate's seats from the parent record.
+    assert "fake-session" in state
 
 
 async def test_ephemeral_consensus_persists_nothing(tmp_path: Path) -> None:
@@ -392,8 +398,10 @@ async def test_strategy_consensus_persists_a_parent_record(tmp_path: Path) -> No
     assert f"status: {JobStatus.SUCCEEDED.value}" in parent_state  # derived from the answering voices
     assert "ok: true" in parent_state  # ok tracks the derived status
     voices_dir = parent / "artifacts" / "voices"
-    voice_files = sorted(p.name for p in voices_dir.glob("voice-*.md"))
-    assert voice_files == ["voice-1.md", "voice-2.md"]  # one file per voice, the locked layout
+    # The clean per-voice result files (the locked 1-layout), excluding the F8a ``.live.md`` raw-stream
+    # tee files (2-G), which are a separate incremental artifact.
+    voice_files = sorted(p.name for p in voices_dir.glob("voice-*.md") if not p.name.endswith(".live.md"))
+    assert voice_files == ["voice-1.md", "voice-2.md"]  # one clean file per voice, the locked layout
     assert "approve" in (voices_dir / "voice-1.md").read_text(encoding="utf-8")
     dirs = [d for d in (tmp_path / "jobs").iterdir() if d.is_dir()]
     assert len(dirs) == 3  # parent + two children
@@ -624,3 +632,157 @@ def test_panel_cost_rollup_is_none_when_no_voice_reported_cost(tmp_path: Path) -
     )
     assert out is not None
     assert "cost:" not in (Path(out) / "state.toon").read_text(encoding="utf-8")  # no misleading zero cost
+
+
+# --- F8a: the time-budget rollup / stop_reason / partial flow into the persisted record ----------
+
+
+def test_panel_parent_records_the_budget_rollup_and_stop_reason(tmp_path: Path) -> None:
+    # F8a: a panel harvested at its time budget records stop_reason=budget plus the rollup (counts,
+    # quorum, effort) on the parent state.toon, and mirrors the rollup's effort onto the record fields.
+    ledger = RunLedger(tmp_path / "jobs")
+    rollup = RunRollup(
+        stop_reason="budget",
+        requested=3,
+        answered=2,
+        cut=1,
+        usable=2,
+        quorum_met=True,
+        elapsed_s=12.0,
+        time_budget_s=10.0,
+        effort_requested=Effort.HIGH,
+        effort_applied=Effort.HIGH,
+    )
+    out = write_panel_record(
+        ledger,
+        run_id="parent",
+        kind="consensus",
+        prompt="q",
+        clis=["a", "b"],
+        voices=[PanelVoice(label="a", ok=True, run_id="c1", text="hi")],
+        answer="ans",
+        created_at=1.0,
+        finished_at=13.0,
+        stop_reason="budget",
+        rollup=rollup,
+    )
+    assert out is not None
+    state = (Path(out) / "state.toon").read_text(encoding="utf-8")
+    assert "stop_reason: budget" in state
+    assert "rollup:" in state
+    assert "cut: 1" in state and "usable: 2" in state
+    assert "requested_effort: high" in state  # mirrored from the rollup onto the record fields
+    assert "effort_applied: high" in state
+
+
+def test_render_panel_voice_files_surfaces_a_cut_voices_partial() -> None:
+    # F8a 2-G: a voice cut at the deadline has no final answer, but the partial it streamed before the
+    # cut is preserved in its voice-N.md so the in-flight work lands in the job artifacts.
+    voices = [
+        PanelVoice(label="a", ok=True, text="full answer", run_id="c1"),
+        PanelVoice(label="b", ok=False, error="cut at the panel time-budget deadline", partial="draft so far"),
+    ]
+    files = render_panel_voice_files(voices)
+    assert "full answer" in files["voices/voice-1.md"]
+    cut = files["voices/voice-2.md"]
+    assert "(failed)" in cut
+    assert "Partial output (harvested at the cut)" in cut
+    assert "draft so far" in cut
+
+
+class _BudgetPersistRunner:
+    """A runner with per-cli delays that streams partial lines before the delay, for an end-to-end test.
+
+    Drives a real time-budget harvest through the persisting consensus service so the parent record and
+    the cut voice's artifact can be asserted on disk.
+    """
+
+    def __init__(self, delays: dict[str, float], partials: dict[str, list[str]] | None = None) -> None:
+        self.delays = delays
+        self.partials = partials or {}
+
+    async def run(
+        self,
+        spec: InvocationSpec,
+        timeout_s: float,
+        on_progress: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
+    ) -> ProcessResult:
+        cli = spec.argv[0]
+        for line in self.partials.get(cli, []):
+            if on_stdout is not None:
+                on_stdout(line)
+        await asyncio.sleep(self.delays.get(cli, 0.0))
+        return ProcessResult(exit_code=0, stdout=f"{cli} answered")
+
+
+async def test_consensus_budget_harvest_persists_rollup_and_partial(tmp_path: Path) -> None:
+    # The full F8a payoff, persisted: a budget harvest writes the parent's rollup/stop_reason AND the cut
+    # voice's pre-deadline partial into the job artifacts, so no in-flight effort is lost on a kept job.
+    # The FakeAdapter is TEXT (supports_partial_output), so the slow voice's streamed partial is harvested
+    # into a usable candidate answer and lands in its voice artifact as the answer.
+    runner = _BudgetPersistRunner({"fast": 0.0, "slow": 5.0}, partials={"slow": ["thinking step one"]})
+    app = make_app(
+        adapters=[FakeAdapter("fast"), FakeAdapter("slow")],
+        runner=runner,  # type: ignore[arg-type]
+        config=RutherfordConfig(jobs_dir=str(tmp_path / "jobs")),
+    )
+    result = await app.consensus.consensus(
+        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", persist=True, time_budget_s=0.3)
+    )
+    assert result.run_dir is not None
+    state = (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
+    assert "stop_reason: budget" in state
+    assert "rollup:" in state
+    # 2-I: the cut voice's resume handle (recovered from the harvested partial) is recorded structurally in
+    # the parent state.toon roster, so a later continuation can read it (not only in the human artifact).
+    assert "fake-session" in state
+    # The cut voice ("slow") is voice 2; the work it streamed before the cut is preserved in its artifact,
+    # along with its resume handle for a human reader.
+    cut_artifact = (Path(result.run_dir) / "artifacts" / "voices" / "voice-2.md").read_text(encoding="utf-8")
+    assert "thinking step one" in cut_artifact
+    assert "_session: fake-session_" in cut_artifact  # the cut voice's resume handle is recorded
+
+
+async def test_persisted_debate_tees_each_round_to_live_artifacts(tmp_path: Path) -> None:
+    # F8a 2-G for debate: a persisted debate tees each round's turns into round-namespaced live artifacts as
+    # they arrive, so a turn cut mid-round preserves its streamed stdout on disk independent of finalization.
+    runner = _BudgetPersistRunner({"a": 0.0, "b": 5.0}, partials={"b": ["round one rebuttal so far"]})
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=runner,  # type: ignore[arg-type]
+        config=RutherfordConfig(jobs_dir=str(tmp_path / "jobs")),
+    )
+    result = await app.debate.debate(
+        DebateRequest(
+            targets=[Target(cli="a"), Target(cli="b")],
+            prompt="q",
+            rounds=2,
+            synthesize=False,
+            persist=True,
+            time_budget_s=0.3,
+        )
+    )
+    assert result.run_dir is not None
+    live = (Path(result.run_dir) / "artifacts" / "voices" / "round-1-voice-2.live.md").read_text(encoding="utf-8")
+    assert "round one rebuttal so far" in live  # the cut turn's in-flight stream, teed live and namespaced
+
+
+async def test_persisted_panel_tees_voice_stdout_to_a_live_artifact(tmp_path: Path) -> None:
+    # F8a 2-G (stream-to-job): a persisted panel tees each voice's stdout into a live artifact as it runs,
+    # so the in-flight stream is on disk independent of finalization. The final snapshot lands a
+    # voice-N.live.md carrying what the voice streamed (here the slow voice's pre-cut partial).
+    runner = _BudgetPersistRunner(
+        {"fast": 0.0, "slow": 5.0}, partials={"slow": ["streamed line one", "streamed line two"]}
+    )
+    app = make_app(
+        adapters=[FakeAdapter("fast"), FakeAdapter("slow")],
+        runner=runner,  # type: ignore[arg-type]
+        config=RutherfordConfig(jobs_dir=str(tmp_path / "jobs")),
+    )
+    result = await app.consensus.consensus(
+        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", persist=True, time_budget_s=0.3)
+    )
+    assert result.run_dir is not None
+    live = (Path(result.run_dir) / "artifacts" / "voices" / "voice-2.live.md").read_text(encoding="utf-8")
+    assert "streamed line one" in live and "streamed line two" in live

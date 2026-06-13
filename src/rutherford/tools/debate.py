@@ -14,7 +14,9 @@ from .common import (
     async_job_envelope,
     ensure_known_cli,
     ensure_known_targets,
+    parse_effort,
     parse_mode,
+    parse_on_budget,
     parse_stances,
     resolve_safety_mode,
 )
@@ -37,6 +39,9 @@ async def debate_tool(
     safety_mode: str | None = None,
     synthesize: bool = True,
     timeout_s: float | None = None,
+    effort: str | None = None,
+    time_budget_s: float | None = None,
+    on_budget: str | None = None,
     mode: str = "sync",
     include_raw: bool = False,
     persist: bool | None = None,
@@ -53,6 +58,12 @@ async def debate_tool(
     default) adds a closing summary of where the panel landed. The result's ``rounds`` hold every
     voice's answer at every round, so the discussion is fully retraceable. With ``mode="async"`` a job
     id is returned.
+
+    ``effort`` (``low`` | ``medium`` | ``high`` | ``xhigh``) is the producer effort hint applied to every
+    turn (F8a); omit it to follow ``default_effort``. ``time_budget_s`` is a wall-clock budget for the WHOLE
+    debate, enforced at ROUND boundaries: once the elapsed time reaches it the transcript-so-far is finalized
+    and the closing runs over the last completed round (round 1 always completes). ``on_budget`` is ``harvest``
+    (default), ``continue`` (run every round; budget advisory), or ``resume``.
     """
     target_objs: list[Target]
     debate_stances: list[Stance] | None
@@ -77,6 +88,9 @@ async def debate_tool(
         safety_mode=resolve_safety_mode(safety_mode, app.config.default_safety_mode),
         synthesize=synthesize,
         timeout_s=timeout_s,
+        effort=parse_effort(effort),
+        time_budget_s=time_budget_s,
+        on_budget=parse_on_budget(on_budget),
         include_raw=include_raw,
         judge=judge_target,
         persist=persist,
@@ -87,7 +101,9 @@ async def debate_tool(
     if parse_mode(mode) is DelegationMode.ASYNC:
         job = app.jobs.submit(
             "debate",
-            lambda progress: app.debate.debate(
+            # A debate's rounds are sequential, so ``on_budget=continue`` means "run every round" rather than
+            # detach-and-append parallel stragglers; it publishes no interim result (the second arg is unused).
+            lambda progress, _set_interim: app.debate.debate(
                 request,
                 correlation_id=correlation_id,
                 base_depth=app.base_depth,

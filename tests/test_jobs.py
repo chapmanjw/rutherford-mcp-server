@@ -52,6 +52,31 @@ def test_store_fail() -> None:
     assert store.get(job.id).status is JobStatus.FAILED
 
 
+def test_set_interim_result_publishes_while_running_and_is_overwritten_by_complete() -> None:
+    # F8a 2-M (continue): an interim result is visible while the job is still RUNNING; the final result
+    # replaces it on completion.
+    store = JobStore()
+    job = store.create("consensus")
+    store.mark_running(job.id)
+    store.set_interim_result(job.id, _result("interim best-effort"))
+    running = store.get(job.id)
+    assert running.status is JobStatus.RUNNING  # still running -- the interim does not finish the job
+    assert isinstance(running.result, DelegationResult) and running.result.text == "interim best-effort"
+    store.complete(job.id, _result("final"))
+    done = store.get(job.id)
+    assert done.status is JobStatus.SUCCEEDED and isinstance(done.result, DelegationResult)
+    assert done.result.text == "final"
+
+
+def test_set_interim_result_is_a_noop_on_a_terminal_job() -> None:
+    # A late interim must not resurrect or mutate a cancelled/finished job.
+    store = JobStore()
+    job = store.create("consensus")
+    store.cancel(job.id)
+    store.set_interim_result(job.id, _result("too late"))
+    assert store.get(job.id).result is None and store.get(job.id).status is JobStatus.CANCELLED
+
+
 def test_store_unknown_raises() -> None:
     with pytest.raises(RutherfordError, match="unknown job"):
         JobStore().get("missing")
@@ -81,7 +106,7 @@ async def _wait_terminal(service: JobService, job_id: str, tries: int = 500) -> 
 async def test_service_runs_body_to_completion() -> None:
     service = JobService()
 
-    async def body(progress: object) -> DelegationResult:
+    async def body(progress: object, set_interim: object) -> DelegationResult:
         progress("working")  # type: ignore[operator]
         return _result("background")
 
@@ -96,7 +121,7 @@ async def test_service_runs_body_to_completion() -> None:
 async def test_service_failing_body_marks_failed() -> None:
     service = JobService()
 
-    async def body(progress: object) -> DelegationResult:
+    async def body(progress: object, set_interim: object) -> DelegationResult:
         raise ValueError("kaboom")
 
     job = service.submit("delegate", body)
@@ -111,7 +136,7 @@ async def test_a_rutherford_error_from_a_body_keeps_its_code() -> None:
     # INTERNAL, dropping its code/details, while the sync tool path preserved them.
     service = JobService()
 
-    async def body(progress: object) -> DelegationResult:
+    async def body(progress: object, set_interim: object) -> DelegationResult:
         raise RutherfordError(ErrorCode.INVALID_INPUT, "bad arguments", details={"field": "prompt"})
 
     job = service.submit("delegate", body)
@@ -188,7 +213,7 @@ async def test_service_cancels_a_running_job() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def body(progress: object) -> DelegationResult:
+    async def body(progress: object, set_interim: object) -> DelegationResult:
         started.set()
         await release.wait()  # block until cancelled
         return _result()
@@ -204,7 +229,7 @@ async def test_job_tools_list_and_cancel() -> None:
     app = make_app()
     release = asyncio.Event()
 
-    async def body(progress: object) -> DelegationResult:
+    async def body(progress: object, set_interim: object) -> DelegationResult:
         await release.wait()
         return _result()
 
@@ -220,7 +245,7 @@ async def test_job_result_on_a_running_job_is_a_still_running_notice() -> None:
     app = make_app()
     release = asyncio.Event()
 
-    async def body(progress: object) -> DelegationResult:
+    async def body(progress: object, set_interim: object) -> DelegationResult:
         await release.wait()
         return _result()
 
@@ -231,10 +256,32 @@ async def test_job_result_on_a_running_job_is_a_still_running_notice() -> None:
     release.set()
 
 
+async def test_job_result_surfaces_an_interim_result_while_running() -> None:
+    # F8a 2-M (continue): a body that publishes an interim makes job_result return it (flagged interim)
+    # while the job is still RUNNING, instead of a bare still-running notice.
+    app = make_app()
+    release = asyncio.Event()
+
+    async def body(progress: object, set_interim: object) -> DelegationResult:
+        set_interim(_result("best-effort so far"))  # type: ignore[operator]
+        await release.wait()
+        return _result("final")
+
+    job = app.jobs.submit("delegate", body)
+    for _ in range(500):  # let the body publish its interim before the release
+        await asyncio.sleep(0)
+        if app.jobs.get(job.id).result is not None:
+            break
+    raw = await job_result_tool(app, job_id=job.id)
+    assert "interim: true" in raw  # the interim is surfaced (raw TOON: the nested result resists strict decode)
+    assert app.jobs.get(job.id).status is JobStatus.RUNNING
+    release.set()
+
+
 async def test_job_result_on_a_failed_job_returns_the_error() -> None:
     app = make_app()
 
-    async def body(progress: object) -> DelegationResult:
+    async def body(progress: object, set_interim: object) -> DelegationResult:
         raise ValueError("kaboom")
 
     job = app.jobs.submit("delegate", body)
@@ -252,7 +299,7 @@ async def test_job_result_on_a_cancelled_job_is_a_structured_notice_not_null() -
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def body(progress: object) -> DelegationResult:
+    async def body(progress: object, set_interim: object) -> DelegationResult:
         started.set()
         await release.wait()
         return _result()

@@ -19,20 +19,24 @@ from pathlib import Path
 from ..adapters.base import CLIAdapter
 from ..adapters.registry import AdapterRegistry
 from ..config.schema import RutherfordConfig
-from ..domain.enums import AuthState, SafetyMode, Stance, Strategy
+from ..domain.enums import EFFORT_ORDER, AuthState, Effort, SafetyMode, Stance, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import (
     AuthStatus,
     ConsensusRequest,
     ConsensusResult,
+    Cost,
     DelegationRequest,
     DelegationResult,
     DetectResult,
     DiversityReport,
     ErrorInfo,
+    InvocationContext,
     PanelInputs,
     PanelTarget,
+    ProcessResult,
+    RunRollup,
     SkippedTarget,
     StrategyResult,
     Target,
@@ -41,7 +45,7 @@ from ..domain.models import (
 from ..io.ledger import RunLedger
 from ..runtime.depth import ensure_within_target_cap
 from .delegation import DelegationService, ProgressCallback
-from .persistence import PanelVoice, render_panel_voice_files, write_panel_record
+from .persistence import PanelVoice, live_tee, render_panel_voice_files, stop_live_tee, write_panel_record
 from .strategies import aggregate, apply_stance, effective_diversity, extract_verdict, verdict_instruction
 
 
@@ -71,6 +75,7 @@ class ConsensusService:
         correlation_id: str = "",
         base_depth: int = 0,
         on_progress: ProgressCallback | None = None,
+        on_interim_result: Callable[[ConsensusResult | StrategyResult], None] | None = None,
     ) -> ConsensusResult | StrategyResult:
         """Fan out ``req`` across its targets and collect every voice.
 
@@ -79,19 +84,17 @@ class ConsensusService:
         its own structured voice, so one bad voice never aborts the panel. With a ``strategy`` other
         than ``all-voices``, the voices are aggregated into a :class:`StrategyResult`; otherwise the
         legacy :class:`ConsensusResult` (every voice, plus optional synthesis) is returned unchanged.
+
+        ``on_interim_result`` implements ``on_budget=continue`` (F8a, 2-M): when set (an async job) and a
+        time budget is in effect, at the deadline the panel publishes the best-effort answered-so-far set
+        through this sink and keeps the stragglers running, publishing an updated set as each lands -- so a
+        poller sees partial answers before the panel finishes -- then returns the full set. Without it (a
+        sync call), ``continue`` simply runs every voice to completion.
         """
         created_at = self._clock()
         persist = self._config.wants_persist(req.persist)
         parent_run_id = uuid.uuid4().hex if persist and self._ledger is not None else None
         targets, skipped = await self._resolve_targets(req, on_progress)
-
-        async def one(index: int, target_request: DelegationRequest) -> DelegationResult:
-            return await self._delegation.delegate(
-                target_request,
-                correlation_id=f"{correlation_id}:{index}",
-                base_depth=base_depth,
-                on_progress=on_progress,
-            )
 
         requests = [
             DelegationRequest(
@@ -102,6 +105,7 @@ class ConsensusService:
                 role=target.role or req.role,
                 safety_mode=req.safety_mode,
                 timeout_s=req.timeout_s,
+                effort=req.effort,  # the panel's producer-effort cap flows to every voice (F8a)
                 include_raw=req.include_raw,
                 # When the panel persists, each voice is a child record under the parent (F2); when it
                 # does not, the voice never self-persists (no orphan per-voice records).
@@ -110,41 +114,127 @@ class ConsensusService:
             )
             for index, target in enumerate(targets)
         ]
-        # return_exceptions: an exception that still escapes one voice's delegate() (a buggy adapter
-        # surface the containment there missed) must become that voice's structured failure, not
-        # abort the gather and discard every healthy sibling -- the panel's headline promise.
-        outcomes = await asyncio.gather(*(one(i, r) for i, r in enumerate(requests)), return_exceptions=True)
-        voices: list[DelegationResult] = []
-        for request, outcome in zip(requests, outcomes, strict=True):
-            if isinstance(outcome, asyncio.CancelledError):  # a real cancellation still propagates
-                raise outcome
-            if isinstance(outcome, BaseException):
-                voices.append(_escaped_voice(request, outcome))
-            else:
-                voices.append(outcome)
+        # Per-voice stdout accumulators (F8a, 2-F): a voice cut at the time-budget deadline can still
+        # surface the partial answer it streamed before the cut, on both the job and ephemeral paths.
+        partials: list[list[str]] = [[] for _ in requests]
 
-        result: ConsensusResult | StrategyResult
-        answer: str
+        async def one(index: int, target_request: DelegationRequest) -> DelegationResult:
+            return await self._delegation.delegate(
+                target_request,
+                correlation_id=f"{correlation_id}:{index}",
+                base_depth=base_depth,
+                on_progress=on_progress,
+                on_stdout=partials[index].append,
+            )
+
+        # Time-budget harvest (F8a, 2-A'/2-behavior/2-where): run the voices as tasks under an
+        # asyncio.wait deadline; at the deadline keep the answered voices and cut the in-flight ones.
+        tasks = [asyncio.create_task(one(i, r)) for i, r in enumerate(requests)]
+        budget = req.time_budget_s if req.time_budget_s is not None else self._config.default_time_budget_s
+        cut: set[int] = set()
+        stop_reason: str | None = None
+        # Resolve the disposition: the call value, else the configured ``default_on_budget`` (2-M's
+        # per-call-param + workspace-default). ``continue`` makes the budget advisory -- run every voice to
+        # completion (nothing is cut). ``harvest`` (the default) and ``resume`` both cut the stragglers at
+        # the deadline; ``resume`` is equivalent to ``harvest`` today (a voice cut mid-run has no established
+        # session to record, and the deliberate come-back rides the item-9 continuation primitive). OnBudget.
+        on_budget = req.on_budget if req.on_budget is not None else self._config.default_on_budget
+        enforce = bool(tasks) and budget is not None and on_budget != "continue"
+        # ``on_budget=continue`` with an interim sink (an async job, 2-M): detach at the deadline -- publish
+        # the best-effort answered-so-far set and keep the stragglers running, appending as each lands --
+        # rather than cut them (harvest) or block until all finish (the sync continue).
+        continue_detach = (
+            bool(tasks) and budget is not None and on_budget == "continue" and on_interim_result is not None
+        )
+        # Stream-to-job (F8a, 2-G): while a persisted panel runs, tee each voice's accumulating stdout into
+        # the job's artifacts off-thread on a coarse timer, so a kept job preserves the in-flight work up to
+        # a crash or a cut -- not just what survives to finalization. No-op for an ephemeral run (in-memory).
+        tee_run_id = parent_run_id if (parent_run_id is not None and self._ledger is not None) else None
+        tee_stop = asyncio.Event()
+        tee_task = (
+            asyncio.create_task(live_tee(self._ledger, tee_run_id, "voice", partials, tee_stop))
+            if tee_run_id and self._ledger is not None
+            else None
+        )
+        try:
+            if enforce:
+                _done, pending = await asyncio.wait(tasks, timeout=budget)
+                if pending:
+                    stop_reason = "budget"
+                    for index, task in enumerate(tasks):
+                        if task in pending:
+                            cut.add(index)
+                            task.cancel()
+                    # MANDATORY cancel-then-drain: the runner kills the CLI process tree only once the
+                    # cancellation is delivered AND awaited -- skipping this leaks orphaned subprocesses.
+                    await asyncio.gather(*pending, return_exceptions=True)
+            elif continue_detach:
+                _done, pending = await asyncio.wait(tasks, timeout=budget)
+                while pending:  # at/after the deadline: publish the set so far, then await the next straggler
+                    assert on_interim_result is not None  # narrowed by continue_detach
+                    on_interim_result(self._interim_result(req, requests, tasks, skipped))
+                    _d, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            else:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            # The OUTER coroutine was cancelled (e.g. job_cancel): asyncio.wait/gather do not cancel the
+            # voice tasks for us, so cancel + drain them (no orphaned trees) before propagating.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            # Stop the tee (it writes a final snapshot itself, then exits), so even a cancelled panel leaves
+            # the live stream on disk. Runs on every exit (normal, budget harvest, or outer cancel).
+            await stop_live_tee(tee_task, tee_stop)
+
+        voices: list[DelegationResult] = []
+        for index, (request, task) in enumerate(zip(requests, tasks, strict=True)):
+            if task.cancelled():
+                if index in cut:
+                    voices.append(self._budget_voice(request, partials[index]))  # cut at the deadline
+                    continue
+                raise asyncio.CancelledError()  # an external cancel we did not induce -- propagate it
+            exc = task.exception()
+            if isinstance(exc, asyncio.CancelledError):
+                raise exc
+            if exc is not None:
+                voices.append(_escaped_voice(request, exc))
+            else:
+                voices.append(task.result())
+
+        # 2-I active resumable harvest: when opted in, re-prompt each cut voice whose session was recovered
+        # for a clean best answer, BEFORE the quorum gate (the follow-up may turn a raw partial into a usable
+        # answer). Runs only on a budget harvest with cut voices.
+        if stop_reason == "budget" and req.harvest_partial and cut:
+            await self._active_harvest(req, voices, cut, correlation_id, base_depth)
+
+        # 2-E': a budget harvest that yielded fewer than min_quorum usable voices is a genuine failure
+        # (BUDGET_EXHAUSTED), raised before any result/persist; otherwise the harvest is a success.
+        if stop_reason == "budget":
+            usable = sum(1 for voice in voices if voice.ok and voice.text.strip())
+            if usable < self._config.min_quorum:
+                raise RutherfordError(
+                    ErrorCode.BUDGET_EXHAUSTED,
+                    f"time budget ({budget:.0f}s) reached with {usable} usable voice(s), below "
+                    f"min_quorum ({self._config.min_quorum})",
+                )
+
+        rollup = self._rollup(req, voices, cut, budget, stop_reason, self._clock() - created_at) if budget else None
+
         # None means the caller omitted synthesize, the one case the configured default fills; an explicit
         # False wins over a synthesize_default=true config. Resolved here so the panel record snapshots the
         # *resolved* value (decision 1-D), not the unresolved request.
         effective_synthesize = req.synthesize if req.synthesize is not None else self._config.synthesize_default
-        if req.strategy is not Strategy.ALL_VOICES:
-            result = self._aggregate(req, voices, skipped)
-            answer = result.decision or result.outcome
-        else:
-            synthesis: str | None = None
-            synthesis_by: str | None = None
-            if effective_synthesize and voices:
-                synthesis, synthesis_by = await self._synthesize(req, voices, correlation_id, base_depth)
-            result = ConsensusResult(
-                voices=voices,
-                synthesis=synthesis,
-                synthesis_by=synthesis_by,
-                skipped=skipped,
-                diversity=self._diversity(voices),
-            )
-            answer = synthesis or "(no synthesis -- see the linked voice records)"
+        synthesis: str | None = None
+        synthesis_by: str | None = None
+        if req.strategy is Strategy.ALL_VOICES and effective_synthesize and voices:
+            synthesis, synthesis_by = await self._synthesize(req, voices, correlation_id, base_depth)
+        result, answer = self._assemble(req, voices, skipped, synthesis=synthesis, synthesis_by=synthesis_by)
+        # Carry the harvest disposition onto the result: ``stop_reason`` flags a budget harvest, and the
+        # rollup (only when a budget governed the run) reports requested/answered/cut/usable + effort (F8a).
+        result.stop_reason = stop_reason
+        result.rollup = rollup
 
         if parent_run_id is not None and self._ledger is not None:
             # Write the parent panel record linking the child voice records (off-thread: file I/O). The
@@ -161,6 +251,9 @@ class ConsensusService:
                         # The effective per-seat stance: the target's own, else the parallel stances entry
                         # (mirrors _voice_prompt), so a parallel-stances panel records who argued which side.
                         stance=_stance_for(voice.target, req.stances, index),
+                        # The seat's resume handle in the parent state.toon (2-I) -- matters most for a cut
+                        # voice, whose handle is recovered from the harvested partial and has no child record.
+                        session_id=voice.session_id,
                     )
                     for index, voice in enumerate(voices)
                 ],
@@ -184,6 +277,8 @@ class ConsensusService:
                 files=req.files,
                 role=req.role,
                 panel=panel_inputs,
+                stop_reason=stop_reason,
+                rollup=rollup,
                 extra_artifacts=render_panel_voice_files(panel_voices, skipped_pairs),
             )
         return result
@@ -194,6 +289,194 @@ class ConsensusService:
         if not answered:
             return None
         return effective_diversity(answered, min_distinct=self._config.min_distinct)
+
+    def _assemble(
+        self,
+        req: ConsensusRequest,
+        voices: list[DelegationResult],
+        skipped: list[SkippedTarget],
+        *,
+        synthesis: str | None = None,
+        synthesis_by: str | None = None,
+    ) -> tuple[ConsensusResult | StrategyResult, str]:
+        """Build the panel result (and its answer text) from ``voices``: a :class:`StrategyResult` under a
+        strategy, else a :class:`ConsensusResult`. Shared by the final result and the ``continue`` interim
+        preview (the interim passes no synthesis -- it is a cheap snapshot, not the finished panel)."""
+        if req.strategy is not Strategy.ALL_VOICES:
+            result = self._aggregate(req, voices, skipped)
+            return result, (result.decision or result.outcome)
+        consensus_result = ConsensusResult(
+            voices=voices,
+            synthesis=synthesis,
+            synthesis_by=synthesis_by,
+            skipped=skipped,
+            diversity=self._diversity(voices),
+        )
+        return consensus_result, (synthesis or "(no synthesis -- see the linked voice records)")
+
+    def _interim_result(
+        self,
+        req: ConsensusRequest,
+        requests: list[DelegationRequest],
+        tasks: list[asyncio.Task[DelegationResult]],
+        skipped: list[SkippedTarget],
+    ) -> ConsensusResult | StrategyResult:
+        """A best-effort preview of the panel from the voices that have finished so far (F8a, 2-M continue).
+
+        Built from the currently-done tasks (a still-running or cancelled voice is omitted), with no
+        synthesis (a cheap snapshot, not the finished panel) and a notice that the panel is still running.
+        Published to the job's interim sink so a poller sees partial answers before the stragglers land.
+        """
+        voices: list[DelegationResult] = []
+        for request, task in zip(requests, tasks, strict=True):
+            if not task.done() or task.cancelled() or isinstance(task.exception(), asyncio.CancelledError):
+                continue  # still running, or cancelled -- not part of the answered-so-far set
+            exc = task.exception()
+            voices.append(_escaped_voice(request, exc) if exc is not None else task.result())
+        result, _answer = self._assemble(req, voices, skipped)
+        result.notice = f"interim: {len(voices)} of {len(tasks)} voice(s) answered; the panel is still running"
+        return result
+
+    def _budget_voice(self, request: DelegationRequest, partial_lines: list[str]) -> DelegationResult:
+        """The voice for a target cut at the panel's time-budget deadline (F8a, 2-E'/2-F/2-H).
+
+        Don't waste the in-flight work: if the target's adapter ``supports_partial_output`` and it streamed
+        something before the cut, the partial is harvested through the adapter's OWN ``parse_output`` -- the
+        only thing that turns a JSONL/text stream into a clean candidate answer (and recovers any session
+        handle for a later resume). A usable partial answer is returned ``ok=True`` with ``stop_reason``
+        ``"budget"`` and the raw bytes on ``partial``, so it counts toward quorum and feeds the
+        aggregation/synthesis. When there is no usable partial (a single-envelope adapter whose answer only
+        arrives at the end, an empty stream, or a partial the adapter can't yet parse into an answer) the
+        voice is the honest ``BUDGET_EXHAUSTED`` failure, with the raw partial preserved as a trace.
+        """
+        partial_text = "\n".join(partial_lines).strip()
+        effort = self._delegation.resolve_effort(request.target.cli, request.effort)
+        applied = self._delegation.applied_effort(request.target.cli, effort)
+        parsed = self._parse_partial(request, partial_text, effort) if partial_text else None
+        if parsed is not None and parsed.ok and parsed.text.strip():
+            # A usable partial answer: keep it ``ok`` (it counts toward quorum) but mark it as a budget
+            # harvest and preserve the raw bytes, so a reader can tell a partial answer from a complete one.
+            parsed.stop_reason = "budget"
+            parsed.partial = partial_text
+            parsed.effort = effort
+            parsed.effort_applied = applied
+            return parsed
+        # A trace-only cut still ran with the resolved effort, so report it (2-L-map: always report what was
+        # enforced); and carry any session the partial established (even with no answer) so the cut voice can
+        # be resumed later (2-I passive). ``parsed`` is the failed parse, which now carries that session.
+        session = parsed.session_id if parsed is not None else None
+        return DelegationResult(
+            target=request.target,
+            ok=False,
+            error=ErrorInfo(code=ErrorCode.BUDGET_EXHAUSTED, message="cut at the panel time-budget deadline"),
+            safety_mode=request.safety_mode,
+            partial=partial_text or None,
+            stop_reason="budget",
+            session_id=session,
+            effort=effort,
+            effort_applied=applied,
+        )
+
+    def _parse_partial(
+        self, request: DelegationRequest, partial_text: str, effort: Effort | None
+    ) -> DelegationResult | None:
+        """Run a cut voice's streamed partial through the adapter's ``parse_output``, or ``None`` (F8a, 2-H).
+
+        Only for an adapter whose ``supports_partial_output`` is true (JSONL/text stream the answer as it is
+        produced); single-envelope adapters emit the answer once at the end, so a cut yields only a trace.
+        Returns the parsed result whether or not it is ``ok``: a clean answer where the stream already carried
+        one, otherwise a failed parse that still carries any ``session_id`` the stream established (for 2-I
+        passive resume). ``None`` when the adapter has no partial output or the parse raised. Never raises.
+        """
+        try:
+            adapter = self._registry.get(request.target.cli)
+            if not adapter.capabilities().supports_partial_output:
+                return None
+            ctx = InvocationContext(target=request.target, safety_mode=request.safety_mode, effort=effort)
+            return adapter.parse_output(ProcessResult(exit_code=0, stdout=partial_text), ctx)
+        except Exception:
+            return None
+
+    async def _active_harvest(
+        self,
+        req: ConsensusRequest,
+        voices: list[DelegationResult],
+        cut: set[int],
+        correlation_id: str,
+        base_depth: int,
+    ) -> None:
+        """Re-prompt each cut voice whose session was recovered for a clean best answer (F8a, 2-I).
+
+        ``harvest_partial=true`` only: a cut voice whose adapter supports resume and whose in-flight session
+        the partial harvest recovered (``session_id``) gets a bounded "you're out of time, give your current
+        best answer" follow-up against that session; its clean answer replaces the raw partial in ``voices``.
+        The follow-ups run concurrently and best-effort -- a failed one leaves the original cut voice intact.
+        The follow-up is not its own job record (it continues a panel voice). It spends budget you may be out
+        of, which is why it is opt-in.
+        """
+
+        async def followup(index: int) -> None:
+            voice = voices[index]
+            if not voice.session_id:
+                return  # no recovered session (single-envelope adapter, or nothing streamed) -- nothing to resume
+            try:
+                if not self._registry.get(voice.target.cli).capabilities().supports_resume:
+                    return
+            except Exception:
+                return
+            follow_req = DelegationRequest(
+                target=voice.target,
+                session_id=voice.session_id,
+                prompt="You are out of time. Give your current best answer now, as concisely as you can.",
+                working_dir=req.working_dir,
+                safety_mode=req.safety_mode,
+                timeout_s=req.timeout_s,
+                effort=voice.effort,
+                persist=False,  # the follow-up continues a panel voice; it is not its own job record
+            )
+            result = await self._delegation.delegate(
+                follow_req, correlation_id=f"{correlation_id}:harvest:{index}", base_depth=base_depth
+            )
+            if result.ok and result.text.strip():
+                result.stop_reason = "budget"  # a post-deadline harvested answer, not a clean in-budget finish
+                voices[index] = result
+
+        await asyncio.gather(*(followup(index) for index in sorted(cut)), return_exceptions=True)
+
+    def _rollup(
+        self,
+        req: ConsensusRequest,
+        voices: list[DelegationResult],
+        cut: set[int],
+        budget: float | None,
+        stop_reason: str | None,
+        elapsed_s: float,
+    ) -> RunRollup:
+        """Summarize a budget-governed panel: counts, quorum, the highest effort applied, and summed cost."""
+        requested = len(voices)
+        cut_count = len(cut)
+        answered = requested - cut_count
+        usable = sum(1 for voice in voices if voice.ok and voice.text.strip())
+        applied = [voice.effort_applied for voice in voices if voice.effort_applied is not None]
+        effort_applied = max(applied, key=EFFORT_ORDER.index) if applied else None
+        # Report the RESOLVED requested effort, derived per seat so a per-adapter ``[adapters.<id>].effort``
+        # default is reflected (not just the global default): the highest tier any voice actually requested.
+        requested_tiers = [self._delegation.resolve_effort(voice.target.cli, req.effort) for voice in voices]
+        present = [tier for tier in requested_tiers if tier is not None]
+        effort_requested = max(present, key=EFFORT_ORDER.index) if present else None
+        return RunRollup(
+            stop_reason=stop_reason or "ok",
+            requested=requested,
+            answered=answered,
+            cut=cut_count,
+            usable=usable,
+            quorum_met=usable >= self._config.min_quorum,
+            elapsed_s=elapsed_s,
+            time_budget_s=budget,
+            effort_requested=effort_requested,
+            effort_applied=effort_applied,
+            cost=_rollup_voice_cost(voices),
+        )
 
     def _voice_prompt(self, req: ConsensusRequest, target: Target, index: int) -> str:
         """The prompt for one voice: the question, stance-steered, plus a verdict ask under a strategy."""
@@ -230,6 +513,7 @@ class ConsensusService:
                     no_verdict_reason=reason,
                     text=voice.text,
                     provenance=voice.provenance,
+                    effort_applied=voice.effort_applied,  # carry the applied effort to the strategy view (F8a)
                 )
             )
         outcome, decision = aggregate(req.strategy, verdicts, min_quorum=self._config.min_quorum)
@@ -407,6 +691,29 @@ def _panel_voice(voice: DelegationResult) -> PanelVoice:
         error=voice.error.message if voice.error else None,
         cost=voice.cost,
         changed_files=tuple(voice.changed_files or ()),
+        partial=voice.partial,  # a budget-cut voice's harvested stdout, persisted into its artifact (F8a, 2-G)
+        session_id=voice.session_id,  # the resume handle, so a cut voice can be continued later (F8a, 2-I)
+    )
+
+
+def _rollup_voice_cost(voices: list[DelegationResult]) -> Cost | None:
+    """Sum the answering voices' reported costs into one panel cost for the rollup, or ``None`` if none.
+
+    Each field is summed only over the voices that reported it (a missing field never zeros the total);
+    a field no voice reported stays ``None``, so an all-unpriced panel rolls up to ``None`` not a fake zero.
+    """
+    costs = [voice.cost for voice in voices if voice.cost is not None]
+    usd = [cost.usd for cost in costs if cost.usd is not None]
+    input_tokens = [cost.input_tokens for cost in costs if cost.input_tokens is not None]
+    output_tokens = [cost.output_tokens for cost in costs if cost.output_tokens is not None]
+    total_tokens = [cost.total_tokens for cost in costs if cost.total_tokens is not None]
+    if not (usd or input_tokens or output_tokens or total_tokens):
+        return None
+    return Cost(
+        usd=sum(usd) if usd else None,
+        input_tokens=sum(input_tokens) if input_tokens else None,
+        output_tokens=sum(output_tokens) if output_tokens else None,
+        total_tokens=sum(total_tokens) if total_tokens else None,
     )
 
 

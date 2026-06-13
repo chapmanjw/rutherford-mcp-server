@@ -17,7 +17,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ..domain.enums import SafetyMode
+from ..domain.enums import Effort, SafetyMode
+from ..domain.models import OnBudget
 
 _log = logging.getLogger(__name__)
 
@@ -38,6 +39,9 @@ class AdapterConfig(BaseModel):
     #: local-model adapters -- Ollama (e.g. ``["--keepalive", "30s"]``) and LM Studio (e.g.
     #: ``["--ttl", "3600"]``).
     extra_args: list[str] = Field(default_factory=list)
+    #: Per-adapter default reasoning-effort tier (F8a). Used when a call names no ``effort``; ``None``
+    #: falls back to the global ``default_effort``. A no-op for an adapter with no effort knob.
+    effort: Effort | None = None
 
 
 class RutherfordConfig(BaseModel):
@@ -53,6 +57,13 @@ class RutherfordConfig(BaseModel):
     default_safety_mode: SafetyMode = SafetyMode.READ_ONLY
     #: Default per-run timeout in seconds.
     default_timeout_s: float = Field(default=300.0, gt=0)
+    #: Default reasoning-effort tier when a call names none (F8a, 2-L); ``None`` = let the CLI decide.
+    default_effort: Effort | None = None
+    #: Default wall-clock time budget (seconds) for a panel / job when a call names none (F8a, 2-A').
+    #: ``None`` = no budget (the out-of-the-box behavior; a panel runs to completion).
+    default_time_budget_s: float | None = Field(default=None, gt=0)
+    #: Default disposition at a time-budget deadline (F8a, 2-M) when a call names none.
+    default_on_budget: OnBudget = "harvest"
     #: Extra directories to search for role markdown files (built-in roles always load).
     role_dirs: list[str] = Field(default_factory=list)
     #: Maximum delegation depth before a chain is refused.
@@ -181,6 +192,16 @@ class RutherfordConfig(BaseModel):
         """Return the configured per-adapter timeout (seconds) for ``adapter_id``, if any."""
         entry = self.adapters.get(adapter_id)
         return entry.timeout_s if entry is not None else None
+
+    def effort_for(self, adapter_id: str) -> Effort | None:
+        """Resolve the default reasoning-effort tier for ``adapter_id`` (F8a): per-adapter, else global.
+
+        Used when a call names no ``effort``; ``None`` means "let the CLI decide" (no effort flag).
+        """
+        entry = self.adapters.get(adapter_id)
+        if entry is not None and entry.effort is not None:
+            return entry.effort
+        return self.default_effort
 
     def extra_args_for(self, adapter_id: str) -> list[str]:
         """Return the configured extra CLI args for ``adapter_id`` (empty when none)."""

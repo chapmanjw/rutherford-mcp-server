@@ -236,6 +236,18 @@ def test_parse_turn_failed_golden() -> None:
     assert "rate limit" in result.error.message.lower()
 
 
+def test_parse_timeout_preserves_the_pre_deadline_partial() -> None:
+    # F8a 2-behavior (single delegate degenerate case): a timed-out run keeps the stdout it streamed
+    # before the deadline on ``partial`` (via the shared timeout_result helper), instead of discarding it.
+    # It stays a TIMEOUT fault and the partial is never promoted to the answer ``text``.
+    raw = ProcessResult(exit_code=None, timed_out=True, partial="half an answer before the cut", duration_s=5.0)
+    result = CodexAdapter().parse_output(raw, _ctx())
+    assert not result.ok
+    assert result.error is not None and result.error.code == "TIMEOUT"
+    assert result.partial == "half an answer before the cut"
+    assert result.text == ""  # the partial is a preserved trace, not the answer
+
+
 def test_parse_transient_error_then_completed_turn_is_success_golden() -> None:
     # A transient `error` event the CLI retried past must not latch a stale failure onto a run
     # whose turn then completed cleanly: turn.completed is the terminal verdict.

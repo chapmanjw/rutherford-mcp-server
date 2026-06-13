@@ -86,7 +86,7 @@ async def test_failed_job_logs_error_type_not_the_exception_message() -> None:
     stream = _stream()
     service = JobService()
 
-    async def body(progress: object) -> DelegationResult:
+    async def body(progress: object, set_interim: object) -> DelegationResult:
         raise ValueError("SECRET prompt content that must not be logged")
 
     job = service.submit("delegate", body)

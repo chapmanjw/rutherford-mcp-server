@@ -76,5 +76,11 @@ class ErrorCode(StrEnum):
     PANEL_NOT_FOUND = "PANEL_NOT_FOUND"
     #: A panels file failed to parse or validate (bad TOON, unknown CLI, malformed target).
     PANEL_INVALID = "PANEL_INVALID"
+    #: A time-budgeted run hit its deadline with ZERO usable results (below ``min_quorum``) -- the
+    #: zero-yield edge of a harvest (F8a, decision 2-E'). A harvest that yields at least ``min_quorum``
+    #: usable voices is a SUCCESS (``ok=true`` + ``stop_reason="budget"``), not this code; this is
+    #: reserved for the genuine empty harvest. Not retryable and not cooldown-counting (it is a budget
+    #: outcome, not an unhealthy adapter).
+    BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
     #: An unexpected internal error.
     INTERNAL = "INTERNAL"

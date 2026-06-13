@@ -27,6 +27,7 @@ class ProcessRunner(Protocol):
         spec: InvocationSpec,
         timeout_s: float,
         on_progress: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
     ) -> ProcessResult:
         """Execute ``spec``, enforce ``timeout_s``, and return the raw outcome.
 
@@ -35,6 +36,12 @@ class ProcessRunner(Protocol):
         delegation service normalizes that to a structured ``SPAWN_FAILED`` result, so a direct
         caller of this interface must handle it. On timeout or cancellation the whole process
         tree is killed.
+
+        ``on_progress`` receives stderr lines as they arrive; ``on_stdout`` (F8a, decision 2-F/2-G)
+        receives stdout lines, so a caller can tee the answer stream into a job artifact and/or
+        accumulate it to harvest a partial answer if a time budget cuts the run. On a timeout the
+        accumulated stdout is returned on ``ProcessResult.partial``; on cancellation the runner
+        re-raises (its contract), so the cancel-path partial is whatever ``on_stdout`` already saw.
         """
         ...
 
@@ -54,6 +61,7 @@ class AsyncProcessRunner:
         spec: InvocationSpec,
         timeout_s: float,
         on_progress: Callable[[str], None] | None = None,
+        on_stdout: Callable[[str], None] | None = None,
     ) -> ProcessResult:
         launch = prepare_argv(spec.argv)
         start = time.monotonic()
@@ -69,9 +77,12 @@ class AsyncProcessRunner:
             env=merged_env(spec.env),
         )
         stdin_bytes = spec.stdin.encode("utf-8") if spec.stdin is not None else None
+        # The accumulator lives in run()'s frame so partial stdout survives a cancellation of
+        # _communicate (the wait_for timeout cancels that coroutine; its locals would be lost).
+        stdout_acc = bytearray()
         try:
             stdout_b, stderr_b = await asyncio.wait_for(
-                self._communicate(process, stdin_bytes, on_progress),
+                self._communicate(process, stdin_bytes, on_progress, on_stdout, stdout_acc),
                 timeout=timeout_s,
             )
         except (TimeoutError, asyncio.CancelledError) as exc:
@@ -85,6 +96,9 @@ class AsyncProcessRunner:
                 stderr=f"timed out after {timeout_s:.0f}s",
                 duration_s=duration,
                 timed_out=True,
+                # Preserve what the child wrote before the deadline so a time-budget harvester can
+                # surface a candidate answer instead of throwing the work away (decision 2-F).
+                partial=bytes(stdout_acc).decode("utf-8", errors="replace") or None,
             )
         except BaseException:
             # Any other escape from the wait (an OSError from the stdin feed beyond the tolerated
@@ -104,44 +118,21 @@ class AsyncProcessRunner:
         process: asyncio.subprocess.Process,
         stdin_bytes: bytes | None,
         on_progress: Callable[[str], None] | None,
+        on_stdout: Callable[[str], None] | None,
+        stdout_acc: bytearray,
     ) -> tuple[bytes, bytes]:
-        """Drain stdout/stderr while feeding stdin, teeing stderr lines to ``on_progress``.
+        """Drain stdout/stderr while feeding stdin, teeing each stream's lines to its callback.
 
         The drains MUST be running before stdin is written: a child that fills its output pipe
         before consuming a large prompt would otherwise deadlock against a parent blocked in
         ``stdin.drain()`` on a full stdin pipe -- surfacing as a false timeout on a healthy CLI.
-        (This is the ordering ``Process.communicate()`` itself uses; reimplemented only to tee
-        stderr lines to ``on_progress`` as they arrive.)
+        (This is the ordering ``Process.communicate()`` itself uses; reimplemented to tee stderr to
+        ``on_progress`` and stdout to ``on_stdout`` as they arrive, and to accumulate stdout into
+        ``stdout_acc`` so a partial answer survives a deadline cut.)
         """
         assert process.stdout is not None
         assert process.stderr is not None
-
-        async def drain_stdout() -> bytes:
-            return await process.stdout.read()  # type: ignore[union-attr]
-
-        async def drain_stderr() -> bytes:
-            # Read in bounded chunks, not readline(): a single stderr line longer than the
-            # StreamReader limit (64 KiB by default) makes readline() raise ValueError, which
-            # would escape the runner as a crash. Lines are re-split here only to feed
-            # on_progress; a pathological never-newline stream just flushes oversized chunks.
-            chunks: list[bytes] = []
-            pending = b""
-            while True:
-                chunk = await process.stderr.read(65536)  # type: ignore[union-attr]
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                if on_progress is not None:
-                    pending += chunk
-                    *lines, pending = pending.split(b"\n")
-                    for line in lines:
-                        on_progress(line.decode("utf-8", errors="replace").rstrip("\r"))
-                    if len(pending) > 65536:  # no newline in sight; flush rather than buffer unbounded
-                        on_progress(pending.decode("utf-8", errors="replace"))
-                        pending = b""
-            if on_progress is not None and pending:
-                on_progress(pending.decode("utf-8", errors="replace").rstrip("\r"))
-            return b"".join(chunks)
+        stderr_acc = bytearray()
 
         async def feed_stdin() -> None:
             if stdin_bytes is None or process.stdin is None:
@@ -154,9 +145,53 @@ class AsyncProcessRunner:
             finally:
                 process.stdin.close()
 
-        stdout_b, stderr_b, _ = await asyncio.gather(drain_stdout(), drain_stderr(), feed_stdin())
+        await asyncio.gather(
+            _drain_stream(process.stdout, stdout_acc, on_stdout),
+            _drain_stream(process.stderr, stderr_acc, on_progress),
+            feed_stdin(),
+        )
         await process.wait()
-        return stdout_b, stderr_b
+        return bytes(stdout_acc), bytes(stderr_acc)
+
+
+async def _drain_stream(
+    reader: asyncio.StreamReader,
+    acc: bytearray,
+    sink: Callable[[str], None] | None,
+) -> None:
+    """Read ``reader`` in bounded chunks into ``acc``, teeing complete lines to ``sink`` as they arrive.
+
+    Bounded ``read(65536)`` rather than ``readline()``: a single line longer than the ``StreamReader``
+    limit (64 KiB) makes ``readline()`` raise ``ValueError``, which would escape the runner as a crash.
+    Lines are re-split only to feed ``sink``; a pathological never-newline stream flushes oversized
+    chunks rather than buffering unbounded. ``acc`` always receives every byte (so a partial answer
+    survives a cut); ``sink`` is optional. Shared by the stdout and stderr drains so both behave
+    identically.
+
+    The trailing not-yet-newline-terminated ``pending`` is flushed to ``sink`` in a ``finally``, so it
+    reaches the sink on EOF AND on cancellation (F8a, 2-F): a budget cut delivers ``CancelledError`` at
+    the ``read`` with no EOF, and without the finally the last incomplete line a voice streamed before
+    the cut would be lost to the panel's partial accumulator (``acc`` still has the bytes for the
+    timeout path, but a cut re-raises rather than returning ``acc``).
+    """
+    pending = b""
+    try:
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                break
+            acc.extend(chunk)
+            if sink is not None:
+                pending += chunk
+                *lines, pending = pending.split(b"\n")
+                for line in lines:
+                    sink(line.decode("utf-8", errors="replace").rstrip("\r"))
+                if len(pending) > 65536:  # no newline in sight; flush rather than buffer unbounded
+                    sink(pending.decode("utf-8", errors="replace"))
+                    pending = b""
+    finally:
+        if sink is not None and pending:
+            sink(pending.decode("utf-8", errors="replace").rstrip("\r"))
 
 
 def kill_process_tree(pid: int, timeout_s: float = 3.0) -> None:

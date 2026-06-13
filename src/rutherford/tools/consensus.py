@@ -14,7 +14,9 @@ from .common import (
     async_job_envelope,
     ensure_known_cli,
     ensure_known_targets,
+    parse_effort,
     parse_mode,
+    parse_on_budget,
     parse_stances,
     parse_strategy,
     resolve_safety_mode,
@@ -39,6 +41,10 @@ async def consensus_tool(
     safety_mode: str | None = None,
     synthesize: bool | None = None,
     timeout_s: float | None = None,
+    effort: str | None = None,
+    time_budget_s: float | None = None,
+    on_budget: str | None = None,
+    harvest_partial: bool = False,
     mode: str = "sync",
     include_raw: bool = False,
     persist: bool | None = None,
@@ -56,6 +62,15 @@ async def consensus_tool(
     defaults to the configured ``synthesize_default`` (false out of the box), and an explicit value
     always wins. With a ``strategy`` other than ``all-voices`` (optionally with a ``verdict_schema``), the
     voices are aggregated into an outcome instead of returned individually.
+
+    ``effort`` (``low`` | ``medium`` | ``high`` | ``xhigh``) is the producer "how hard may each voice think"
+    hint, mapped per adapter and reported as applied (F8a); omit it to follow ``default_effort``.
+    ``time_budget_s`` is a wall-clock harvest deadline for the WHOLE panel, distinct from each voice's
+    ``timeout_s``: at the deadline the answered voices are kept and in-flight ones are cut, and the panel
+    aggregates over the harvest if ``min_quorum`` holds (else ``BUDGET_EXHAUSTED``). ``on_budget`` picks the
+    disposition: ``harvest`` (default), ``continue`` (run all voices; budget advisory), or ``resume``.
+    ``harvest_partial=true`` additionally re-prompts each cut voice whose session was recovered for a clean
+    best answer at the cut (it spends extra budget, hence opt-in).
     """
     target_objs: list[Target]
     panel_strategy: str | None = None
@@ -90,6 +105,10 @@ async def consensus_tool(
         safety_mode=resolve_safety_mode(safety_mode, app.config.default_safety_mode),
         synthesize=synthesize,
         timeout_s=timeout_s,
+        effort=parse_effort(effort),
+        time_budget_s=time_budget_s,
+        on_budget=parse_on_budget(on_budget),
+        harvest_partial=harvest_partial,
         include_raw=include_raw,
         expand_all=expand_all,
         strategy=effective_strategy,
@@ -101,13 +120,16 @@ async def consensus_tool(
     correlation_id = app.new_correlation_id()
 
     if parse_mode(mode) is DelegationMode.ASYNC:
+        # ``set_interim`` carries the F8a ``on_budget=continue`` best-effort result to the job while the
+        # stragglers keep running, so a poller sees the harvested-so-far set before the panel finishes.
         job = app.jobs.submit(
             "consensus",
-            lambda progress: app.consensus.consensus(
+            lambda progress, set_interim: app.consensus.consensus(
                 request,
                 correlation_id=correlation_id,
                 base_depth=app.base_depth,
                 on_progress=progress,
+                on_interim_result=set_interim,
             ),
         )
         return tool_success(

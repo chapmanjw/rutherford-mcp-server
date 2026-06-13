@@ -188,6 +188,72 @@ async def test_on_progress_receives_stderr_lines() -> None:
     assert any("progress one" in line for line in seen)
 
 
+async def test_on_stdout_receives_stdout_lines_separately_from_stderr() -> None:
+    # F8a 2-F/2-G: stdout is teed to on_stdout as it arrives, the channel a panel uses to accumulate a
+    # per-voice partial. It must carry ONLY stdout -- stderr still goes to on_progress, never mixed in.
+    runner = AsyncProcessRunner()
+    out_lines: list[str] = []
+    err_lines: list[str] = []
+    code = (
+        "import sys; print('answer line one'); print('answer line two'); "
+        "sys.stderr.write('noise\\n'); sys.stderr.flush()"
+    )
+    result = await runner.run(_spec(code), timeout_s=30, on_progress=err_lines.append, on_stdout=out_lines.append)
+    assert result.exit_code == 0
+    assert "answer line one" in out_lines
+    assert "answer line two" in out_lines
+    assert not any("noise" in line for line in out_lines)  # stderr never bleeds into the stdout channel
+    assert any("noise" in line for line in err_lines)
+
+
+async def test_timeout_preserves_partial_stdout_written_before_the_deadline() -> None:
+    # F8a 2-F: the pre-deadline stdout is no longer thrown away. A child that streams an answer line and
+    # then hangs must, on timeout, return what it wrote on ``partial`` (not the empty ``stdout``).
+    runner = AsyncProcessRunner()
+    code = "import sys, time; print('partial answer so far'); sys.stdout.flush(); time.sleep(30)"
+    result = await runner.run(_spec(code), timeout_s=1)
+    assert result.timed_out
+    assert result.stdout == ""  # the clean-finish field stays empty on a timeout
+    assert result.partial is not None
+    assert "partial answer so far" in result.partial
+
+
+async def test_clean_finish_leaves_partial_unset() -> None:
+    # The complement: a run that finishes cleanly carries its answer in ``stdout`` and leaves ``partial``
+    # None, so a reader never mistakes a complete answer for a harvested fragment.
+    runner = AsyncProcessRunner()
+    result = await runner.run(_spec("print('all done')"), timeout_s=30)
+    assert result.exit_code == 0
+    assert "all done" in result.stdout
+    assert result.partial is None
+
+
+async def test_on_stdout_sees_the_partial_before_a_timeout_cut() -> None:
+    # The panel-harvest path end to end at the runtime layer: on_stdout accumulates the streamed answer,
+    # and that accumulation survives the timeout cut (it lives in run()'s frame, not _communicate's).
+    runner = AsyncProcessRunner()
+    seen: list[str] = []
+    code = "import sys, time; print('harvest me'); sys.stdout.flush(); time.sleep(30)"
+    result = await runner.run(_spec(code), timeout_s=1, on_stdout=seen.append)
+    assert result.timed_out
+    assert "harvest me" in seen
+
+
+async def test_partial_without_a_trailing_newline_still_reaches_on_stdout_on_a_cut() -> None:
+    # F8a 2-F (regression): a voice can be cut mid-line, before it writes a newline. The chunked drain
+    # buffers the not-yet-terminated bytes until a newline/EOF -- and a deadline cut delivers no EOF -- so
+    # without a finally-flush the last incomplete line a voice streamed before the cut is lost to the
+    # panel's on_stdout accumulator. The bytes are in ProcessResult.partial either way; this guards the
+    # on_stdout channel the consensus harvest actually reads from.
+    runner = AsyncProcessRunner()
+    seen: list[str] = []
+    code = "import sys, time; sys.stdout.write('NO_NEWLINE_DRAFT'); sys.stdout.flush(); time.sleep(30)"
+    result = await runner.run(_spec(code), timeout_s=1, on_stdout=seen.append)
+    assert result.timed_out
+    assert any("NO_NEWLINE_DRAFT" in line for line in seen)  # flushed to on_stdout despite no newline
+    assert result.partial is not None and "NO_NEWLINE_DRAFT" in result.partial
+
+
 async def test_env_overlay_passed_to_child() -> None:
     runner = AsyncProcessRunner()
     code = "import os; print(os.environ.get('RUTHERFORD_DEPTH', 'unset'))"

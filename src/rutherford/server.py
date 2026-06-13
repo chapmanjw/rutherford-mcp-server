@@ -98,6 +98,7 @@ async def delegate(
     safety_mode: str | None = None,
     mode: str = "sync",
     timeout_s: float | None = None,
+    effort: str | None = None,
     session_id: str | None = None,
     include_raw: bool = False,
     trust_workspace: bool = False,
@@ -114,9 +115,11 @@ async def delegate(
     `mode="async"` a job id is returned; poll `job_status` / `job_result`. `session_id` resumes a
     prior session where the CLI supports it. `persist=true` keeps the run as a durable job under
     `.rutherford/jobs/<id>/` (state.toon + a Markdown answer); `None` follows `default_persistence`,
-    and the kept run's `run_dir` is on the result. `fallback` is an ordered list of alternate `cli` /
-    `cli:model` targets tried if the primary fails on a retryable category (rate-limit, auth, timeout,
-    a down CLI); the result's `target` is whoever answered and `fallback_chain` records the path.
+    and the kept run's `run_dir` is on the result. `effort` (low | medium | high | xhigh) is the
+    producer "how hard may it think" hint, mapped to the CLI's native knob and reported as
+    `effort_applied`; omit it to follow `default_effort`. `fallback` is an ordered list of alternate
+    `cli` / `cli:model` targets tried if the primary fails on a retryable category (rate-limit, auth,
+    timeout, a down CLI); the result's `target` is whoever answered and `fallback_chain` records the path.
     """
     return await _guarded(
         delegate_tool(
@@ -130,6 +133,7 @@ async def delegate(
             safety_mode=safety_mode,
             mode=mode,
             timeout_s=timeout_s,
+            effort=effort,
             session_id=session_id,
             include_raw=include_raw,
             trust_workspace=trust_workspace,
@@ -156,6 +160,10 @@ async def consensus(
     safety_mode: str | None = None,
     synthesize: bool | None = None,
     timeout_s: float | None = None,
+    effort: str | None = None,
+    time_budget_s: float | None = None,
+    on_budget: str | None = None,
+    harvest_partial: bool = False,
     mode: str = "sync",
     include_raw: bool = False,
     persist: bool | None = None,
@@ -175,7 +183,11 @@ async def consensus(
     `weighted` | `parity-pair`), optionally with a `verdict_schema`, aggregates the voices into an
     `outcome` instead of returning them individually. Optional `judge` names a target (ideally a
     non-participant) that writes the synthesis or closing instead of the first voice; recorded as
-    `synthesis_by` in the result. With `mode="async"` a job id is returned.
+    `synthesis_by` in the result. `effort` (low | medium | high | xhigh) is the producer effort hint
+    applied to every voice; `time_budget_s` is a wall-clock harvest deadline for the WHOLE panel
+    (distinct from each voice's `timeout_s`): at the deadline answered voices are kept and in-flight ones
+    cut, aggregating over the harvest if `min_quorum` holds. `on_budget` is harvest (default) | continue
+    (run all; budget advisory) | resume. With `mode="async"` a job id is returned.
     """
     return await _guarded(
         consensus_tool(
@@ -194,6 +206,10 @@ async def consensus(
             safety_mode=safety_mode,
             synthesize=synthesize,
             timeout_s=timeout_s,
+            effort=effort,
+            time_budget_s=time_budget_s,
+            on_budget=on_budget,
+            harvest_partial=harvest_partial,
             mode=mode,
             include_raw=include_raw,
             persist=persist,
@@ -217,6 +233,9 @@ async def debate(
     safety_mode: str | None = None,
     synthesize: bool = True,
     timeout_s: float | None = None,
+    effort: str | None = None,
+    time_budget_s: float | None = None,
+    on_budget: str | None = None,
     mode: str = "sync",
     include_raw: bool = False,
     persist: bool | None = None,
@@ -232,7 +251,11 @@ async def debate(
     against | neutral throughout. `synthesize=true` (default) adds a closing summary. Optional `judge`
     names a target (ideally a non-participant) that writes the closing synthesis instead of the first
     voice; recorded as `synthesis_by` in the result. The result's `rounds` hold every voice's answer
-    at every round, so the discussion is fully retraceable. With `mode="async"` a job id is returned.
+    at every round, so the discussion is fully retraceable. `effort` (low | medium | high | xhigh) is the
+    producer effort hint applied to every turn; `time_budget_s` is a wall-clock budget for the WHOLE
+    debate, enforced at ROUND boundaries (the transcript-so-far is finalized once it is reached; round 1
+    always completes). `on_budget` is harvest (default) | continue (run every round) | resume. With
+    `mode="async"` a job id is returned.
     """
     return await _guarded(
         debate_tool(
@@ -250,6 +273,9 @@ async def debate(
             safety_mode=safety_mode,
             synthesize=synthesize,
             timeout_s=timeout_s,
+            effort=effort,
+            time_budget_s=time_budget_s,
+            on_budget=on_budget,
             mode=mode,
             include_raw=include_raw,
             persist=persist,

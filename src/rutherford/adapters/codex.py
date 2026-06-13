@@ -36,7 +36,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..domain.enums import AuthState, OutputMode, SafetyMode
+from ..domain.enums import AuthState, Effort, OutputMode, SafetyMode
 from ..domain.error_codes import ErrorCode
 from ..domain.models import (
     AdapterCapabilities,
@@ -44,6 +44,7 @@ from ..domain.models import (
     Cost,
     DelegationRequest,
     DelegationResult,
+    EffortFlags,
     InvocationContext,
     InvocationSpec,
     ProcessResult,
@@ -138,6 +139,23 @@ class CodexAdapter(BaseCLIAdapter):
         args = ["-s", sandbox, "-c", "approval_policy=never", *self._windows_sandbox_args()]
         return SafetyFlags(args=args, note=f"{sandbox} sandbox, non-interactive (approval_policy=never)")
 
+    def map_effort(self, effort: Effort) -> EffortFlags:
+        """Map effort to Codex's ``-c model_reasoning_effort=<tier>`` config override (F8a, 2-L-cov).
+
+        Codex's reasoning effort tops out at ``high``, so ``xhigh`` clamps down to ``high`` (recorded in
+        the note and ``effort_applied``). ``low`` / ``medium`` / ``high`` pass through. Applied in both the
+        fresh and resume build paths (resume accepts ``-c`` overrides), before the ``--`` separator.
+        """
+        applied = self._clamp_effort(effort, Effort.HIGH)
+        note = f"model_reasoning_effort={applied.value}"
+        if applied is not effort:
+            note += f" (clamped from {effort.value})"
+        return EffortFlags(args=["-c", f"model_reasoning_effort={applied.value}"], note=note, applied=applied)
+
+    def _effort_args(self, ctx: InvocationContext) -> list[str]:
+        """The ``-c model_reasoning_effort`` args for this call, or empty when no effort was requested."""
+        return self.map_effort(ctx.effort).args if ctx.effort is not None else []
+
     def _windows_sandbox_args(self) -> list[str]:
         """``-c windows.sandbox=unelevated`` on native Windows, else empty.
 
@@ -169,6 +187,7 @@ class CodexAdapter(BaseCLIAdapter):
             argv += ["-m", req.target.model]
         safety = self.map_safety(ctx.safety_mode)
         argv += safety.args
+        argv += self._effort_args(ctx)
         return InvocationSpec(argv=argv, env=dict(safety.env), cwd=req.working_dir, stdin=prompt)
 
     def _build_resume(
@@ -186,6 +205,7 @@ class CodexAdapter(BaseCLIAdapter):
         if req.target.model:
             argv += ["-m", req.target.model]
         argv += _resume_safety_args(safety.args)
+        argv += self._effort_args(ctx)  # a ``-c`` override; must precede the ``--`` positional separator
         argv += ["--", session_id, "-"]
         return InvocationSpec(argv=argv, env=dict(safety.env), cwd=req.working_dir, stdin=prompt)
 

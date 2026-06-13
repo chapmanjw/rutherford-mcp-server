@@ -23,9 +23,17 @@ async def job_status_tool(app: AppContext, *, job_id: str) -> str:
 
 
 async def job_result_tool(app: AppContext, *, job_id: str) -> str:
-    """Return a finished job's result, or a still-running notice (raises if id is unknown)."""
+    """Return a finished job's result, or a still-running notice (raises if id is unknown).
+
+    A still-running job that has published a best-effort INTERIM result (F8a, ``on_budget=continue``:
+    the harvested-so-far set while the stragglers keep running) returns that interim, flagged
+    ``interim: true``, instead of a bare running notice -- so a poller sees partial answers sooner. The
+    final result replaces it when the job completes.
+    """
     job = app.jobs.get(job_id)
     if job.status in (JobStatus.PENDING, JobStatus.RUNNING):
+        if job.result is not None:
+            return tool_success({"id": job.id, "status": job.status, "interim": True, "result": job.result})
         return tool_success({"id": job.id, "status": job.status, "message": "job is still running"})
     if job.error is not None:
         return tool_success({"id": job.id, "status": job.status, "error": job.error})

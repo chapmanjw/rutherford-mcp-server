@@ -10,13 +10,14 @@ Adapters and services exchange these; nothing passes around raw CLI-specific sha
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from .enums import (
     AuthState,
     DelegationMode,
+    Effort,
     JobStatus,
     OutputMode,
     Runtime,
@@ -25,6 +26,18 @@ from .enums import (
     Strategy,
 )
 from .error_codes import ErrorCode
+
+#: The dispositions for a unit of work that hits its time budget (F8a, decision 2-M):
+#: * ``harvest`` (default) -- take the voices that finished, cancel the rest, aggregate over the harvest.
+#: * ``continue`` -- the budget is advisory: every voice/round runs to completion (nothing is cut). The
+#:   decision's richer "detach: return best-effort now and append the stragglers' late results to the job"
+#:   refinement needs job-result mutation and is deferred with the jobs/continuation work (item 9); today
+#:   ``continue`` means "run everything," which for an async job completes once all voices finish.
+#: * ``resume`` -- cancel the stragglers like ``harvest``, intending a later deliberate come-back to them.
+#:   That come-back rides the item-9 continuation primitive (decision 9-F); and a voice cut mid-run has no
+#:   cleanly-established session to record passively (its process is killed before ``parse_output`` runs),
+#:   so today ``resume`` is equivalent to ``harvest``.
+OnBudget = Literal["harvest", "continue", "resume"]
 
 # --- The unit of delegation --------------------------------------------------
 
@@ -146,6 +159,28 @@ class DiversityReport(BaseModel):
     providers: list[str] = Field(default_factory=list)
 
 
+class RunRollup(BaseModel):
+    """Per-run budget / effort rollup (F8a), the sibling of :class:`DiversityReport`.
+
+    Set on a panel result (and the run record) when a **time budget** was in effect, so a reader can see
+    how the unit of work concluded: how many voices were issued, how many answered before the deadline,
+    how many were cut for the budget, how many are usable, whether quorum held, and the effort actually
+    applied. ``None`` when no budget governed the run.
+    """
+
+    stop_reason: str = "ok"  #: "ok" (finished within budget) | "budget" (harvested at the deadline)
+    requested: int = 0  #: voices / contributions issued
+    answered: int = 0  #: finished before the deadline
+    cut: int = 0  #: in-flight, cut at the time-budget deadline (reason time_budget)
+    usable: int = 0  #: answered with a non-empty, parseable answer
+    quorum_met: bool = True  #: usable >= min_quorum
+    elapsed_s: float = 0.0
+    time_budget_s: float | None = None
+    effort_requested: Effort | None = None
+    effort_applied: Effort | None = None  #: the highest tier any seat actually applied
+    cost: Cost | None = None  #: summed across the answering voices
+
+
 class ErrorInfo(BaseModel):
     """The error payload carried in a failed result envelope.
 
@@ -197,6 +232,17 @@ class AdapterCapabilities(BaseModel):
     #: so out loud.
     write_uses_bypass: bool = False
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def supports_partial_output(self) -> bool:
+        """Whether a cut / timed-out run yields a usable PARTIAL ANSWER vs only a trace (F8a, 2-H).
+
+        Derived from ``output_mode``, never hand-set: JSONL/TEXT stream the answer as it is produced, so
+        a time-budget harvest can read a partial answer; single-envelope JSON / TRANSCRIPT emit the
+        answer once at the end, so a cut yields only a partial trace, not an answer.
+        """
+        return self.output_mode in (OutputMode.JSONL, OutputMode.TEXT)
+
 
 class SafetyFlags(BaseModel):
     """A SafetyMode translated to one CLI's approval/sandbox flags.
@@ -209,6 +255,21 @@ class SafetyFlags(BaseModel):
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     note: str = ""
+
+
+class EffortFlags(BaseModel):
+    """An :class:`~rutherford.domain.enums.Effort` tier translated to one CLI's flags (F8a, 2-L-map).
+
+    Mirrors :class:`SafetyFlags` (``args`` appended to argv, ``env`` overlaid) plus ``applied``: the tier
+    the CLI will actually use after clamping to its supported range, or ``None`` for an adapter with no
+    effort knob (a no-op). ``note`` records the mapping -- including a no-op or a clamp (e.g. xhigh -> high)
+    -- for ``doctor`` and logs, so a budget that silently did nothing is never silent.
+    """
+
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    note: str = ""
+    applied: Effort | None = None
 
 
 class InvocationSpec(BaseModel):
@@ -233,6 +294,11 @@ class ProcessResult(BaseModel):
     stderr: str = ""
     duration_s: float = 0.0
     timed_out: bool = False
+    #: stdout accumulated up to a timeout/cancel, when the process did not finish (F8a, decision 2-F).
+    #: The full ``stdout`` field is only populated on a clean finish; ``partial`` preserves the bytes the
+    #: child wrote before a deadline cut it, so a time-budget harvest can surface a candidate answer
+    #: instead of discarding the work. ``None`` on a clean finish (the answer is in ``stdout``).
+    partial: str | None = None
 
 
 class InvocationContext(BaseModel):
@@ -255,6 +321,10 @@ class InvocationContext(BaseModel):
     #: Extra CLI args the service resolved from ``[adapters.<id>] extra_args`` for this target.
     #: An adapter that supports passthrough flags (e.g. Ollama, LM Studio) appends these to its argv.
     extra_args: list[str] = Field(default_factory=list)
+    #: The resolved reasoning-effort tier for this call (F8a, 2-L), or ``None`` when none was requested.
+    #: The service applies ``map_effort`` generically; an adapter whose effort is encoded in the model id
+    #: (Cursor) reads this in ``build_invocation`` to rewrite the model.
+    effort: Effort | None = None
 
 
 # --- Delegation request / result --------------------------------------------
@@ -271,6 +341,11 @@ class DelegationRequest(BaseModel):
     safety_mode: SafetyMode = SafetyMode.READ_ONLY
     mode: DelegationMode = DelegationMode.SYNC
     timeout_s: float | None = None
+    #: The reasoning-effort tier to ask the CLI to spend (F8a, decision 2-L), the producer "how much may
+    #: it think" knob -- distinct from ``timeout_s`` (the unresponsiveness fault). Mapped per adapter to
+    #: its native flag (``map_effort``), clamped to the nearest supported tier, no-op + reported where
+    #: unsupported. ``None`` follows the configured ``default_effort``.
+    effort: Effort | None = None
     session_id: str | None = None
     include_raw: bool = False
     #: Persist this run as a durable job under ``<jobs_dir>/<run_id>/`` (Model A: durability is
@@ -335,6 +410,21 @@ class DelegationResult(BaseModel):
     #: suggestion to keep a complex run as a job). ``None`` when there are none, so the field is absent
     #: from the wire. Never affects the result -- a UX channel, not an error.
     notice: str | None = None
+    #: stdout the CLI wrote before it was cut, preserved instead of discarded (F8a, 2-F). Set when a panel
+    #: time-budget deadline harvested this voice in-flight, and also on a single-delegation ``timeout`` (the
+    #: degenerate budget case, 2-behavior). A candidate answer for an adapter whose ``supports_partial_output``
+    #: is true, a trace otherwise -- but never the answer ``text`` itself. ``None`` when the run finished
+    #: cleanly (the answer is in ``text``).
+    partial: str | None = None
+    #: Why this run stopped, when not a clean finish: ``"budget"`` when a time budget harvested it.
+    #: ``None`` on a normal completion. A harvested run is still ``ok`` if it produced an answer (2-E').
+    stop_reason: str | None = None
+    #: The effort tier requested for this run (echo of the resolved request value), or ``None``.
+    effort: Effort | None = None
+    #: The effort tier actually applied after the adapter clamped to its supported range (F8a, 2-L-map).
+    #: May differ from ``effort`` (e.g. xhigh clamped to high), or be ``None`` when the adapter has no
+    #: effort knob (a no-op) or nothing ran.
+    effort_applied: Effort | None = None
 
 
 # --- Consensus ---------------------------------------------------------------
@@ -378,6 +468,25 @@ class ConsensusRequest(BaseModel):
     persist: bool | None = None
     #: Suppress the suggest-a-job advisory notice when an external orchestrator already tracks this run.
     external_tracking: bool = False
+    #: The reasoning-effort tier asked of every voice (F8a, 2-L); ``None`` follows ``default_effort``.
+    effort: Effort | None = None
+    #: Wall-clock allotment for the WHOLE panel (F8a, 2-A'/2-where), a harvest deadline distinct from each
+    #: voice's ``timeout_s`` fault. At the deadline, answered voices are kept and in-flight ones are cut;
+    #: the panel aggregates over the harvested set if ``min_quorum`` holds. ``None`` follows the configured
+    #: ``default_time_budget_s`` (no budget out of the box).
+    time_budget_s: float | None = None
+    #: What to do at the deadline (2-M): ``harvest`` (cut the stragglers), ``continue`` (the budget is
+    #: advisory -- every voice runs to completion), or ``resume`` (cut the stragglers; today equivalent to
+    #: ``harvest`` because a voice cut mid-run has no established session to record -- the deliberate
+    #: come-back to a cut voice rides the item-9 continuation primitive). ``None`` follows the configured
+    #: ``default_on_budget`` (``harvest`` out of the box), so an omitted value honors the workspace default.
+    on_budget: OnBudget | None = None
+    #: Active resumable harvest (F8a, 2-I): when ``True``, at the deadline a cut voice whose adapter supports
+    #: resume and whose in-flight session was recovered (from its streamed partial) gets a bounded "you're
+    #: out of time, give your current best answer" follow-up against that session, and its clean answer
+    #: replaces the raw partial. Opt-in because the follow-up itself spends budget you may be out of. A cut
+    #: voice with no recoverable session (a single-envelope adapter, or nothing streamed) is unaffected.
+    harvest_partial: bool = False
 
 
 class SkippedTarget(BaseModel):
@@ -409,6 +518,12 @@ class ConsensusResult(BaseModel):
     #: The directory this panel was persisted to when kept as a job (the parent record, with a child
     #: record per voice). ``None`` for an ephemeral panel.
     run_dir: str | None = None
+    #: ``"budget"`` when a time budget harvested this panel (some voices were cut at the deadline);
+    #: ``None`` on a normal completion (F8a, 2-E'). The panel is still ``ok`` if quorum held.
+    stop_reason: str | None = None
+    #: Per-run budget/effort rollup; set only when a time budget governed the panel (F8a). ``None``
+    #: otherwise.
+    rollup: RunRollup | None = None
 
 
 # --- Consensus strategies ----------------------------------------------------
@@ -439,6 +554,9 @@ class VoiceVerdict(BaseModel):
     #: The effective provider/model that answered this seat (F3), carried from the voice's result so a
     #: strategy reader sees per-voice identity. ``None`` when undetermined.
     provenance: Provenance | None = None
+    #: The effort tier this seat actually applied (F8a, 2-L), carried from the voice's result. ``None``
+    #: when the adapter has no effort knob or no effort was requested.
+    effort_applied: Effort | None = None
 
 
 class StrategyResult(BaseModel):
@@ -463,6 +581,10 @@ class StrategyResult(BaseModel):
     #: The directory this panel was persisted to when kept as a job (parent + a child record per voice).
     #: ``None`` for an ephemeral panel.
     run_dir: str | None = None
+    #: ``"budget"`` when a time budget harvested this panel; ``None`` on a normal completion (F8a, 2-E').
+    stop_reason: str | None = None
+    #: Per-run budget/effort rollup; set only when a time budget governed the panel. ``None`` otherwise.
+    rollup: RunRollup | None = None
 
 
 # --- Debate ------------------------------------------------------------------
@@ -499,6 +621,19 @@ class DebateRequest(BaseModel):
     persist: bool | None = None
     #: Suppress the suggest-a-job advisory notice when an external orchestrator already tracks this run.
     external_tracking: bool = False
+    #: The reasoning-effort tier asked of every voice (F8a, 2-L); ``None`` follows ``default_effort``.
+    effort: Effort | None = None
+    #: Wall-clock allotment for the WHOLE debate (F8a, 2-A'/2-where/2-behavior). Each round runs under the
+    #: REMAINING budget via ``asyncio.wait``: a turn still in flight when the deadline is reached is cut (its
+    #: process tree killed), the turns that finished keep their answers, and the transcript-so-far is
+    #: finalized with the closing running over what completed. So the budget bounds the debate's real
+    #: wall-clock, not just how many whole rounds run. A harvest that leaves fewer than ``min_quorum`` usable
+    #: positions in the last round is ``BUDGET_EXHAUSTED`` (2-E'). ``None`` follows ``default_time_budget_s``.
+    time_budget_s: float | None = None
+    #: What to do at the deadline (2-M): ``harvest`` | ``continue`` (advisory; run every round) | ``resume``
+    #: (today equivalent to ``harvest``; the deliberate come-back rides the item-9 primitive). ``None``
+    #: follows the configured ``default_on_budget`` (``harvest`` out of the box).
+    on_budget: OnBudget | None = None
 
 
 class DebateContribution(BaseModel):
@@ -526,12 +661,24 @@ class DebateContribution(BaseModel):
     duration_s: float = 0.0
     error: ErrorInfo | None = None
     fallback_from: str | None = None
+    #: This turn's resume session handle, carried from the voice's result so the debate parent's roster can
+    #: record each seat's handle in ``state.toon`` for a later continuation (F8a, 2-I). ``None`` when the
+    #: CLI established no resumable session.
+    session_id: str | None = None
+    #: stdout this turn streamed before a time-budget deadline cut it (F8a, 2-F: capture always). A debate
+    #: turn cut mid-flight is a trace, not a stance (a rebuttal assumes each voice saw the others' complete
+    #: positions), so the partial is preserved here for the transcript/audit but never promoted to ``text``.
+    #: ``None`` when the turn finished cleanly.
+    partial: str | None = None
     #: The effective provider/model that produced this turn (F3), carried from the voice's result.
     #: ``None`` when undetermined.
     provenance: Provenance | None = None
     #: The cost this turn reported, carried from the voice's result, so a persisted debate's parent can
     #: roll up panel cost into ``state.toon`` (decision 1-D). ``None`` when the CLI reported none.
     cost: Cost | None = None
+    #: The effort tier this turn actually applied (F8a, 2-L), carried from the voice's result. ``None``
+    #: when the adapter has no effort knob or no effort was requested.
+    effort_applied: Effort | None = None
     #: The files this turn changed (a write-mode debate), carried from the voice's result so the parent
     #: rolls up the panel's changed-file union (decision 1-D), mirroring consensus. Empty for a read run.
     changed_files: list[str] = Field(default_factory=list)
@@ -571,6 +718,11 @@ class DebateResult(BaseModel):
     #: The directory this debate was persisted to when kept as a job (parent + a child record per
     #: voice/round). ``None`` for an ephemeral debate.
     run_dir: str | None = None
+    #: ``"budget"`` when a time budget finalized this debate early (at a round boundary); ``None`` on a
+    #: normal completion (F8a, 2-E').
+    stop_reason: str | None = None
+    #: Per-run budget/effort rollup; set only when a time budget governed the debate. ``None`` otherwise.
+    rollup: RunRollup | None = None
 
 
 # --- Jobs --------------------------------------------------------------------
@@ -611,11 +763,15 @@ class Topology(BaseModel):
 
 
 class PanelTarget(BaseModel):
-    """One seat of a persisted panel's resolved roster: the CLI, its model, and any stance steering."""
+    """One seat of a persisted panel's resolved roster: the CLI, its model, stance, and resume handle."""
 
     cli: str
     model: str | None = None
     stance: Stance | None = None
+    #: The seat's resume session handle, recorded in the parent ``state.toon`` so a later continuation can
+    #: resume it (F8a, 2-I) -- in particular a voice cut at the time budget, which has no child record of its
+    #: own (its handle is recovered from the harvested partial). ``None`` when the seat established no session.
+    session_id: str | None = None
 
 
 class PanelInputs(BaseModel):
@@ -682,6 +838,11 @@ class RunRecord(BaseModel):
     adapter_version: str | None = None
     provenance: Provenance | None = None
     safety_mode: SafetyMode = SafetyMode.READ_ONLY
+    #: The reasoning-effort tier requested for this run, and the tier actually applied after the adapter
+    #: clamped to its supported range (F8a, 2-L). ``None`` when no effort was requested or the adapter
+    #: has no knob (a no-op).
+    requested_effort: Effort | None = None
+    effort_applied: Effort | None = None
     #: Process/agent fan-out slot (decision 1-D), reserved for the item-3 N1 work; unset today.
     topology: Topology | None = None
     # --- the pinned invocation (replay-complete; no env -- it can hold secrets) ---
@@ -700,6 +861,11 @@ class RunRecord(BaseModel):
     error_code: ErrorCode | None = None
     changed_files: list[str] = Field(default_factory=list)
     cost: Cost | None = None
+    #: Why the run stopped when not a clean finish: ``"budget"`` for a time-budget harvest (F8a, 2-E').
+    #: ``None`` on a normal completion.
+    stop_reason: str | None = None
+    #: Per-run budget/effort rollup for a panel parent governed by a time budget (F8a). ``None`` otherwise.
+    rollup: RunRollup | None = None
 
 
 # --- Health / capability reporting ------------------------------------------

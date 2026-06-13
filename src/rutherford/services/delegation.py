@@ -21,7 +21,7 @@ from pathlib import Path
 from ..adapters.base import CLIAdapter
 from ..adapters.registry import AdapterRegistry
 from ..config.schema import RutherfordConfig
-from ..domain.enums import JobStatus, is_mutating
+from ..domain.enums import Effort, JobStatus, SafetyMode, is_mutating
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import DepthLimitError, RegistryError, RutherfordError
 from ..domain.models import (
@@ -33,6 +33,7 @@ from ..domain.models import (
     ProcessResult,
     Provenance,
     RunRecord,
+    Target,
 )
 from ..io.ledger import RunLedger
 from ..runtime.cooldown import CooldownTracker
@@ -104,8 +105,14 @@ class DelegationService:
         correlation_id: str = "",
         base_depth: int = 0,
         on_progress: ProgressCallback | None = None,
+        on_stdout: ProgressCallback | None = None,
     ) -> DelegationResult:
-        """Run ``req`` against its target CLI and return the normalized result."""
+        """Run ``req`` against its target CLI and return the normalized result.
+
+        ``on_stdout`` (F8a, 2-F/2-G) receives the CLI's stdout lines as they stream, distinct from
+        ``on_progress`` (stderr). A panel uses it to accumulate a per-voice partial answer that survives a
+        time-budget cut; the jobs layer tees it into the run's artifacts. ``None`` disables streaming.
+        """
         created_at = self._clock()
         # Fill in the per-adapter configured default model when the call names none, so
         # ``[adapters.<id>] default_model`` is honored before the adapter ever sees the request.
@@ -113,6 +120,9 @@ class DelegationService:
             configured = self._config.default_model_for(req.target.cli)
             if configured:
                 req = req.model_copy(update={"target": req.target.model_copy(update={"model": configured})})
+        # Resolve the reasoning-effort tier the same way (call value wins, else the configured default),
+        # so an adapter's map_effort/build_invocation and the result stamp all see one resolved value (F8a).
+        effort = req.effort if req.effort is not None else self._config.effort_for(req.target.cli)
         ctx = InvocationContext(
             target=req.target,
             safety_mode=req.safety_mode,
@@ -120,6 +130,7 @@ class DelegationService:
             correlation_id=correlation_id,
             session_id=req.session_id,
             extra_args=self._config.extra_args_for(req.target.cli),
+            effort=effort,
         )
 
         try:
@@ -165,11 +176,13 @@ class DelegationService:
         # Snapshot the changed files before a mutating persisted run so the record reports its delta.
         before_changed = await self._snapshot_changed_files(req)
 
-        result, raw, spec = await self._execute(adapter, req, ctx, base_depth, on_progress)
+        result, raw, spec = await self._execute(adapter, req, ctx, base_depth, on_progress, on_stdout)
 
         fallback_model = self._model_fallback_for(adapter, req, result)
         if fallback_model is not None:
-            result, raw, spec = await self._fallback(adapter, req, ctx, base_depth, on_progress, fallback_model)
+            result, raw, spec = await self._fallback(
+                adapter, req, ctx, base_depth, on_progress, on_stdout, fallback_model
+            )
 
         # Refine a generic non-zero exit into a specific failure category (rate-limit / auth / context
         # overflow / model-unavailable) so a caller -- and the fallback decision below -- can act on it.
@@ -192,7 +205,7 @@ class DelegationService:
             and result.error is not None
             and is_retryable(result.error.code)
         ):
-            recovered = await self._fallback_chain(req, result, correlation_id, base_depth, on_progress)
+            recovered = await self._fallback_chain(req, result, correlation_id, base_depth, on_progress, on_stdout)
             if recovered is not None:
                 self._log_delegation(req, result, correlation_id, base_depth)
                 return recovered
@@ -219,6 +232,11 @@ class DelegationService:
         # the detect() probe already run above -- no extra subprocess). Best-effort: a buggy provenance
         # hook must never fail the delegation, and an all-unknown result keeps provenance absent.
         result.provenance = self._provenance(adapter, ctx, result, detected.version)
+        # F8a: stamp the requested effort and the tier the adapter actually applied (after its clamp), so
+        # a budget that silently did nothing is never silent. Best-effort: a buggy map_effort must not
+        # fail a delegation that produced an answer.
+        result.effort = effort
+        result.effort_applied = self._effort_applied(adapter, effort)
         result.raw = _combine_raw(raw) if (req.include_raw and raw is not None) else None
         self._log_delegation(req, result, correlation_id, base_depth)
         # Off-thread: persistence runs blocking git subprocesses + file I/O, and delegate() is the
@@ -258,6 +276,7 @@ class DelegationService:
         ctx: InvocationContext,
         base_depth: int,
         on_progress: ProgressCallback | None,
+        on_stdout: ProgressCallback | None = None,
     ) -> tuple[DelegationResult, ProcessResult | None, InvocationSpec | None]:
         """Build, run, and parse one invocation. Returns the result, its raw process output, and the spec.
 
@@ -299,7 +318,7 @@ class DelegationService:
         # pure build/parse, to keep the critical section to the expensive part.
         try:
             async with self._semaphore:
-                raw = await self._runner.run(spec, timeout, on_progress)
+                raw = await self._runner.run(spec, timeout, on_progress, on_stdout)
         except OSError as exc:  # the subprocess could not be launched (a broken shim, a runtime error)
             return self._fail(ctx, ErrorCode.SPAWN_FAILED, f"failed to launch {req.target.cli}: {exc}"), None, spec
 
@@ -345,6 +364,7 @@ class DelegationService:
         ctx: InvocationContext,
         base_depth: int,
         on_progress: ProgressCallback | None,
+        on_stdout: ProgressCallback | None,
         fallback_model: str,
     ) -> tuple[DelegationResult, ProcessResult | None, InvocationSpec | None]:
         """Re-run the request once with ``fallback_model``, recording the fallback."""
@@ -352,7 +372,7 @@ class DelegationService:
         fb_target = req.target.model_copy(update={"model": fallback_model})
         fb_req = req.model_copy(update={"target": fb_target, "allow_model_fallback": False})
         fb_ctx = ctx.model_copy(update={"target": fb_target})
-        result, raw, spec = await self._execute(adapter, fb_req, fb_ctx, base_depth, on_progress)
+        result, raw, spec = await self._execute(adapter, fb_req, fb_ctx, base_depth, on_progress, on_stdout)
         result.fallback_from = original_model or "(default)"
         return result, raw, spec
 
@@ -407,6 +427,7 @@ class DelegationService:
         correlation_id: str,
         base_depth: int,
         on_progress: ProgressCallback | None,
+        on_stdout: ProgressCallback | None = None,
     ) -> DelegationResult | None:
         """Try each fallback target in order; return the first successful, fully-processed result.
 
@@ -428,6 +449,7 @@ class DelegationService:
                 correlation_id=f"{correlation_id}:fb{index}",
                 base_depth=base_depth,
                 on_progress=on_progress,
+                on_stdout=on_stdout,
             )
             if recovered.ok:
                 recovered.fallback_chain = failed_labels
@@ -459,6 +481,61 @@ class DelegationService:
     def _should_persist(self, req: DelegationRequest) -> bool:
         """Whether this run should be kept as a durable job (F2); see ``RutherfordConfig.wants_persist``."""
         return self._config.wants_persist(req.persist)
+
+    def _effort_applied(self, adapter: CLIAdapter, effort: Effort | None) -> Effort | None:
+        """The effort tier the adapter will actually apply after its clamp (F8a), or ``None``.
+
+        ``None`` when no effort was requested or the adapter has no knob (a no-op ``map_effort``).
+        Best-effort: a buggy ``map_effort`` degrades to ``None`` rather than failing a produced answer.
+        """
+        if effort is None:
+            return None
+        try:
+            return adapter.map_effort(effort).applied
+        except Exception:
+            return None
+
+    def resolve_effort(self, cli: str, effort: Effort | None) -> Effort | None:
+        """The effort a ``cli`` voice runs with: the call value, else the configured default (F8a, 2-L).
+
+        Public so a panel (consensus/debate) reports the SAME resolved tier on a voice it cut at the budget
+        -- whose subprocess was launched with this effort -- as the delegation hot path uses internally.
+        """
+        return effort if effort is not None else self._config.effort_for(cli)
+
+    def applied_effort(self, cli: str, effort: Effort | None) -> Effort | None:
+        """The tier ``cli``'s adapter actually applies for ``effort`` (F8a, 2-L-map), or ``None``.
+
+        Public companion to :meth:`resolve_effort`, used by a panel to stamp ``effort_applied`` on a cut
+        voice (no full delegation result of its own). Best-effort: an unknown cli or buggy hook -> ``None``.
+        """
+        if effort is None:
+            return None
+        try:
+            return self._effort_applied(self._registry.get(cli), effort)
+        except Exception:
+            return None
+
+    def recover_session(
+        self, target: Target, partial_text: str, safety_mode: SafetyMode, effort: Effort | None
+    ) -> str | None:
+        """Recover a resumable session handle from a cut voice's streamed partial (F8a, 2-I), or ``None``.
+
+        Parses the partial through the adapter's ``parse_output`` (``supports_partial_output`` only -- a
+        single-envelope adapter streams no session before the end), returning the session the stream
+        established even when no answer was produced yet, so a cut voice can be resumed later. Best-effort:
+        an unknown cli, a non-partial adapter, an empty partial, or a raising parse all yield ``None``.
+        """
+        if not partial_text.strip():
+            return None
+        try:
+            adapter = self._registry.get(target.cli)
+            if not adapter.capabilities().supports_partial_output:
+                return None
+            ctx = InvocationContext(target=target, safety_mode=safety_mode, effort=effort)
+            return adapter.parse_output(ProcessResult(exit_code=0, stdout=partial_text), ctx).session_id
+        except Exception:
+            return None
 
     async def _snapshot_changed_files(self, req: DelegationRequest) -> set[str] | None:
         """Off-thread before-snapshot of the working tree's changed files, for a mutating persisted run.
@@ -530,6 +607,10 @@ class DelegationService:
             adapter_version=adapter_version,
             provenance=result.provenance,
             safety_mode=req.safety_mode,
+            # F8a: the effort requested for this run and the tier the adapter actually applied (post-clamp),
+            # so a persisted record shows what the producer was asked to spend and what was enforced.
+            requested_effort=result.effort,
+            effort_applied=result.effort_applied,
             argv=list(spec.argv) if spec is not None else [],
             cwd=spec.cwd if spec is not None else req.working_dir,
             prompt=req.prompt,
@@ -539,6 +620,9 @@ class DelegationService:
             error_code=result.error.code if result.error is not None else None,
             changed_files=result.changed_files or [],
             cost=result.cost,
+            # F8a: a leaf run harvested at a panel budget carries its stop_reason so the child record
+            # agrees with the parent's harvest disposition. ``None`` on a clean finish.
+            stop_reason=result.stop_reason,
         )
         try:
             run_dir = self._ledger.write(record, answer=result.text, diff=diff)
