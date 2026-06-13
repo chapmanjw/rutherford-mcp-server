@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..domain.enums import JobStatus, SafetyMode
-from ..domain.models import Cost, RunRecord
+from ..domain.models import Cost, PanelInputs, RunRecord
 from ..io.ledger import RunLedger
 from ..runtime.logging import log_event
 
@@ -59,6 +59,7 @@ def write_panel_record(
     cwd: str | None = None,
     files: list[str] | None = None,
     role: str | None = None,
+    panel: PanelInputs | None = None,
     extra_artifacts: dict[str, str] | None = None,
 ) -> str | None:
     """Write a panel's parent :class:`RunRecord` linking its child voice records; return its run_dir.
@@ -67,8 +68,9 @@ def write_panel_record(
     produced an answer. ``clis`` are the distinct voice CLIs (a readable panel label); ``voices`` are the
     per-voice outcomes in panel order -- their ``run_id``s become the parent's ``child_run_ids``, their
     ``ok`` flags decide the parent ``status`` (succeeded when any voice answered, else failed), and their
-    ``cost`` / ``changed_files`` roll up onto the parent. ``safety_mode`` / ``cwd`` / ``files`` / ``role``
-    are the panel request's, captured so the parent record is replay-complete (decision 1-D). ``extra_artifacts``
+    ``cost`` / ``changed_files`` roll up onto the parent. ``safety_mode`` / ``cwd`` / ``files`` / ``role`` /
+    ``panel`` are the panel request's (``panel`` is the resolved orchestration config -- roster, strategy,
+    rounds, ...), captured so the parent record is replay-complete (decision 1-D). ``extra_artifacts``
     carries the parent's audit artifacts -- a consensus passes its ``voices/voice-N.md`` set (see
     :func:`render_panel_voice_files`), a debate passes its ``transcript.md``.
     """
@@ -86,6 +88,7 @@ def write_panel_record(
         cwd=cwd,
         role=role,
         files=list(files or []),
+        panel=panel,
         prompt=prompt,
         changed_files=_union_changed_files(voices),
         cost=_rollup_cost(voices),

@@ -54,6 +54,9 @@ async def delegate_tool(
         fallback=[as_target(entry) for entry in (fallback or [])],
     )
     correlation_id = app.new_correlation_id()
+    # A non-trivial delegation worth a suggest-a-job nudge (1-J): a mutating run, or a multi-target run --
+    # a fallback chain names alternate targets, so it is no longer a "plain single-target" delegation.
+    complex_run = is_mutating(request.safety_mode) or bool(request.fallback)
 
     if request.mode is DelegationMode.ASYNC:
         job = app.jobs.submit(
@@ -70,7 +73,7 @@ async def delegate_tool(
                 app,
                 job,
                 persist=request.persist,
-                complex_run=is_mutating(request.safety_mode),
+                complex_run=complex_run,
                 external_tracking=external_tracking,
             )
         )
@@ -78,7 +81,7 @@ async def delegate_tool(
     result = await app.delegation.delegate(request, correlation_id=correlation_id, base_depth=app.base_depth)
     result.notice = app.persistence_notice(
         persisted=result.run_dir is not None,
-        complex_run=is_mutating(request.safety_mode),
+        complex_run=complex_run,
         external_tracking=external_tracking,
     )
     return tool_success(result)

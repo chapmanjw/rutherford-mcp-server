@@ -188,6 +188,28 @@ async def test_async_submit_omits_notice_when_external_tracking(monkeypatch: pyt
     assert "notice" not in submitted
 
 
+async def test_fallback_chain_triggers_suggest_a_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1-J: a read-only delegate with a fallback chain names alternate targets -- a multi-target run, no
+    # longer "plain single-target read-only" -- so it should get the suggest-a-job nudge.
+    monkeypatch.chdir(tmp_path)
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+    )
+    app.setup_hint_emitted = True  # isolate from the first-run hint
+    out = _decode(await delegate_tool(app, cli="a", prompt="q", fallback=["b"]))
+    assert out["notice"] and "persist=true" in out["notice"]
+
+
+async def test_plain_read_only_delegate_stays_quiet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The other side of 1-J: a plain single-target read-only delegation (no fallback) gets no notice.
+    monkeypatch.chdir(tmp_path)
+    app = make_app(adapters=[FakeAdapter("a")], runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")))
+    app.setup_hint_emitted = True
+    out = _decode(await delegate_tool(app, cli="a", prompt="q"))
+    assert out.get("notice") is None
+
+
 async def test_consensus_tool_returns_voices() -> None:
     app = make_app(
         adapters=[FakeAdapter("a"), FakeAdapter("b")],

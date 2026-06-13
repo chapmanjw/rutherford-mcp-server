@@ -31,6 +31,8 @@ from ..domain.models import (
     DetectResult,
     DiversityReport,
     ErrorInfo,
+    PanelInputs,
+    PanelTarget,
     SkippedTarget,
     StrategyResult,
     Target,
@@ -150,6 +152,15 @@ class ConsensusService:
             # child record still on disk. The parent also rolls up the request's safety/files/role.
             panel_voices = [_panel_voice(voice) for voice in voices]
             skipped_pairs = [(entry.cli, entry.reason) for entry in skipped]
+            panel_inputs = PanelInputs(
+                targets=[
+                    PanelTarget(cli=voice.target.cli, model=voice.target.model, stance=voice.target.stance)
+                    for voice in voices
+                ],
+                strategy=req.strategy.value,
+                synthesize=req.synthesize,
+                judge=req.judge.display_label if req.judge else None,
+            )
             result.run_dir = await asyncio.to_thread(
                 write_panel_record,
                 self._ledger,
@@ -165,6 +176,7 @@ class ConsensusService:
                 cwd=req.working_dir,
                 files=req.files,
                 role=req.role,
+                panel=panel_inputs,
                 extra_artifacts=render_panel_voice_files(panel_voices, skipped_pairs),
             )
         return result

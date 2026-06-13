@@ -282,6 +282,44 @@ async def test_consensus_persists_a_parent_and_child_records(tmp_path: Path) -> 
         assert f"parent_run_id: {parent.name}" in (child / "state.toon").read_text(encoding="utf-8")
 
 
+async def test_consensus_parent_records_the_panel_orchestration_config(tmp_path: Path) -> None:
+    # 1-D (panel parent): the parent snapshots the panel's resolved config -- the seat roster (incl.
+    # per-target model) and the aggregation strategy -- so the panel, not just each voice, replays from
+    # the parent's state.toon. These semantics live on no child record.
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="approve")),
+        config=RutherfordConfig(jobs_dir=str(tmp_path / "jobs")),
+    )
+    result = await app.consensus.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="a"), Target(cli="b", model="m1")],
+            prompt="q",
+            strategy=Strategy.MAJORITY,
+            persist=True,
+        )
+    )
+    assert result.run_dir is not None
+    state = (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
+    assert "panel:" in state
+    assert "strategy: majority" in state
+    assert "cli: b" in state and "m1" in state  # the resolved roster incl. the per-target model
+
+
+async def test_debate_parent_records_rounds_in_the_panel_config(tmp_path: Path) -> None:
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="my position")),
+        config=RutherfordConfig(jobs_dir=str(tmp_path / "jobs")),
+    )
+    result = await app.debate.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, synthesize=False, persist=True)
+    )
+    assert result.run_dir is not None
+    state = (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
+    assert "panel:" in state and "rounds: 2" in state
+
+
 async def test_ephemeral_consensus_persists_nothing(tmp_path: Path) -> None:
     app = make_app(
         adapters=[FakeAdapter("a"), FakeAdapter("b")],

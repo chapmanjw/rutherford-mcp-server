@@ -610,6 +610,29 @@ class Topology(BaseModel):
     over_cap: bool = False
 
 
+class PanelTarget(BaseModel):
+    """One seat of a persisted panel's resolved roster: the CLI, its model, and any stance steering."""
+
+    cli: str
+    model: str | None = None
+    stance: Stance | None = None
+
+
+class PanelInputs(BaseModel):
+    """The resolved orchestration config of a persisted consensus/debate, captured on the panel PARENT
+    record so the panel -- not just each voice -- can be replayed or continued from ``state.toon`` alone
+    (decision 1-D for the panel parent). Leaf child records capture each voice's per-invocation argv/model;
+    these are the panel-level semantics that live on no child: the seat roster, the consensus aggregation
+    ``strategy``, whether a ``synthesize`` pass was requested, a debate's ``rounds``, and any ``judge``.
+    """
+
+    targets: list[PanelTarget] = Field(default_factory=list)
+    strategy: str | None = None
+    synthesize: bool | None = None
+    rounds: int | None = None
+    judge: str | None = None
+
+
 class RunRecord(BaseModel):
     """A durable, replay-complete record of one run, persisted as a job (F2).
 
@@ -669,6 +692,9 @@ class RunRecord(BaseModel):
     #: The role persona this run argued under, part of the recomposable input. ``None`` when unset.
     role: str | None = None
     files: list[str] = Field(default_factory=list)
+    #: For a panel PARENT record, the resolved panel orchestration config (seat roster, strategy,
+    #: synthesize, rounds, judge) so the panel replays from here; ``None`` for a leaf delegate record.
+    panel: PanelInputs | None = None
     # --- outputs ---
     ok: bool = True
     error_code: ErrorCode | None = None

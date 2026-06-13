@@ -34,6 +34,8 @@ from ..domain.models import (
     DelegationResult,
     DiversityReport,
     ErrorInfo,
+    PanelInputs,
+    PanelTarget,
     Target,
 )
 from ..io.ledger import RunLedger
@@ -123,6 +125,12 @@ class DebateService:
             # transcript.md already inlines every turn, so no separate voices.md is needed here.
             contributions = [c for round_ in rounds for c in round_.contributions]
             clis = sorted({c.target.cli for c in contributions})
+            panel_inputs = PanelInputs(
+                targets=[PanelTarget(cli=v.target.cli, model=v.target.model, stance=v.stance) for v in voices],
+                synthesize=req.synthesize,
+                rounds=req.rounds,
+                judge=req.judge.display_label if req.judge else None,
+            )
             result.run_dir = await asyncio.to_thread(
                 write_panel_record,
                 self._ledger,
@@ -138,6 +146,7 @@ class DebateService:
                 cwd=req.working_dir,
                 files=req.files,
                 role=req.role,
+                panel=panel_inputs,
                 extra_artifacts={"transcript.md": _render_transcript(req.prompt, rounds)},
             )
         return result

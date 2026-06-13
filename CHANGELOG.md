@@ -20,8 +20,10 @@ All notable changes to this project are documented in this file. The format is b
     `parent_run_id`, so a reader can open the parent and walk to each voice. The parent's status is
     derived from the voices (succeeded when any voice answered, failed when none did) and it rolls up
     the panel's duration, safety mode, working directory, files, role, the union of the voices' changed
-    files (consensus and debate alike), and the summed cost. A consensus adds one
-    `artifacts/voices/voice-N.md` per voice (plus a `voices/skipped.md`
+    files (consensus and debate alike), and the summed cost, plus the resolved panel orchestration config
+    (the seat roster with per-target models and stances, the consensus strategy, `synthesize`, a debate's
+    `rounds`, and any judge) so the panel itself -- not just each voice -- replays from the parent record.
+    A consensus adds one `artifacts/voices/voice-N.md` per voice (plus a `voices/skipped.md`
     naming any auto-panel adapters left out and why); a debate adds a `transcript.md` -- so the parent
     explains itself even when no child records remain.
   - A persisted write run records its own `changed_files` delta -- the files it dirtied, minus those
@@ -29,8 +31,9 @@ All notable changes to this project are documented in this file. The format is b
     own bookkeeping as a change to the user's code. The saved `diff.md` captures both tracked-file
     changes and the full contents of files the run *created* (plain `git diff` omits untracked files).
   - The first time a workspace is used, Rutherford notes once that runs are ephemeral by default and
-    how to keep one; for an unpersisted complex run (a panel, or a mutating delegation) it suggests
-    `persist=true`. The notice rides both the sync result and the `mode=async` submit envelope. The
+    how to keep one; for an unpersisted complex run (a panel, a mutating delegation, or a delegation with
+    a fallback chain) it suggests `persist=true`. The notice rides both the sync result and the
+    `mode=async` submit envelope. The
     `setup` tool takes a `default_persistence` (`ephemeral` | `job`) and a `scope` (`global` |
     `project`); `scope=project` writes the choice to the workspace's `.rutherford/config.toml` (now a
     loaded config location), answering the first-run hint for that workspace. `external_tracking=true`
