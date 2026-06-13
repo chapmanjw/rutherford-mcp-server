@@ -390,6 +390,7 @@ async def test_strategy_consensus_persists_a_parent_record(tmp_path: Path) -> No
     assert "kind: consensus" in parent_state
     assert "child_run_ids[2]" in parent_state
     assert f"status: {JobStatus.SUCCEEDED.value}" in parent_state  # derived from the answering voices
+    assert "ok: true" in parent_state  # ok tracks the derived status
     voices_dir = parent / "artifacts" / "voices"
     voice_files = sorted(p.name for p in voices_dir.glob("voice-*.md"))
     assert voice_files == ["voice-1.md", "voice-2.md"]  # one file per voice, the locked layout
@@ -411,7 +412,9 @@ async def test_all_voices_failed_persists_a_failed_parent(tmp_path: Path) -> Non
     )
     assert result.run_dir is not None
     parent = Path(result.run_dir)
-    assert f"status: {JobStatus.FAILED.value}" in (parent / "state.toon").read_text(encoding="utf-8")
+    parent_state = (parent / "state.toon").read_text(encoding="utf-8")
+    assert f"status: {JobStatus.FAILED.value}" in parent_state
+    assert "ok: false" in parent_state  # ok must track the derived status, not default to true
     voice_1 = (parent / "artifacts" / "voices" / "voice-1.md").read_text(encoding="utf-8")
     assert "(failed)" in voice_1
     assert "boom" in voice_1  # the actual error text is inlined, not just a (failed) marker
@@ -429,7 +432,9 @@ async def test_expand_all_with_everything_skipped_persists_an_auditable_failed_p
     result = await app.consensus.consensus(ConsensusRequest(targets=[], expand_all=True, prompt="q", persist=True))
     assert result.run_dir is not None
     parent = Path(result.run_dir)
-    assert f"status: {JobStatus.FAILED.value}" in (parent / "state.toon").read_text(encoding="utf-8")
+    parent_state = (parent / "state.toon").read_text(encoding="utf-8")
+    assert f"status: {JobStatus.FAILED.value}" in parent_state
+    assert "ok: false" in parent_state  # no voice answered -> failed and not-ok
     skipped_md = (parent / "artifacts" / "voices" / "skipped.md").read_text(encoding="utf-8")
     assert "Skipped" in skipped_md
     assert "a: " in skipped_md and "b: " in skipped_md  # both skipped adapters named with their reason

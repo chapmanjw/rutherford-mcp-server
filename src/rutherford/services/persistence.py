@@ -79,6 +79,9 @@ def write_panel_record(
         run_id=run_id,
         kind=kind,
         status=status,
+        # Keep ``ok`` consistent with the derived status: an all-failed panel must not record ok=true
+        # (the RunRecord default), which would contradict its own status: failed (1-D outputs).
+        ok=status is JobStatus.SUCCEEDED,
         created_at=created_at,
         finished_at=finished_at,
         duration_s=max(0.0, finished_at - created_at),
