@@ -22,10 +22,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..config.schema import RutherfordConfig
-from ..domain.enums import EFFORT_ORDER, SafetyMode, Stance
+from ..domain.enums import EFFORT_ORDER, ActivityEventKind, SafetyMode, Stance
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import (
+    ActivityEvent,
     Cost,
     DebateContribution,
     DebateRequest,
@@ -39,10 +40,11 @@ from ..domain.models import (
     PanelTarget,
     RunRollup,
     Target,
+    Topology,
 )
 from ..io.ledger import RunLedger
-from ..runtime.depth import ensure_within_target_cap
-from .delegation import DelegationService, ProgressCallback
+from ..runtime.depth import ensure_within_aggregate_cap, ensure_within_target_cap
+from .delegation import ActivityCallback, DelegationService, PanelLifecycle, ProgressCallback, emit_activity
 from .persistence import PanelVoice, live_tee, stop_live_tee, write_panel_record
 from .strategies import apply_stance, effective_diversity
 
@@ -85,6 +87,7 @@ class DebateService:
         correlation_id: str = "",
         base_depth: int = 0,
         on_progress: ProgressCallback | None = None,
+        on_activity: ActivityCallback | None = None,
     ) -> DebateResult:
         """Run ``req`` across its targets for up to ``rounds`` rounds and return the transcript.
 
@@ -92,11 +95,57 @@ class DebateService:
         round is recorded and drops out, and the debate stops early once fewer than two voices remain.
         With ``synthesize``, a closing pass over the final positions states where the panel landed.
         """
+        # N1 (3-K): wrap the whole debate run so a cancellation at ANY of its awaits (a round's turns, the
+        # live-tee stop, the closing synthesis, the record persist) closes the activity stream with exactly
+        # one terminal event. The lifecycle emits panel_started/finished from inside the body; here a cancel
+        # emits job_cancelled iff the debate started and has not already closed.
+        lifecycle = PanelLifecycle("debate", base_depth, on_activity)
+        try:
+            return await self._debate_impl(
+                req,
+                lifecycle,
+                correlation_id=correlation_id,
+                base_depth=base_depth,
+                on_progress=on_progress,
+                on_activity=on_activity,
+            )
+        except asyncio.CancelledError:
+            lifecycle.on_cancel()
+            raise
+
+    async def _debate_impl(
+        self,
+        req: DebateRequest,
+        lifecycle: PanelLifecycle,
+        *,
+        correlation_id: str = "",
+        base_depth: int = 0,
+        on_progress: ProgressCallback | None = None,
+        on_activity: ActivityCallback | None = None,
+    ) -> DebateResult:
+        """The debate body; the public :meth:`debate` wraps this with the lifecycle guard."""
         voices = self._resolve_voices(req)
         rounds_cap = self._resolve_rounds(req)
         created_at = self._clock()
         persist = self._config.wants_persist(req.persist)
         parent_run_id = uuid.uuid4().hex if persist and self._ledger is not None else None
+
+        # N1 (item 3): the declared width is the panel size. Check it against the advisory aggregate-agent
+        # cap up front (a no-op unless configured; refuses only with ``enforce_agent_cap``), and announce the
+        # debate as started so a sync caller sees the fan-out before the rounds run.
+        declared_width = len(voices)
+        ensure_within_aggregate_cap(
+            declared_width, self._config.max_agents_advisory, enforce=self._config.enforce_agent_cap
+        )
+        lifecycle.mark_started(
+            ActivityEvent(
+                kind=ActivityEventKind.PANEL_STARTED,
+                tool="debate",
+                depth=base_depth,
+                declared=declared_width,
+                message=f"debate started: {declared_width} voice(s), up to {rounds_cap} round(s)",
+            )
+        )
 
         # Time-budget harvest (F8a, 2-A'/2-where/2-behavior): each round runs under the REMAINING wall-clock
         # budget via ``asyncio.wait``; a turn still in flight when the deadline is reached is cut (its
@@ -125,7 +174,16 @@ class DebateService:
             _announce(on_progress, f"debate: round {round_index} of {rounds_cap} ({len(active)} voices)")
             previous = rounds[-1] if rounds else None
             contributions, round_cut = await self._run_round(
-                req, active, round_index, previous, correlation_id, base_depth, on_progress, parent_run_id, remaining
+                req,
+                active,
+                round_index,
+                previous,
+                correlation_id,
+                base_depth,
+                on_progress,
+                on_activity,
+                parent_run_id,
+                remaining,
             )
             if round_cut:  # turns were cut in-flight at the deadline -- finalize over the transcript so far
                 stop_reason = "budget"
@@ -149,6 +207,19 @@ class DebateService:
             usable_round = _last_usable_round(rounds)
             usable = sum(1 for c in usable_round.contributions if c.ok and c.text.strip()) if usable_round else 0
             if usable < self._config.min_quorum:
+                # N1 (3-K): a terminal outcome -- close the activity stream with a (failed) panel_finished
+                # BEFORE raising, so the stream/push has a terminal event on this failure path.
+                lifecycle.mark_closed(
+                    ActivityEvent(
+                        kind=ActivityEventKind.PANEL_FINISHED,
+                        tool="debate",
+                        depth=base_depth,
+                        declared=declared_width,
+                        done=usable,
+                        status="failed",
+                        message=f"debate budget exhausted: {usable} usable voice(s), below quorum",
+                    )
+                )
                 raise RutherfordError(
                     ErrorCode.BUDGET_EXHAUSTED,
                     f"time budget ({budget:.0f}s) reached with {usable} usable voice(s), below "
@@ -159,6 +230,8 @@ class DebateService:
         rollup = (
             self._rollup(req, rounds, budget, stop_reason, self._clock() - created_at) if budget is not None else None
         )
+        # N1 (item 3): the debate's observed fan-out across every round.
+        topology = self._topology(declared_width, rounds)
         result = DebateResult(
             prompt=req.prompt,
             rounds=rounds,
@@ -167,6 +240,7 @@ class DebateService:
             diversity=self._diversity(rounds),
             stop_reason=stop_reason,
             rollup=rollup,
+            topology=topology,
         )
         if parent_run_id is not None and self._ledger is not None:
             # Write the parent panel record linking every turn's child record, plus the transcript. The
@@ -206,8 +280,23 @@ class DebateService:
                 panel=panel_inputs,
                 stop_reason=stop_reason,
                 rollup=rollup,
+                topology=topology,
                 extra_artifacts={"transcript.md": _render_transcript(req.prompt, rounds)},
             )
+        # N1 (3-K): the terminal panel_finished is the LAST step (no await follows), so the lifecycle guard
+        # never has to choose between this and job_cancelled -- a cancel before here lands in the guard.
+        last_round = _last_usable_round(rounds)
+        lifecycle.mark_closed(
+            ActivityEvent(
+                kind=ActivityEventKind.PANEL_FINISHED,
+                tool="debate",
+                depth=base_depth,
+                declared=declared_width,
+                done=sum(1 for c in last_round.contributions if c.ok) if last_round else 0,
+                observed_agents=topology.observed_peak_agents,
+                message=f"debate finished: {len(rounds)} round(s)",
+            )
+        )
         return result
 
     def _diversity(self, rounds: list[DebateRound]) -> DiversityReport | None:
@@ -268,6 +357,27 @@ class DebateService:
             effort_requested=effort_requested,
             effort_applied=effort_applied,
             cost=_rollup_contribution_cost(all_contributions),
+        )
+
+    def _topology(self, declared_width: int, rounds: list[DebateRound]) -> Topology:
+        """The debate's observed process/agent fan-out across every round (N1, item 3).
+
+        ``declared`` is the panel width (intent); ``realized_delegations`` is the TOTAL subprocess delegations
+        Rutherford launched across all rounds, summed per turn and INCLUDING each turn's fallback re-runs
+        (decision 3-A) -- so a 3-voice 2-round debate with no fallback realizes 6, and a fallback pushes it
+        higher. This cumulative fan-out is why ``over_cap`` (realized over the advisory cap) can trip even
+        when the panel width passed the up-front declared-width check. ``observed_peak_agents`` is the max
+        local descendant peak across the turns (a FLOOR; ``None`` when no turn was sampled).
+        """
+        contributions = [c for round_ in rounds for c in round_.contributions]
+        observed = [c.observed_peak_agents for c in contributions if c.observed_peak_agents is not None]
+        realized = sum(c.delegation_call_count for c in contributions)
+        cap = self._config.max_agents_advisory
+        return Topology(
+            declared=declared_width,
+            realized_delegations=realized,
+            observed_peak_agents=max(observed) if observed else None,
+            over_cap=cap is not None and realized > cap,
         )
 
     def _resolve_voices(self, req: DebateRequest) -> list[_Voice]:
@@ -335,6 +445,7 @@ class DebateService:
         correlation_id: str,
         base_depth: int,
         on_progress: ProgressCallback | None,
+        on_activity: ActivityCallback | None,
         parent_run_id: str | None,
         remaining_budget: float | None,
     ) -> tuple[list[DebateContribution], bool]:
@@ -377,6 +488,7 @@ class DebateService:
                 base_depth=base_depth,
                 on_progress=on_progress,
                 on_stdout=partials[index].append,
+                on_activity=on_activity,  # N1: each turn emits its own voice_started/voice_finished
             )
             return _to_contribution(voice, round_index, result)
 
@@ -395,10 +507,37 @@ class DebateService:
             if remaining_budget is not None:
                 _done, pending = await asyncio.wait(tasks, timeout=max(0.0, remaining_budget))
                 if pending:
+                    # N1: one budget_tick at the round's deadline, then a cut event per turn harvested.
+                    emit_activity(
+                        on_activity,
+                        ActivityEvent(
+                            kind=ActivityEventKind.BUDGET_TICK,
+                            tool="debate",
+                            depth=base_depth,
+                            budget_left_s=0.0,
+                            message=f"round {round_index} reached the time budget; cutting {len(pending)} turn(s)",
+                        ),
+                    )
                     for index, task in enumerate(tasks):
                         if task in pending:
                             cut.add(index)
                             task.cancel()
+                            emit_activity(
+                                on_activity,
+                                ActivityEvent(
+                                    kind=ActivityEventKind.CUT,
+                                    # The same per-turn correlation id its delegate used, so the cut collapses
+                                    # onto that turn's row (the stable key, robust to a model fallback).
+                                    correlation_id=f"{correlation_id}:r{round_index}:{voices[index].index}",
+                                    tool="debate",
+                                    cli=voices[index].target.cli,
+                                    model=voices[index].target.model,
+                                    role=voices[index].role,
+                                    depth=base_depth,
+                                    status="cut",
+                                    message=f"{voices[index].label} cut at the time budget",
+                                ),
+                            )
                     # MANDATORY cancel-then-drain: the runner kills the CLI process tree only once the
                     # cancellation is delivered AND awaited -- skipping this leaks orphaned subprocesses.
                     await asyncio.gather(*pending, return_exceptions=True)
@@ -406,7 +545,8 @@ class DebateService:
                 await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
             # An external cancel of the whole debate: asyncio.wait/gather do not cancel the turn tasks for
-            # us, so cancel + drain them (no orphaned trees) before propagating.
+            # us, so cancel + drain them (no orphaned trees) before propagating. The terminal job_cancelled
+            # activity event is emitted once by the panel-lifecycle guard in ``debate``.
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -585,6 +725,8 @@ def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) 
         provenance=result.provenance,
         cost=result.cost,
         effort_applied=result.effort_applied,
+        observed_peak_agents=result.observed_peak_agents,  # N1: carried so the parent rolls panel topology
+        delegation_call_count=result.delegation_call_count,  # N1 (3-A): incl. this turn's fallback re-runs
         changed_files=list(result.changed_files or []),
         run_dir=result.run_dir,
     )

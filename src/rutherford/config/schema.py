@@ -70,6 +70,16 @@ class RutherfordConfig(BaseModel):
     max_depth: int = Field(default=3, ge=1, le=10)
     #: Maximum number of targets a single consensus call may fan out to.
     max_targets: int = Field(default=8, ge=1, le=32)
+    #: Optional ADVISORY aggregate-agent ceiling (N1, item 3): when set, a panel whose declared width
+    #: exceeds it is flagged (``Topology.over_cap``) and a warning is logged, so runaway fan-out is visible
+    #: without being blocked. ``None`` (the default) disables the check. Distinct from ``max_targets`` (the
+    #: always-on per-call cap): this is the cross-cutting "how many agents total" budget, observed not
+    #: enforced unless ``enforce_agent_cap`` is also set. A floor, since psutil sees only local processes.
+    max_agents_advisory: int | None = Field(default=None, ge=2)
+    #: Hard-enforce the advisory cap (N1, item 3): when ``True`` and ``max_agents_advisory`` is set, a panel
+    #: whose declared width exceeds the cap is REFUSED up front with ``AGENT_CAP_EXCEEDED`` instead of merely
+    #: warned. Default ``False`` -- the cap is observe-and-warn out of the box (decision: advisory first).
+    enforce_agent_cap: bool = False
     #: Maximum number of rounds a single debate call may run (each round is a full panel pass).
     max_debate_rounds: int = Field(default=4, ge=1, le=10)
     #: Minimum number of parseable voices (ok, with an extracted verdict) an aggregating consensus

@@ -10,23 +10,28 @@ different transport without touching it.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import os
 import sys
 from collections.abc import Awaitable
 from typing import Any
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
 from . import __version__
 from .context import AppContext, build_app_context, error_payload_from, tool_error
+from .domain.enums import ActivityEventKind
 from .domain.error_codes import ErrorCode
 from .domain.errors import ConfigError, RutherfordError
-from .domain.models import Target
+from .domain.models import ActivityEvent, Target
 from .runtime.logging import configure_logging
+from .services.delegation import ActivityCallback
 from .services.probing import probe_adapter
 from .services.setup import apply_setup_plan, build_setup_plan, format_plan_summary
+from .tools.activity import activity_tool
 from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
 from .tools.debate import debate_tool
@@ -87,6 +92,59 @@ async def _guarded(coro: Awaitable[str]) -> str:
         raise ToolError(tool_error(ErrorCode.INTERNAL, "internal server error; see the server log")) from exc
 
 
+async def _report_progress(context: Context, progress: float, total: float | None, message: str | None) -> None:
+    """Send one MCP progress notification, swallowing any transport error (N1, item 3 push, best-effort).
+
+    A no-op on the client side unless the caller supplied a ``progressToken`` (FastMCP gates it), so this is
+    always safe to call; ``message`` ``None`` when an event carried no text.
+    """
+    with contextlib.suppress(Exception):
+        await context.report_progress(progress, total, message)
+
+
+def make_progress_pusher(context: Context) -> ActivityCallback:
+    """Build the live-activity sink that pushes a sync call's :class:`ActivityEvent`s as MCP progress (N1).
+
+    The PUSH half of N1 (the ``activity`` tool is the poll half): each event becomes a ``report_progress``
+    notification so the caller sees a sync panel advance live. Only meaningful for a synchronous call -- an
+    async job returns a job id immediately, so its progress is polled, not pushed. ``progress`` counts the
+    voices finished and ``total`` the panel's declared width once known, so a client can show a real
+    fraction. The notification is fire-and-forget (scheduled, not awaited) so a slow client never stalls the
+    run; the tasks are tracked in a set so they are not garbage-collected before they send.
+    """
+    total: int | None = None
+    done = 0
+    resolved: set[str] = set()  # correlation ids already counted, so a voice is counted at most once
+    pending: set[asyncio.Task[None]] = set()
+
+    def push(event: ActivityEvent) -> None:
+        nonlocal total, done
+        if event.kind is ActivityEventKind.PANEL_STARTED and event.declared:
+            # Only a consensus resolves exactly one voice per declared seat (each ends finished OR cut), so
+            # its done/declared is a true fraction. A debate resolves one per TURN across rounds (turns
+            # exceed the width, and the count varies with early stop), so it stays indeterminate -- a total
+            # here would be passed and then overshot ("4/2"). The push fraction is consensus-only by design.
+            if event.tool == "consensus":
+                total = event.declared
+        elif event.kind in (ActivityEventKind.VOICE_FINISHED, ActivityEventKind.CUT):
+            # A voice is resolved either way -- it finished, or a budget deadline cut it (the cut path emits
+            # no voice_finished). Count each voice ONCE, keyed by its correlation id, so a harvested voice
+            # (cut, then a follow-up finish reusing the same id) does not double-count past the declared total.
+            cid = event.correlation_id
+            if cid is None or cid not in resolved:
+                if cid is not None:
+                    resolved.add(cid)
+                done += 1
+        elif event.kind is ActivityEventKind.PANEL_FINISHED and total is not None:
+            done = int(total)  # the panel is complete: snap to 100% regardless of any cut/escape accounting
+        cap = float(total) if total else None
+        task = asyncio.create_task(_report_progress(context, float(done), cap, event.message or None))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    return push
+
+
 @mcp.tool
 async def delegate(
     cli: str,
@@ -105,6 +163,7 @@ async def delegate(
     persist: bool | None = None,
     external_tracking: bool = False,
     fallback: list[str] | None = None,
+    ctx: Context | None = None,
 ) -> str:
     """Delegate a task to one CLI and return its normalized result.
 
@@ -140,6 +199,7 @@ async def delegate(
             persist=persist,
             external_tracking=external_tracking,
             fallback=fallback,
+            on_activity=make_progress_pusher(ctx) if ctx is not None else None,
         )
     )
 
@@ -168,6 +228,7 @@ async def consensus(
     include_raw: bool = False,
     persist: bool | None = None,
     external_tracking: bool = False,
+    ctx: Context | None = None,
 ) -> str:
     """Ask the same prompt of several targets in parallel and return every voice.
 
@@ -214,6 +275,7 @@ async def consensus(
             include_raw=include_raw,
             persist=persist,
             external_tracking=external_tracking,
+            on_activity=make_progress_pusher(ctx) if ctx is not None else None,
         )
     )
 
@@ -240,6 +302,7 @@ async def debate(
     include_raw: bool = False,
     persist: bool | None = None,
     external_tracking: bool = False,
+    ctx: Context | None = None,
 ) -> str:
     """Have several targets argue a question across rounds and return the full transcript.
 
@@ -280,6 +343,7 @@ async def debate(
             include_raw=include_raw,
             persist=persist,
             external_tracking=external_tracking,
+            on_activity=make_progress_pusher(ctx) if ctx is not None else None,
         )
     )
 
@@ -300,6 +364,20 @@ async def job_result(job_id: str) -> str:
 async def list_jobs() -> str:
     """List background jobs (id, kind, status, timestamps), newest first."""
     return await _guarded(list_jobs_tool(get_app()))
+
+
+@mcp.tool
+async def activity() -> str:
+    """Show a live, structured snapshot of in-flight work across running background jobs.
+
+    One row per voice/turn (job_id, tool, cli, model, role, status, elapsed, observed_agents, budget_left),
+    read from the same structured activity stream a synchronous call pushes -- the live in-flight tree.
+    Distinct from `list_jobs` (every job record, terminal ones included). Watch it while panels run; supply
+    a row's `job_id` to `cancel_job`. A synchronous call does not appear here (it has no job record); its
+    progress rides MCP progress notifications instead. `observed_agents` is a floor (psutil sees local
+    processes only).
+    """
+    return await _guarded(activity_tool(get_app()))
 
 
 @mcp.tool

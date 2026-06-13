@@ -365,6 +365,52 @@ async def test_debate_parent_records_rounds_in_the_panel_config(tmp_path: Path) 
     assert "fake-session" in state
 
 
+# --- N1 (item 3): persisted topology ------------------------------------------------------------
+
+
+async def test_leaf_record_persists_topology(tmp_path: Path) -> None:
+    # A single persisted delegation records its width-1 topology so a kept leaf carries its fan-out slot.
+    result = await _service(tmp_path).delegate(_req(persist=True))
+    assert result.run_dir is not None
+    state = (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
+    assert "topology:" in state
+    assert "declared: 1" in state
+    assert "realized_delegations: 1" in state
+
+
+async def test_consensus_parent_persists_topology(tmp_path: Path) -> None:
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok", observed_peak_agents=3)),
+        config=RutherfordConfig(jobs_dir=str(tmp_path / "jobs")),
+    )
+    result = await app.consensus.consensus(
+        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", persist=True)
+    )
+    assert result.run_dir is not None
+    state = (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
+    assert "topology:" in state
+    assert "declared: 2" in state
+    assert "realized_delegations: 2" in state
+    assert "observed_peak_agents: 3" in state  # the max local peak across the voices, persisted
+
+
+async def test_debate_parent_persists_topology(tmp_path: Path) -> None:
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="pos", observed_peak_agents=2)),
+        config=RutherfordConfig(jobs_dir=str(tmp_path / "jobs")),
+    )
+    result = await app.debate.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, synthesize=False, persist=True)
+    )
+    assert result.run_dir is not None
+    state = (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
+    assert "topology:" in state
+    assert "declared: 2" in state
+    assert "observed_peak_agents: 2" in state
+
+
 async def test_ephemeral_consensus_persists_nothing(tmp_path: Path) -> None:
     app = make_app(
         adapters=[FakeAdapter("a"), FakeAdapter("b")],

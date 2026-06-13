@@ -9,6 +9,7 @@ from typing import Any
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode, Stance
 from ..domain.models import DebateRequest, Target
+from ..services.delegation import ActivityCallback
 from .common import (
     as_target,
     async_job_envelope,
@@ -46,6 +47,7 @@ async def debate_tool(
     include_raw: bool = False,
     persist: bool | None = None,
     external_tracking: bool = False,
+    on_activity: ActivityCallback | None = None,
 ) -> str:
     """Run a multi-round debate across several CLIs and return the full transcript.
 
@@ -103,18 +105,22 @@ async def debate_tool(
             "debate",
             # A debate's rounds are sequential, so ``on_budget=continue`` means "run every round" rather than
             # detach-and-append parallel stragglers; it publishes no interim result (the second arg is unused).
-            lambda progress, _set_interim: app.debate.debate(
+            lambda progress, activity, _set_interim: app.debate.debate(
                 request,
                 correlation_id=correlation_id,
                 base_depth=app.base_depth,
                 on_progress=progress,
+                on_activity=activity,  # N1: the structured stream feeds the job's poll buffer (decision 3-K)
             ),
         )
         return tool_success(
             async_job_envelope(app, job, persist=persist, complex_run=True, external_tracking=external_tracking)
         )
 
-    result = await app.debate.debate(request, correlation_id=correlation_id, base_depth=app.base_depth)
+    # Sync path only: push live progress via MCP (N1, item 3); an async job is polled, not pushed.
+    result = await app.debate.debate(
+        request, correlation_id=correlation_id, base_depth=app.base_depth, on_activity=on_activity
+    )
     result.notice = app.persistence_notice(
         persisted=result.run_dir is not None, complex_run=True, external_tracking=external_tracking
     )

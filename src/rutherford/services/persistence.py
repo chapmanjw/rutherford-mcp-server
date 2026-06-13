@@ -22,7 +22,7 @@ import asyncio
 from dataclasses import dataclass, field
 
 from ..domain.enums import JobStatus, SafetyMode
-from ..domain.models import Cost, PanelInputs, RunRecord, RunRollup
+from ..domain.models import Cost, PanelInputs, RunRecord, RunRollup, Topology
 from ..io.ledger import RunLedger
 from ..runtime.logging import log_event
 
@@ -108,6 +108,7 @@ def write_panel_record(
     panel: PanelInputs | None = None,
     stop_reason: str | None = None,
     rollup: RunRollup | None = None,
+    topology: Topology | None = None,
     extra_artifacts: dict[str, str] | None = None,
 ) -> str | None:
     """Write a panel's parent :class:`RunRecord` linking its child voice records; return its run_dir.
@@ -120,7 +121,8 @@ def write_panel_record(
     ``panel`` are the panel request's (``panel`` is the resolved orchestration config -- roster, strategy,
     rounds, ...), captured so the parent record is replay-complete (decision 1-D). ``stop_reason`` /
     ``rollup`` record a time-budget harvest (F8a): ``"budget"`` and the per-run rollup when a budget cut the
-    panel, both ``None`` on a normal completion. ``extra_artifacts`` carries the parent's audit artifacts --
+    panel, both ``None`` on a normal completion. ``topology`` is the panel's observed process/agent fan-out
+    (N1, item 3), ``None`` when not measured. ``extra_artifacts`` carries the parent's audit artifacts --
     a consensus passes its ``voices/voice-N.md`` set (see :func:`render_panel_voice_files`), a debate passes
     its ``transcript.md``.
     """
@@ -147,6 +149,7 @@ def write_panel_record(
         cost=_rollup_cost(voices),
         stop_reason=stop_reason,
         rollup=rollup,
+        topology=topology,  # N1 (item 3): the panel's observed process/agent fan-out
         # Mirror the rollup's effort onto the record's own effort fields so the parent agrees with its
         # rollup (and a reader scanning records by effort sees the panel, not just its leaves).
         requested_effort=rollup.effort_requested if rollup else None,

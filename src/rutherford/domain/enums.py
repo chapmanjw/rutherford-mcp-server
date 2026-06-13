@@ -143,3 +143,32 @@ class Effort(StrEnum):
 
 #: The canonical effort order, least to most, for clamp-to-nearest in ``map_effort``.
 EFFORT_ORDER: tuple[Effort, ...] = (Effort.LOW, Effort.MEDIUM, Effort.HIGH, Effort.XHIGH)
+
+
+class ActivityEventKind(StrEnum):
+    """What happened in a run's live activity stream (N1, item 3): the kinds of an :class:`ActivityEvent`.
+
+    One structured vocabulary feeding two transparency sinks that never diverge -- the poll view
+    (``activity`` tool over running jobs) and the MCP push (``Context.report_progress`` on a sync call).
+    A discrete kind lets a consumer filter (push a panel's lifecycle, fold ``voice_finished`` into a
+    progress fraction) without re-parsing a free-text line.
+    """
+
+    #: A single delegation (a panel voice or a standalone delegate) started running its subprocess.
+    VOICE_STARTED = "voice_started"
+    #: A single delegation finished -- cleanly, with an error, or cut at a budget (see ``status``).
+    VOICE_FINISHED = "voice_finished"
+    #: A local descendant-count snapshot from psutil sampling. Carried on ``voice_finished``'s
+    #: ``observed_agents`` today (a voice reports its own peak); reserved as a standalone kind for a
+    #: future coarse whole-run sampler.
+    OBSERVED = "observed"
+    #: A consensus/debate panel began, carrying the declared width (the fan-out total).
+    PANEL_STARTED = "panel_started"
+    #: A panel finished, carrying its outcome summary.
+    PANEL_FINISHED = "panel_finished"
+    #: A time-budget deadline was reached and the panel is harvesting (one tick at the deadline).
+    BUDGET_TICK = "budget_tick"
+    #: A voice/turn was cut at the time-budget deadline (its process tree killed).
+    CUT = "cut"
+    #: The whole run was cancelled by the caller (best-effort, on the outer cancel path).
+    JOB_CANCELLED = "job_cancelled"

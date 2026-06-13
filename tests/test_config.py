@@ -154,6 +154,20 @@ def test_explicit_max_concurrency_wins_over_the_derived_default(tmp_path: Path) 
     assert config.max_concurrency == 4  # an explicit cap (e.g. a laptop) is respected
 
 
+def test_agent_cap_defaults_are_off(tmp_path: Path) -> None:
+    # N1 (item 3): the advisory aggregate-agent cap is disabled out of the box, observe-not-enforce.
+    config = RutherfordConfig()
+    assert config.max_agents_advisory is None
+    assert config.enforce_agent_cap is False
+
+
+def test_max_agents_advisory_rejects_below_two() -> None:
+    # A cap of 1 would refuse every panel; the floor of 2 keeps it meaningful (N1, item 3).
+    with pytest.raises(ValidationError):
+        RutherfordConfig(max_agents_advisory=1)
+    assert RutherfordConfig(max_agents_advisory=2).max_agents_advisory == 2
+
+
 def test_probe_timeout_default_covers_the_longest_auth_probe() -> None:
     # The ceiling must not shorten a deliberate auth probe (codex doctor asks for 20s); an 8s default
     # truncated it and mis-reported a slow but valid auth as logged-out.

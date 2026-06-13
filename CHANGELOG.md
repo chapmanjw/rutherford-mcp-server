@@ -6,6 +6,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Topology observation and live transparency (N1). Rutherford now observes how wide a run actually
+  fans out, and surfaces in-flight work both by polling and by push, all fed from one structured
+  activity-event stream.
+  - Process topology: the runner samples each subprocess's local descendant count with psutil on a
+    coarse timer and reports the peak. A consensus/debate result (and its persisted record) carries a
+    `Topology` — `declared` (the intended width), `realized_delegations` (the delegations Rutherford
+    launched; a debate counts every turn across rounds), and `observed_peak_agents` (the local
+    descendant high-water mark, a floor — a CLI's remote agents are invisible). A single persisted
+    delegation records its width-1 topology too, filling the slot the F2 record reserved from day one.
+  - A new `activity` tool: a live snapshot of the background jobs running right now (tool, elapsed,
+    progress-line count, latest line), distinct from `list_jobs` (which lists every job, terminal ones
+    included). Watch it while panels run; pass a row's `job_id` to `cancel_job`.
+  - MCP progress push: a synchronous `delegate` / `consensus` / `debate` call now reports live progress
+    to the caller (voices finished over the declared width) via `report_progress`, gated on a
+    client-supplied `progressToken` and silent otherwise. An async job is polled via `activity`, not pushed.
+  - An optional advisory aggregate-agent cap: `max_agents_advisory` flags a panel that fans out wider
+    than the cap (`Topology.over_cap`) and logs a warning without blocking it; `enforce_agent_cap=true`
+    refuses such a panel up front with the new `AGENT_CAP_EXCEEDED` code. Off by default — observe first.
+  - Lineage env: a spawned child carries `RUTHERFORD_LINEAGE` (a count-first depth across nested
+    Rutherford layers) and, for a panel voice, `RUTHERFORD_PARENT_RUN` (written for external/corpus
+    correlation), alongside the existing `RUTHERFORD_DEPTH`.
+
 ## [1.6.0] - 2026-06-13
 
 ### Added

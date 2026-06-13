@@ -149,8 +149,10 @@ by accident. See the [safety model](../README.md#safety-model).
 > in `C:\work\myrepo` — and just give me the job id.
 
 `delegate` (or `consensus` / `debate`) in async mode returns a job id immediately. Use `list_jobs` to see
-all retained jobs, `job_status` / `job_result` to poll a specific one, and `cancel_job` to cancel a
-running or pending job.
+all retained jobs, `activity` for a live snapshot of just the jobs running right now (with each one's
+latest progress line), `job_status` / `job_result` to poll a specific one, and `cancel_job` to cancel a
+running or pending job. A synchronous panel pushes its progress to the client live instead, so `activity`
+is for the background ones.
 
 > List my Rutherford jobs. Is that refactor done? If it is, show me the result.
 

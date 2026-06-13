@@ -12,6 +12,7 @@ failure (unknown target, missing binary, timeout, non-zero exit, parse failure) 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import subprocess
 import time
 import uuid
@@ -21,10 +22,11 @@ from pathlib import Path
 from ..adapters.base import CLIAdapter
 from ..adapters.registry import AdapterRegistry
 from ..config.schema import RutherfordConfig
-from ..domain.enums import Effort, JobStatus, SafetyMode, is_mutating
+from ..domain.enums import ActivityEventKind, Effort, JobStatus, SafetyMode, is_mutating
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import DepthLimitError, RegistryError, RutherfordError
 from ..domain.models import (
+    ActivityEvent,
     DelegationRequest,
     DelegationResult,
     ErrorInfo,
@@ -34,17 +36,89 @@ from ..domain.models import (
     Provenance,
     RunRecord,
     Target,
+    Topology,
 )
 from ..io.ledger import RunLedger
 from ..runtime.cooldown import CooldownTracker
-from ..runtime.depth import child_depth_env, ensure_within_depth
+from ..runtime.depth import child_depth_env, child_lineage_env, current_lineage_count, ensure_within_depth
 from ..runtime.failures import classify_failure, indicates_unhealthy, is_model_unavailable, is_retryable
 from ..runtime.logging import log_event
 from ..runtime.platform import PlatformInfo, detect_platform
 from ..runtime.process import ProcessRunner
 from .roles import RoleStore
 
+#: The raw line-stream sink: stderr lines (``on_progress``) or stdout lines (``on_stdout``), as they
+#: arrive from the subprocess. Forwarded straight to the runner; the poll view (``job.progress``) is fed
+#: from it. Unchanged by N1 -- the structured stream below is a SEPARATE, parallel channel.
 ProgressCallback = Callable[[str], None]
+
+#: The structured live-activity sink (N1, item 3): lifecycle :class:`ActivityEvent`s a service emits as a
+#: run progresses (a voice starting/finishing, a panel boundary, a budget cut). A sync tool maps each to an
+#: MCP progress push; distinct from :data:`ProgressCallback` so the raw line stream and the structured
+#: lifecycle stream never have to be the same shape. Best-effort: a raising sink never breaks the run.
+ActivityCallback = Callable[[ActivityEvent], None]
+
+
+def emit_activity(on_activity: ActivityCallback | None, event: ActivityEvent) -> None:
+    """Deliver an :class:`ActivityEvent` to a sink if one is listening; swallow any error (N1, item 3).
+
+    Transparency is a side-channel: a buggy or slow activity sink must never fail (or abort) the run it is
+    only observing, so every emission goes through here and a raising sink is silently dropped.
+    """
+    if on_activity is None:
+        return
+    with contextlib.suppress(Exception):  # a transparency sink must never break the run it observes
+        on_activity(event)
+
+
+def panel_cancelled_event(tool: str, depth: int) -> ActivityEvent:
+    """The terminal ``job_cancelled`` event for a panel cancelled after it started (N1, item 3, 3-K).
+
+    Emitted (via :class:`PanelLifecycle`) when a panel is cancelled after ``panel_started`` so the activity
+    stream always closes with one terminal event rather than being orphaned -- a cancel can land at ANY of
+    the panel's awaits (a voice wait, the live-tee stop, an active-harvest follow-up, the closing synthesis,
+    or the parent-record persist), so the guarantee is centralized rather than guarded await-by-await.
+    """
+    return ActivityEvent(
+        kind=ActivityEventKind.JOB_CANCELLED, tool=tool, depth=depth, status="cut", message=f"{tool} panel cancelled"
+    )
+
+
+class PanelLifecycle:
+    """Guarantees a panel's activity stream emits EXACTLY ONE terminal event (N1, item 3, decision 3-K).
+
+    A panel emits ``panel_started`` once it is past its up-front guards, then -- after any number of awaits
+    (voice waits, the live-tee stop, active harvest, the closing synthesis, the record persist) -- exactly
+    one terminal: ``panel_finished`` on a clean finish or a budget-exhausted failure, or ``job_cancelled``
+    if it is cancelled anywhere in between. Because a cancellation can surface at ANY of those awaits, the
+    panel body is wrapped once (see the panel services) and the terminal is emitted here -- tracking
+    ``started`` (so a cancel BEFORE the panel started emits nothing) and ``closed`` (so a terminal is never
+    emitted twice).
+    """
+
+    def __init__(self, tool: str, depth: int, on_activity: ActivityCallback | None) -> None:
+        self._tool = tool
+        self._depth = depth
+        self._on_activity = on_activity
+        self._started = False
+        self._closed = False
+
+    def mark_started(self, event: ActivityEvent) -> None:
+        """Emit the ``panel_started`` event and record that the panel is live."""
+        self._started = True
+        emit_activity(self._on_activity, event)
+
+    def mark_closed(self, event: ActivityEvent) -> None:
+        """Emit a terminal ``panel_finished`` event (clean or failed) and record the panel as closed."""
+        self._closed = True
+        emit_activity(self._on_activity, event)
+
+    def on_cancel(self) -> None:
+        """Emit the terminal ``job_cancelled`` -- but only if the panel started and has not already closed."""
+        if self._started and not self._closed:
+            self._closed = True
+            emit_activity(self._on_activity, panel_cancelled_event(self._tool, self._depth))
+
 
 #: Conservative preflight bound for an argv-borne prompt on Windows: ``CreateProcessW`` caps the
 #: command line at 32767 chars, and ``prepare_argv`` may still wrap the argv in a shim, so refuse
@@ -106,12 +180,18 @@ class DelegationService:
         base_depth: int = 0,
         on_progress: ProgressCallback | None = None,
         on_stdout: ProgressCallback | None = None,
+        on_activity: ActivityCallback | None = None,
     ) -> DelegationResult:
         """Run ``req`` against its target CLI and return the normalized result.
 
         ``on_stdout`` (F8a, 2-F/2-G) receives the CLI's stdout lines as they stream, distinct from
         ``on_progress`` (stderr). A panel uses it to accumulate a per-voice partial answer that survives a
         time-budget cut; the jobs layer tees it into the run's artifacts. ``None`` disables streaming.
+
+        ``on_activity`` (N1, item 3) receives structured :class:`ActivityEvent`s -- a ``voice_started`` once
+        the run reaches execution and a single ``voice_finished`` with its outcome -- so a sync caller can be
+        pushed live progress. A cross-target fallback runs its alternates silently (they do not re-emit), so
+        a voice is exactly one started/finished pair regardless of how many alternates it tried.
         """
         created_at = self._clock()
         # Fill in the per-adapter configured default model when the call names none, so
@@ -176,13 +256,42 @@ class DelegationService:
         # Snapshot the changed files before a mutating persisted run so the record reports its delta.
         before_changed = await self._snapshot_changed_files(req)
 
-        result, raw, spec = await self._execute(adapter, req, ctx, base_depth, on_progress, on_stdout)
+        # N1: announce the voice as started when its subprocess actually LAUNCHES -- i.e. after the
+        # concurrency semaphore is acquired inside _execute, not here. A voice that is still queued on the
+        # semaphore when a budget deadline cuts it never launches, so it never emits a misleading "started".
+        # The flag keeps it to one started even if a model fallback runs a second subprocess for this voice.
+        started = False
+
+        def on_launch() -> None:
+            nonlocal started
+            if started:
+                return
+            started = True
+            emit_activity(
+                on_activity,
+                ActivityEvent(
+                    kind=ActivityEventKind.VOICE_STARTED,
+                    correlation_id=correlation_id,  # the stable per-voice key (survives a model fallback)
+                    cli=req.target.cli,
+                    model=req.target.model,
+                    role=req.role,
+                    depth=base_depth,
+                    status="started",
+                    message=f"{req.target.display_label} started",
+                ),
+            )
+
+        result, raw, spec = await self._execute(adapter, req, ctx, base_depth, on_progress, on_stdout, on_launch)
+        # N1 (decision 3-A): count every subprocess delegation this call launches, so realized fan-out
+        # includes fallback re-runs (not just the one declared seat). The primary attempt is 1.
+        attempts = 1
 
         fallback_model = self._model_fallback_for(adapter, req, result)
         if fallback_model is not None:
             result, raw, spec = await self._fallback(
                 adapter, req, ctx, base_depth, on_progress, on_stdout, fallback_model
             )
+            attempts += 1  # a model-fallback re-run is a second subprocess delegation
 
         # Refine a generic non-zero exit into a specific failure category (rate-limit / auth / context
         # overflow / model-unavailable) so a caller -- and the fallback decision below -- can act on it.
@@ -205,9 +314,17 @@ class DelegationService:
             and result.error is not None
             and is_retryable(result.error.code)
         ):
-            recovered = await self._fallback_chain(req, result, correlation_id, base_depth, on_progress, on_stdout)
+            recovered, alternate_attempts = await self._fallback_chain(
+                req, result, correlation_id, base_depth, on_progress, on_stdout
+            )
+            # Every alternate the chain tried counts toward realized fan-out, win or lose (3-A). Folding it
+            # into ``attempts`` also covers the EXHAUSTED chain: the fall-through below stamps the primary's
+            # result with this total, so failed alternates are not dropped from the count.
+            attempts += alternate_attempts
             if recovered is not None:
+                recovered.delegation_call_count = attempts  # primary + model fallback + every alternate tried
                 self._log_delegation(req, result, correlation_id, base_depth)
+                emit_activity(on_activity, _voice_finished_event(recovered, req.role, base_depth, correlation_id))
                 return recovered
 
         # Check the tree only when the run actually succeeded. A run that already failed (timeout,
@@ -237,6 +354,12 @@ class DelegationService:
         # fail a delegation that produced an answer.
         result.effort = effort
         result.effort_applied = self._effort_applied(adapter, effort)
+        # N1: carry the runner's observed local-descendant peak up onto the result, so a panel can roll it
+        # into its topology. ``None`` when nothing ran (a build failure) or the runner did not sample.
+        result.observed_peak_agents = raw.observed_peak_agents if raw is not None else None
+        # N1 (3-A): record how many subprocess delegations this seat launched (primary + any model fallback)
+        # so a panel's realized fan-out counts the fallback re-runs.
+        result.delegation_call_count = attempts
         result.raw = _combine_raw(raw) if (req.include_raw and raw is not None) else None
         self._log_delegation(req, result, correlation_id, base_depth)
         # Off-thread: persistence runs blocking git subprocesses + file I/O, and delegate() is the
@@ -249,6 +372,7 @@ class DelegationService:
             await asyncio.to_thread(
                 self._maybe_persist, req, result, spec, detected.version, created_at, before_changed
             )
+        emit_activity(on_activity, _voice_finished_event(result, req.role, base_depth, correlation_id))
         return result
 
     def _log_delegation(
@@ -277,11 +401,14 @@ class DelegationService:
         base_depth: int,
         on_progress: ProgressCallback | None,
         on_stdout: ProgressCallback | None = None,
+        on_launch: Callable[[], None] | None = None,
     ) -> tuple[DelegationResult, ProcessResult | None, InvocationSpec | None]:
         """Build, run, and parse one invocation. Returns the result, its raw process output, and the spec.
 
         Raw and spec are ``None`` only when ``build_invocation`` itself failed (nothing ran). The spec
-        is returned so the delegation can pin its ``argv`` into a durable run record (F2).
+        is returned so the delegation can pin its ``argv`` into a durable run record (F2). ``on_launch``
+        (N1, item 3) fires once the concurrency semaphore is acquired and the subprocess is about to run,
+        so a caller can mark the voice "launched" only when it truly launches (not while it is still queued).
         """
         try:
             spec = adapter.build_invocation(req, ctx)
@@ -309,7 +436,14 @@ class DelegationService:
                     spec,
                 )
 
-        spec = spec.model_copy(update={"env": {**spec.env, **child_depth_env(base_depth)}})
+        # Propagate the recursion-depth guard and the N1 lineage signal (count-first: the lineage count
+        # incremented for the child, plus the panel parent run id when this is a panel voice) so a nested
+        # Rutherford host reads where it sits in the agent tree and the aggregate cap can reason across layers.
+        child_env = {
+            **child_depth_env(base_depth),
+            **child_lineage_env(parent_run_id=req.parent_run_id, current_count=current_lineage_count()),
+        }
+        spec = spec.model_copy(update={"env": {**spec.env, **child_env}})
         # Precedence: an explicit per-call timeout, else the per-adapter ``[adapters.<id>]
         # timeout_s``, else the global default. A slow local model can set the per-adapter one.
         timeout = req.timeout_s or self._config.timeout_for(req.target.cli) or self._config.default_timeout_s
@@ -318,6 +452,8 @@ class DelegationService:
         # pure build/parse, to keep the critical section to the expensive part.
         try:
             async with self._semaphore:
+                if on_launch is not None:  # N1: the voice has the slot and is launching now (not just queued)
+                    on_launch()
                 raw = await self._runner.run(spec, timeout, on_progress, on_stdout)
         except OSError as exc:  # the subprocess could not be launched (a broken shim, a runtime error)
             return self._fail(ctx, ErrorCode.SPAWN_FAILED, f"failed to launch {req.target.cli}: {exc}"), None, spec
@@ -428,18 +564,21 @@ class DelegationService:
         base_depth: int,
         on_progress: ProgressCallback | None,
         on_stdout: ProgressCallback | None = None,
-    ) -> DelegationResult | None:
-        """Try each fallback target in order; return the first successful, fully-processed result.
+    ) -> tuple[DelegationResult | None, int]:
+        """Try each fallback target in order; return the first successful result and the alternates' attempts.
 
         The failed primary leads the recorded ``fallback_chain`` -- by its *effective* label (the
         post-model-fallback target that actually failed). A benched (cooled-down) alternate is skipped.
         Each alternate is delegated fresh with no further fallback (so the chain cannot recurse) and no
         carried ``session_id`` (a different CLI's resume token does not transfer), at the same depth (a
         sibling retry, not a deeper delegation). The list is capped at ``max_targets`` so a long chain
-        cannot fan out unbounded. Returns ``None`` when every alternate failed, so the caller keeps the
-        primary's (refined) failure.
+        cannot fan out unbounded. Returns ``(recovered_or_None, alternate_attempts)``: the first successful
+        result (or ``None`` when every alternate failed, so the caller keeps the primary's refined failure)
+        AND the total subprocess delegations every alternate tried (win or lose), so the caller can count the
+        whole chain into realized fan-out -- including an EXHAUSTED chain (3-A: realized incl. fallback).
         """
         failed_labels = [primary.target.display_label]
+        alternate_attempts = 0
         for index, target in enumerate(req.fallback[: self._config.max_targets]):
             if self._cooldown.is_benched(target.cli):
                 continue
@@ -451,11 +590,12 @@ class DelegationService:
                 on_progress=on_progress,
                 on_stdout=on_stdout,
             )
+            alternate_attempts += recovered.delegation_call_count  # this alternate's own subprocess attempts
             if recovered.ok:
                 recovered.fallback_chain = failed_labels
-                return recovered
+                return recovered, alternate_attempts
             failed_labels.append(target.display_label)
-        return None
+        return None, alternate_attempts
 
     def _record_health(self, cli: str, result: DelegationResult) -> None:
         """Feed the cooldown tracker from a finished result: success clears the streak, an unhealthy
@@ -623,6 +763,13 @@ class DelegationService:
             # F8a: a leaf run harvested at a panel budget carries its stop_reason so the child record
             # agrees with the parent's harvest disposition. ``None`` on a clean finish.
             stop_reason=result.stop_reason,
+            # N1 (item 3): a single delegation declares width 1; realized counts the subprocess delegations it
+            # launched, INCLUDING a model fallback re-run (3-A). ``observed_peak_agents`` is the sampled peak.
+            topology=Topology(
+                declared=1,
+                realized_delegations=result.delegation_call_count,
+                observed_peak_agents=result.observed_peak_agents,
+            ),
         )
         try:
             run_dir = self._ledger.write(record, answer=result.text, diff=diff)
@@ -657,6 +804,37 @@ class DelegationService:
             error=ErrorInfo(code=code, message=message),
             safety_mode=ctx.safety_mode,
         )
+
+
+def _voice_finished_event(result: DelegationResult, role: str | None, depth: int, correlation_id: str) -> ActivityEvent:
+    """Build the ``voice_finished`` :class:`ActivityEvent` for a finished delegation (N1, item 3).
+
+    ``status`` distinguishes a clean ``ok`` from a ``cut`` (a time-budget harvest, ``stop_reason='budget'``)
+    and a plain ``failed``, so the push side can colour the outcome without re-reading the result.
+    ``correlation_id`` is the stable per-voice key so this terminal event collapses onto the same activity
+    row as its ``voice_started`` even when a model fallback changed ``result.target.model``.
+    """
+    if result.ok:
+        status = "ok"
+    elif result.stop_reason == "budget":
+        status = "cut"
+    else:
+        status = "failed"
+    message = f"{result.target.display_label} {status}"
+    if result.duration_s:
+        message += f" ({result.duration_s:.1f}s)"
+    return ActivityEvent(
+        kind=ActivityEventKind.VOICE_FINISHED,
+        correlation_id=correlation_id,
+        cli=result.target.cli,
+        model=result.target.model,
+        role=role,
+        status=status,
+        elapsed_s=result.duration_s,
+        observed_agents=result.observed_peak_agents,
+        depth=depth,
+        message=message,
+    )
 
 
 def _combine_raw(raw: ProcessResult) -> str:

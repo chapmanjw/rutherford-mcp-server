@@ -347,3 +347,60 @@ def test_kill_process_tree_tolerates_the_parent_vanishing_before_children(
 
     monkeypatch.setattr(psutil_mod, "Process", lambda pid: _VanishingParent())
     kill_process_tree(12345)  # must not raise
+
+
+# --- N1 (item 3): psutil descendant sampling (matrix-sensitive, NO integration marker) -------------
+
+
+#: A parent that spawns a child and keeps both alive ~1s, so the sampler can observe a peak >= 2.
+_SAMPLING_TREE = (
+    "import subprocess, sys, time\n"
+    "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1.2)'])\n"
+    "time.sleep(1.0)\n"
+    "p.wait()\n"
+)
+
+
+async def test_sampling_observes_local_descendants() -> None:
+    # The mechanism: while a process tree is live, psutil sampling records its local descendant peak.
+    # A floor, so >= 2 (the parent plus the child it spawns) is the robust cross-platform assertion.
+    result = await AsyncProcessRunner().run(_spec(_SAMPLING_TREE), timeout_s=30)
+    assert result.exit_code == 0
+    assert result.observed_peak_agents is not None
+    assert result.observed_peak_agents >= 2
+
+
+async def test_sampling_populated_on_a_timeout_cut() -> None:
+    # A long run cut by the deadline still reports an observed peak: the sampler is stopped (not leaked)
+    # on the timeout path and its accumulated peak rides the timed-out result.
+    result = await AsyncProcessRunner().run(_spec("import time; time.sleep(60)"), timeout_s=1)
+    assert result.timed_out
+    assert result.observed_peak_agents is not None
+    assert result.observed_peak_agents >= 1
+
+
+async def test_sampling_does_not_swallow_cancellation() -> None:
+    # Cancelling run() mid-flight must still re-raise CancelledError -- the sampler is stopped on the
+    # cancel path, never leaving the outer cancel masked or a sampler task leaked.
+    task = asyncio.create_task(AsyncProcessRunner().run(_spec("import time; time.sleep(60)"), timeout_s=30))
+    await asyncio.sleep(0.3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_sampling_returns_zero_when_psutil_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Graceful degrade: with psutil unimportable, the sampler returns 0 rather than raising.
+    import builtins
+
+    from rutherford.runtime import process as process_mod
+
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "psutil":
+            raise ImportError("psutil gone")
+        return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert await process_mod._sample_descendants(99999, interval_s=0.01) == 0

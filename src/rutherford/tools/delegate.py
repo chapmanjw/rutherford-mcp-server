@@ -7,6 +7,7 @@ from __future__ import annotations
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode, is_mutating
 from ..domain.models import DelegationRequest, Target
+from ..services.delegation import ActivityCallback
 from .common import as_target, async_job_envelope, parse_effort, parse_mode, resolve_safety_mode
 
 
@@ -29,6 +30,7 @@ async def delegate_tool(
     persist: bool | None = None,
     external_tracking: bool = False,
     fallback: list[str] | None = None,
+    on_activity: ActivityCallback | None = None,
 ) -> str:
     """Delegate ``prompt`` to ``(cli, model)`` and return the normalized result.
 
@@ -70,13 +72,15 @@ async def delegate_tool(
     if request.mode is DelegationMode.ASYNC:
         job = app.jobs.submit(
             "delegate",
-            # A single delegation has no fan-out to harvest, so it publishes no interim result (the second
-            # body arg is unused); time-budget continue/harvest is a panel feature.
-            lambda progress, _set_interim: app.delegation.delegate(
+            # A single delegation has no fan-out to harvest, so it publishes no interim result (the third
+            # body arg is unused); time-budget continue/harvest is a panel feature. The activity stream goes
+            # to the job's structured poll buffer (an async job has no live request to push to).
+            lambda progress, activity, _set_interim: app.delegation.delegate(
                 request,
                 correlation_id=correlation_id,
                 base_depth=app.base_depth,
                 on_progress=progress,
+                on_activity=activity,
             ),
         )
         return tool_success(
@@ -89,7 +93,12 @@ async def delegate_tool(
             )
         )
 
-    result = await app.delegation.delegate(request, correlation_id=correlation_id, base_depth=app.base_depth)
+    # Sync path only: push live progress to the caller via MCP (N1, item 3). An async job returns a job id
+    # immediately, so its progress is polled (``activity`` / ``job_status``), never pushed -- hence on_activity
+    # is wired here, not into the job body above.
+    result = await app.delegation.delegate(
+        request, correlation_id=correlation_id, base_depth=app.base_depth, on_activity=on_activity
+    )
     result.notice = app.persistence_notice(
         persisted=result.run_dir is not None,
         complex_run=complex_run,

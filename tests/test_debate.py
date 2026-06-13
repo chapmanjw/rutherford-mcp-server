@@ -11,9 +11,10 @@ import pytest
 
 from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import RutherfordConfig
-from rutherford.domain.enums import Stance
+from rutherford.domain.enums import ActivityEventKind, Stance
+from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import DebateRequest, InvocationSpec, ProcessResult, Target
+from rutherford.domain.models import ActivityEvent, DebateRequest, InvocationSpec, ProcessResult, Target
 from rutherford.services.debate import DebateService
 from rutherford.services.delegation import DelegationService
 from rutherford.services.roles import load_roles
@@ -543,3 +544,100 @@ async def test_effort_flows_to_every_debate_turn() -> None:
     contributions = [c for round_ in result.rounds for c in round_.contributions]
     assert contributions and all(c.effort_applied == Effort.HIGH for c in contributions)
     assert all("--effort=high" in spec.argv for spec, _ in runner.calls)
+
+
+# --- N1 (item 3): topology + activity events + advisory cap --------------------------------------
+
+
+async def test_debate_populates_topology_with_observed_peak() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="pos", observed_peak_agents=2))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, synthesize=False)
+    )
+    assert result.topology is not None
+    assert result.topology.declared == 2
+    assert result.topology.realized_delegations == 2  # 2 voices x 1 round
+    assert result.topology.observed_peak_agents == 2
+
+
+async def test_debate_realized_delegations_counts_every_turn() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="pos"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, synthesize=False)
+    )
+    assert result.topology is not None
+    assert result.topology.realized_delegations == 4  # 2 voices x 2 rounds is the cumulative fan-out
+
+
+async def test_debate_emits_panel_and_voice_activity_events() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="pos"))
+    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
+    events: list[ActivityEvent] = []
+    await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, synthesize=False),
+        on_activity=events.append,
+    )
+    kinds = [event.kind for event in events]
+    assert kinds[0] is ActivityEventKind.PANEL_STARTED and events[0].tool == "debate"
+    assert kinds[-1] is ActivityEventKind.PANEL_FINISHED
+    assert ActivityEventKind.VOICE_STARTED in kinds
+    assert ActivityEventKind.VOICE_FINISHED in kinds
+
+
+async def test_debate_enforced_cap_refuses_up_front() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="pos"))
+    cfg = RutherfordConfig(max_agents_advisory=2, enforce_agent_cap=True)
+    service = _debate([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner, cfg)
+    with pytest.raises(RutherfordError) as info:
+        await service.debate(
+            DebateRequest(targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")], prompt="q", rounds=1)
+        )
+    assert info.value.code == ErrorCode.AGENT_CAP_EXCEEDED
+    assert not runner.calls  # refused before launching any turn
+
+
+async def test_debate_emits_cut_and_budget_tick_on_a_harvest() -> None:
+    runner = _PerCliDelayRunner({"a": 0.0, "b": 5.0})
+    service = _delay_debate(runner)
+    events: list[ActivityEvent] = []
+    await service.debate(
+        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.3),
+        on_activity=events.append,
+    )
+    kinds = [event.kind for event in events]
+    assert ActivityEventKind.BUDGET_TICK in kinds
+    assert any(event.kind is ActivityEventKind.CUT and event.cli == "b" for event in events)
+
+
+async def test_debate_emits_job_cancelled_on_outer_cancel() -> None:
+    runner = _PerCliDelayRunner({"a": 5.0, "b": 5.0})
+    service = _delay_debate(runner)
+    events: list[ActivityEvent] = []
+    task = asyncio.ensure_future(
+        service.debate(
+            DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, synthesize=False),
+            on_activity=events.append,
+        )
+    )
+    await asyncio.sleep(0.05)  # let the first round start
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert any(event.kind is ActivityEventKind.JOB_CANCELLED for event in events)
+
+
+async def test_debate_emits_panel_finished_before_budget_exhausted_raise() -> None:
+    # N1 (3-K): BUDGET_EXHAUSTED after panel_started must still close the stream with a (failed)
+    # panel_finished before raising. Round 1 is all-cut here, so no usable round -> exhaustion.
+    runner = _PerCliDelayRunner({"a": 5.0, "b": 5.0})
+    service = _delay_debate(runner)
+    events: list[ActivityEvent] = []
+    with pytest.raises(RutherfordError) as info:
+        await service.debate(
+            DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.3),
+            on_activity=events.append,
+        )
+    assert info.value.code == ErrorCode.BUDGET_EXHAUSTED
+    assert any(event.kind is ActivityEventKind.PANEL_FINISHED and event.status == "failed" for event in events)

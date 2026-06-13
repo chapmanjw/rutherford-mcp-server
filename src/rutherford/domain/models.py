@@ -10,11 +10,13 @@ Adapters and services exchange these; nothing passes around raw CLI-specific sha
 
 from __future__ import annotations
 
+import time
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from .enums import (
+    ActivityEventKind,
     AuthState,
     DelegationMode,
     Effort,
@@ -299,6 +301,52 @@ class ProcessResult(BaseModel):
     #: child wrote before a deadline cut it, so a time-budget harvest can surface a candidate answer
     #: instead of discarding the work. ``None`` on a clean finish (the answer is in ``stdout``).
     partial: str | None = None
+    #: Peak count of local processes (this subprocess plus its recursive descendants) observed by psutil
+    #: sampling while the run was live (N1, item 3). A floor, not a ceiling: it sees only LOCAL processes,
+    #: so a CLI's remote/cloud agents are invisible. ``None`` when sampling did not run (psutil missing, a
+    #: fake runner, or the process exited before the first sample).
+    observed_peak_agents: int | None = None
+
+
+class ActivityEvent(BaseModel):
+    """One structured event from a run in flight (N1, item 3): the unit of the live activity stream.
+
+    Single source of truth for live transparency: a service emits these at lifecycle milestones (a voice
+    starting/finishing, a panel starting/finishing, a budget cut), and a sync tool projects each one to an
+    MCP progress notification (``Context.report_progress``) so the caller sees the work as it happens.
+    Distinct from the job-progress STRING channel (``job.progress``), which stays the poll view; this is the
+    richer carrier the push side reads counts and status from. Every field but ``kind`` is optional so a
+    producer fills only what it knows; ``ts`` is wall-clock epoch seconds, stamped at construction.
+    """
+
+    kind: ActivityEventKind
+    #: The owning background job id, or ``None`` for a synchronous in-flight call (which has no job record;
+    #: its liveness rides the MCP push, not the ``activity`` poll table).
+    job_id: str | None = None
+    #: A STABLE per-voice identity (the delegation's correlation id), constant across this voice's
+    #: ``voice_started`` / ``voice_finished`` / ``cut`` events even when a model fallback changes ``model``
+    #: mid-run. The ``activity`` table collapses a voice to one current row by this, not by ``(cli, model,
+    #: role)`` -- which a fallback would split into a stale "started" row plus the terminal row. ``None`` on
+    #: panel-level events (they are not voice rows).
+    correlation_id: str | None = None
+    #: The orchestration tool: ``delegate`` | ``consensus`` | ``debate``. ``None`` on a voice event, whose
+    #: ``cli`` already identifies it (the parent panel event carries the tool).
+    tool: str | None = None
+    cli: str | None = None  #: The adapter id of a voice event.
+    model: str | None = None  #: The resolved model (post-fallback) of a voice event.
+    role: str | None = None  #: The role persona this seat argued under, when set.
+    #: A transient lifecycle status for a voice/panel: ``started`` | ``ok`` | ``failed`` | ``cut``.
+    status: str | None = None
+    elapsed_s: float | None = None  #: Seconds the finished voice/turn ran.
+    #: The voice's peak LOCAL descendant count from psutil (a floor; remote agents invisible). ``None``
+    #: when not sampled.
+    observed_agents: int | None = None
+    budget_left_s: float | None = None  #: Remaining time budget at a ``budget_tick``, or ``None``.
+    declared: int | None = None  #: A panel's declared width (the fan-out total) on a ``panel_started``.
+    done: int | None = None  #: Voices finished so far, for a progress fraction (``done`` of ``declared``).
+    depth: int | None = None  #: Delegation depth (``RUTHERFORD_DEPTH``) of this work.
+    message: str = ""  #: A human-readable one-line summary, used as the push notification message.
+    ts: float = Field(default_factory=time.time)  #: Wall-clock epoch seconds, stamped at construction.
 
 
 class InvocationContext(BaseModel):
@@ -425,6 +473,45 @@ class DelegationResult(BaseModel):
     #: May differ from ``effort`` (e.g. xhigh clamped to high), or be ``None`` when the adapter has no
     #: effort knob (a no-op) or nothing ran.
     effort_applied: Effort | None = None
+    #: Peak count of LOCAL processes (this voice plus its descendants) psutil observed while it ran (N1,
+    #: item 3), carried up from the :class:`ProcessResult` so a panel can roll it into its
+    #: :class:`Topology`. A floor (remote agents invisible). ``None`` when not sampled (nothing ran, a fake
+    #: runner, or psutil missing).
+    observed_peak_agents: int | None = None
+    #: How many subprocess delegations Rutherford launched for this one result, INCLUDING fallback re-runs
+    #: (N1, item 3, decision 3-A: realized = own calls incl. fallback): 1 for a clean run, 2 when a model
+    #: fallback re-ran, and the primary plus every alternate when a cross-target fallback chain ran. A panel
+    #: sums this into :attr:`Topology.realized_delegations`, so a fallback's extra agents are counted. Scope
+    #: note: this is the chain aggregate on the RETURNED result (what the panel rolls up); a cross-target
+    #: fallback's alternates each persist their OWN leaf record (their own count) and the failed primary is
+    #: not persisted, so a standalone ``persist=True`` cross-target fallback's leaf ``state.toon`` records the
+    #: winning run rather than the whole chain -- the chain total is on this returned field. A best-effort
+    #: count (3-B-limit): a voice cut mid-fallback contributes a floor of 1 (its cancelled task is opaque).
+    delegation_call_count: int = 1
+
+
+class Topology(BaseModel):
+    """The process/agent fan-out a run declared and (locally) realized (N1, item 3); the F2 record's slot.
+
+    Reserved in the schema from day one (decision 1-D) so a kept run has a home for fan-out data, and now
+    POPULATED by item 3. ``declared`` is the intended width (a panel's target count after filtering; 1 for a
+    single delegation). ``realized_delegations`` is Rutherford's own subprocess delegations, INCLUDING
+    fallback re-runs (decision 3-A) -- summed across the voices (a consensus) or turns (a debate), where each
+    counts its primary plus any model fallback plus the alternates a cross-target fallback chain tried -- so a
+    fallback shows up as realized > declared; it excludes the internal synthesis/judge pass. A voice CUT at a
+    time-budget deadline contributes a floor of 1 here: its delegate task is cancelled, so an in-flight model
+    fallback before the cut is not recovered into the count (consistent with 3-B-limit, realized is best-effort).
+    ``observed_peak_agents`` is the local descendant high-water mark from psutil across the voices -- a FLOOR,
+    since a CLI's remote agents are invisible, and ``None`` when no voice was sampled. ``over_cap`` flags a run
+    whose realized count exceeded the advisory aggregate cap (``max_agents_advisory``); advisory by default, so
+    it is informational, not a refusal (the up-front refusal, when ``enforce_agent_cap`` is set, is on the
+    declared width).
+    """
+
+    declared: int | None = None
+    realized_delegations: int | None = None
+    observed_peak_agents: int | None = None
+    over_cap: bool = False
 
 
 # --- Consensus ---------------------------------------------------------------
@@ -524,6 +611,9 @@ class ConsensusResult(BaseModel):
     #: Per-run budget/effort rollup; set only when a time budget governed the panel (F8a). ``None``
     #: otherwise.
     rollup: RunRollup | None = None
+    #: Process/agent fan-out observed for this panel (N1, item 3): declared width, Rutherford's realized
+    #: delegations, and the local descendant peak (a floor). ``None`` when not measured.
+    topology: Topology | None = None
 
 
 # --- Consensus strategies ----------------------------------------------------
@@ -585,6 +675,8 @@ class StrategyResult(BaseModel):
     stop_reason: str | None = None
     #: Per-run budget/effort rollup; set only when a time budget governed the panel. ``None`` otherwise.
     rollup: RunRollup | None = None
+    #: Process/agent fan-out observed for this panel (N1, item 3). ``None`` when not measured.
+    topology: Topology | None = None
 
 
 # --- Debate ------------------------------------------------------------------
@@ -679,6 +771,13 @@ class DebateContribution(BaseModel):
     #: The effort tier this turn actually applied (F8a, 2-L), carried from the voice's result. ``None``
     #: when the adapter has no effort knob or no effort was requested.
     effort_applied: Effort | None = None
+    #: The local descendant peak psutil observed for this turn (N1, item 3), carried from the voice's result
+    #: so the debate parent can roll the panel topology's ``observed_peak_agents`` (a floor). ``None`` when not
+    #: sampled (a cut turn, a fake runner, or psutil missing).
+    observed_peak_agents: int | None = None
+    #: How many subprocess delegations this turn launched, incl. fallback re-runs (N1, item 3, decision 3-A),
+    #: carried from the voice's result so the debate parent sums it into ``Topology.realized_delegations``.
+    delegation_call_count: int = 1
     #: The files this turn changed (a write-mode debate), carried from the voice's result so the parent
     #: rolls up the panel's changed-file union (decision 1-D), mirroring consensus. Empty for a read run.
     changed_files: list[str] = Field(default_factory=list)
@@ -723,6 +822,8 @@ class DebateResult(BaseModel):
     stop_reason: str | None = None
     #: Per-run budget/effort rollup; set only when a time budget governed the debate. ``None`` otherwise.
     rollup: RunRollup | None = None
+    #: Process/agent fan-out observed for this debate (N1, item 3). ``None`` when not measured.
+    topology: Topology | None = None
 
 
 # --- Jobs --------------------------------------------------------------------
@@ -739,27 +840,14 @@ class Job(BaseModel):
     created_at: float = 0.0
     updated_at: float = 0.0
     progress: list[str] = Field(default_factory=list)
+    #: The structured live-activity buffer (N1, item 3, decision 3-K): the same :class:`ActivityEvent`
+    #: stream the sync path pushes, captured here so the ``activity`` tool can render the rich in-flight
+    #: table (per-voice cli/model/role/status/observed/budget). ``progress`` stays the human-string
+    #: projection of this stream for backward compatibility; the two are two sinks of one source.
+    activity: list[ActivityEvent] = Field(default_factory=list)
 
 
 # --- Durable run records (F2) ------------------------------------------------
-
-
-class Topology(BaseModel):
-    """The process/agent fan-out a run declared and (locally) realized -- the F2 record's topology slot.
-
-    Reserved in the schema from day one (decision 1-D) so a kept run has a home for fan-out data the
-    moment the N1 topology observation work (the roadmap's item 3) lands, without a schema bump
-    invalidating the corpus recorded before then. All fields are optional and unset today: nothing
-    populates this yet -- the record carries the slot, not the data. ``declared`` is the intended
-    width, ``realized_delegations`` is Rutherford's own calls (incl. fallback / nested), and
-    ``observed_peak_agents`` is the local descendant high-water mark (a floor: a CLI's remote agents
-    are invisible). ``over_cap`` flags a panel that ran wider than the advisory aggregate cap.
-    """
-
-    declared: int | None = None
-    realized_delegations: int | None = None
-    observed_peak_agents: int | None = None
-    over_cap: bool = False
 
 
 class PanelTarget(BaseModel):

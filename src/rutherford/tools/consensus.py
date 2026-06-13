@@ -9,6 +9,7 @@ from typing import Any
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode
 from ..domain.models import ConsensusRequest, Target
+from ..services.delegation import ActivityCallback
 from .common import (
     as_target,
     async_job_envelope,
@@ -49,6 +50,7 @@ async def consensus_tool(
     include_raw: bool = False,
     persist: bool | None = None,
     external_tracking: bool = False,
+    on_activity: ActivityCallback | None = None,
 ) -> str:
     """Run ``prompt`` across several CLIs in parallel and return every voice.
 
@@ -124,11 +126,12 @@ async def consensus_tool(
         # stragglers keep running, so a poller sees the harvested-so-far set before the panel finishes.
         job = app.jobs.submit(
             "consensus",
-            lambda progress, set_interim: app.consensus.consensus(
+            lambda progress, activity, set_interim: app.consensus.consensus(
                 request,
                 correlation_id=correlation_id,
                 base_depth=app.base_depth,
                 on_progress=progress,
+                on_activity=activity,  # N1: the structured stream feeds the job's poll buffer (decision 3-K)
                 on_interim_result=set_interim,
             ),
         )
@@ -136,7 +139,10 @@ async def consensus_tool(
             async_job_envelope(app, job, persist=persist, complex_run=True, external_tracking=external_tracking)
         )
 
-    result = await app.consensus.consensus(request, correlation_id=correlation_id, base_depth=app.base_depth)
+    # Sync path only: push live progress via MCP (N1, item 3); an async job is polled, not pushed.
+    result = await app.consensus.consensus(
+        request, correlation_id=correlation_id, base_depth=app.base_depth, on_activity=on_activity
+    )
     result.notice = app.persistence_notice(
         persisted=result.run_dir is not None, complex_run=True, external_tracking=external_tracking
     )

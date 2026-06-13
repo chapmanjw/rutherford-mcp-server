@@ -192,8 +192,9 @@ You rarely call these by name; your agent picks them from your request. Everythi
 | `capabilities` / `doctor` | `capabilities` is an instant snapshot of install, auth, and models; `doctor` live-checks the CLIs whose auth only shows on a real round trip. |
 
 Long tasks run as background jobs (`mode=async`): the call returns a job id immediately, and `list_jobs`,
-`job_status`, `job_result`, and `cancel_job` manage them. `setup`, `list_roles`, and `reload_panels`
-round out the surface.
+`job_status`, `job_result`, and `cancel_job` manage them. `activity` shows a live snapshot of the jobs
+running right now (a synchronous call instead pushes live progress over MCP). `setup`, `list_roles`, and
+`reload_panels` round out the surface.
 
 ## How it works
 

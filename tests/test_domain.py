@@ -7,10 +7,10 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from rutherford.domain.enums import SafetyMode
+from rutherford.domain.enums import ActivityEventKind, SafetyMode
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import ConfigError, DepthLimitError, RutherfordError
-from rutherford.domain.models import DelegationRequest, ErrorInfo, Target
+from rutherford.domain.models import ActivityEvent, DelegationRequest, ErrorInfo, Target, Topology
 
 
 def test_error_codes_are_strings_and_known() -> None:
@@ -99,3 +99,44 @@ def test_error_envelope_rejects_a_non_contract_code() -> None:
     # Valid code strings still coerce -- the ergonomic path is unchanged.
     assert ErrorInfo(code="TIMEOUT", message="slow").code is ErrorCode.TIMEOUT  # type: ignore[arg-type]
     assert RutherfordError("TIMEOUT", "slow").code is ErrorCode.TIMEOUT
+
+
+# --- N1 (item 3): ActivityEvent + Topology -----------------------------------
+
+
+def test_activity_event_kind_values_are_the_locked_vocabulary() -> None:
+    assert ActivityEventKind.PANEL_FINISHED.value == "panel_finished"
+    assert [k.value for k in ActivityEventKind] == [
+        "voice_started",
+        "voice_finished",
+        "observed",
+        "panel_started",
+        "panel_finished",
+        "budget_tick",
+        "cut",
+        "job_cancelled",
+    ]
+
+
+def test_activity_event_stamps_ts_and_defaults() -> None:
+    event = ActivityEvent(kind=ActivityEventKind.VOICE_STARTED, cli="codex")
+    assert event.kind is ActivityEventKind.VOICE_STARTED
+    assert event.ts > 0  # stamped at construction
+    assert event.job_id is None
+    assert event.message == ""
+
+
+def test_activity_event_drops_none_fields_on_the_wire() -> None:
+    # exclude_none keeps the structured event compact when a producer fills only a few fields.
+    dumped = ActivityEvent(kind=ActivityEventKind.PANEL_STARTED, declared=3).model_dump(mode="json", exclude_none=True)
+    assert dumped["kind"] == "panel_started"
+    assert dumped["declared"] == 3
+    assert "cli" not in dumped and "observed_agents" not in dumped
+
+
+def test_topology_defaults() -> None:
+    topo = Topology()
+    assert topo.declared is None
+    assert topo.realized_delegations is None
+    assert topo.observed_peak_agents is None
+    assert topo.over_cap is False

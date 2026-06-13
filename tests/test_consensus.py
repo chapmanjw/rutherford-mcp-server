@@ -12,9 +12,11 @@ import pytest
 
 from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import RutherfordConfig
-from rutherford.domain.enums import AuthState, Stance, Strategy
+from rutherford.domain.enums import ActivityEventKind, AuthState, Stance, Strategy
+from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import (
+    ActivityEvent,
     ConsensusRequest,
     ConsensusResult,
     DelegationRequest,
@@ -845,16 +847,26 @@ async def test_harvest_partial_reprompts_a_cut_voice_for_a_clean_best_answer() -
     # partial) for a clean best answer, which replaces the raw partial.
     runner = _HarvestRunner()
     service = _budget_consensus(runner)
+    events: list[ActivityEvent] = []
     result = await service.consensus(
         ConsensusRequest(
             targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3, harvest_partial=True
-        )
+        ),
+        on_activity=events.append,
     )
     assert isinstance(result, ConsensusResult)
     slow = next(voice for voice in result.voices if voice.target.cli == "slow")
     assert slow.ok
     assert slow.text == "clean best answer"  # the re-prompt replaced the raw partial
     assert slow.stop_reason == "budget"  # still flagged as a (post-deadline) harvest
+    # N1 (3-A): the harvest follow-up is another delegation on top of the cut voice, counted in realized.
+    assert slow.delegation_call_count == 2  # the cut voice (1) + the follow-up (1)
+    assert result.topology is not None
+    assert result.topology.realized_delegations == 3  # fast (1) + slow cut+follow-up (2)
+    # N1 (3-K): the follow-up is visible in the activity stream -- a cut then a finished slow voice.
+    slow_events = [e for e in events if e.cli == "slow"]
+    assert any(e.kind is ActivityEventKind.CUT for e in slow_events)
+    assert any(e.kind is ActivityEventKind.VOICE_FINISHED and e.status == "ok" for e in slow_events)
 
 
 async def test_cut_voice_records_a_recovered_session_even_without_an_answer() -> None:
@@ -957,3 +969,156 @@ async def test_expand_all_skips_a_benched_adapter() -> None:
     assert "a" in included
     assert "b" not in included
     assert any(entry.cli == "b" and "cooldown" in entry.reason for entry in result.skipped)
+
+
+# --- (f) N1 (item 3): topology + activity events + advisory cap ----------------------------------
+
+
+async def test_consensus_populates_topology() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok", observed_peak_agents=3))
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
+    result = await service.consensus(ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
+    assert result.topology is not None
+    assert result.topology.declared == 2
+    assert result.topology.realized_delegations == 2
+    assert result.topology.observed_peak_agents == 3  # the max local peak across the voices
+    assert result.topology.over_cap is False
+
+
+async def test_consensus_emits_panel_and_voice_activity_events() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
+    events: list[ActivityEvent] = []
+    await service.consensus(
+        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"), on_activity=events.append
+    )
+    kinds = [event.kind for event in events]
+    assert kinds[0] is ActivityEventKind.PANEL_STARTED
+    assert events[0].tool == "consensus" and events[0].declared == 2
+    assert kinds[-1] is ActivityEventKind.PANEL_FINISHED
+    assert ActivityEventKind.VOICE_STARTED in kinds
+    assert ActivityEventKind.VOICE_FINISHED in kinds
+
+
+async def test_consensus_over_cap_flag_is_advisory_not_a_refusal() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    cfg = RutherfordConfig(max_agents_advisory=2)  # 3 declared voices exceeds the advisory cap
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner, cfg)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")], prompt="q")
+    )
+    assert isinstance(result, ConsensusResult)
+    assert len(result.voices) == 3  # advisory: ran anyway
+    assert result.topology is not None and result.topology.over_cap is True
+
+
+async def test_consensus_enforced_cap_refuses_up_front() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    cfg = RutherfordConfig(max_agents_advisory=2, enforce_agent_cap=True)
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner, cfg)
+    with pytest.raises(RutherfordError) as info:
+        await service.consensus(
+            ConsensusRequest(targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")], prompt="q")
+        )
+    assert info.value.code == ErrorCode.AGENT_CAP_EXCEEDED
+    assert not runner.calls  # refused before launching any voice
+
+
+async def test_consensus_emits_cut_and_budget_tick_on_a_harvest() -> None:
+    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0})
+    service = _budget_consensus(runner)
+    events: list[ActivityEvent] = []
+    await service.consensus(
+        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3),
+        on_activity=events.append,
+    )
+    kinds = [event.kind for event in events]
+    assert ActivityEventKind.BUDGET_TICK in kinds
+    cut_events = [event for event in events if event.kind is ActivityEventKind.CUT]
+    assert any(event.cli == "slow" for event in cut_events)  # the in-flight voice was cut at the deadline
+
+
+async def test_consensus_emits_job_cancelled_on_outer_cancel() -> None:
+    runner = _BudgetRunner({"slow": 5.0, "slow2": 5.0})
+    service = _budget_consensus(runner)
+    events: list[ActivityEvent] = []
+    task = asyncio.ensure_future(
+        service.consensus(
+            ConsensusRequest(targets=[Target(cli="slow"), Target(cli="slow2")], prompt="q"),
+            on_activity=events.append,
+        )
+    )
+    await asyncio.sleep(0.05)  # let the voices start
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert any(event.kind is ActivityEventKind.JOB_CANCELLED for event in events)
+
+
+async def test_consensus_emits_job_cancelled_on_cancel_during_synthesis() -> None:
+    # N1 (3-K): a cancel during the closing synthesis (after every voice finished, so the voice-task guard
+    # has already exited) must still close the activity stream with a terminal event, not orphan it.
+    class _SlowSynthRunner:
+        async def run(
+            self,
+            spec: InvocationSpec,
+            timeout_s: float,
+            on_progress: Callable[[str], None] | None = None,
+            on_stdout: Callable[[str], None] | None = None,
+        ) -> ProcessResult:
+            prompt = spec.argv[2] if len(spec.argv) > 2 else ""
+            if "synthesizing" in prompt:  # the synthesis pass overruns so a cancel can land inside it
+                await asyncio.sleep(5.0)
+                return ProcessResult(exit_code=0, stdout="synth")
+            return ProcessResult(exit_code=0, stdout="voice answer")
+
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], _SlowSynthRunner())  # type: ignore[arg-type]
+    events: list[ActivityEvent] = []
+    task = asyncio.ensure_future(
+        service.consensus(
+            ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", synthesize=True),
+            on_activity=events.append,
+        )
+    )
+    for _ in range(300):  # wait until both voices finished and the (slow) synthesis is in flight
+        await asyncio.sleep(0.01)
+        if sum(1 for e in events if e.kind is ActivityEventKind.VOICE_FINISHED) >= 2:
+            break
+    await asyncio.sleep(0.05)  # let the synthesis await start
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert any(e.kind is ActivityEventKind.JOB_CANCELLED for e in events)  # the stream is closed, not orphaned
+
+
+async def test_consensus_topology_counts_a_voice_model_fallback() -> None:
+    # N1 (decision 3-A): realized counts fallback re-runs. Voice b's requested model is rejected and it
+    # falls back, running two subprocesses, so realized (3) exceeds the declared width (2).
+    def run_fn(spec: InvocationSpec) -> ProcessResult:
+        if "named-only" in spec.argv:
+            return ProcessResult(exit_code=1, stderr="Named models unavailable on your plan. Switch to Auto.")
+        return ProcessResult(exit_code=0, stdout="ok")
+
+    runner = FakeProcessRunner(run_fn=run_fn)
+    service = _consensus([FakeAdapter("a"), FakeAdapter("b", fallback_model="auto")], runner)
+    result = await service.consensus(
+        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b", model="named-only")], prompt="q")
+    )
+    assert result.topology is not None
+    assert result.topology.declared == 2
+    assert result.topology.realized_delegations == 3  # a: 1, b: primary + fallback = 2
+
+
+async def test_consensus_emits_panel_finished_before_budget_exhausted_raise() -> None:
+    # N1 (3-K): BUDGET_EXHAUSTED is a terminal outcome after panel_started, so the stream must still get a
+    # (failed) panel_finished before the raise -- otherwise push/poll has no terminal event.
+    runner = _BudgetRunner({"slow": 5.0, "slow2": 5.0})  # both cut, none usable -> BUDGET_EXHAUSTED
+    service = _budget_consensus(runner)
+    events: list[ActivityEvent] = []
+    with pytest.raises(RutherfordError) as info:
+        await service.consensus(
+            ConsensusRequest(targets=[Target(cli="slow"), Target(cli="slow2")], prompt="q", time_budget_s=0.3),
+            on_activity=events.append,
+        )
+    assert info.value.code == ErrorCode.BUDGET_EXHAUSTED
+    assert any(e.kind is ActivityEventKind.PANEL_FINISHED and e.status == "failed" for e in events)

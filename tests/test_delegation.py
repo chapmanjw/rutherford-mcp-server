@@ -11,8 +11,15 @@ from rutherford.adapters.base import CLIAdapter
 from rutherford.adapters.ollama import OllamaAdapter
 from rutherford.adapters.registry import AdapterRegistry
 from rutherford.config.schema import AdapterConfig, RutherfordConfig
-from rutherford.domain.enums import SafetyMode
-from rutherford.domain.models import DelegationRequest, InvocationContext, InvocationSpec, ProcessResult, Target
+from rutherford.domain.enums import ActivityEventKind, SafetyMode
+from rutherford.domain.models import (
+    ActivityEvent,
+    DelegationRequest,
+    InvocationContext,
+    InvocationSpec,
+    ProcessResult,
+    Target,
+)
 from rutherford.runtime.depth import ENV_DEPTH
 from rutherford.runtime.platform import OSFamily, PlatformInfo
 from rutherford.services.delegation import DelegationService
@@ -287,6 +294,14 @@ async def test_model_fallback_retries_with_fallback_model() -> None:
     assert result.fallback_from == "named-only"  # the originally requested model that was rejected
     assert result.target.model == "auto"  # the model that actually answered
     assert len(runner.calls) == 2  # one original attempt + one fallback retry
+    # N1 (3-A): the realized delegation count for this seat includes the fallback re-run.
+    assert result.delegation_call_count == 2
+
+
+async def test_no_fallback_counts_one_delegation() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    result = await _service([FakeAdapter("fake")], runner).delegate(_req())
+    assert result.delegation_call_count == 1  # a clean single run is one delegation
 
 
 async def test_no_fallback_without_a_fallback_model() -> None:
@@ -363,6 +378,17 @@ async def test_fallback_chain_exhausted_keeps_the_primary_failure() -> None:
     assert not result.ok
     assert result.target.cli == "a"  # the primary's failure is preserved
     assert result.fallback_chain is None
+
+
+async def test_exhausted_cross_target_chain_counts_every_alternate() -> None:
+    # N1 (3-A): an EXHAUSTED fallback chain still counts the alternates' subprocess attempts in realized --
+    # the failed alternates ran subprocesses and must not be dropped from the count.
+    runner = FakeProcessRunner(ProcessResult(exit_code=1, stderr="rate limit exceeded (429)"))  # all fail retryably
+    service = _service([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner)
+    result = await service.delegate(_req("a", fallback=[Target(cli="b"), Target(cli="c")]))
+    assert not result.ok
+    assert result.fallback_chain is None  # no alternate answered
+    assert result.delegation_call_count == 3  # primary a + alternates b + c, all counted
 
 
 async def test_no_fallback_chain_when_failure_is_not_retryable() -> None:
@@ -566,3 +592,59 @@ async def test_oversized_argv_prompt_passes_through_off_windows() -> None:
     result = await _service([FakeAdapter("fake")], runner, platform=linux).delegate(_req(prompt="x" * 31_000))
     assert result.ok
     assert len(runner.calls) == 1
+
+
+# --- N1 (item 3): activity events + observed-peak passthrough + lineage env ---
+
+
+async def test_delegate_emits_voice_started_then_finished() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="answer"))
+    events: list[ActivityEvent] = []
+    await _service([FakeAdapter("fake")], runner).delegate(_req(), on_activity=events.append)
+    assert [e.kind for e in events] == [ActivityEventKind.VOICE_STARTED, ActivityEventKind.VOICE_FINISHED]
+    assert events[0].cli == "fake" and events[0].status == "started"
+    assert events[1].status == "ok"
+
+
+async def test_delegate_voice_finished_status_is_failed_on_error() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=1, stdout="", stderr="boom"))
+    events: list[ActivityEvent] = []
+    await _service([FakeAdapter("fake")], runner).delegate(_req(), on_activity=events.append)
+    assert events[-1].kind is ActivityEventKind.VOICE_FINISHED
+    assert events[-1].status == "failed"
+
+
+async def test_delegate_carries_observed_peak_agents_from_the_runner() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok", observed_peak_agents=4))
+    result = await _service([FakeAdapter("fake")], runner).delegate(_req())
+    assert result.observed_peak_agents == 4
+
+
+async def test_delegate_voice_finished_carries_observed_agents() -> None:
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok", observed_peak_agents=4))
+    events: list[ActivityEvent] = []
+    await _service([FakeAdapter("fake")], runner).delegate(_req(), on_activity=events.append)
+    assert events[-1].observed_agents == 4
+
+
+async def test_delegate_activity_sink_errors_are_swallowed() -> None:
+    # A raising activity sink must never break the delegation it only observes (best-effort transparency).
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+
+    def boom(_event: ActivityEvent) -> None:
+        raise RuntimeError("sink exploded")
+
+    result = await _service([FakeAdapter("fake")], runner).delegate(_req(), on_activity=boom)
+    assert result.ok and result.text == "ok"
+
+
+async def test_delegate_overlays_lineage_env_on_the_child() -> None:
+    # Count-first lineage: a child is launched with RUTHERFORD_LINEAGE incremented; the parent run id is
+    # carried only when one is set (a panel voice), which a bare delegation has not.
+    from rutherford.runtime.depth import ENV_LINEAGE, ENV_PARENT_RUN
+
+    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
+    await _service([FakeAdapter("fake")], runner).delegate(_req())
+    spec, _ = runner.calls[0]
+    assert spec.env[ENV_LINEAGE] == "1"
+    assert ENV_PARENT_RUN not in spec.env

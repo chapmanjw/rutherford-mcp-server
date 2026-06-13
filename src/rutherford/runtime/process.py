@@ -80,38 +80,57 @@ class AsyncProcessRunner:
         # The accumulator lives in run()'s frame so partial stdout survives a cancellation of
         # _communicate (the wait_for timeout cancels that coroutine; its locals would be lost).
         stdout_acc = bytearray()
+        # N1 (item 3): sample the process tree's local descendant count on a coarse timer, in parallel with
+        # the run, so a panel can observe its real fan-out. Best-effort and self-contained -- it never raises;
+        # the finally guarantees it is always stopped (a leaked sampler would outlive its dead pid).
+        sample_task = asyncio.create_task(_sample_descendants(process.pid))
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                self._communicate(process, stdin_bytes, on_progress, on_stdout, stdout_acc),
-                timeout=timeout_s,
-            )
-        except (TimeoutError, asyncio.CancelledError) as exc:
-            await asyncio.to_thread(kill_process_tree, process.pid)
-            duration = time.monotonic() - start
-            if isinstance(exc, asyncio.CancelledError):
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    self._communicate(process, stdin_bytes, on_progress, on_stdout, stdout_acc),
+                    timeout=timeout_s,
+                )
+            except (TimeoutError, asyncio.CancelledError) as exc:
+                # Kill the tree FIRST, before stopping the sampler: the kill runs in a thread that completes
+                # even if THIS await is itself cancelled (a second external cancel during cleanup), so the
+                # subprocess tree is never left orphaned. Only after the tree is reaped do we read the peak.
+                await asyncio.to_thread(kill_process_tree, process.pid)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                observed = await _stop_sampler(sample_task)
+                return ProcessResult(
+                    exit_code=None,
+                    stdout="",
+                    stderr=f"timed out after {timeout_s:.0f}s",
+                    duration_s=time.monotonic() - start,
+                    timed_out=True,
+                    # Preserve what the child wrote before the deadline so a time-budget harvester can
+                    # surface a candidate answer instead of throwing the work away (decision 2-F).
+                    partial=bytes(stdout_acc).decode("utf-8", errors="replace") or None,
+                    # 0 means "sampled but observed nothing", which is impossible while the child is alive
+                    # (a live process is >=1) -- it is the no-sample case, so report it as None, not 0.
+                    observed_peak_agents=observed or None,
+                )
+            except BaseException:
+                # Any other escape from the wait (an OSError from the stdin feed beyond the tolerated
+                # pipe errors, a raising on_progress callback) must not leak a live child: kill the
+                # tree (best-effort, a no-op on a dead pid) and let the original exception propagate.
+                await asyncio.to_thread(kill_process_tree, process.pid)
                 raise
+            observed = await _stop_sampler(sample_task)
             return ProcessResult(
-                exit_code=None,
-                stdout="",
-                stderr=f"timed out after {timeout_s:.0f}s",
-                duration_s=duration,
-                timed_out=True,
-                # Preserve what the child wrote before the deadline so a time-budget harvester can
-                # surface a candidate answer instead of throwing the work away (decision 2-F).
-                partial=bytes(stdout_acc).decode("utf-8", errors="replace") or None,
+                exit_code=process.returncode,
+                stdout=stdout_b.decode("utf-8", errors="replace"),
+                stderr=stderr_b.decode("utf-8", errors="replace"),
+                duration_s=time.monotonic() - start,
+                observed_peak_agents=observed or None,
             )
-        except BaseException:
-            # Any other escape from the wait (an OSError from the stdin feed beyond the tolerated
-            # pipe errors, a raising on_progress callback) must not leak a live child: kill the
-            # tree (best-effort, a no-op on a dead pid) and let the original exception propagate.
-            await asyncio.to_thread(kill_process_tree, process.pid)
-            raise
-        return ProcessResult(
-            exit_code=process.returncode,
-            stdout=stdout_b.decode("utf-8", errors="replace"),
-            stderr=stderr_b.decode("utf-8", errors="replace"),
-            duration_s=time.monotonic() - start,
-        )
+        finally:
+            # The sampler must never outlive run(): on any path that did not call _stop_sampler (e.g. an
+            # external cancel during cleanup) cancel it here. A cancelled sampler self-terminates; on a path
+            # that already stopped it this is a no-op (the task is done).
+            if not sample_task.done():
+                sample_task.cancel()
 
     @staticmethod
     async def _communicate(
@@ -192,6 +211,57 @@ async def _drain_stream(
     finally:
         if sink is not None and pending:
             sink(pending.decode("utf-8", errors="replace").rstrip("\r"))
+
+
+async def _sample_descendants(pid: int, interval_s: float = 0.5) -> int:
+    """Sample ``pid``'s recursive LOCAL descendant count on a coarse timer; return the peak (N1, item 3).
+
+    Runs as its own task alongside the subprocess. Each tick counts ``pid`` plus its recursive children and
+    keeps the high-water mark. A FLOOR, deliberately: it sees only local processes, so a CLI's remote/cloud
+    agents are invisible. Entirely best-effort -- it NEVER raises: a missing psutil returns 0, and any psutil
+    error (the process is gone, access denied) just ends sampling with the peak so far. Stopped by cancelling
+    it (see :func:`_stop_sampler`); the cancellation ends the sleep and the accumulated peak is returned.
+    """
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - psutil is a hard dependency
+        return 0
+    peak = 0
+    while True:
+        try:
+            peak = max(peak, len(psutil.Process(pid).children(recursive=True)) + 1)  # +1 for the process
+        except psutil.Error:
+            break  # the process is gone or we lost access -- stop with the peak so far
+        except Exception:  # pragma: no cover - belt and braces: sampling must never crash the run
+            break
+        try:
+            await asyncio.sleep(interval_s)
+        except asyncio.CancelledError:
+            break  # stop requested (the run is exiting); return the peak rather than re-raising
+    return peak
+
+
+async def _stop_sampler(task: asyncio.Task[int]) -> int:
+    """Stop the descendant sampler and return its peak; best-effort, never raises (N1, item 3).
+
+    Cancels the task (which breaks its sleep and returns the peak it accumulated) and awaits it. A sampler
+    that was cancelled before its first sample, or that errored, yields 0 rather than propagating.
+    """
+    task.cancel()
+    try:
+        return await task
+    except asyncio.CancelledError:
+        # The sampler catches its own cancellation and RETURNS its peak, so a normal stop never lands here.
+        # This fires only when a CancelledError surfaces at ``await task``. The decisive question is whether
+        # the CURRENT task (run()) is being cancelled from OUTSIDE: if so, this cancel belongs to run() and
+        # must propagate -- never swallow it into a clean result. Only when run() is NOT being cancelled is
+        # this the sampler's own cancellation, with no peak to report (0). ``cancelling()`` (py3.11+) counts
+        # pending external cancels on the current task and is the correct signal -- ``task.cancelled()`` (the
+        # sampler's state) is not, since the sampler returns rather than ends cancelled.
+        current = asyncio.current_task()
+        if current is not None and current.cancelling() > 0:
+            raise
+        return 0
 
 
 def kill_process_tree(pid: int, timeout_s: float = 3.0) -> None:

@@ -18,18 +18,34 @@ from collections.abc import Awaitable, Callable
 from ..domain.enums import JobStatus
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
-from ..domain.models import ConsensusResult, DebateResult, DelegationResult, ErrorInfo, Job, StrategyResult
+from ..domain.models import (
+    ActivityEvent,
+    ConsensusResult,
+    DebateResult,
+    DelegationResult,
+    ErrorInfo,
+    Job,
+    StrategyResult,
+)
 from ..runtime.logging import log_event
 
-#: A job body: given a progress callback and an interim-result sink, produces a delegation, consensus,
-#: debate, or strategy result. The interim sink (F8a, 2-M ``on_budget=continue``) lets a long body publish
-#: a best-effort result while it keeps running -- so a poller sees the harvested-so-far set before the
-#: stragglers finish; a body that has no interim to publish simply never calls it.
+#: A job body: given a string-progress callback, a structured activity callback, and an interim-result sink,
+#: produces a delegation, consensus, debate, or strategy result. The activity callback (N1, item 3, decision
+#: 3-K) carries the structured :class:`ActivityEvent` stream into the job's poll buffer; the interim sink
+#: (F8a, 2-M ``on_budget=continue``) lets a long body publish a best-effort result while it keeps running --
+#: so a poller sees the harvested-so-far set before the stragglers finish; a body with no interim never calls it.
 JobResult = DelegationResult | ConsensusResult | DebateResult | StrategyResult
-JobBody = Callable[[Callable[[str], None], Callable[[JobResult], None]], Awaitable[JobResult]]
+JobBody = Callable[
+    [Callable[[str], None], Callable[[ActivityEvent], None], Callable[[JobResult], None]],
+    Awaitable[JobResult],
+]
 
 #: Job states past which nothing more happens: eligible for TTL eviction and not cancellable.
 _TERMINAL_STATUSES = frozenset({JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED})
+
+#: Cap the per-job structured activity buffer so a long debate cannot grow it without bound; the activity
+#: tool only needs the latest per-voice state, comfortably within this recent-window cap.
+_MAX_ACTIVITY_EVENTS = 500
 
 
 class JobStore:
@@ -97,6 +113,19 @@ class JobStore:
         job = self._jobs.get(job_id)
         if job is not None:
             job.progress.append(line)
+            job.updated_at = self._clock()
+
+    def append_activity(self, job_id: str, event: ActivityEvent) -> None:
+        """Buffer a structured :class:`ActivityEvent` on the job (N1, item 3, the poll sink of decision 3-K).
+
+        Kept to a bounded recent window so a long run cannot grow it without limit; the activity tool reads
+        only the latest per-voice state from it.
+        """
+        job = self._jobs.get(job_id)
+        if job is not None:
+            job.activity.append(event)
+            if len(job.activity) > _MAX_ACTIVITY_EVENTS:
+                del job.activity[: len(job.activity) - _MAX_ACTIVITY_EVENTS]
             job.updated_at = self._clock()
 
     def set_interim_result(self, job_id: str, result: JobResult) -> None:
@@ -186,9 +215,18 @@ class JobService:
 
     async def _run(self, job_id: str, body: JobBody) -> None:
         self._store.mark_running(job_id)
+
+        def on_activity(event: ActivityEvent) -> None:
+            # One stream, two sinks (decision 3-K): buffer the structured event for the activity table AND
+            # project its human message into job.progress for the existing string poll (job_status).
+            self._store.append_activity(job_id, event)
+            if event.message:
+                self._store.append_progress(job_id, event.message)
+
         try:
             result = await body(
                 lambda line: self._store.append_progress(job_id, line),
+                on_activity,
                 lambda interim: self._store.set_interim_result(job_id, interim),
             )
             self._store.complete(job_id, result)

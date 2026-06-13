@@ -66,6 +66,11 @@ class ErrorCode(StrEnum):
     MAX_DEPTH_EXCEEDED = "MAX_DEPTH_EXCEEDED"
     #: A consensus call requested more targets than the per-request cap allows.
     TOO_MANY_TARGETS = "TOO_MANY_TARGETS"
+    #: A panel's declared width exceeded the advisory aggregate-agent cap AND hard enforcement was on
+    #: (``enforce_agent_cap``). Off by default: the cap is advisory (observed and warned, not refused), so
+    #: this is raised only when an operator opts into preemptive refusal (N1, item 3). Distinct from
+    #: TOO_MANY_TARGETS, which is the always-on per-call fan-out cap.
+    AGENT_CAP_EXCEEDED = "AGENT_CAP_EXCEEDED"
     #: A referenced background job id does not exist (or its result has expired).
     JOB_NOT_FOUND = "JOB_NOT_FOUND"
     #: A background job could not be created because the configured ``max_jobs`` cap is reached.

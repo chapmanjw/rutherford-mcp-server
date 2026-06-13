@@ -19,10 +19,11 @@ from pathlib import Path
 from ..adapters.base import CLIAdapter
 from ..adapters.registry import AdapterRegistry
 from ..config.schema import RutherfordConfig
-from ..domain.enums import EFFORT_ORDER, AuthState, Effort, SafetyMode, Stance, Strategy
+from ..domain.enums import EFFORT_ORDER, ActivityEventKind, AuthState, Effort, SafetyMode, Stance, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import (
+    ActivityEvent,
     AuthStatus,
     ConsensusRequest,
     ConsensusResult,
@@ -40,11 +41,12 @@ from ..domain.models import (
     SkippedTarget,
     StrategyResult,
     Target,
+    Topology,
     VoiceVerdict,
 )
 from ..io.ledger import RunLedger
-from ..runtime.depth import ensure_within_target_cap
-from .delegation import DelegationService, ProgressCallback
+from ..runtime.depth import ensure_within_aggregate_cap, ensure_within_target_cap
+from .delegation import ActivityCallback, DelegationService, PanelLifecycle, ProgressCallback, emit_activity
 from .persistence import PanelVoice, live_tee, render_panel_voice_files, stop_live_tee, write_panel_record
 from .strategies import aggregate, apply_stance, effective_diversity, extract_verdict, verdict_instruction
 
@@ -75,6 +77,7 @@ class ConsensusService:
         correlation_id: str = "",
         base_depth: int = 0,
         on_progress: ProgressCallback | None = None,
+        on_activity: ActivityCallback | None = None,
         on_interim_result: Callable[[ConsensusResult | StrategyResult], None] | None = None,
     ) -> ConsensusResult | StrategyResult:
         """Fan out ``req`` across its targets and collect every voice.
@@ -91,10 +94,58 @@ class ConsensusService:
         poller sees partial answers before the panel finishes -- then returns the full set. Without it (a
         sync call), ``continue`` simply runs every voice to completion.
         """
+        # N1 (3-K): wrap the whole panel run so a cancellation at ANY of its awaits (voice waits, the
+        # live-tee stop, active harvest, the closing synthesis, the record persist) closes the activity
+        # stream with exactly one terminal event. The lifecycle emits panel_started/finished from inside the
+        # body; here a cancel emits job_cancelled iff the panel started and has not already closed.
+        lifecycle = PanelLifecycle("consensus", base_depth, on_activity)
+        try:
+            return await self._consensus_impl(
+                req,
+                lifecycle,
+                correlation_id=correlation_id,
+                base_depth=base_depth,
+                on_progress=on_progress,
+                on_activity=on_activity,
+                on_interim_result=on_interim_result,
+            )
+        except asyncio.CancelledError:
+            lifecycle.on_cancel()
+            raise
+
+    async def _consensus_impl(
+        self,
+        req: ConsensusRequest,
+        lifecycle: PanelLifecycle,
+        *,
+        correlation_id: str = "",
+        base_depth: int = 0,
+        on_progress: ProgressCallback | None = None,
+        on_activity: ActivityCallback | None = None,
+        on_interim_result: Callable[[ConsensusResult | StrategyResult], None] | None = None,
+    ) -> ConsensusResult | StrategyResult:
+        """The consensus panel body; the public :meth:`consensus` wraps this with the lifecycle guard."""
         created_at = self._clock()
         persist = self._config.wants_persist(req.persist)
         parent_run_id = uuid.uuid4().hex if persist and self._ledger is not None else None
         targets, skipped = await self._resolve_targets(req, on_progress)
+
+        # N1 (item 3): the declared fan-out width. Check it against the advisory aggregate-agent cap up
+        # front (a no-op unless one is configured; refuses only when ``enforce_agent_cap`` is also set), and
+        # announce the panel as started so a sync caller is pushed the fan-out total before the voices run.
+        declared_width = len(targets)
+        ensure_within_aggregate_cap(
+            declared_width, self._config.max_agents_advisory, enforce=self._config.enforce_agent_cap
+        )
+        lifecycle.mark_started(
+            ActivityEvent(
+                kind=ActivityEventKind.PANEL_STARTED,
+                tool="consensus",
+                depth=base_depth,
+                declared=declared_width,
+                message=f"consensus panel started: {declared_width} voice(s)",
+            )
+        )
 
         requests = [
             DelegationRequest(
@@ -125,6 +176,7 @@ class ConsensusService:
                 base_depth=base_depth,
                 on_progress=on_progress,
                 on_stdout=partials[index].append,
+                on_activity=on_activity,  # N1: each voice emits its own voice_started/voice_finished
             )
 
         # Time-budget harvest (F8a, 2-A'/2-behavior/2-where): run the voices as tasks under an
@@ -161,10 +213,37 @@ class ConsensusService:
                 _done, pending = await asyncio.wait(tasks, timeout=budget)
                 if pending:
                     stop_reason = "budget"
+                    # N1: one budget_tick at the deadline, then a cut event per voice being harvested.
+                    emit_activity(
+                        on_activity,
+                        ActivityEvent(
+                            kind=ActivityEventKind.BUDGET_TICK,
+                            tool="consensus",
+                            depth=base_depth,
+                            budget_left_s=0.0,
+                            message=f"time budget ({budget:.0f}s) reached; harvesting {len(pending)} voice(s)",
+                        ),
+                    )
                     for index, task in enumerate(tasks):
                         if task in pending:
                             cut.add(index)
                             task.cancel()
+                            emit_activity(
+                                on_activity,
+                                ActivityEvent(
+                                    kind=ActivityEventKind.CUT,
+                                    # The same per-voice correlation id its delegate used, so the cut collapses
+                                    # onto that voice's row (the stable key, robust to a model fallback).
+                                    correlation_id=f"{correlation_id}:{index}",
+                                    tool="consensus",
+                                    cli=requests[index].target.cli,
+                                    model=requests[index].target.model,
+                                    role=requests[index].role,
+                                    depth=base_depth,
+                                    status="cut",
+                                    message=f"{requests[index].target.display_label} cut at the time budget",
+                                ),
+                            )
                     # MANDATORY cancel-then-drain: the runner kills the CLI process tree only once the
                     # cancellation is delivered AND awaited -- skipping this leaks orphaned subprocesses.
                     await asyncio.gather(*pending, return_exceptions=True)
@@ -178,7 +257,8 @@ class ConsensusService:
                 await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
             # The OUTER coroutine was cancelled (e.g. job_cancel): asyncio.wait/gather do not cancel the
-            # voice tasks for us, so cancel + drain them (no orphaned trees) before propagating.
+            # voice tasks for us, so cancel + drain them (no orphaned trees) before propagating. The terminal
+            # job_cancelled activity event is emitted once by the panel-lifecycle guard in ``consensus``.
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -207,13 +287,26 @@ class ConsensusService:
         # for a clean best answer, BEFORE the quorum gate (the follow-up may turn a raw partial into a usable
         # answer). Runs only on a budget harvest with cut voices.
         if stop_reason == "budget" and req.harvest_partial and cut:
-            await self._active_harvest(req, voices, cut, correlation_id, base_depth)
+            await self._active_harvest(req, voices, cut, correlation_id, base_depth, on_activity)
 
         # 2-E': a budget harvest that yielded fewer than min_quorum usable voices is a genuine failure
         # (BUDGET_EXHAUSTED), raised before any result/persist; otherwise the harvest is a success.
         if stop_reason == "budget":
             usable = sum(1 for voice in voices if voice.ok and voice.text.strip())
             if usable < self._config.min_quorum:
+                # N1 (3-K): this is a terminal outcome, so close the activity stream with a (failed)
+                # panel_finished BEFORE raising -- otherwise the stream/push has no terminal event.
+                lifecycle.mark_closed(
+                    ActivityEvent(
+                        kind=ActivityEventKind.PANEL_FINISHED,
+                        tool="consensus",
+                        depth=base_depth,
+                        declared=declared_width,
+                        done=usable,
+                        status="failed",
+                        message=f"consensus budget exhausted: {usable} usable voice(s), below quorum",
+                    )
+                )
                 raise RutherfordError(
                     ErrorCode.BUDGET_EXHAUSTED,
                     f"time budget ({budget:.0f}s) reached with {usable} usable voice(s), below "
@@ -221,6 +314,10 @@ class ConsensusService:
                 )
 
         rollup = self._rollup(req, voices, cut, budget, stop_reason, self._clock() - created_at) if budget else None
+        # N1 (item 3): the panel's observed fan-out -- declared width, the voice delegations launched, and
+        # the local descendant peak across the voices (a floor). Attached to the result and persisted onto
+        # the parent record so a kept run has its topology.
+        topology = self._topology(declared_width, voices)
 
         # None means the caller omitted synthesize, the one case the configured default fills; an explicit
         # False wins over a synthesize_default=true config. Resolved here so the panel record snapshots the
@@ -235,6 +332,7 @@ class ConsensusService:
         # rollup (only when a budget governed the run) reports requested/answered/cut/usable + effort (F8a).
         result.stop_reason = stop_reason
         result.rollup = rollup
+        result.topology = topology  # N1: the observed fan-out
 
         if parent_run_id is not None and self._ledger is not None:
             # Write the parent panel record linking the child voice records (off-thread: file I/O). The
@@ -279,8 +377,23 @@ class ConsensusService:
                 panel=panel_inputs,
                 stop_reason=stop_reason,
                 rollup=rollup,
+                topology=topology,
                 extra_artifacts=render_panel_voice_files(panel_voices, skipped_pairs),
             )
+        # N1 (3-K): the terminal panel_finished is the LAST step (no await follows), so the lifecycle guard
+        # never has to choose between this and job_cancelled -- a cancel before here lands in the guard, a
+        # clean run emits this and returns.
+        lifecycle.mark_closed(
+            ActivityEvent(
+                kind=ActivityEventKind.PANEL_FINISHED,
+                tool="consensus",
+                depth=base_depth,
+                declared=declared_width,
+                done=sum(1 for voice in voices if voice.ok),
+                observed_agents=topology.observed_peak_agents,
+                message=f"consensus panel finished: {sum(1 for v in voices if v.ok)}/{len(voices)} ok",
+            )
+        )
         return result
 
     def _diversity(self, voices: list[DelegationResult]) -> DiversityReport | None:
@@ -404,6 +517,7 @@ class ConsensusService:
         cut: set[int],
         correlation_id: str,
         base_depth: int,
+        on_activity: ActivityCallback | None = None,
     ) -> None:
         """Re-prompt each cut voice whose session was recovered for a clean best answer (F8a, 2-I).
 
@@ -412,7 +526,9 @@ class ConsensusService:
         best answer" follow-up against that session; its clean answer replaces the raw partial in ``voices``.
         The follow-ups run concurrently and best-effort -- a failed one leaves the original cut voice intact.
         The follow-up is not its own job record (it continues a panel voice). It spends budget you may be out
-        of, which is why it is opt-in.
+        of, which is why it is opt-in. ``on_activity`` is threaded so the follow-up appears in the live stream
+        (decision 3-K): it reuses the cut voice's correlation id, so its start/finish collapse onto that
+        voice's activity row (cut -> ok) rather than adding a phantom seat.
         """
 
         async def followup(index: int) -> None:
@@ -435,10 +551,18 @@ class ConsensusService:
                 persist=False,  # the follow-up continues a panel voice; it is not its own job record
             )
             result = await self._delegation.delegate(
-                follow_req, correlation_id=f"{correlation_id}:harvest:{index}", base_depth=base_depth
+                # Reuse the cut voice's correlation id so the follow-up's activity events collapse onto that
+                # voice's row (cut -> ok) and the pusher counts the voice once, not as an extra seat.
+                follow_req,
+                correlation_id=f"{correlation_id}:{index}",
+                base_depth=base_depth,
+                on_activity=on_activity,
             )
             if result.ok and result.text.strip():
                 result.stop_reason = "budget"  # a post-deadline harvested answer, not a clean in-budget finish
+                # N1 (3-A): the follow-up is ANOTHER Rutherford delegation on top of the cut voice's own, so
+                # carry the cut voice's count forward rather than dropping it when we replace the voice.
+                result.delegation_call_count += voice.delegation_call_count
                 voices[index] = result
 
         await asyncio.gather(*(followup(index) for index in sorted(cut)), return_exceptions=True)
@@ -476,6 +600,26 @@ class ConsensusService:
             effort_requested=effort_requested,
             effort_applied=effort_applied,
             cost=_rollup_voice_cost(voices),
+        )
+
+    def _topology(self, declared_width: int, voices: list[DelegationResult]) -> Topology:
+        """The panel's observed process/agent fan-out (N1, item 3).
+
+        ``declared`` is the intended width; ``realized_delegations`` is the subprocess delegations Rutherford
+        launched, summed across the voices and INCLUDING each voice's fallback re-runs (decision 3-A), so a
+        model/cross-target fallback shows up as realized > declared; ``observed_peak_agents`` is the max local
+        descendant peak across the voices (a FLOOR -- remote agents are invisible -- and ``None`` when no voice
+        was sampled, e.g. a fake runner). ``over_cap`` flags a realized count over the advisory cap
+        (informational unless ``enforce_agent_cap`` is on, which refuses on the declared width up front).
+        """
+        observed = [voice.observed_peak_agents for voice in voices if voice.observed_peak_agents is not None]
+        realized = sum(voice.delegation_call_count for voice in voices)
+        cap = self._config.max_agents_advisory
+        return Topology(
+            declared=declared_width,
+            realized_delegations=realized,
+            observed_peak_agents=max(observed) if observed else None,
+            over_cap=cap is not None and realized > cap,
         )
 
     def _voice_prompt(self, req: ConsensusRequest, target: Target, index: int) -> str:

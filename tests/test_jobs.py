@@ -12,10 +12,11 @@ from toon import decode
 from rutherford.domain.enums import JobStatus
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import DelegationResult, ErrorInfo, Job, Target
+from rutherford.domain.models import DelegationResult, ErrorInfo, Job, ProcessResult, Target
 from rutherford.services.jobs import JobService, JobStore
+from rutherford.tools.consensus import consensus_tool
 from rutherford.tools.jobs import cancel_job_tool, job_result_tool, list_jobs_tool
-from tests.fakes import make_app
+from tests.fakes import FakeAdapter, FakeProcessRunner, make_app
 
 
 class _Clock:
@@ -106,7 +107,7 @@ async def _wait_terminal(service: JobService, job_id: str, tries: int = 500) -> 
 async def test_service_runs_body_to_completion() -> None:
     service = JobService()
 
-    async def body(progress: object, set_interim: object) -> DelegationResult:
+    async def body(progress: object, activity: object, set_interim: object) -> DelegationResult:
         progress("working")  # type: ignore[operator]
         return _result("background")
 
@@ -121,7 +122,7 @@ async def test_service_runs_body_to_completion() -> None:
 async def test_service_failing_body_marks_failed() -> None:
     service = JobService()
 
-    async def body(progress: object, set_interim: object) -> DelegationResult:
+    async def body(progress: object, activity: object, set_interim: object) -> DelegationResult:
         raise ValueError("kaboom")
 
     job = service.submit("delegate", body)
@@ -136,7 +137,7 @@ async def test_a_rutherford_error_from_a_body_keeps_its_code() -> None:
     # INTERNAL, dropping its code/details, while the sync tool path preserved them.
     service = JobService()
 
-    async def body(progress: object, set_interim: object) -> DelegationResult:
+    async def body(progress: object, activity: object, set_interim: object) -> DelegationResult:
         raise RutherfordError(ErrorCode.INVALID_INPUT, "bad arguments", details={"field": "prompt"})
 
     job = service.submit("delegate", body)
@@ -213,7 +214,7 @@ async def test_service_cancels_a_running_job() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def body(progress: object, set_interim: object) -> DelegationResult:
+    async def body(progress: object, activity: object, set_interim: object) -> DelegationResult:
         started.set()
         await release.wait()  # block until cancelled
         return _result()
@@ -229,7 +230,7 @@ async def test_job_tools_list_and_cancel() -> None:
     app = make_app()
     release = asyncio.Event()
 
-    async def body(progress: object, set_interim: object) -> DelegationResult:
+    async def body(progress: object, activity: object, set_interim: object) -> DelegationResult:
         await release.wait()
         return _result()
 
@@ -245,7 +246,7 @@ async def test_job_result_on_a_running_job_is_a_still_running_notice() -> None:
     app = make_app()
     release = asyncio.Event()
 
-    async def body(progress: object, set_interim: object) -> DelegationResult:
+    async def body(progress: object, activity: object, set_interim: object) -> DelegationResult:
         await release.wait()
         return _result()
 
@@ -262,7 +263,7 @@ async def test_job_result_surfaces_an_interim_result_while_running() -> None:
     app = make_app()
     release = asyncio.Event()
 
-    async def body(progress: object, set_interim: object) -> DelegationResult:
+    async def body(progress: object, activity: object, set_interim: object) -> DelegationResult:
         set_interim(_result("best-effort so far"))  # type: ignore[operator]
         await release.wait()
         return _result("final")
@@ -281,7 +282,7 @@ async def test_job_result_surfaces_an_interim_result_while_running() -> None:
 async def test_job_result_on_a_failed_job_returns_the_error() -> None:
     app = make_app()
 
-    async def body(progress: object, set_interim: object) -> DelegationResult:
+    async def body(progress: object, activity: object, set_interim: object) -> DelegationResult:
         raise ValueError("kaboom")
 
     job = app.jobs.submit("delegate", body)
@@ -292,6 +293,29 @@ async def test_job_result_on_a_failed_job_returns_the_error() -> None:
     assert "kaboom" in out["error"]["message"]
 
 
+async def test_async_consensus_folds_the_activity_stream_into_job_progress() -> None:
+    # N1 (item 3): the poll path (job.progress) is fed by the same ActivityEvent stream the sync path
+    # pushes, so an async panel's progress shows the panel / voice lifecycle, not just stderr lines.
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+    )
+    out = decode(await consensus_tool(app, prompt="q", targets=["a", "b"], mode="async"))
+    job = await _wait_terminal(app.jobs, out["job_id"])
+    # The string projection (job.progress) shows the lifecycle...
+    assert any("panel started" in line for line in job.progress)
+    assert any("started" in line for line in job.progress)  # per-voice voice_started
+    assert any("finished" in line for line in job.progress)  # panel_finished
+    # ...and the SAME stream is buffered structurally (decision 3-K) so the activity table can render it.
+    from rutherford.domain.enums import ActivityEventKind
+
+    kinds = {event.kind for event in job.activity}
+    assert ActivityEventKind.PANEL_STARTED in kinds
+    assert ActivityEventKind.VOICE_FINISHED in kinds
+    assert ActivityEventKind.PANEL_FINISHED in kinds
+    assert {event.cli for event in job.activity if event.cli} == {"a", "b"}  # both voices captured
+
+
 async def test_job_result_on_a_cancelled_job_is_a_structured_notice_not_null() -> None:
     # Regression (F16): a cancelled job has result=None and error=None, so the tool used to
     # serialize the literal "null" instead of an envelope a client can act on.
@@ -299,7 +323,7 @@ async def test_job_result_on_a_cancelled_job_is_a_structured_notice_not_null() -
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def body(progress: object, set_interim: object) -> DelegationResult:
+    async def body(progress: object, activity: object, set_interim: object) -> DelegationResult:
         started.set()
         await release.wait()
         return _result()
