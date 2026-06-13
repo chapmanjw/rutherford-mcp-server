@@ -68,11 +68,13 @@ def test_store_ttl_eviction() -> None:
 
 
 async def _wait_terminal(service: JobService, job_id: str, tries: int = 500) -> Job:
+    # Poll on real time (asyncio.sleep(0.005)), not a zero-delay busy-yield: a job body may await a
+    # thread-pool round-trip, and 500 instant yields can elapse before it returns on a loaded runner.
     for _ in range(tries):
         job = service.get(job_id)
         if job.status in (JobStatus.SUCCEEDED, JobStatus.FAILED):
             return job
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.005)
     raise AssertionError("job did not finish in time")
 
 

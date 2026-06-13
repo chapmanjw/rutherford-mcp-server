@@ -223,8 +223,14 @@ class DelegationService:
         self._log_delegation(req, result, correlation_id, base_depth)
         # Off-thread: persistence runs blocking git subprocesses + file I/O, and delegate() is the
         # convergence point shared by concurrent panel voices -- keep the event loop free, matching
-        # how _git_fingerprint and adapter.detect are already offloaded above.
-        await asyncio.to_thread(self._maybe_persist, req, result, spec, detected.version, created_at, before_changed)
+        # how _git_fingerprint and adapter.detect are already offloaded above. Gated on actually
+        # persisting so an ephemeral run (the default) does not pay a thread-pool round-trip just to
+        # early-return -- _maybe_persist is a no-op otherwise, and that needless hop on every
+        # delegation also added latency that destabilized the async-job poll timing.
+        if self._ledger is not None and self._should_persist(req):
+            await asyncio.to_thread(
+                self._maybe_persist, req, result, spec, detected.version, created_at, before_changed
+            )
         return result
 
     def _log_delegation(

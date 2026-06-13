@@ -93,7 +93,7 @@ async def test_failed_job_logs_error_type_not_the_exception_message() -> None:
     for _ in range(500):
         if service.get(job.id).status is JobStatus.FAILED:
             break
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.005)  # real time, not a zero-delay busy-yield (see test_jobs._wait_terminal)
     finished = [
         json.loads(line)
         for line in stream.getvalue().splitlines()

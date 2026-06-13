@@ -139,11 +139,16 @@ async def test_delegate_tool_async_returns_job_then_result() -> None:
     submitted = _decode(await delegate_tool(app, cli="fake", prompt="q", mode="async"))
     job_id = submitted["job_id"]
 
+    # Poll on REAL time, not asyncio.sleep(0): the job body awaits a thread-pool hop (adapter.detect),
+    # and a zero-delay busy-yield can exhaust its budget before that round-trip completes on a loaded
+    # CI runner -- which surfaced as a flaky KeyError('ok') when the still-running result was read.
+    status = {"status": "pending"}
     for _ in range(500):
         status = _decode(await job_status_tool(app, job_id=job_id))
         if status["status"] in ("succeeded", "failed"):
             break
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.005)
+    assert status["status"] == "succeeded", f"job did not finish: {status}"  # fail at the poll, not on a missing key
 
     result = _decode(await job_result_tool(app, job_id=job_id))
     assert result["ok"] is True
