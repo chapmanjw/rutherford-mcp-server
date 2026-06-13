@@ -63,13 +63,15 @@ def build_setup_plan(
     safety_mode: str = "read_only",
     trusted_workspaces: Iterable[str] = (),
     panel_name: str = "default",
+    default_persistence: str | None = None,
 ) -> SetupPlan:
     """Build a :class:`SetupPlan` from probed adapter statuses, without touching disk.
 
     A CLI is "ready" when it is installed and either authenticated or auth-unknown (the optimistic
     case doctor verifies live). The starter panel is the ready, non-optional CLIs, proposed only
-    when at least two are ready -- an opt-in local model is never auto-added to it. The
-    config carries the chosen default safety mode and any trusted workspaces.
+    when at least two are ready -- an opt-in local model is never auto-added to it. The config carries
+    the chosen default safety mode, any trusted workspaces, and -- when the caller answers the
+    first-run persistence question (F2, decision 1-I) -- the chosen ``default_persistence``.
     """
     detected: list[DetectedCli] = []
     ready: list[str] = []
@@ -86,6 +88,8 @@ def build_setup_plan(
     notes: list[str] = []
 
     config: dict[str, Any] = {"default_safety_mode": safety_mode}
+    if default_persistence is not None:
+        config["default_persistence"] = default_persistence
     workspaces = [path for path in trusted_workspaces if path]
     if workspaces:
         config["trusted_workspaces"] = workspaces

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -153,6 +154,38 @@ async def test_delegate_tool_async_returns_job_then_result() -> None:
     result = _decode(await job_result_tool(app, job_id=job_id))
     assert result["ok"] is True
     assert result["text"] == "bg-answer"
+
+
+async def test_async_consensus_submit_carries_a_persistence_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 1-J: a non-trivial run started as a background job still gets the persistence notice, even though
+    # the async path returns at submit time (before any result), where it used to be silently skipped.
+    monkeypatch.chdir(tmp_path)  # no .rutherford -> ephemeral default + first-run hint
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+    )
+    submitted = _decode(await consensus_tool(app, targets=[{"cli": "a"}, {"cli": "b"}], prompt="q", mode="async"))
+    assert submitted["job_id"]
+    assert submitted["notice"]  # the suggest-a-job / first-run hint rides the async submit envelope
+
+
+async def test_async_submit_omits_notice_when_external_tracking(monkeypatch: pytest.MonkeyPatch) -> None:
+    # external_tracking=true (an orchestrator already tracks the run) suppresses the suggestion; with a
+    # config dir present there is no first-run hint either, so the envelope carries no notice key.
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+    )
+    app.setup_hint_emitted = True  # suppress the first-run hint regardless of cwd
+    submitted = _decode(
+        await consensus_tool(
+            app, targets=[{"cli": "a"}, {"cli": "b"}], prompt="q", mode="async", external_tracking=True
+        )
+    )
+    assert submitted["job_id"]
+    assert "notice" not in submitted
 
 
 async def test_consensus_tool_returns_voices() -> None:

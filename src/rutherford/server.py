@@ -378,11 +378,14 @@ async def setup(
     safety_mode: str = "read_only",
     trusted_workspaces: list[str] | None = None,
     panel_name: str = "default",
+    default_persistence: str | None = None,
 ) -> str:
     """Scaffold a starter config and panel from the CLIs you have installed and signed in.
 
     By default this is a dry run: it returns the proposed files (with their full contents) so you can
     review them. Pass `apply=true` to write them; an existing file is kept unless `force=true`.
+    `default_persistence` (`ephemeral` | `job`) answers the first-run question of whether runs are kept
+    as durable jobs by default (F2); when given, it is written into the config.
     """
     return await _guarded(
         setup_tool(
@@ -392,6 +395,7 @@ async def setup(
             safety_mode=safety_mode,
             trusted_workspaces=trusted_workspaces,
             panel_name=panel_name,
+            default_persistence=default_persistence,
         )
     )
 

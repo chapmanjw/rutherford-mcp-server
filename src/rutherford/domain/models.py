@@ -529,6 +529,9 @@ class DebateContribution(BaseModel):
     #: The effective provider/model that produced this turn (F3), carried from the voice's result.
     #: ``None`` when undetermined.
     provenance: Provenance | None = None
+    #: The cost this turn reported, carried from the voice's result, so a persisted debate's parent can
+    #: roll up panel cost into ``state.toon`` (decision 1-D). ``None`` when the CLI reported none.
+    cost: Cost | None = None
     #: The directory this turn was persisted to when the debate was kept as a job (the child record of
     #: the panel parent). ``None`` for an ephemeral debate.
     run_dir: str | None = None
@@ -586,6 +589,24 @@ class Job(BaseModel):
 # --- Durable run records (F2) ------------------------------------------------
 
 
+class Topology(BaseModel):
+    """The process/agent fan-out a run declared and (locally) realized -- the F2 record's topology slot.
+
+    Reserved in the schema from day one (decision 1-D) so a kept run has a home for fan-out data the
+    moment the N1 topology observation work (the roadmap's item 3) lands, without a schema bump
+    invalidating the corpus recorded before then. All fields are optional and unset today: nothing
+    populates this yet -- the record carries the slot, not the data. ``declared`` is the intended
+    width, ``realized_delegations`` is Rutherford's own calls (incl. fallback / nested), and
+    ``observed_peak_agents`` is the local descendant high-water mark (a floor: a CLI's remote agents
+    are invisible). ``over_cap`` flags a panel that ran wider than the advisory aggregate cap.
+    """
+
+    declared: int | None = None
+    realized_delegations: int | None = None
+    observed_peak_agents: int | None = None
+    over_cap: bool = False
+
+
 class RunRecord(BaseModel):
     """A durable, replay-complete record of one run, persisted as a job (F2).
 
@@ -626,10 +647,17 @@ class RunRecord(BaseModel):
     child_run_ids: list[str] = Field(default_factory=list)
     # --- what produced the answer ---
     cli: str
+    #: The model the caller requested (pre-fallback); ``None`` means "the adapter's default". Kept
+    #: alongside the resolved ``model`` so the record shows requested-vs-resolved when a model fallback
+    #: fired (the ``argv`` is the *resolved* invocation; the requested form recomposes from this +
+    #: ``prompt``/``role``/``files``).
+    requested_model: str | None = None
     model: str | None = None
     adapter_version: str | None = None
     provenance: Provenance | None = None
     safety_mode: SafetyMode = SafetyMode.READ_ONLY
+    #: Process/agent fan-out slot (decision 1-D), reserved for the item-3 N1 work; unset today.
+    topology: Topology | None = None
     # --- the pinned invocation (replay-complete; no env -- it can hold secrets) ---
     argv: list[str] = Field(default_factory=list)
     cwd: str | None = None

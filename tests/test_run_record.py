@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from rutherford.domain.enums import JobStatus, SafetyMode
-from rutherford.domain.models import RunRecord
+from rutherford.domain.models import RunRecord, Topology
 
 
 def _record(**kwargs: object) -> RunRecord:
@@ -47,3 +47,18 @@ def test_none_fields_drop_from_the_persisted_shape() -> None:
     assert "model" not in dumped
     assert "cost" not in dumped
     assert dumped["schema_version"] == 1
+
+
+def test_replay_complete_slots_exist_and_default_empty() -> None:
+    # 1-D: the schema carries a requested-vs-resolved model and a reserved topology slot from day one,
+    # both unset by default (the topology data lands with the item-3 N1 work; the slot is reserved now
+    # so adding it later does not invalidate the corpus).
+    record = _record()
+    assert record.requested_model is None
+    assert record.topology is None
+    assert "requested_model" in RunRecord.model_fields
+    assert "topology" in RunRecord.model_fields
+    # A populated record keeps both: the requested model (pre-fallback) and the resolved one.
+    resolved = _record(requested_model="opus", model="sonnet", topology=Topology(declared=5, observed_peak_agents=12))
+    assert resolved.requested_model == "opus" and resolved.model == "sonnet"
+    assert resolved.topology is not None and resolved.topology.declared == 5

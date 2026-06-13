@@ -10,7 +10,7 @@ FastMCP layer reports a clean error.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -20,8 +20,32 @@ from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import Target
 
+if TYPE_CHECKING:
+    from ..context import AppContext
+    from ..domain.models import Job
+
 #: The per-target metadata keys read from a target dict, beyond ``cli`` and ``model``.
 _TARGET_META_KEYS = ("role", "label", "weight", "parity", "stance")
+
+
+def async_job_envelope(
+    app: AppContext, job: Job, *, persist: bool | None, complex_run: bool, external_tracking: bool
+) -> dict[str, Any]:
+    """Build the ``mode=async`` submit envelope, carrying the same F2 persistence notice the sync path adds.
+
+    A non-trivial run started as a background job is exactly the case decision 1-J targets, but the async
+    path returns at submit time before any result exists -- so the notice is computed here from whether the
+    run *will* persist (``persist``, else the configured ``default_persistence``). ``None`` notice is
+    omitted so the envelope stays minimal when there is nothing to say.
+    """
+    would_persist = persist if persist is not None else (app.config.default_persistence == "job")
+    notice = app.persistence_notice(
+        persisted=would_persist, complex_run=complex_run, external_tracking=external_tracking
+    )
+    payload: dict[str, Any] = {"job_id": job.id, "status": job.status, "kind": job.kind}
+    if notice is not None:
+        payload["notice"] = notice
+    return payload
 
 
 def parse_safety_mode(value: str | SafetyMode) -> SafetyMode:
@@ -35,6 +59,19 @@ def parse_safety_mode(value: str | SafetyMode) -> SafetyMode:
         raise RutherfordError(
             ErrorCode.INVALID_INPUT, f"unknown safety_mode {value!r}; choose one of: {options}"
         ) from None
+
+
+def parse_persistence(value: str) -> str:
+    """Validate a ``default_persistence`` choice (``ephemeral`` | ``job``) for setup, or raise ``INVALID_INPUT``.
+
+    Kept as a string (the config field is a ``Literal``, not an enum) but validated at the tool boundary so
+    an invalid value is a clean error here, never written into config where it would fail the next load.
+    """
+    if value in ("ephemeral", "job"):
+        return value
+    raise RutherfordError(
+        ErrorCode.INVALID_INPUT, f"unknown default_persistence {value!r}; choose one of: ephemeral, job"
+    )
 
 
 def resolve_safety_mode(value: str | SafetyMode | None, default: SafetyMode) -> SafetyMode:

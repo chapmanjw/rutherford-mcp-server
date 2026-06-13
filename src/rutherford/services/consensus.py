@@ -39,7 +39,7 @@ from ..domain.models import (
 from ..io.ledger import RunLedger
 from ..runtime.depth import ensure_within_target_cap
 from .delegation import DelegationService, ProgressCallback
-from .persistence import PanelVoice, render_panel_voices, write_panel_record
+from .persistence import PanelVoice, render_panel_voice_files, write_panel_record
 from .strategies import aggregate, apply_stance, effective_diversity, extract_verdict, verdict_instruction
 
 
@@ -123,11 +123,9 @@ class ConsensusService:
 
         result: ConsensusResult | StrategyResult
         answer: str
-        synthesized: bool
         if req.strategy is not Strategy.ALL_VOICES:
             result = self._aggregate(req, voices, skipped)
             answer = result.decision or result.outcome
-            synthesized = False  # a strategy outcome is a terse decision, not free-text synthesis
         else:
             synthesis: str | None = None
             synthesis_by: str | None = None
@@ -144,15 +142,14 @@ class ConsensusService:
                 diversity=self._diversity(voices),
             )
             answer = synthesis or "(no synthesis -- see the linked voice records)"
-            synthesized = synthesis is not None
 
         if parent_run_id is not None and self._ledger is not None:
             # Write the parent panel record linking the child voice records (off-thread: file I/O). The
-            # parent's status is derived from the voices, and when there is no synthesis a voices.md
-            # inlines each voice so the parent is auditable without every child record still on disk.
+            # parent's status is derived from the voices, and a voices/voice-N.md per voice (plus a
+            # skipped.md for an auto-panel's left-out adapters) makes the parent auditable without every
+            # child record still on disk. The parent also rolls up the request's safety/files/role.
             panel_voices = [_panel_voice(voice) for voice in voices]
             skipped_pairs = [(entry.cli, entry.reason) for entry in skipped]
-            extra = None if synthesized else {"voices.md": render_panel_voices(panel_voices, skipped_pairs)}
             result.run_dir = await asyncio.to_thread(
                 write_panel_record,
                 self._ledger,
@@ -164,7 +161,10 @@ class ConsensusService:
                 answer=answer,
                 created_at=created_at,
                 finished_at=self._clock(),
-                extra_artifacts=extra,
+                safety_mode=req.safety_mode,
+                files=req.files,
+                role=req.role,
+                extra_artifacts=render_panel_voice_files(panel_voices, skipped_pairs),
             )
         return result
 
@@ -385,6 +385,8 @@ def _panel_voice(voice: DelegationResult) -> PanelVoice:
         run_id=Path(voice.run_dir).name if voice.run_dir else None,
         text=voice.text,
         error=voice.error.message if voice.error else None,
+        cost=voice.cost,
+        changed_files=tuple(voice.changed_files or ()),
     )
 
 

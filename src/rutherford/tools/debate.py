@@ -9,7 +9,15 @@ from typing import Any
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode, Stance
 from ..domain.models import DebateRequest, Target
-from .common import as_target, ensure_known_cli, ensure_known_targets, parse_mode, parse_stances, resolve_safety_mode
+from .common import (
+    as_target,
+    async_job_envelope,
+    ensure_known_cli,
+    ensure_known_targets,
+    parse_mode,
+    parse_stances,
+    resolve_safety_mode,
+)
 from .panels import panel_for_call
 
 
@@ -86,7 +94,9 @@ async def debate_tool(
                 on_progress=progress,
             ),
         )
-        return tool_success({"job_id": job.id, "status": job.status, "kind": job.kind})
+        return tool_success(
+            async_job_envelope(app, job, persist=persist, complex_run=True, external_tracking=external_tracking)
+        )
 
     result = await app.debate.debate(request, correlation_id=correlation_id, base_depth=app.base_depth)
     result.notice = app.persistence_notice(

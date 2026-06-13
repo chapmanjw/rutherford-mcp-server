@@ -99,6 +99,19 @@ def test_config_file_carries_safety_mode_and_workspaces(tmp_path: Path) -> None:
     assert r"trusted_workspaces = ['C:\work\repo']" in config.content
 
 
+def test_config_file_carries_default_persistence_when_chosen(tmp_path: Path) -> None:
+    # 1-I: setup writes the first-run persistence choice into config, so the hint's "run setup" works.
+    plan = build_setup_plan([_status("a"), _status("b")], env=_env(tmp_path), default_persistence="job")
+    config = next(f for f in plan.files if f.kind == "config")
+    assert "default_persistence = 'job'" in config.content
+
+
+def test_default_persistence_is_omitted_when_not_chosen(tmp_path: Path) -> None:
+    plan = build_setup_plan([_status("a"), _status("b")], env=_env(tmp_path))
+    config = next(f for f in plan.files if f.kind == "config")
+    assert "default_persistence" not in config.content  # not forced when the caller did not answer
+
+
 def test_apply_writes_new_files_and_skips_existing(tmp_path: Path) -> None:
     plan = build_setup_plan([_status("a"), _status("b")], env=_env(tmp_path))
     written = apply_setup_plan(plan)
@@ -155,6 +168,21 @@ async def test_setup_tool_rejects_an_invalid_safety_mode_and_writes_nothing(
     )
     with pytest.raises(RutherfordError, match="safety_mode"):
         await setup_tool(app, apply=True, safety_mode="bogus")
+    assert not default_global_config_path(os.environ).exists()
+
+
+async def test_setup_tool_rejects_an_invalid_default_persistence_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Same boundary discipline as safety_mode: a bogus default_persistence is a clean INVALID_INPUT,
+    # never written into config.toml where it would fail the Literal validation on the next load.
+    _pin_env(monkeypatch, tmp_path)
+    app = make_app(
+        adapters=[FakeAdapter("a"), FakeAdapter("b")],
+        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
+    )
+    with pytest.raises(RutherfordError, match="default_persistence"):
+        await setup_tool(app, apply=True, default_persistence="sometimes")
     assert not default_global_config_path(os.environ).exists()
 
 

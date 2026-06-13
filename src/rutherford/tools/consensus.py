@@ -11,6 +11,7 @@ from ..domain.enums import DelegationMode
 from ..domain.models import ConsensusRequest, Target
 from .common import (
     as_target,
+    async_job_envelope,
     ensure_known_cli,
     ensure_known_targets,
     parse_mode,
@@ -109,7 +110,9 @@ async def consensus_tool(
                 on_progress=progress,
             ),
         )
-        return tool_success({"job_id": job.id, "status": job.status, "kind": job.kind})
+        return tool_success(
+            async_job_envelope(app, job, persist=persist, complex_run=True, external_tracking=external_tracking)
+        )
 
     result = await app.consensus.consensus(request, correlation_id=correlation_id, base_depth=app.base_depth)
     result.notice = app.persistence_notice(

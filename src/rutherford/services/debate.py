@@ -134,6 +134,9 @@ class DebateService:
                 answer=final or "(no closing synthesis -- see the linked voice records)",
                 created_at=created_at,
                 finished_at=self._clock(),
+                safety_mode=req.safety_mode,
+                files=req.files,
+                role=req.role,
                 extra_artifacts={"transcript.md": _render_transcript(req.prompt, rounds)},
             )
         return result
@@ -360,6 +363,7 @@ def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) 
         error=result.error,
         fallback_from=result.fallback_from,
         provenance=result.provenance,
+        cost=result.cost,
         run_dir=result.run_dir,
     )
 
@@ -372,6 +376,7 @@ def _panel_voice(contribution: DebateContribution) -> PanelVoice:
         run_id=Path(contribution.run_dir).name if contribution.run_dir else None,
         text=contribution.text,
         error=contribution.error.message if contribution.error else None,
+        cost=contribution.cost,
     )
 
 

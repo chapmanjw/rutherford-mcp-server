@@ -526,6 +526,7 @@ class DelegationService:
             duration_s=result.duration_s,
             parent_run_id=req.parent_run_id,
             cli=req.target.cli,
+            requested_model=req.target.model,  # pre-fallback; result.target.model is the resolved one
             model=result.target.model,
             adapter_version=adapter_version,
             provenance=result.provenance,

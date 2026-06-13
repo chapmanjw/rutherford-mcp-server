@@ -7,7 +7,7 @@ from __future__ import annotations
 from ..context import AppContext, tool_success
 from ..domain.enums import DelegationMode, is_mutating
 from ..domain.models import DelegationRequest, Target
-from .common import as_target, parse_mode, resolve_safety_mode
+from .common import as_target, async_job_envelope, parse_mode, resolve_safety_mode
 
 
 async def delegate_tool(
@@ -65,7 +65,15 @@ async def delegate_tool(
                 on_progress=progress,
             ),
         )
-        return tool_success({"job_id": job.id, "status": job.status, "kind": job.kind})
+        return tool_success(
+            async_job_envelope(
+                app,
+                job,
+                persist=request.persist,
+                complex_run=is_mutating(request.safety_mode),
+                external_tracking=external_tracking,
+            )
+        )
 
     result = await app.delegation.delegate(request, correlation_id=correlation_id, base_depth=app.base_depth)
     result.notice = app.persistence_notice(

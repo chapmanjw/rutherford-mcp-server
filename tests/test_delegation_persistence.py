@@ -13,6 +13,7 @@ from rutherford.config.schema import RutherfordConfig
 from rutherford.domain.enums import JobStatus, SafetyMode, Strategy
 from rutherford.domain.models import (
     ConsensusRequest,
+    Cost,
     DebateRequest,
     DelegationRequest,
     InvocationContext,
@@ -24,7 +25,7 @@ from rutherford.domain.models import (
 from rutherford.io.ledger import RunLedger
 from rutherford.services import delegation as delegation_module
 from rutherford.services.delegation import DelegationService
-from rutherford.services.persistence import PanelVoice, write_panel_record
+from rutherford.services.persistence import PanelVoice, render_panel_voice_files, write_panel_record
 from rutherford.services.roles import load_roles
 from tests.fakes import FakeAdapter, FakeProcessRunner, make_app
 
@@ -267,8 +268,8 @@ async def test_ephemeral_consensus_persists_nothing(tmp_path: Path) -> None:
 
 async def test_strategy_consensus_persists_a_parent_record(tmp_path: Path) -> None:
     # The strategy path (an aggregated StrategyResult, not all-voices) persists the same parent + child
-    # records. With no free-text synthesis, the parent's status is derived from the voices (succeeded) and
-    # a voices.md inlines each voice so the panel is auditable without every child record.
+    # records. The parent's status is derived from the voices (succeeded) and one voices/voice-N.md per
+    # voice (the locked 1-layout) makes the panel auditable without every child record.
     app = make_app(
         adapters=[FakeAdapter("a"), FakeAdapter("b")],
         runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="approve")),
@@ -285,15 +286,17 @@ async def test_strategy_consensus_persists_a_parent_record(tmp_path: Path) -> No
     assert "kind: consensus" in parent_state
     assert "child_run_ids[2]" in parent_state
     assert f"status: {JobStatus.SUCCEEDED.value}" in parent_state  # derived from the answering voices
-    voices_md = (parent / "artifacts" / "voices.md").read_text(encoding="utf-8")
-    assert voices_md.count("\n## ") == 2  # one section per voice
+    voices_dir = parent / "artifacts" / "voices"
+    voice_files = sorted(p.name for p in voices_dir.glob("voice-*.md"))
+    assert voice_files == ["voice-1.md", "voice-2.md"]  # one file per voice, the locked layout
+    assert "approve" in (voices_dir / "voice-1.md").read_text(encoding="utf-8")
     dirs = [d for d in (tmp_path / "jobs").iterdir() if d.is_dir()]
     assert len(dirs) == 3  # parent + two children
 
 
 async def test_all_voices_failed_persists_a_failed_parent(tmp_path: Path) -> None:
     # The parent status is derived from the voices, not assumed SUCCEEDED: when every voice fails the parent
-    # is FAILED, and its voices.md still inlines each voice's error so the failed panel stays auditable.
+    # is FAILED, and each voices/voice-N.md still inlines that voice's error so the failed panel stays auditable.
     app = make_app(
         adapters=[FakeAdapter("a"), FakeAdapter("b")],
         runner=FakeProcessRunner(ProcessResult(exit_code=1, stdout="", stderr="boom")),
@@ -305,15 +308,15 @@ async def test_all_voices_failed_persists_a_failed_parent(tmp_path: Path) -> Non
     assert result.run_dir is not None
     parent = Path(result.run_dir)
     assert f"status: {JobStatus.FAILED.value}" in (parent / "state.toon").read_text(encoding="utf-8")
-    voices_md = (parent / "artifacts" / "voices.md").read_text(encoding="utf-8")
-    assert "(failed)" in voices_md
-    assert "boom" in voices_md  # the actual error text is inlined, not just a (failed) marker
+    voice_1 = (parent / "artifacts" / "voices" / "voice-1.md").read_text(encoding="utf-8")
+    assert "(failed)" in voice_1
+    assert "boom" in voice_1  # the actual error text is inlined, not just a (failed) marker
 
 
 async def test_expand_all_with_everything_skipped_persists_an_auditable_failed_parent(tmp_path: Path) -> None:
     # An auto-expanded panel where every adapter is skipped (here: not installed) still persists an honest
-    # parent: status FAILED, no children, and a voices.md that inlines the skip reasons -- so the all-skipped
-    # panel, which has no child records to walk to, still explains itself from the parent alone.
+    # parent: status FAILED, no children, and a voices/skipped.md that inlines the skip reasons -- so the
+    # all-skipped panel, which has no child records to walk to, still explains itself from the parent alone.
     app = make_app(
         adapters=[FakeAdapter("a", installed=False), FakeAdapter("b", installed=False)],
         runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="x")),
@@ -323,9 +326,9 @@ async def test_expand_all_with_everything_skipped_persists_an_auditable_failed_p
     assert result.run_dir is not None
     parent = Path(result.run_dir)
     assert f"status: {JobStatus.FAILED.value}" in (parent / "state.toon").read_text(encoding="utf-8")
-    voices_md = (parent / "artifacts" / "voices.md").read_text(encoding="utf-8")
-    assert "## Skipped" in voices_md
-    assert "a: " in voices_md and "b: " in voices_md  # both skipped adapters named with their reason
+    skipped_md = (parent / "artifacts" / "voices" / "skipped.md").read_text(encoding="utf-8")
+    assert "Skipped" in skipped_md
+    assert "a: " in skipped_md and "b: " in skipped_md  # both skipped adapters named with their reason
     children = [d for d in (tmp_path / "jobs").iterdir() if d.is_dir() and d.name != parent.name]
     assert children == []  # no voice ran, so the parent links no children
 
@@ -403,3 +406,90 @@ async def test_role_is_captured_in_the_record(tmp_path: Path) -> None:
     result = await _service(tmp_path).delegate(_req(persist=True, role="planner"))
     assert result.run_dir is not None
     assert "role: planner" in (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
+
+
+async def test_requested_model_is_captured_on_the_leaf_record(tmp_path: Path) -> None:
+    # 1-D: the leaf record keeps the requested model (pre-fallback) alongside the resolved one.
+    result = await _service(tmp_path).delegate(_req(persist=True, target=Target(cli="fake", model="m1")))
+    assert result.run_dir is not None
+    assert "requested_model: m1" in (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
+
+
+def test_render_panel_voice_files_one_per_voice_plus_skipped() -> None:
+    # The locked 1-layout: one voices/voice-N.md per voice, and a voices/skipped.md for skipped adapters.
+    voices = [
+        PanelVoice(label="a", ok=True, text="hi", run_id="c1"),
+        PanelVoice(label="b", ok=False, error="boom"),
+    ]
+    files = render_panel_voice_files(voices, skipped=[("c", "not installed")])
+    assert set(files) == {"voices/voice-1.md", "voices/voice-2.md", "voices/skipped.md"}
+    assert "hi" in files["voices/voice-1.md"] and "_run: c1_" in files["voices/voice-1.md"]
+    assert "(failed)" in files["voices/voice-2.md"] and "boom" in files["voices/voice-2.md"]
+    assert "c: not installed" in files["voices/skipped.md"]
+
+
+def test_render_panel_voice_files_no_skipped_section_when_none() -> None:
+    files = render_panel_voice_files([PanelVoice(label="a", ok=True, text="hi")])
+    assert set(files) == {"voices/voice-1.md"}  # no skipped.md when nothing was skipped
+
+
+def test_panel_parent_rolls_up_cost_files_and_request_metadata(tmp_path: Path) -> None:
+    # 1-D: the panel parent is not a thin link record -- it rolls up duration, the request's
+    # safety_mode/files/role, the deduped union of the voices' changed files, and the summed cost.
+    ledger = RunLedger(tmp_path / "jobs")
+    voices = [
+        PanelVoice(
+            label="a", ok=True, run_id="c1", text="hi", cost=Cost(usd=0.5, input_tokens=10), changed_files=("x.py",)
+        ),
+        PanelVoice(
+            label="b",
+            ok=False,
+            run_id="c2",
+            error="boom",
+            cost=Cost(usd=0.25, input_tokens=4),
+            changed_files=("x.py", "y.py"),
+        ),
+    ]
+    out = write_panel_record(
+        ledger,
+        run_id="parent",
+        kind="consensus",
+        prompt="q",
+        clis=["a", "b"],
+        voices=voices,
+        answer="ans",
+        created_at=1000.0,
+        finished_at=1002.5,
+        safety_mode=SafetyMode.WRITE,
+        files=["in.py"],
+        role="reviewer",
+        extra_artifacts=render_panel_voice_files(voices),
+    )
+    assert out is not None
+    state = (Path(out) / "state.toon").read_text(encoding="utf-8")
+    assert "role: reviewer" in state
+    assert "safety_mode: write" in state
+    assert "status: succeeded" in state  # any voice ok -> succeeded
+    assert "duration_s: 2.5" in state
+    assert "usd: 0.75" in state  # 0.5 + 0.25 summed
+    assert "input_tokens: 14" in state  # 10 + 4 summed
+    assert "x.py" in state and "y.py" in state  # changed-file union, deduped
+    assert (Path(out) / "artifacts" / "voices" / "voice-1.md").is_file()
+    assert (Path(out) / "artifacts" / "voices" / "voice-2.md").is_file()
+
+
+def test_panel_cost_rollup_is_none_when_no_voice_reported_cost(tmp_path: Path) -> None:
+    ledger = RunLedger(tmp_path / "jobs")
+    out = write_panel_record(
+        ledger,
+        run_id="parent",
+        kind="consensus",
+        prompt="q",
+        clis=["a"],
+        voices=[PanelVoice(label="a", ok=True, run_id="c1", text="hi")],
+        answer="ans",
+        created_at=1.0,
+        finished_at=2.0,
+    )
+    assert out is not None
+    assert "cost:" not in (Path(out) / "state.toon").read_text(encoding="utf-8")  # no misleading zero cost
