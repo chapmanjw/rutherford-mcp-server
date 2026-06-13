@@ -15,6 +15,14 @@ All notable changes to this project are documented in this file. The format is b
   A config that defined `generic_adapters` should move those CLIs to code adapters; the key is no
   longer accepted (config load rejects unknown keys).
 
+### Fixed
+
+- Ollama adapter: pass `--nowordwrap` so `ollama run`'s interactive word-wrap renderer -- which runs
+  even when stdout is a pipe -- no longer duplicates words at the ~80-column wrap boundary. The
+  renderer printed the start of a word, erased the fragment with cursor escapes (`ESC[ND ESC[K`), and
+  reprinted the whole word on the next line; stripping the ANSI afterwards left the orphaned fragment
+  behind, corrupting any output line longer than ~75 characters. Thanks to @arondee for the fix.
+
 ## [1.4.0] - 2026-06-12
 
 ### Added
