@@ -88,6 +88,36 @@ async def test_persist_writes_a_durable_job_to_disk(real_app: AppContext, tmp_pa
     assert "env:" not in state  # the child env (secrets) must never be persisted
 
 
+async def test_consensus_persists_a_parent_and_child_records_to_disk(real_app: AppContext, tmp_path: Path) -> None:
+    # F2 live: a persisted 2-voice consensus writes a parent record (kind=consensus, linking the voices)
+    # plus a child record per voice, end to end through real subprocesses.
+    ready = available_clis(real_app)
+    if len(ready) < 2:
+        pytest.skip("need at least two opted-in CLIs for a live panel persistence test")
+    app = build_app_context(
+        config=RutherfordConfig(
+            jobs_dir=str(tmp_path / "jobs"),
+            adapters={"ollama": AdapterConfig(default_model="gemma3:12b")},
+        ),
+        registry=real_app.registry,
+        base_depth=0,
+    )
+    targets = [Target(cli=ready[0]), Target(cli=ready[1])]
+    result = await app.consensus.consensus(
+        ConsensusRequest(targets=targets, prompt=_OK_PROMPT, timeout_s=180, persist=True)
+    )
+    assert isinstance(result, ConsensusResult)
+    assert result.run_dir is not None, "a persisted panel must report its parent run_dir"
+    parent = Path(result.run_dir)
+    parent_state = (parent / "state.toon").read_text(encoding="utf-8")
+    assert "kind: consensus" in parent_state
+    assert "child_run_ids[" in parent_state  # the voices are linked
+    dirs = [path for path in (tmp_path / "jobs").iterdir() if path.is_dir()]
+    assert len(dirs) >= 3  # parent + at least the two voice children
+    for child in (path for path in dirs if path.name != parent.name):
+        assert f"parent_run_id: {parent.name}" in (child / "state.toon").read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("cli_id", list(CLI_ENV))
 async def test_model_selection_is_honored_where_supported(real_app: AppContext, cli_id: str) -> None:
     # This is the SOLE live guard for model-flag drift: unit tests prove Rutherford constructs the

@@ -15,7 +15,11 @@ turn and falls out of later rounds; it never aborts the debate. The debate spawn
 from __future__ import annotations
 
 import asyncio
+import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..config.schema import RutherfordConfig
 from ..domain.enums import SafetyMode, Stance
@@ -32,8 +36,10 @@ from ..domain.models import (
     ErrorInfo,
     Target,
 )
+from ..io.ledger import RunLedger
 from ..runtime.depth import ensure_within_target_cap
 from .delegation import DelegationService, ProgressCallback
+from .persistence import PanelVoice, write_panel_record
 from .strategies import apply_stance, effective_diversity
 
 
@@ -54,9 +60,19 @@ class _Voice:
 class DebateService:
     """Runs a multi-round debate across targets and returns the full transcript."""
 
-    def __init__(self, delegation: DelegationService, config: RutherfordConfig) -> None:
+    def __init__(
+        self,
+        delegation: DelegationService,
+        config: RutherfordConfig,
+        *,
+        ledger: RunLedger | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self._delegation = delegation
         self._config = config
+        #: The durable run ledger (F2) for the debate's parent record; ``None`` disables persistence.
+        self._ledger = ledger
+        self._clock = clock
 
     async def debate(
         self,
@@ -74,6 +90,9 @@ class DebateService:
         """
         voices = self._resolve_voices(req)
         rounds_cap = self._resolve_rounds(req)
+        created_at = self._clock()
+        persist = req.persist if req.persist is not None else (self._config.default_persistence == "job")
+        parent_run_id = uuid.uuid4().hex if persist and self._ledger is not None else None
 
         rounds: list[DebateRound] = []
         # The voices still in the debate; a failed turn removes its voice from later rounds.
@@ -84,20 +103,40 @@ class DebateService:
             _announce(on_progress, f"debate: round {round_index} of {rounds_cap} ({len(active)} voices)")
             previous = rounds[-1] if rounds else None
             contributions = await self._run_round(
-                req, active, round_index, previous, correlation_id, base_depth, on_progress
+                req, active, round_index, previous, correlation_id, base_depth, on_progress, parent_run_id
             )
             rounds.append(DebateRound(index=round_index, contributions=contributions))
             survivors = {c.seat_id for c in contributions if c.ok}
             active = [voice for voice in active if voice.seat_id in survivors]
 
         final, synthesis_by = await self._synthesize_final(req, rounds, correlation_id, base_depth, on_progress)
-        return DebateResult(
+        result = DebateResult(
             prompt=req.prompt,
             rounds=rounds,
             final=final,
             synthesis_by=synthesis_by,
             diversity=self._diversity(rounds),
         )
+        if parent_run_id is not None and self._ledger is not None:
+            # Write the parent panel record linking every turn's child record, plus the transcript. The
+            # parent's status is derived from the turns (succeeded when any voice ever answered); the
+            # transcript.md already inlines every turn, so no separate voices.md is needed here.
+            contributions = [c for round_ in rounds for c in round_.contributions]
+            clis = sorted({c.target.cli for c in contributions})
+            result.run_dir = await asyncio.to_thread(
+                write_panel_record,
+                self._ledger,
+                run_id=parent_run_id,
+                kind="debate",
+                prompt=req.prompt,
+                clis=clis,
+                voices=[_panel_voice(c) for c in contributions],
+                answer=final or "(no closing synthesis -- see the linked voice records)",
+                created_at=created_at,
+                finished_at=self._clock(),
+                extra_artifacts={"transcript.md": _render_transcript(req.prompt, rounds)},
+            )
+        return result
 
     def _diversity(self, rounds: list[DebateRound]) -> DiversityReport | None:
         """Effective diversity across the final round's answering voices, or ``None`` if none survived."""
@@ -173,6 +212,7 @@ class DebateService:
         correlation_id: str,
         base_depth: int,
         on_progress: ProgressCallback | None,
+        parent_run_id: str | None,
     ) -> list[DebateContribution]:
         """Run one round: every active voice answers (round 1) or rebuts (later rounds) in parallel."""
 
@@ -187,8 +227,9 @@ class DebateService:
                 safety_mode=req.safety_mode,
                 timeout_s=req.timeout_s,
                 include_raw=req.include_raw,
-                # A debate turn never self-persists (F2): panel-level records ship next slice.
-                persist=False,
+                # When the debate persists, each turn is a child record under the parent (F2).
+                persist=parent_run_id is not None,
+                parent_run_id=parent_run_id,
             )
             result = await self._delegation.delegate(
                 request,
@@ -319,7 +360,35 @@ def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) 
         error=result.error,
         fallback_from=result.fallback_from,
         provenance=result.provenance,
+        run_dir=result.run_dir,
     )
+
+
+def _panel_voice(contribution: DebateContribution) -> PanelVoice:
+    """Project one debate turn into the panel-parent's :class:`PanelVoice` summary (status + child link)."""
+    return PanelVoice(
+        label=contribution.label,
+        ok=contribution.ok,
+        run_id=Path(contribution.run_dir).name if contribution.run_dir else None,
+        text=contribution.text,
+        error=contribution.error.message if contribution.error else None,
+    )
+
+
+def _render_transcript(prompt: str, rounds: list[DebateRound]) -> str:
+    """Render the full debate as a Markdown ``transcript.md`` artifact for a persisted panel (F2)."""
+    lines = [f"# Debate transcript\n\n**Question:** {prompt}\n"]
+    for round_ in rounds:
+        lines.append(f"\n## Round {round_.index}\n")
+        for contribution in round_.contributions:
+            status = "" if contribution.ok else " (failed)"
+            body = (
+                contribution.text.strip()
+                if contribution.ok and contribution.text.strip()
+                else (contribution.error.message if contribution.error else "(no answer)")
+            )
+            lines.append(f"\n### {contribution.label}{status}\n\n{body}\n")
+    return "".join(lines)
 
 
 def _rebuttal_prompt(

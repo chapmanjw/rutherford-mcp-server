@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from ..context import AppContext, tool_success
-from ..domain.enums import DelegationMode
+from ..domain.enums import DelegationMode, is_mutating
 from ..domain.models import DelegationRequest, Target
 from .common import as_target, parse_mode, resolve_safety_mode
 
@@ -26,6 +26,7 @@ async def delegate_tool(
     include_raw: bool = False,
     trust_workspace: bool = False,
     persist: bool | None = None,
+    external_tracking: bool = False,
     fallback: list[str] | None = None,
 ) -> str:
     """Delegate ``prompt`` to ``(cli, model)`` and return the normalized result.
@@ -67,4 +68,9 @@ async def delegate_tool(
         return tool_success({"job_id": job.id, "status": job.status, "kind": job.kind})
 
     result = await app.delegation.delegate(request, correlation_id=correlation_id, base_depth=app.base_depth)
+    result.notice = app.persistence_notice(
+        persisted=result.run_dir is not None,
+        complex_run=is_mutating(request.safety_mode),
+        external_tracking=external_tracking,
+    )
     return tool_success(result)

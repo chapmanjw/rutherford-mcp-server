@@ -8,18 +8,31 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-- Durable run persistence (F2), opt-in. A delegation can be kept as a job on disk: `persist=true` (or
-  `default_persistence = "job"` in config) writes the run under `<jobs_dir>/<run_id>/` as `state.toon`
-  -- a structured, versioned `RunRecord` (pinned argv, resolved model, provenance, role, timing, and
+- Durable run persistence (F2), opt-in. A run can be kept as a job on disk: `persist=true` (or
+  `default_persistence = "job"` in config) writes it under `<jobs_dir>/<run_id>/` as `state.toon` --
+  a structured, versioned `RunRecord` (pinned argv, resolved model, provenance, role, timing, and
   outcome) -- plus a Markdown `artifacts/answer.md` (and a `diff.md` for a write run). `jobs_dir`
   defaults to the workspace's `.rutherford/jobs`, so a kept run lives with the project. Durability is
-  opt-in (Model A): an ephemeral run leaves nothing on disk, and the run's directory is returned as
-  `run_dir` on the result. Persistence is best-effort (a filesystem failure never fails a delegation
-  that already produced an answer), runs off the event loop, never persists the child process
-  environment (it can carry secrets), and excludes its own jobs directory from a write run's captured
-  `changed_files`. Panel voices (consensus/debate) do not self-persist; panel-level records are a
-  later slice. Note: `state.toon` is written for a human/LLM to re-read; machine round-trip via the
-  current TOON codec is a known limitation tracked for the reader-side roadmap items.
+  opt-in (Model A): an ephemeral run leaves nothing on disk, and a kept run's directory is returned
+  as `run_dir` on the result.
+  - Consensus and debate persist as well. A kept panel writes one parent record (`kind` consensus or
+    debate) that links each voice by `run_id`, and every voice is a leaf record carrying its
+    `parent_run_id`, so a reader can open the parent and walk to each voice. The parent's status is
+    derived from the voices -- succeeded when any voice answered, failed when none did. A debate adds
+    a `transcript.md`; a panel with no free-text synthesis adds a `voices.md` that inlines each voice's
+    answer or error and lists any skipped adapters and why, so the parent explains itself even when no
+    child records remain.
+  - A persisted write run records its own `changed_files` delta -- the files it dirtied, minus those
+    already dirty before it ran -- with the jobs directory excluded so a run never reports Rutherford's
+    own bookkeeping as a change to the user's code.
+  - The first time a workspace is used, Rutherford notes once that runs are ephemeral by default and
+    how to keep one; for an unpersisted complex run (a panel, or a mutating delegation) it suggests
+    `persist=true`. `external_tracking=true` on `delegate` / `consensus` / `debate` silences both hints
+    when a workflow already tracks run state.
+  - Persistence is best-effort: a filesystem failure never fails a run that already produced an answer,
+    it runs off the event loop, and it never persists the child process environment (it can carry
+    secrets). Note: `state.toon` is written for a human or LLM to re-read; machine round-trip via the
+    current TOON codec is a known limitation tracked for the reader-side roadmap items.
 
 ### Removed
 

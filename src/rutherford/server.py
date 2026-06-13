@@ -102,6 +102,7 @@ async def delegate(
     include_raw: bool = False,
     trust_workspace: bool = False,
     persist: bool | None = None,
+    external_tracking: bool = False,
     fallback: list[str] | None = None,
 ) -> str:
     """Delegate a task to one CLI and return its normalized result.
@@ -133,6 +134,7 @@ async def delegate(
             include_raw=include_raw,
             trust_workspace=trust_workspace,
             persist=persist,
+            external_tracking=external_tracking,
             fallback=fallback,
         )
     )
@@ -156,6 +158,8 @@ async def consensus(
     timeout_s: float | None = None,
     mode: str = "sync",
     include_raw: bool = False,
+    persist: bool | None = None,
+    external_tracking: bool = False,
 ) -> str:
     """Ask the same prompt of several targets in parallel and return every voice.
 
@@ -192,6 +196,8 @@ async def consensus(
             timeout_s=timeout_s,
             mode=mode,
             include_raw=include_raw,
+            persist=persist,
+            external_tracking=external_tracking,
         )
     )
 
@@ -213,6 +219,8 @@ async def debate(
     timeout_s: float | None = None,
     mode: str = "sync",
     include_raw: bool = False,
+    persist: bool | None = None,
+    external_tracking: bool = False,
 ) -> str:
     """Have several targets argue a question across rounds and return the full transcript.
 
@@ -244,6 +252,8 @@ async def debate(
             timeout_s=timeout_s,
             mode=mode,
             include_raw=include_raw,
+            persist=persist,
+            external_tracking=external_tracking,
         )
     )
 

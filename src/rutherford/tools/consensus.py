@@ -40,6 +40,8 @@ async def consensus_tool(
     timeout_s: float | None = None,
     mode: str = "sync",
     include_raw: bool = False,
+    persist: bool | None = None,
+    external_tracking: bool = False,
 ) -> str:
     """Run ``prompt`` across several CLIs in parallel and return every voice.
 
@@ -92,6 +94,8 @@ async def consensus_tool(
         strategy=effective_strategy,
         verdict_schema=verdict_schema,
         judge=judge_target,
+        persist=persist,
+        external_tracking=external_tracking,
     )
     correlation_id = app.new_correlation_id()
 
@@ -108,6 +112,9 @@ async def consensus_tool(
         return tool_success({"job_id": job.id, "status": job.status, "kind": job.kind})
 
     result = await app.consensus.consensus(request, correlation_id=correlation_id, base_depth=app.base_depth)
+    result.notice = app.persistence_notice(
+        persisted=result.run_dir is not None, complex_run=True, external_tracking=external_tracking
+    )
     return tool_success(result)
 
 

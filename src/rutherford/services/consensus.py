@@ -11,6 +11,10 @@ One failing voice never aborts the panel -- each target's failure is its own str
 from __future__ import annotations
 
 import asyncio
+import time
+import uuid
+from collections.abc import Callable
+from pathlib import Path
 
 from ..adapters.base import CLIAdapter
 from ..adapters.registry import AdapterRegistry
@@ -32,8 +36,10 @@ from ..domain.models import (
     Target,
     VoiceVerdict,
 )
+from ..io.ledger import RunLedger
 from ..runtime.depth import ensure_within_target_cap
 from .delegation import DelegationService, ProgressCallback
+from .persistence import PanelVoice, render_panel_voices, write_panel_record
 from .strategies import aggregate, apply_stance, effective_diversity, extract_verdict, verdict_instruction
 
 
@@ -45,10 +51,16 @@ class ConsensusService:
         delegation: DelegationService,
         config: RutherfordConfig,
         registry: AdapterRegistry,
+        *,
+        ledger: RunLedger | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._delegation = delegation
         self._config = config
         self._registry = registry
+        #: The durable run ledger (F2) for the panel's parent record; ``None`` disables persistence.
+        self._ledger = ledger
+        self._clock = clock
 
     async def consensus(
         self,
@@ -66,6 +78,9 @@ class ConsensusService:
         than ``all-voices``, the voices are aggregated into a :class:`StrategyResult`; otherwise the
         legacy :class:`ConsensusResult` (every voice, plus optional synthesis) is returned unchanged.
         """
+        created_at = self._clock()
+        persist = req.persist if req.persist is not None else (self._config.default_persistence == "job")
+        parent_run_id = uuid.uuid4().hex if persist and self._ledger is not None else None
         targets, skipped = await self._resolve_targets(req, on_progress)
 
         async def one(index: int, target_request: DelegationRequest) -> DelegationResult:
@@ -86,9 +101,10 @@ class ConsensusService:
                 safety_mode=req.safety_mode,
                 timeout_s=req.timeout_s,
                 include_raw=req.include_raw,
-                # A panel voice never self-persists (F2): with default_persistence="job" this would
-                # scatter orphan per-voice records with no parent linkage. Panel records ship next slice.
-                persist=False,
+                # When the panel persists, each voice is a child record under the parent (F2); when it
+                # does not, the voice never self-persists (no orphan per-voice records).
+                persist=parent_run_id is not None,
+                parent_run_id=parent_run_id,
             )
             for index, target in enumerate(targets)
         ]
@@ -105,24 +121,52 @@ class ConsensusService:
             else:
                 voices.append(outcome)
 
+        result: ConsensusResult | StrategyResult
+        answer: str
+        synthesized: bool
         if req.strategy is not Strategy.ALL_VOICES:
-            return self._aggregate(req, voices, skipped)
+            result = self._aggregate(req, voices, skipped)
+            answer = result.decision or result.outcome
+            synthesized = False  # a strategy outcome is a terse decision, not free-text synthesis
+        else:
+            synthesis: str | None = None
+            synthesis_by: str | None = None
+            # None means the caller omitted synthesize, the one case the configured default fills;
+            # an explicit False wins over a synthesize_default=true config.
+            effective_synthesize = req.synthesize if req.synthesize is not None else self._config.synthesize_default
+            if effective_synthesize and voices:
+                synthesis, synthesis_by = await self._synthesize(req, voices, correlation_id, base_depth)
+            result = ConsensusResult(
+                voices=voices,
+                synthesis=synthesis,
+                synthesis_by=synthesis_by,
+                skipped=skipped,
+                diversity=self._diversity(voices),
+            )
+            answer = synthesis or "(no synthesis -- see the linked voice records)"
+            synthesized = synthesis is not None
 
-        synthesis: str | None = None
-        synthesis_by: str | None = None
-        # None means the caller omitted synthesize, the one case the configured default fills;
-        # an explicit False wins over a synthesize_default=true config.
-        effective_synthesize = req.synthesize if req.synthesize is not None else self._config.synthesize_default
-        if effective_synthesize and voices:
-            synthesis, synthesis_by = await self._synthesize(req, voices, correlation_id, base_depth)
-
-        return ConsensusResult(
-            voices=voices,
-            synthesis=synthesis,
-            synthesis_by=synthesis_by,
-            skipped=skipped,
-            diversity=self._diversity(voices),
-        )
+        if parent_run_id is not None and self._ledger is not None:
+            # Write the parent panel record linking the child voice records (off-thread: file I/O). The
+            # parent's status is derived from the voices, and when there is no synthesis a voices.md
+            # inlines each voice so the parent is auditable without every child record still on disk.
+            panel_voices = [_panel_voice(voice) for voice in voices]
+            skipped_pairs = [(entry.cli, entry.reason) for entry in skipped]
+            extra = None if synthesized else {"voices.md": render_panel_voices(panel_voices, skipped_pairs)}
+            result.run_dir = await asyncio.to_thread(
+                write_panel_record,
+                self._ledger,
+                run_id=parent_run_id,
+                kind="consensus",
+                prompt=req.prompt,
+                clis=sorted({voice.target.cli for voice in voices}),
+                voices=panel_voices,
+                answer=answer,
+                created_at=created_at,
+                finished_at=self._clock(),
+                extra_artifacts=extra,
+            )
+        return result
 
     def _diversity(self, voices: list[DelegationResult]) -> DiversityReport | None:
         """Effective model/provider diversity across the voices that answered, or ``None`` if none did."""
@@ -331,6 +375,17 @@ def _stance_for(target: Target, stances: list[Stance] | None, index: int) -> Sta
     if target.stance is not None:
         return target.stance
     return stances[index] if stances else None
+
+
+def _panel_voice(voice: DelegationResult) -> PanelVoice:
+    """Project a voice's :class:`DelegationResult` into the panel-parent's :class:`PanelVoice` summary."""
+    return PanelVoice(
+        label=voice.target.display_label,
+        ok=voice.ok,
+        run_id=Path(voice.run_dir).name if voice.run_dir else None,
+        text=voice.text,
+        error=voice.error.message if voice.error else None,
+    )
 
 
 def _escaped_voice(request: DelegationRequest, exc: BaseException) -> DelegationResult:

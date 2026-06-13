@@ -277,6 +277,9 @@ class DelegationRequest(BaseModel):
     #: opt-in; an ephemeral run leaves nothing on disk). ``None`` follows the configured
     #: ``default_persistence``; ``True`` / ``False`` force it for this one call.
     persist: bool | None = None
+    #: When set, this delegation is a voice of a persisted panel: its run record is written as a child
+    #: of this parent run id (consensus/debate set it on each voice). ``None`` for a top-level run.
+    parent_run_id: str | None = None
     #: Per-call confirmation that a write/yolo delegation may mutate ``working_dir`` even when
     #: it is not on the configured trusted-workspace allowlist.
     trust_workspace: bool = False
@@ -328,6 +331,10 @@ class DelegationResult(BaseModel):
     #: The directory this run was persisted to when it was run as a durable job
     #: (``<jobs_dir>/<run_id>``). ``None`` for an ephemeral run (Model A: nothing on disk unless asked).
     run_dir: str | None = None
+    #: Advisory, non-fatal notices for the caller (e.g. a first-run persistence setup hint, or a
+    #: suggestion to keep a complex run as a job). ``None`` when there are none, so the field is absent
+    #: from the wire. Never affects the result -- a UX channel, not an error.
+    notice: str | None = None
 
 
 # --- Consensus ---------------------------------------------------------------
@@ -366,6 +373,11 @@ class ConsensusRequest(BaseModel):
     #: first successful voice when unset; pass a distinct CLI so an independent, non-participant judge
     #: combines the panel instead of one of the debaters.
     judge: Target | None = None
+    #: Persist this panel as a durable job (F2): a parent record plus a child record per voice, under
+    #: ``<jobs_dir>/``. ``None`` follows ``default_persistence``; ``True`` / ``False`` force it.
+    persist: bool | None = None
+    #: Suppress the suggest-a-job advisory notice when an external orchestrator already tracks this run.
+    external_tracking: bool = False
 
 
 class SkippedTarget(BaseModel):
@@ -392,6 +404,11 @@ class ConsensusResult(BaseModel):
     #: Effective model/provider diversity across the answering voices (F3). ``None`` when no voice
     #: answered (nothing to measure).
     diversity: DiversityReport | None = None
+    #: Advisory, non-fatal notices for the caller (e.g. a suggestion to keep this panel as a job).
+    notice: str | None = None
+    #: The directory this panel was persisted to when kept as a job (the parent record, with a child
+    #: record per voice). ``None`` for an ephemeral panel.
+    run_dir: str | None = None
 
 
 # --- Consensus strategies ----------------------------------------------------
@@ -441,6 +458,11 @@ class StrategyResult(BaseModel):
     skipped: list[SkippedTarget] = Field(default_factory=list)
     #: Effective model/provider diversity across the answering voices (F3). ``None`` when none answered.
     diversity: DiversityReport | None = None
+    #: Advisory, non-fatal notices for the caller (e.g. a suggestion to keep this panel as a job).
+    notice: str | None = None
+    #: The directory this panel was persisted to when kept as a job (parent + a child record per voice).
+    #: ``None`` for an ephemeral panel.
+    run_dir: str | None = None
 
 
 # --- Debate ------------------------------------------------------------------
@@ -472,6 +494,11 @@ class DebateRequest(BaseModel):
     #: An optional target to write the closing synthesis. Defaults to the first surviving voice when
     #: unset; pass a distinct CLI for an independent, non-participant judge.
     judge: Target | None = None
+    #: Persist this debate as a durable job (F2): a parent record plus a child record per voice/round,
+    #: under ``<jobs_dir>/``. ``None`` follows ``default_persistence``; ``True`` / ``False`` force it.
+    persist: bool | None = None
+    #: Suppress the suggest-a-job advisory notice when an external orchestrator already tracks this run.
+    external_tracking: bool = False
 
 
 class DebateContribution(BaseModel):
@@ -502,6 +529,9 @@ class DebateContribution(BaseModel):
     #: The effective provider/model that produced this turn (F3), carried from the voice's result.
     #: ``None`` when undetermined.
     provenance: Provenance | None = None
+    #: The directory this turn was persisted to when the debate was kept as a job (the child record of
+    #: the panel parent). ``None`` for an ephemeral debate.
+    run_dir: str | None = None
 
 
 class DebateRound(BaseModel):
@@ -530,6 +560,11 @@ class DebateResult(BaseModel):
     #: Effective model/provider diversity across the final round's answering voices (F3). ``None``
     #: when no voice survived to the final round.
     diversity: DiversityReport | None = None
+    #: Advisory, non-fatal notices for the caller (e.g. a suggestion to keep this debate as a job).
+    notice: str | None = None
+    #: The directory this debate was persisted to when kept as a job (parent + a child record per
+    #: voice/round). ``None`` for an ephemeral debate.
+    run_dir: str | None = None
 
 
 # --- Jobs --------------------------------------------------------------------
@@ -584,6 +619,11 @@ class RunRecord(BaseModel):
     duration_s: float = 0.0
     #: A parent run's id when this record is a child of a panel (consensus/debate); ``None`` at top level.
     parent_run_id: str | None = None
+    #: For a panel record (``kind`` consensus/debate), the run ids of the child voice records so a reader
+    #: can reassemble the panel from its parts: one child per voice in panel order for a consensus, and
+    #: one child per turn in round-major order (round 1's voices, then round 2's, ...) for a debate. Empty
+    #: for a leaf delegate record.
+    child_run_ids: list[str] = Field(default_factory=list)
     # --- what produced the answer ---
     cli: str
     model: str | None = None

@@ -75,10 +75,37 @@ class AppContext:
     #: The caching probe wrapping the adapters' metadata calls, when one was built (``None`` when a
     #: registry was injected, e.g. in tests). ``doctor`` invalidates it before a live re-check.
     probe_cache: CachingProbe | None = None
+    #: Whether the one-time first-run persistence setup hint has been emitted this session (F2).
+    setup_hint_emitted: bool = False
 
     def new_correlation_id(self) -> str:
         """Mint a short correlation id for a tool call."""
         return uuid.uuid4().hex[:12]
+
+    def persistence_notice(self, *, persisted: bool, complex_run: bool, external_tracking: bool) -> str | None:
+        """Advisory F2 notice for a tool result, or ``None`` when there is none.
+
+        Up to two non-fatal hints, joined: a *one-time* (per session) first-run hint when this workspace
+        has no Rutherford config dir, and a suggestion to keep a complex (multi-voice / write) run as a
+        durable job when persistence is off by default and the run was not persisted. ``external_tracking``
+        suppresses the suggestion (an orchestrator already tracks the run). stdio cannot prompt, so the
+        notice rides the result's ``notice`` field for the calling agent to relay. A single string (not a
+        list) so the TOON payload stays decodable.
+        """
+        notices: list[str] = []
+        if not self.setup_hint_emitted and not (Path.cwd() / CONFIG_DIRNAME).exists():
+            notices.append(
+                "No Rutherford config in this workspace yet: runs are ephemeral by default (nothing is "
+                "kept on disk). To keep runs as durable jobs under .rutherford/jobs/, set "
+                "default_persistence in config (run setup) or pass persist=true per call."
+            )
+            self.setup_hint_emitted = True
+        if complex_run and not persisted and not external_tracking and self.config.default_persistence == "ephemeral":
+            notices.append(
+                "This run spans multiple voices or writes. Pass persist=true to keep it as a durable job "
+                "for tracking, reference, or to continue later."
+            )
+        return "\n\n".join(notices) if notices else None
 
 
 def build_app_context(
@@ -117,8 +144,8 @@ def build_app_context(
     jobs_root = Path(resolved_config.jobs_dir) if resolved_config.jobs_dir else Path.cwd() / CONFIG_DIRNAME / "jobs"
     ledger = RunLedger(jobs_root)
     delegation = DelegationService(resolved_registry, resolved_runner, resolved_config, resolved_roles, ledger=ledger)
-    consensus = ConsensusService(delegation, resolved_config, resolved_registry)
-    debate = DebateService(delegation, resolved_config)
+    consensus = ConsensusService(delegation, resolved_config, resolved_registry, ledger=ledger)
+    debate = DebateService(delegation, resolved_config, ledger=ledger)
     jobs = JobService(JobStore(ttl_s=resolved_config.job_ttl_s, max_jobs=resolved_config.max_jobs))
     return AppContext(
         config=resolved_config,

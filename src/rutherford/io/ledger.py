@@ -41,12 +41,22 @@ class RunLedger:
         """The jobs root directory this ledger writes under."""
         return self._root
 
-    def write(self, record: RunRecord, *, answer: str, diff: str | None = None) -> Path:
+    def write(
+        self,
+        record: RunRecord,
+        *,
+        answer: str,
+        diff: str | None = None,
+        extra_artifacts: dict[str, str] | None = None,
+    ) -> Path:
         """Persist ``record`` and its artifacts under ``<root>/<run_id>/``; return the run directory.
 
         ``state.toon`` holds the structured record; ``artifacts/answer.md`` holds the answer the run
         produced (or a placeholder when empty, so the file always exists); ``artifacts/diff.md`` holds
-        ``diff`` as a fenced block when a write run captured one. Directories are created as needed.
+        ``diff`` as a fenced block when a write run captured one; ``extra_artifacts`` maps additional
+        filenames to Markdown content under ``artifacts/`` (e.g. a panel's ``transcript.md``). A
+        filename may contain a subdirectory (``voices/voice-1.md``); it is created as needed. Directories
+        are created as needed.
 
         Raises ``OSError`` on a filesystem failure -- the caller treats persistence as best-effort and
         must not let that failure escape and fail the delegation that already produced an answer.
@@ -58,4 +68,8 @@ class RunLedger:
         (artifacts / "answer.md").write_text(answer if answer.strip() else "(no answer)", encoding="utf-8")
         if diff is not None and diff.strip():
             (artifacts / "diff.md").write_text(f"```diff\n{diff}\n```\n", encoding="utf-8")
+        for name, content in (extra_artifacts or {}).items():
+            path = artifacts / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content if content.strip() else "(empty)", encoding="utf-8")
         return run_dir

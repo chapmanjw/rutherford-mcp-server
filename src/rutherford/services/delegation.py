@@ -162,6 +162,8 @@ class DelegationService:
         # delegation that nonetheless writes is caught (off by default; only for git working dirs).
         verify = self._config.verify_read_only and not is_mutating(req.safety_mode) and bool(req.working_dir)
         before = await asyncio.to_thread(_git_fingerprint, req.working_dir) if verify and req.working_dir else None
+        # Snapshot the changed files before a mutating persisted run so the record reports its delta.
+        before_changed = await self._snapshot_changed_files(req)
 
         result, raw, spec = await self._execute(adapter, req, ctx, base_depth, on_progress)
 
@@ -222,7 +224,7 @@ class DelegationService:
         # Off-thread: persistence runs blocking git subprocesses + file I/O, and delegate() is the
         # convergence point shared by concurrent panel voices -- keep the event loop free, matching
         # how _git_fingerprint and adapter.detect are already offloaded above.
-        await asyncio.to_thread(self._maybe_persist, req, result, spec, detected.version, created_at)
+        await asyncio.to_thread(self._maybe_persist, req, result, spec, detected.version, created_at, before_changed)
         return result
 
     def _log_delegation(
@@ -448,6 +450,26 @@ class DelegationService:
         if refined is not None:
             result.error.code = refined
 
+    def _should_persist(self, req: DelegationRequest) -> bool:
+        """Whether this run should be kept as a durable job (F2): explicit ``persist`` wins, else the
+        configured ``default_persistence`` (Model A: ``ephemeral`` out of the box)."""
+        return req.persist if req.persist is not None else (self._config.default_persistence == "job")
+
+    async def _snapshot_changed_files(self, req: DelegationRequest) -> set[str] | None:
+        """Off-thread before-snapshot of the working tree's changed files, for a mutating persisted run.
+
+        Returns the set of files already dirty before execution so :meth:`_maybe_persist` can report
+        only *this run's* delta and not pre-existing edits. ``None`` when not applicable (not persisting,
+        not mutating, no working dir, no ledger, or not a git tree).
+        """
+        if self._ledger is None or not self._should_persist(req) or not is_mutating(req.safety_mode):
+            return None
+        if not req.working_dir:
+            return None
+        wd = _resolved_dir(req.working_dir)
+        before = await asyncio.to_thread(_git_changed_files, wd, _exclude_pathspec(wd, self._ledger.root))
+        return set(before) if before is not None else None
+
     def _maybe_persist(
         self,
         req: DelegationRequest,
@@ -455,6 +477,7 @@ class DelegationService:
         spec: InvocationSpec | None,
         adapter_version: str | None,
         created_at: float,
+        before_changed: set[str] | None = None,
     ) -> None:
         """Persist this run as a durable job (F2) when the call opts in -- best-effort, in place.
 
@@ -465,29 +488,27 @@ class DelegationService:
         Boundary: only a run that reached execution is recorded here. A run refused by an up-front guard
         (unknown target, depth, missing binary, untrusted workspace, role lookup) returns before this
         hook and is *not* persisted -- the corpus is post-launch outcomes (success and runtime failure),
-        not pre-flight refusals. For a mutating run in a git tree the changed files and a HEAD diff are
-        captured, with the jobs directory excluded so a run never reports Rutherford's own bookkeeping;
-        in an already-dirty tree these reflect the current worktree, not a proven per-run delta. A
+        not pre-flight refusals. For a mutating run in a git tree the changed files (this run's delta vs
+        the ``before_changed`` snapshot) and a HEAD diff are captured, with the jobs directory excluded
+        so a run never reports Rutherford's own bookkeeping; a file already dirty before the run that the
+        run merely edited further is not re-attributed (the honest limit of a status-level delta). A
         filesystem failure is swallowed -- a run that already produced an answer must never fail because
-        its record could not be written -- leaving the result without ``run_dir``.
+        its record could not be written -- leaving the result without ``run_dir``. ``req.parent_run_id``
+        links a voice's record to its panel parent.
         """
-        persist = req.persist if req.persist is not None else (self._config.default_persistence == "job")
-        if not persist or self._ledger is None:
+        if not self._should_persist(req) or self._ledger is None:
             return
 
         diff: str | None = None
         if is_mutating(req.safety_mode) and req.working_dir:
-            # Resolve the working dir once so the exclude-pathspec offset and git's ``-C`` dir share a
-            # single canonicalization -- a working_dir with ``..`` or a symlinked segment would
-            # otherwise misalign the relative offset against git's literal view.
-            try:
-                wd = str(Path(req.working_dir).resolve())
-            except OSError:
-                wd = req.working_dir
+            wd = _resolved_dir(req.working_dir)
             exclude = _exclude_pathspec(wd, self._ledger.root)
-            changed = _git_changed_files(wd, exclude)
-            if changed is not None:
-                result.changed_files = changed
+            after = _git_changed_files(wd, exclude)
+            if after is not None:
+                # Report this run's delta: files dirty after the run that were not already dirty before.
+                result.changed_files = (
+                    after if before_changed is None else [name for name in after if name not in before_changed]
+                )
                 diff = _git_run(wd, ["diff", "HEAD", "--", ".", *exclude]) or None
 
         record = RunRecord(
@@ -497,6 +518,7 @@ class DelegationService:
             created_at=created_at,
             finished_at=self._clock(),
             duration_s=result.duration_s,
+            parent_run_id=req.parent_run_id,
             cli=req.target.cli,
             model=result.target.model,
             adapter_version=adapter_version,
@@ -514,8 +536,8 @@ class DelegationService:
         )
         try:
             run_dir = self._ledger.write(record, answer=result.text, diff=diff)
-        except OSError as exc:  # persistence is best-effort; never fail a produced answer over a bad write
-            log_event("run_persist_failed", run_id=record.run_id, error_type=type(exc).__name__)
+        except Exception as exc:  # persistence is best-effort; never fail a produced answer over a bad write
+            log_event("run_persist_failed", run_id=record.run_id, error_type=type(exc).__name__, error=str(exc))
             return
         result.run_dir = str(run_dir)
 
@@ -600,6 +622,17 @@ def _git_fingerprint(working_dir: str) -> str | None:
             return None
         parts.append(section)
     return "\x1e".join(parts)
+
+
+def _resolved_dir(working_dir: str) -> str:
+    """Canonicalize ``working_dir`` (resolve ``..``/symlinks), or return it unchanged on failure.
+
+    Used so the exclude-pathspec offset and git's ``-C`` directory share one canonicalization.
+    """
+    try:
+        return str(Path(working_dir).resolve())
+    except OSError:
+        return working_dir
 
 
 def _exclude_pathspec(working_dir: str, jobs_root: Path) -> list[str]:
