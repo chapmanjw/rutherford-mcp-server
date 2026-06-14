@@ -42,8 +42,10 @@ FAKE = AgentDescriptor("fake", "Fake", _FAKE_CMD)
 FAKE_A = AgentDescriptor("fake_a", "Fake A", _FAKE_CMD, provider="alpha", default_model="model-a")
 FAKE_B = AgentDescriptor("fake_b", "Fake B", _FAKE_CMD, provider="beta", default_model="model-b")
 # A slow agent: streams a partial then sleeps, so a panel can mix a fast and a slow voice, or a serialized
-# pair takes measurably longer than a parallel one.
-SLOW = AgentDescriptor("slow", "Slow", _FAKE_CMD, env_overrides=(("RUTHERFORD_FAKE_SLEEP", "2.0"),))
+# pair takes measurably longer than a parallel one. The 0.4s sleep is sub-second on purpose: the semaphore
+# bounds concurrency at asyncio resolution, so a serialized pair (two 0.4s sleeps back-to-back, ~0.8s) only
+# needs a measurable gap over the parallel control (~0.4s) -- whole seconds add nothing the gap doesn't.
+SLOW = AgentDescriptor("slow", "Slow", _FAKE_CMD, env_overrides=(("RUTHERFORD_FAKE_SLEEP", "0.4"),))
 
 
 def _registry(extra: list[AgentDescriptor] | None = None) -> DescriptorRegistry:
@@ -172,19 +174,23 @@ async def _slow_panel_elapsed(max_concurrency: int) -> tuple[float, ConsensusRes
 async def test_semaphore_serializes_a_wide_panel() -> None:
     """With max_concurrency=1, two slow voices run SERIALLY, taking measurably longer than running in parallel.
 
-    The fake sleeps 2.0s per voice. Serialized that is ~4s of sleep; in parallel the sleeps overlap (~2s).
-    Asserting the serial run is at least ~1.5s SLOWER than the parallel control proves the semaphore bounded
+    The fake sleeps 0.4s per voice. Serialized that is ~0.8s of sleep; in parallel the sleeps overlap (~0.4s).
+    Asserting the serial run is measurably SLOWER than the parallel control proves the semaphore bounded
     concurrency to one -- a relative comparison, robust to per-machine spawn overhead that a fixed floor is not.
+    The extra sleep the serialization forces (~0.4s) is the invariant; we require a margin well above timing
+    jitter (>0.2s) rather than tight wall-clock equality, so a loaded machine does not misorder the two runs.
     """
     serial_elapsed, serial = await _slow_panel_elapsed(max_concurrency=1)
     parallel_elapsed, _ = await _slow_panel_elapsed(max_concurrency=2)
     assert len(serial.voices) == 2 and all(v.ok for v in serial.voices)
-    # Serialized adds ~one extra 2.0s sleep over the parallel run; require at least 1.5s of separation.
-    assert serial_elapsed - parallel_elapsed > 1.5, (
+    # Serialized adds ~one extra 0.4s sleep over the parallel run; require at least 0.2s of separation (half the
+    # nominal gap) so jitter cannot flip the order, and check the serial run is at least ~1.5x the parallel run.
+    assert serial_elapsed - parallel_elapsed > 0.2, (
         f"serial={serial_elapsed:.2f}s parallel={parallel_elapsed:.2f}s -- the semaphore did not serialize"
     )
-    # And the absolute serial time exceeds two sleeps (the voices did not overlap at all).
-    assert serial_elapsed > 4.0, f"expected serialized (>4.0s), got {serial_elapsed:.2f}s"
+    assert serial_elapsed > 1.5 * parallel_elapsed, (
+        f"serial={serial_elapsed:.2f}s parallel={parallel_elapsed:.2f}s -- serial was not ~1.5x the parallel run"
+    )
 
 
 # --- B. Per-voice activity stream + snapshot ---------------------------------

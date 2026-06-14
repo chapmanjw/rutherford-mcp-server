@@ -26,9 +26,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 _FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
 FAKE = AgentDescriptor("fake", "Fake", _FAKE_CMD)
 DEAD = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.exit(0)"))
-# A slow agent: streams a partial then sleeps 10s, so a tight round deadline cuts its turn mid-round.
+# A slow agent: streams a partial then sleeps 1.5s, so a tight round deadline cuts its turn mid-round. The
+# sleep is kept small on purpose: round-boundary budget cuts work at asyncio resolution, so the slow voice
+# only needs to outlast the ~1.2s cut budget by a clear margin (it finishes near subprocess-spawn + 1.5s).
+# The budgets below sit near a second rather than truly sub-second because of a ~0.7s subprocess-spawn floor
+# per voice: a budget under that floor would cut the FAST voice too, starving the round.
 SLOW = AgentDescriptor(
-    "slow", "Slow", _FAKE_CMD, default_model="model-s", env_overrides=(("RUTHERFORD_FAKE_SLEEP", "10"),)
+    "slow", "Slow", _FAKE_CMD, default_model="model-s", env_overrides=(("RUTHERFORD_FAKE_SLEEP", "1.5"),)
 )
 
 
@@ -140,7 +144,7 @@ async def test_debate_budget_cuts_a_round_and_finalizes() -> None:
         prompt="what is 17 + 25?",
         rounds=3,
         working_dir=str(REPO_ROOT),
-        time_budget_s=4.0,
+        time_budget_s=1.2,
     )
     result = await _service().debate(request)
     assert result.stop_reason == "budget" and len(result.rounds) == 1  # cut at the round-1 deadline
@@ -160,7 +164,7 @@ async def test_debate_budget_below_quorum_raises_budget_exhausted() -> None:
         prompt="x",
         rounds=2,
         working_dir=str(REPO_ROOT),
-        time_budget_s=2.0,
+        time_budget_s=1.2,
     )
     with pytest.raises(RutherfordError) as exc:
         await _service().debate(request)
@@ -192,7 +196,7 @@ async def test_debate_on_budget_continue_runs_every_round() -> None:
         prompt="what is 17 + 25?",
         rounds=1,
         working_dir=str(REPO_ROOT),
-        time_budget_s=2.0,
+        time_budget_s=1.2,
         on_budget="continue",
     )
     result = await _service().debate(request)
@@ -207,7 +211,7 @@ async def test_debate_budget_rollup_records_effort_requested() -> None:
         prompt="what is 17 + 25?",
         rounds=2,
         working_dir=str(REPO_ROOT),
-        time_budget_s=4.0,
+        time_budget_s=1.2,
         effort=Effort.MEDIUM,
     )
     result = await _service().debate(request)
@@ -222,7 +226,7 @@ async def test_debate_cut_turn_with_no_stream_has_no_partial() -> None:
         prompt="what is 17 + 25?\nHANG",  # both voices receive HANG (the shared prompt) -> both cut
         rounds=1,
         working_dir=str(REPO_ROOT),
-        time_budget_s=2.0,
+        time_budget_s=1.2,
     )
     config = RutherfordConfig(min_quorum=1)
     # both cut with no usable position -> below quorum -> BUDGET_EXHAUSTED

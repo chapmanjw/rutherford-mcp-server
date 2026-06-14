@@ -31,15 +31,19 @@ FAKE_A = AgentDescriptor("fake_a", "Fake A", _FAKE_CMD, provider="alpha", defaul
 FAKE_B = AgentDescriptor("fake_b", "Fake B", _FAKE_CMD, provider="beta", default_model="model-b")
 # An agent that exits before the handshake, so its voice always fails.
 DEAD = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.exit(0)"))
-# A slow agent: it streams a partial then sleeps 10s, so a tight panel deadline cuts it mid-turn. Slowness
-# rides the descriptor env, not the prompt, so a panel can mix a fast voice and a slow one on one prompt.
+# A slow agent: it streams a partial then sleeps 1.5s, so a tight panel deadline cuts it mid-turn. Slowness
+# rides the descriptor env, not the prompt, so a panel can mix a fast voice and a slow one on one prompt. The
+# sleep is kept small on purpose: the budget/cut/harvest logic works at asyncio resolution, so the slow voice
+# only needs to outlast the ~1.2s cut budget by a clear margin (it finishes near subprocess-spawn + 1.5s),
+# not take whole seconds. A floor of ~0.7s of subprocess-spawn overhead per voice is why the budgets below
+# sit near a second rather than truly sub-second: a budget under the spawn floor would cut the FAST voice too.
 SLOW = AgentDescriptor(
     "slow",
     "Slow",
     _FAKE_CMD,
     provider="gamma",
     default_model="model-s",
-    env_overrides=(("RUTHERFORD_FAKE_SLEEP", "10"),),
+    env_overrides=(("RUTHERFORD_FAKE_SLEEP", "1.5"),),
 )
 
 
@@ -423,7 +427,7 @@ async def test_budget_cuts_the_inflight_voice_and_keeps_the_fast_one() -> None:
         targets=[Target(cli="fake"), Target(cli="slow")],
         prompt="what is 17 + 25?",
         working_dir=str(REPO_ROOT),
-        time_budget_s=4.0,
+        time_budget_s=1.2,
     )
     result = await _service(extra=[SLOW]).consensus(request)
     assert isinstance(result, ConsensusResult)
@@ -435,7 +439,7 @@ async def test_budget_cuts_the_inflight_voice_and_keeps_the_fast_one() -> None:
     assert result.rollup is not None
     assert result.rollup.stop_reason == "budget" and result.rollup.cut == 1 and result.rollup.answered == 1
     assert result.rollup.usable == 2 and result.rollup.quorum_met is True
-    assert result.rollup.time_budget_s == 4.0 and result.rollup.elapsed_s > 0
+    assert result.rollup.time_budget_s == 1.2 and result.rollup.elapsed_s > 0
 
 
 async def test_budget_below_quorum_raises_budget_exhausted() -> None:
@@ -446,7 +450,7 @@ async def test_budget_below_quorum_raises_budget_exhausted() -> None:
         targets=[Target(cli="slow"), Target(cli="slow")],
         prompt="x",
         working_dir=str(REPO_ROOT),
-        time_budget_s=2.0,
+        time_budget_s=1.2,
     )
     with pytest.raises(RutherfordError) as exc:
         await _service(config, extra=[SLOW]).consensus(request)
@@ -483,7 +487,7 @@ async def test_on_budget_continue_runs_every_voice_to_completion() -> None:
         targets=[Target(cli="fake"), Target(cli="slow")],
         prompt="what is 17 + 25?",
         working_dir=str(REPO_ROOT),
-        time_budget_s=2.0,
+        time_budget_s=1.2,
         on_budget="continue",
     )
     result = await _service(extra=[SLOW]).consensus(request)
@@ -501,7 +505,7 @@ async def test_budget_carries_into_a_strategy_result() -> None:
         prompt=_prompt("VERDICT: yes"),
         strategy=Strategy.PLURALITY,
         working_dir=str(REPO_ROOT),
-        time_budget_s=4.0,
+        time_budget_s=1.2,
     )
     result = await _service(extra=[SLOW]).consensus(request)
     assert isinstance(result, StrategyResult)
@@ -514,7 +518,7 @@ async def test_budget_rollup_records_effort_requested() -> None:
         targets=[Target(cli="fake"), Target(cli="slow")],
         prompt="what is 17 + 25?",
         working_dir=str(REPO_ROOT),
-        time_budget_s=4.0,
+        time_budget_s=1.2,
         effort=Effort.HIGH,
     )
     result = await _service(extra=[SLOW]).consensus(request)
