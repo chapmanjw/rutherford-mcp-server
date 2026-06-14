@@ -64,14 +64,14 @@ async def test_official_adapter_answers(agent_id: str) -> None:
     assert "42" in result.text
 
 
-@pytest.mark.parametrize("agent_id", ["copilot", "qwen", "droid", "cursor", "kiro"])
+@pytest.mark.parametrize("agent_id", ["copilot", "qwen", "droid", "cursor", "kiro", "pi"])
 async def test_second_wave_agent_answers(agent_id: str) -> None:
-    """The second/third wave (probed live, receipt 12) each drive over ACP with the existing CLI auth.
+    """The second/third wave (probed live, receipts 12/13) each drive over ACP with the existing CLI auth.
 
     copilot (GitHub Copilot plan), qwen (~/.qwen), droid (Factory -- separate billing), cursor (Cursor
-    subscription; the `acp` subcommand is hidden from --help), kiro (kiro-cli, not the IDE-launcher `kiro`).
-    Each answers a trivial prompt end to end. (hermes probed OK but blew a 180s turn on its free Nous model,
-    so it is left to config rather than shipped as a confirmed built-in.)
+    subscription; the `acp` subcommand is hidden from --help), kiro (kiro-cli, not the IDE-launcher `kiro`),
+    pi (the pi-acp wrapper over `pi --mode rpc`). Each answers a trivial prompt end to end. (hermes was too
+    slow on its free Nous model and kilo needs `kilo auth`; both are left to config, not shipped built-in.)
     """
     descriptor = default_registry().get(agent_id)
     result = await run_acp_turn(

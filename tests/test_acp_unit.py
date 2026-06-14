@@ -83,7 +83,7 @@ def test_descriptor_registry() -> None:
     registry = default_registry()
     assert registry.has("goose") and "goose" in registry.ids()
     assert registry.get("goose").command == ("goose", "acp")
-    assert len(registry) == 14
+    assert len(registry) == 15
     with pytest.raises(KeyError):
         registry.get("nope")
     with pytest.raises(ValueError, match="duplicate"):
@@ -135,6 +135,8 @@ def test_third_wave_descriptors() -> None:
     assert registry.get("cursor").command == ("cursor-agent", "acp")
     # kiro's ACP binary is kiro-cli (the `kiro` binary is the IDE launcher).
     assert registry.get("kiro").command == ("kiro-cli", "acp")
+    # pi runs through the pi-acp wrapper (npm pi-acp), which spawns `pi --mode rpc`.
+    assert registry.get("pi").command == ("pi-acp",) and registry.get("pi").provider is None
 
 
 def test_journal_event_from_message() -> None:

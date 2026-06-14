@@ -81,10 +81,11 @@ class DescriptorRegistry:
 #: (``~/.codex/auth.json``) and ``claude-agent-acp`` reuses the Claude Code login (receipt
 #: ``11-official-adapters-auth-test.md``). The launch command is the adapter shim, not the underlying CLI.
 #:
-#: ``copilot``/``droid``/``cursor``/``kiro`` are bring-your-own-model (provider ``None``); ``qwen`` carries
-#: its vendor as an unconfirmed guess. ``cursor``'s ``acp`` subcommand is real but hidden from ``--help``;
-#: ``kiro``'s ACP binary is ``kiro-cli`` (the ``kiro`` binary is the IDE launcher). (``hermes`` probed OK
-#: but blew a 180s turn on its free Nous model -- left to config; ``kilo`` needs work. Receipt 12.)
+#: ``copilot``/``droid``/``cursor``/``kiro``/``pi`` are bring-your-own-model (provider ``None``); ``qwen``
+#: carries its vendor as an unconfirmed guess. ``cursor``'s ``acp`` subcommand is real but hidden from
+#: ``--help``; ``kiro``'s ACP binary is ``kiro-cli`` (the ``kiro`` binary is the IDE launcher); ``pi`` runs
+#: through the ``pi-acp`` wrapper (``npm i -g pi-acp``), which spawns ``pi --mode rpc``. (``hermes`` was too
+#: slow on its free Nous model and ``kilo`` needs ``kilo auth`` set up -- both left to config. Receipts 12/13.)
 HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("goose", "Goose", ("goose", "acp")),
     AgentDescriptor("opencode", "OpenCode", ("opencode", "acp")),
@@ -100,6 +101,7 @@ HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("droid", "Factory Droid", ("droid", "exec", "--output-format", "acp")),
     AgentDescriptor("cursor", "Cursor", ("cursor-agent", "acp")),
     AgentDescriptor("kiro", "Kiro", ("kiro-cli", "acp")),
+    AgentDescriptor("pi", "Pi", ("pi-acp",)),
 )
 
 
