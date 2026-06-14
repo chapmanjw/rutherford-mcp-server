@@ -69,13 +69,13 @@ order the fields appear in `config/schema.py`.
 | `max_debate_rounds` | `int` | `4` | Maximum rounds a single `debate` call may run (1–10). |
 | `min_quorum` | `int` | `1` | Minimum parseable voices an aggregating consensus strategy needs (≥ 1) before it returns a decision. |
 | `min_distinct` | `int` | `2` | Distinct-identity floor below which a panel's answers are flagged `low_diversity` (≥ 1). |
-| `max_concurrency` | `int` | `max_targets` | Maximum agent subprocesses run at once across every panel (≥ 1). Defaults to `max_targets` when not set explicitly. |
+| `max_concurrency` | `int` | `max_targets` | Intended ceiling on agents run at once across a panel (≥ 1); defaults to `max_targets`. Not yet enforced in v3 (see the note below) — a panel currently fans out to every voice at once. |
 | `cooldown_threshold` | `int` | `3` | Unhealthy failures within `cooldown_window_s` before an agent is benched (≥ 0; `0` disables). |
 | `cooldown_window_s` | `float` | `120.0` | The sliding window over which `cooldown_threshold` failures are counted (> 0). |
 | `cooldown_duration_s` | `float` | `60.0` | How long a benched agent stays benched (> 0). |
 | `trusted_workspaces` | `list[str]` | `[]` | Absolute paths under which `write` / `yolo` delegations are permitted. Resolved to absolute; a missing directory warns. |
 | `synthesize_default` | `bool` | `false` | Whether consensus synthesizes server-side by default. |
-| `verify_read_only` | `bool` | `false` | Opt-in: after a successful `read_only` / `propose` delegation whose `working_dir` is a git repo, fingerprint the tree before and after and fail the result with `READONLY_VIOLATED` if it changed. Off by default (adds git calls). |
+| `verify_read_only` | `bool` | `false` | Intended opt-in: after a successful `read_only` / `propose` delegation in a git repo, fingerprint the tree before and after and fail with `READONLY_VIOLATED` if it changed. Not yet wired into the v3 delegation path (see the note below) — it validates and loads but performs no check today. |
 | `probe_cache_ttl_s` | `float` | `10.0` | Seconds to cache an agent's metadata probe (≥ 0; `0` disables). |
 | `probe_timeout_s` | `float` | `20.0` | Hard per-probe timeout ceiling in seconds (≥ 1), a hang guard. |
 | `job_ttl_s` | `float` | `3600.0` | Seconds a finished background job is retained before eviction (≥ 1). |
@@ -85,11 +85,21 @@ order the fields appear in `config/schema.py`.
 | `log_level` | `string` | `"info"` | Structured-log verbosity (`debug` / `info` / `warning` / `error`). Logs go to stderr as JSON. |
 | `log_format` | `string` | `"json"` | Structured-log format (`json` / `off`). stdout is the MCP channel and is never written to. |
 
-> Some fields (`default_effort`, `default_time_budget_s`, `default_on_budget`, the cooldown and
-> diversity knobs, `default_persistence`, `jobs_dir`) belong to features that are part of the config
-> contract but are not yet wired into the leaner v3 consensus / debate path. They validate and load;
-> their effect lands as those features are re-added over the ACP core. The safety, roster, timeout,
-> job, and logging fields are fully active.
+> Several fields are part of the config contract but are **not yet wired** into the leaner v3
+> consensus / debate path — they validate and load, but have no effect today, and land as those features
+> are re-added over the ACP core. The not-yet-active set: `default_effort`, `default_time_budget_s`,
+> `default_on_budget` (time budget / effort); `max_agents_advisory`, `enforce_agent_cap` (topology cap);
+> `min_quorum`, `min_distinct`, `synthesize_default` (consensus aggregation / synthesis / diversity);
+> `max_concurrency` (no concurrency semaphore yet); `cooldown_threshold` / `cooldown_window_s` /
+> `cooldown_duration_s` (cooldown / quarantine); `verify_read_only` (the post-run git check);
+> `probe_cache_ttl_s`, `probe_timeout_s` (metadata-probe caching); and `default_persistence`, `jobs_dir`
+> (durable on-disk jobs — v3 jobs are in-memory).
+>
+> What **is** active today: the roster fields (`agents`, `enabled_agents`, `auto_detect_local_models`),
+> `default_safety_mode` and `trusted_workspaces` (read_only is the default and the write/yolo trust gate
+> is enforced — but `verify_read_only` above is not), `default_timeout_s`, `max_targets`, `max_depth`,
+> `max_debate_rounds`, `role_dirs`, the in-memory job knobs (`job_ttl_s`, `max_jobs`), and the logging
+> fields.
 
 ### `AgentConfig` fields (under `[agents.<id>]`)
 

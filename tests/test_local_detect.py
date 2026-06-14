@@ -91,6 +91,15 @@ def test_ollama_registers_only_tool_models(patch_urlopen: Any) -> None:
     assert dict(agent.env_overrides) == _goose_native("qwen3:8b", "localhost:11434")
 
 
+def test_malformed_http_response_is_swallowed(patch_urlopen: Any) -> None:
+    # A half-broken local server raises http.client.HTTPException (BadStatusLine / IncompleteRead /
+    # LineTooLong) -- NOT a URLError/OSError. Detection must still never raise (the never-raises contract).
+    import http.client
+
+    patch_urlopen({"http://localhost:11434/api/tags": http.client.BadStatusLine("garbage")})
+    assert detect_local_agents() == []
+
+
 # ---- (b) LM Studio: embedding models skipped -------------------------------------------------------
 
 

@@ -138,12 +138,11 @@ class RutherfordConfig(BaseModel):
     #: its CLI count implied. Default 2 (two same-model or same-vendor voices flag); raise it to demand
     #: wider diversity.
     min_distinct: int = Field(default=2, ge=1)
-    #: Maximum CLI subprocess delegations Rutherford runs at once, across every panel (a global
-    #: semaphore in the delegation primitive). Decouples panel width from host process pressure: a
-    #: wide consensus or a multi-round debate cannot launch more than this many heavy agent
-    #: subprocesses simultaneously. When not set explicitly it defaults to ``max_targets`` (see the
-    #: validator below), so raising ``max_targets`` does not silently throttle a single auto-panel;
-    #: set it explicitly to pin a different cap (e.g. lower on a laptop). Read once at startup.
+    #: Intended ceiling on how many agents Rutherford runs at once across a panel, to decouple panel
+    #: width from host pressure. NOT YET ENFORCED in v3: there is no concurrency semaphore in the
+    #: consensus/debate fan-out (they ``gather`` over every voice), so this validates and loads but has
+    #: no effect today. Defaults to ``max_targets`` (see the validator below). It is kept in the contract
+    #: for when the semaphore is wired into the delegation primitive.
     max_concurrency: int = Field(default=8, ge=1)
     #: Cooldown (F7): how many *unhealthy* failures (down / throttled / mis-launching -- not a bad
     #: prompt) an adapter may have within ``cooldown_window_s`` before it is benched for

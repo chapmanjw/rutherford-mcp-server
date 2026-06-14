@@ -19,6 +19,7 @@ from typing import Any
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
+from .config.loader import load_config
 from .context import AppContext, build_app_context, error_payload_from, tool_error
 from .domain.error_codes import ErrorCode
 from .domain.errors import ConfigError, RutherfordError
@@ -221,7 +222,7 @@ async def doctor(agent: str | None = None, timeout_s: float = 60.0) -> str:
     """Probe each agent (or one named `agent`) with a real read-only ACP round trip and report conformance.
 
     The trustworthy health check for ACP agents: whether each spawns, handshakes, and answers. Each report
-    is working / no_answer / handshake_failed / not_installed / error. Slower than `capabilities` (it makes
+    is ok / no_answer / handshake_failed / not_installed / error. Slower than `capabilities` (it makes
     a real call per agent); run it to see which of the roster actually drive on this machine.
     """
     return await _guarded(doctor_tool(get_app(), agent=agent, timeout_s=timeout_s))
@@ -281,14 +282,24 @@ async def cancel_job(job_id: str) -> str:
 
 
 def main() -> None:
-    """Console entry point: start the stdio MCP server."""
+    """Console entry point: start the stdio MCP server. ``--smoke`` builds the app and exits, no server loop.
+
+    The smoke path is the entrypoint health check (``just smoke``): it loads config and builds the full app
+    context -- exercising config validation and registry build -- then prints a line and returns instead of
+    blocking on ``mcp.run``. It disables live local-backend probing so the check is fast and deterministic.
+    """
+    smoke = "--smoke" in sys.argv
     try:
         global _APP
-        _APP = build_app_context()
+        config = load_config().model_copy(update={"auto_detect_local_models": False}) if smoke else None
+        _APP = build_app_context(config=config)
     except ConfigError as exc:
         print(f"rutherford: configuration error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     configure_logging(_APP.config.log_level, _APP.config.log_format)
+    if smoke:
+        print(f"rutherford: smoke ok -- {len(_APP.descriptors)} agents registered")
+        return
     mcp.run(show_banner=False)
 
 

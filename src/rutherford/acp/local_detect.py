@@ -16,6 +16,7 @@ there is one source of truth for how goose is pointed at a local runtime.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import re
@@ -148,7 +149,11 @@ def _get_json(url: str, timeout_s: float, *, data: bytes | None = None) -> Any:
     try:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
             body = response.read()
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
+        # http.client.HTTPException covers malformed-HTTP failures (IncompleteRead / BadStatusLine /
+        # LineTooLong) that a half-broken local server raises -- these are NOT URLError/OSError, so without
+        # this a slowloris on :11434/:1234 would escape and break registry build, breaking the never-raises
+        # contract this module promises.
         _log.debug("local-detect: %s unreachable (%s)", url, exc)
         return None
     try:
