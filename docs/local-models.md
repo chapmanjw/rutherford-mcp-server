@@ -50,7 +50,7 @@ A local agent is an `[agents.<id>]` entry. The id (`local-goose` above) is the n
 
 | field     | meaning |
 |-----------|---------|
-| `base`    | the built-in agent to launch (`goose`, `qwen`, or `claude_code`) |
+| `base`    | the built-in agent to launch (`goose`, `qwen`, `opencode`, or `claude_code`) |
 | `backend` | the runtime: `ollama` or `lmstudio` |
 | `model`   | the model id the runtime serves (e.g. `qwen3:8b`, `openai/gpt-oss-20b`) — required |
 | `host`    | optional `host:port`; defaults to `localhost:11434` (Ollama) / `localhost:1234` (LM Studio) |
@@ -60,18 +60,43 @@ fully local panel.
 
 ## Supported agent + backend pairs
 
-Not every agent can target a local runtime, and the runtimes expose different API shapes. These pairs are
-proven:
+Not every agent can target a local runtime, and the runtimes expose different API shapes. The pairs below
+were vetted live (2026-06-14) by driving a real ACP turn against Ollama (`qwen3:8b`) and LM Studio
+(`openai/gpt-oss-20b`). The ones marked ✓ each answered; the rest are documented honestly with the reason.
 
 | base          | ollama | lmstudio | how it connects |
 |---------------|:------:|:--------:|-----------------|
 | `goose`       |   ✓    |    ✓     | Ollama natively; LM Studio via goose's OpenAI provider |
 | `qwen`        |   ✓    |    ✓     | the OpenAI-compatible `/v1` endpoint both runtimes expose |
-| `claude_code` |   ✓    |    —     | Ollama's Anthropic-compatible `/v1/messages`; LM Studio is OpenAI-only, so this pair is unavailable |
+| `opencode`    |   ✓    |    ✓     | an `@ai-sdk/openai-compatible` provider declared inline via `OPENCODE_CONFIG_CONTENT`, pointed at `/v1` |
+| `claude_code` |  ✓*    |    —     | Ollama's Anthropic-compatible `/v1/messages`; LM Studio is OpenAI-only. *Slow — see the note below |
 
-The other built-in agents (`cursor`, `copilot`, `kiro`, `droid`, `junie`, `hermes`, `opencode`, `cline`,
-`vibe`, `codex`, `pi`) are vendor-locked to their own services or do not expose a usable headless local
-endpoint, so they have no local backend. Use one of the three above to run a local model.
+`*` **claude_code over a local model is slow.** The claude-agent-acp adapter runs a full agentic loop over
+the Anthropic wire, which a local model serves much more slowly than its native OpenAI path. With a capable
+model (`qwen3:8b`) and a generous `timeout_s` it answers correctly; a tight timeout times out, and a weak
+model (e.g. `llama3.2:3b`) can answer wrong. Prefer `goose` / `qwen` / `opencode` for a local model unless
+you specifically want Claude Code's loop; if you use it, give it a long timeout and a strong model.
+
+### Agents with no local backend, and why
+
+These were checked and genuinely cannot be pointed at a local runtime through Rutherford's env-keyed config:
+
+- **`codex`** — codex's custom model providers now require the OpenAI **Responses API** wire
+  (`wire_api = "responses"`); `wire_api = "chat"` is rejected. Ollama and LM Studio speak only
+  chat-completions, not the Responses API, so codex has no usable local provider. The `codex-acp` adapter is
+  also auth-gated (it demands a ChatGPT/API-key login at `session/new`), and codex's standalone `--oss`
+  flag is not reachable through the ACP adapter. Use one of the supported agents instead.
+- **`hermes`** — hermes *can* talk to Ollama, but only via its own `~/.hermes` `config.yaml` (`model.provider`
+  + `model.base_url`). Its `acp` mode reads that config and **ignores** the `HERMES_INFERENCE_PROVIDER` /
+  `HERMES_BASE_URL` environment (the persisted config selection deliberately wins over the env). So a local
+  hermes is a config-file edit, not a per-session env, and it does not fit Rutherford's env-keyed `backend`
+  mechanism. To run hermes locally, set `model.provider: ollama` and `model.base_url` in `config.yaml`
+  yourself, then use hermes as a normal (non-`backend`) agent.
+- **`cursor`, `copilot`, `kiro`, `droid`, `junie`, `cline`, `vibe`, `pi`, `kimi`** — vendor-locked to their
+  own services or no usable headless local endpoint over ACP, so no local backend.
+
+Use `goose`, `qwen`, or `opencode` (or `claude_code` on Ollama, with the slowness caveat) to run a local
+model.
 
 ## Requirements
 
@@ -114,6 +139,12 @@ base = "goose"
 backend = "lmstudio"
 model = "openai/gpt-oss-20b"
 
+# Local opencode on Ollama (opencode is configured entirely through an inline env)
+[agents.opencode-ollama]
+base = "opencode"
+backend = "ollama"
+model = "qwen3:8b"
+
 # Claude Code driving a local model via Ollama's Anthropic-compatible endpoint
 [agents.claude-local]
 base = "claude_code"
@@ -140,3 +171,11 @@ host = "192.168.1.50:11434"
 - **`claude_code` + `lmstudio` is rejected** — by design: Claude Code needs an Anthropic-compatible
   endpoint, which LM Studio does not provide. Use `ollama` for `claude_code`, or use `goose`/`qwen` for LM
   Studio.
+- **`claude_code` local turn times out** — it is slow over a local model (see the support matrix). Raise
+  `timeout_s` and use a capable model (`qwen3:8b`+), or switch to `goose`/`qwen`/`opencode`.
+- **`opencode` local turn returns nothing / wrong model** — the local provider is declared inline via
+  `OPENCODE_CONFIG_CONTENT`, which Rutherford fills in from `model`; don't also set a conflicting
+  `OPENCODE_CONFIG` file env, and make sure `model` is the exact id the runtime serves.
+- **`codex` / `hermes` rejected as a `backend`** — neither has an env-keyed local pair (codex needs the
+  OpenAI Responses API wire that local runtimes don't speak; hermes' `acp` reads its `config.yaml` provider
+  and ignores the env). See the support matrix for the details and the hermes config-file workaround.

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -134,6 +136,30 @@ def test_backend_claude_code_uses_anthropic_compatible_env() -> None:
     config = RutherfordConfig(agents={"c": AgentConfig(base="claude_code", backend="ollama", model="m")})
     env = dict(build_registry(config).get("c").env_overrides)
     assert env["ANTHROPIC_BASE_URL"] == "http://localhost:11434" and env["ANTHROPIC_MODEL"] == "m"
+
+
+def test_backend_opencode_ollama_builds_inline_config_env() -> None:
+    config = RutherfordConfig(agents={"oc": AgentConfig(base="opencode", backend="ollama", model="qwen3:8b")})
+    agent = build_registry(config).get("oc")
+    assert agent.command == ("opencode", "acp")
+    env = dict(agent.env_overrides)
+    assert set(env) == {"OPENCODE_CONFIG_CONTENT"}  # opencode is configured entirely through one inline-JSON env
+    config_json = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    provider = config_json["provider"]["ollama"]  # provider id is the backend name
+    assert provider["npm"] == "@ai-sdk/openai-compatible"
+    assert provider["options"]["baseURL"] == "http://localhost:11434/v1"
+    assert "qwen3:8b" in provider["models"]  # the requested model is opencode's single default model
+
+
+def test_backend_opencode_lmstudio_points_at_1234_and_names_lmstudio_provider() -> None:
+    config = RutherfordConfig(
+        agents={"oc": AgentConfig(base="opencode", backend="lmstudio", model="openai/gpt-oss-20b")}
+    )
+    env = dict(build_registry(config).get("oc").env_overrides)
+    config_json = json.loads(env["OPENCODE_CONFIG_CONTENT"])
+    provider = config_json["provider"]["lmstudio"]  # LM Studio gets an lmstudio-named provider block
+    assert provider["options"]["baseURL"] == "http://localhost:1234/v1"
+    assert "openai/gpt-oss-20b" in provider["models"]
 
 
 def test_backend_without_a_base_is_an_error() -> None:

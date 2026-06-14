@@ -13,6 +13,7 @@ that, under ACP, replaces a hand-written adapter.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 
 from ..config.schema import AgentConfig, RutherfordConfig
@@ -125,16 +126,47 @@ def _anthropic_compatible(model: str, host: str) -> dict[str, str]:
     }
 
 
-#: How each supported (base agent, backend) pair is pointed at a local runtime, all proven live (receipt 14).
-#: ``goose`` reaches Ollama natively and LM Studio via its openai provider. ``qwen`` uses the OpenAI-compatible
-#: endpoint both runtimes expose (Ollama ``/v1``, LM Studio ``/v1``). ``claude_code`` needs an
-#: Anthropic-compatible endpoint, which Ollama provides (``/v1/messages``) but LM Studio (OpenAI-only) does
-#: not -- so ``claude_code`` supports ``ollama`` only.
+def _opencode_openai(model: str, host: str) -> dict[str, str]:
+    """Point opencode at a local OpenAI-compatible runtime via an inline ``OPENCODE_CONFIG_CONTENT``.
+
+    opencode is config-driven, but it reads a whole config as JSON from ``OPENCODE_CONFIG_CONTENT`` (not just
+    a file path), so a custom provider can be declared entirely in the environment -- one source of truth, no
+    file on disk. The provider uses opencode's ``@ai-sdk/openai-compatible`` adapter pointed at the runtime's
+    ``/v1`` endpoint, with the requested model as its single (default) model so opencode selects it without an
+    explicit ``set_model``. The provider id is the backend name so the config reads naturally; the model key is
+    the bare runtime model id (e.g. ``qwen3:8b`` / ``openai/gpt-oss-20b``). Proven live on both runtimes.
+    """
+    provider = "ollama" if ":11434" in host else "lmstudio"
+    config = {
+        "provider": {
+            provider: {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": f"{provider} (local)",
+                "options": {"baseURL": f"http://{host}/v1"},
+                "models": {model: {"name": model}},
+            }
+        }
+    }
+    return {"OPENCODE_CONFIG_CONTENT": json.dumps(config, separators=(",", ":"))}
+
+
+#: How each supported (base agent, backend) pair is pointed at a local runtime, every entry proven live
+#: (2026-06-14 vetting against Ollama qwen3:8b and LM Studio openai/gpt-oss-20b). ``goose`` reaches Ollama
+#: natively and LM Studio via its openai provider. ``qwen`` and ``opencode`` use the OpenAI-compatible ``/v1``
+#: endpoint both runtimes expose -- ``opencode`` via an inline ``OPENCODE_CONFIG_CONTENT`` provider block.
+#: ``claude_code`` needs an Anthropic-compatible endpoint, which Ollama provides (``/v1/messages``) but
+#: LM Studio (OpenAI-only) does not, so it supports ``ollama`` only; it is also slow over a local model (drive
+#: it with a generous timeout and a capable model). ``codex`` and ``hermes`` are NOT here: codex's custom
+#: providers now require the OpenAI Responses API wire (``wire_api="responses"``), which neither runtime
+#: speaks, and the codex-acp adapter is auth-gated; hermes' ``acp`` reads its config.yaml provider and ignores
+#: the inference-provider env, so a local hermes is a config-file change, not an env-keyed pair.
 _BACKEND_ENV: dict[tuple[str, str], Callable[[str, str], dict[str, str]]] = {
     ("goose", "ollama"): _goose_native,
     ("goose", "lmstudio"): _goose_openai,
     ("qwen", "ollama"): _openai_compatible,
     ("qwen", "lmstudio"): _openai_compatible,
+    ("opencode", "ollama"): _opencode_openai,
+    ("opencode", "lmstudio"): _opencode_openai,
     ("claude_code", "ollama"): _anthropic_compatible,
 }
 

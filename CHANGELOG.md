@@ -8,6 +8,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Local-model support for **opencode** on both Ollama and LM Studio (`[agents.<id>] base="opencode"
+  backend="ollama"|"lmstudio" model=...`). opencode is configured entirely through one inline-JSON
+  environment variable (`OPENCODE_CONFIG_CONTENT`) that declares an `@ai-sdk/openai-compatible` provider
+  pointed at the runtime's `/v1` endpoint, so there is no config file on disk — one source of truth in
+  `roster._opencode_openai`. Vetted live (2026-06-14): a real ACP turn answered on Ollama (`qwen3:8b`) and
+  LM Studio (`openai/gpt-oss-20b`). This supersedes the earlier "opencode's acp turn returns empty" finding,
+  which was an unconfigured-provider artifact, not an opencode limitation.
+- Documented the full, honestly-vetted local-backend support matrix in `docs/local-models.md`: which
+  agent × {ollama, lmstudio} pairs work, and — for the ones that do **not** — the concrete reason. `codex`
+  has no local pair (its custom providers now require the OpenAI Responses API wire that local runtimes don't
+  speak, and `codex-acp` is auth-gated); `hermes` can talk to Ollama but only via its own `config.yaml`
+  provider (its `acp` mode ignores the inference-provider env), so it is a config-file change, not an
+  env-keyed `backend`. `claude_code` on Ollama works but is slow and needs a generous timeout + a capable
+  model. A new `-m integration` suite (`tests/integration/test_local_backends.py`) drives every supported
+  pair live and skips a runtime that is down.
 - Durable runs (F2): a `delegate` / `consensus` / `debate` call can now be kept as a job on disk. Each of
   the three tools takes a `persist` flag (`true` / `false`, or `None` to follow the configured
   `default_persistence` — `ephemeral` out of the box, so nothing is written unless asked), and the
