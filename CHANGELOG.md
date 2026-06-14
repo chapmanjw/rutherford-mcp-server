@@ -12,6 +12,28 @@ All notable changes to this project are documented in this file. The format is b
   Zed adapters `codex-acp` and `claude-agent-acp`. Both reuse the existing CLI login over ACP and need no
   API key — `codex-acp` keeps the ChatGPT subscription, `claude-agent-acp` keeps the Claude Code login —
   correcting the earlier research note that flagged them as possibly API-key-only. Roster: 9 descriptors.
+- Config-driven agents. Under ACP an agent is just how to launch it plus a few quirks (no per-CLI parser),
+  so the roster is now built from the curated built-in defaults plus a `[agents.<id>]` config section.
+  A config entry overrides a built-in agent's command/env/provider/model/handshake, disables one with
+  `enabled = false`, or defines a brand-new agent (any unknown id, which must supply a launch `command`);
+  `enabled_agents` restricts the result. The launch fields mirror the Zed/Cline `acp.json` shape.
+- Zed/Cline `acp.json` import. The loader auto-discovers an `acp.json` beside the global config and in the
+  project's `.rutherford/`, folding its `agent_servers` into the agents config the way Zed/Cline read it.
+  The native TOML wins over an imported `acp.json` at the same scope; an import never overrides a built-in
+  or blocks startup when malformed.
+
+### Fixed
+
+- Orphaned agent process trees. A wrapper adapter spawns the underlying CLI as a child; the ACP transport
+  terminated only the direct child, leaving that CLI running, holding the working directory, and piling up
+  across `doctor` probes. The session now reaps the agent's descendant tree on close.
+- A relative `working_dir` is resolved to an absolute path before `session/new` (ACP requires absolute);
+  a `working_dir` that points at a file now fails cleanly as a spawn failure instead of an internal error.
+
+### Changed
+
+- Config: `AdapterConfig` → `AgentConfig` (gains `command`/`env`/`provider`/`handshake_timeout_s`),
+  `adapters` → `agents`, `enabled_adapters` → `enabled_agents`.
 
 ## [1.7.0] - 2026-06-13
 
