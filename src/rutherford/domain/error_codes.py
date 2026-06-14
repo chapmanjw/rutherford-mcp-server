@@ -77,6 +77,10 @@ class ErrorCode(StrEnum):
     TOO_MANY_JOBS = "TOO_MANY_JOBS"
     #: A named role could not be found in any configured role directory.
     ROLE_NOT_FOUND = "ROLE_NOT_FOUND"
+    #: A ``role="<id>"`` on ``delegate`` / ``consensus`` / ``debate`` named a persona that the
+    #: ``RoleStore`` does not know (no built-in and no ``role_dirs`` file of that id). The error lists
+    #: the known role ids; ``list_roles`` enumerates them.
+    UNKNOWN_ROLE = "UNKNOWN_ROLE"
     #: A named panel could not be found in any discovered panels file.
     PANEL_NOT_FOUND = "PANEL_NOT_FOUND"
     #: A panels file failed to parse or validate (bad TOON, unknown CLI, malformed target).

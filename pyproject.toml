@@ -62,9 +62,13 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rutherford"]
+# Ship the built-in role personas (package data) alongside the .py modules so importlib.resources
+# resolves them from an installed wheel, not just a source checkout.
+artifacts = ["src/rutherford/roles/*.md"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/rutherford", "README.md", "CHANGELOG.md", "LICENSE"]
+artifacts = ["src/rutherford/roles/*.md"]
 
 # --- Lint and format (ruff is the single Python equivalent of the siblings'
 # ESLint/Prettier and Spotless/Checkstyle; 120-char lines match the Java

@@ -16,6 +16,7 @@ from ..domain.enums import DelegationMode, SafetyMode
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import Target
+from ..services.roles import RoleStore
 
 
 def parse_safety_mode(value: str | SafetyMode) -> SafetyMode:
@@ -87,3 +88,16 @@ def ensure_known_targets(descriptors: DescriptorRegistry, targets: list[Target])
     """Validate every target's ``cli`` against the registry (see :func:`ensure_known_agent`)."""
     for target in targets:
         ensure_known_agent(descriptors, target.cli)
+
+
+def apply_role(roles: RoleStore, role: str | None, prompt: str) -> str:
+    """Prepend role ``role``'s persona to ``prompt`` when one is named, else return ``prompt`` unchanged.
+
+    The single role seam for ``delegate`` / ``consensus`` / ``debate``: a named role is validated against
+    the store (a bad id raises ``UNKNOWN_ROLE`` on the request path, listing the known roles) and its
+    prompt is prepended; an omitted role is a no-op. The role is folded into the prompt here, at the tool
+    layer, so the services keep handing one composed prompt to the agent.
+    """
+    if role is None:
+        return prompt
+    return roles.apply(role, prompt)

@@ -26,6 +26,7 @@ from .services.consensus import ConsensusService
 from .services.debate import DebateService
 from .services.delegation import DelegationService
 from .services.jobs import JobStore
+from .services.roles import RoleStore
 
 
 def tool_success(data: Any) -> str:
@@ -56,6 +57,7 @@ class AppContext:
     consensus: ConsensusService
     debate: DebateService
     jobs: JobStore
+    roles: RoleStore
 
     def new_correlation_id(self) -> str:
         """Mint a short correlation id for a tool call."""
@@ -79,6 +81,7 @@ def build_app_context(
     consensus = ConsensusService(delegation, resolved_config)
     debate = DebateService(resolved_descriptors, resolved_config)
     jobs = JobStore(max_jobs=resolved_config.max_jobs, job_ttl_s=resolved_config.job_ttl_s)
+    roles = RoleStore(role_dirs=resolved_config.role_dirs)
     return AppContext(
         config=resolved_config,
         descriptors=resolved_descriptors,
@@ -86,4 +89,5 @@ def build_app_context(
         consensus=consensus,
         debate=debate,
         jobs=jobs,
+        roles=roles,
     )

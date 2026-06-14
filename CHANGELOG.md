@@ -8,6 +8,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Role personas (the "good duck" role surface, over the ACP core). A `role="<id>"` argument on
+  `delegate` / `consensus` / `debate` prepends a reusable system prompt to the caller's task (the role
+  text, a `---` delimiter, then the prompt). Five substantive built-ins ship as package data:
+  `principal-reviewer`, `architect`, `debugger`, `security-reviewer`, and `explainer`. A `role_dirs`
+  directory adds new roles or overrides a built-in of the same id; each role is a markdown file with a
+  small `name` / `description` frontmatter block whose body is the prompt. Loading is tolerant — a
+  missing directory or a malformed role file is logged and skipped, never a startup crash. A new
+  `list_roles` tool enumerates the catalog (`{roles: [{id, name, description}]}`), and a bad `role` id
+  fails on the request path with the new `UNKNOWN_ROLE` code listing the known roles.
 - Async background jobs. `delegate` / `consensus` / `debate` take `mode="async"` to run the work off the
   request path: the call returns a small `{job_id, status, tool}` envelope immediately and the work runs as
   an in-memory `asyncio` task. Four tools manage them — `list_jobs` (light listing, newest first),

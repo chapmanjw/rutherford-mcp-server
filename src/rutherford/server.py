@@ -28,6 +28,7 @@ from .tools.consensus import consensus_tool
 from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
 from .tools.jobs import cancel_job_tool, job_result_tool, job_status_tool, list_jobs_tool
+from .tools.roles import list_roles_tool
 
 mcp: FastMCP = FastMCP(
     "rutherford",
@@ -78,6 +79,7 @@ async def delegate(
     safety_mode: str | None = None,
     timeout_s: float | None = None,
     trust_workspace: bool = False,
+    role: str | None = None,
     mode: str = "sync",
 ) -> str:
     """Delegate a task to one ACP agent and return its normalized result.
@@ -85,7 +87,8 @@ async def delegate(
     `cli` is an agent id (see `capabilities`); `model` is optional (the agent's default otherwise).
     `safety_mode` is read_only | propose | write | yolo; when omitted, the configured `default_safety_mode`
     applies (read_only out of the box). write and yolo also need a trusted workspace (`trust_workspace=true`
-    or a configured allowlist). `files` lists paths to put in scope. `mode="async"` runs the turn as a
+    or a configured allowlist). `files` lists paths to put in scope. `role` names a persona (see
+    `list_roles`) whose system prompt is prepended to `prompt`. `mode="async"` runs the turn as a
     background job and returns a `job_id` (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
     """
     return await _guarded(
@@ -99,6 +102,7 @@ async def delegate(
             safety_mode=safety_mode,
             timeout_s=timeout_s,
             trust_workspace=trust_workspace,
+            role=role,
             mode=mode,
         )
     )
@@ -112,14 +116,16 @@ async def consensus(
     files: list[str] | None = None,
     safety_mode: str | None = None,
     timeout_s: float | None = None,
+    role: str | None = None,
     mode: str = "sync",
 ) -> str:
     """Ask the same prompt of several ACP agents in parallel and return every voice.
 
     `targets` is a list of `{cli, model}` objects or `cli` / `cli:model` strings; each runs as its own ACP
     session concurrently. `safety_mode` and `timeout_s` apply to every voice; one failing voice is returned
-    as a failed result, never an aborted panel. `mode="async"` runs the panel as a background job and
-    returns a `job_id` (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
+    as a failed result, never an aborted panel. `role` names a persona (see `list_roles`) prepended to the
+    prompt every voice receives. `mode="async"` runs the panel as a background job and returns a `job_id`
+    (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
     """
     return await _guarded(
         consensus_tool(
@@ -130,6 +136,7 @@ async def consensus(
             files=files,
             safety_mode=safety_mode,
             timeout_s=timeout_s,
+            role=role,
             mode=mode,
         )
     )
@@ -145,6 +152,7 @@ async def debate(
     safety_mode: str | None = None,
     synthesize: bool = True,
     timeout_s: float | None = None,
+    role: str | None = None,
     mode: str = "sync",
 ) -> str:
     """Have several ACP agents argue a question across rounds and return the full transcript.
@@ -153,7 +161,8 @@ async def debate(
     two. Each voice keeps ONE persistent ACP session across all `rounds`: round one is each voice's
     independent answer, and each later round shows a voice the others' latest positions and asks it to
     revise -- the agent remembers its own prior reasoning in-session, so only the delta is sent.
-    `synthesize=true` (default) adds a closing summary; `judge` names a target to write it. `mode="async"`
+    `synthesize=true` (default) adds a closing summary; `judge` names a target to write it. `role` names a
+    persona (see `list_roles`) prepended to the opening prompt every voice argues from. `mode="async"`
     runs the debate as a background job and returns a `job_id` (poll with `job_status` / `job_result`);
     `mode="sync"` awaits it.
     """
@@ -168,6 +177,7 @@ async def debate(
             safety_mode=safety_mode,
             synthesize=synthesize,
             timeout_s=timeout_s,
+            role=role,
             mode=mode,
         )
     )
@@ -177,6 +187,17 @@ async def debate(
 async def capabilities() -> str:
     """List the ACP agents Rutherford can drive (id, display name, launch command, provider)."""
     return await _guarded(capabilities_tool(get_app()))
+
+
+@mcp.tool
+async def list_roles() -> str:
+    """List the available role personas (id, name, description) for the `role` param.
+
+    A role is a reusable system prompt; pass its `id` as `role="<id>"` to `delegate` / `consensus` /
+    `debate` and the persona is prepended to your prompt. Built-in roles ship with Rutherford; a
+    `role_dirs` directory can add or override one.
+    """
+    return await _guarded(list_roles_tool(get_app()))
 
 
 @mcp.tool
