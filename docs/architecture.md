@@ -1,13 +1,20 @@
 # Architecture
 
-Rutherford is a stdio MCP server that runs other agentic coding CLIs as headless subprocesses.
-Its two operations are **delegate** (hand one task to one CLI) and **consensus** (hand the same
-task to several CLIs in parallel and collect every answer). It never calls a model provider API
-directly and never reimplements a CLI's own features.
+Rutherford is a stdio MCP server that orchestrates other agentic coding agents over the
+[Agent Client Protocol (ACP)](https://agentclientprotocol.com). Its three orchestration operations are
+**delegate** (hand one task to one agent), **consensus** (hand the same task to several agents in
+parallel), and **debate** (have several agents argue across rounds on persistent sessions). It never
+calls a model provider API directly and never reimplements an agent's own features.
 
-**Non-goals.** Rutherford does not manage CLI authentication, does not store conversation history
-itself, does not stream tokens to the MCP client, and does not implement any coding agent behavior.
-It is a transport and orchestration layer, not an agent.
+The defining fact: Rutherford is the ACP *client* and each coding agent is an ACP *agent*. It spawns
+the agent as an ACP server over stdio and drives a real `initialize` / `new_session` / `prompt`
+exchange. Under ACP the protocol negotiates output, system prompts, file context, permissions, and
+resume as structured messages, so there is no per-agent stdout parser — the v2 subprocess-adapter
+model is gone.
+
+**Non-goals.** Rutherford does not manage agent authentication, does not store conversation history
+itself, and does not implement any coding-agent behavior. It is a transport and orchestration layer,
+not an agent.
 
 ---
 
@@ -15,288 +22,277 @@ It is a transport and orchestration layer, not an agent.
 
 ```
 MCP tool layer     src/rutherford/server.py + tools/
-                   FastMCP @mcp.tool wrappers; validates input, calls a service,
-                   returns toolSuccess / toolError; no orchestration logic here.
+                   FastMCP @mcp.tool wrappers; validate input, call a service,
+                   return tool_success / tool_error; no orchestration logic here.
         |
 services           src/rutherford/services/
-                   delegation.py  -- single-target, sync/async, guards
-                   consensus.py   -- fan-out, stance steering, optional synthesis
-                   jobs.py        -- background job store
-                   roles.py       -- role preamble loader and store
+                   delegation.py  -- single agent, one ACP turn, the safety gate
+                   consensus.py   -- fan the prompt out to N agents in parallel
+                   debate.py      -- N agents, persistent sessions, multi-round
+                   jobs.py        -- in-memory background-job store
+                   roles.py       -- role persona loader and store
         |
-adapters           src/rutherford/adapters/
-                   base.py        -- CLIAdapter Protocol + BaseCLIAdapter
-                   registry.py    -- closed id -> adapter mapping
-                   claude_code.py, codex.py, cursor.py, qwen.py,
-                   kiro.py, opencode.py, goose.py, ollama.py,
-                   lmstudio.py, antigravity.py, droid.py, vibe.py, copilot.py
-        |
-runtime            src/rutherford/runtime/
-                   process.py     -- ProcessRunner Protocol + AsyncProcessRunner
-                   probe.py       -- CommandProbe Protocol + SystemProbe
-                   launch.py      -- cross-platform argv preparation
-                   depth.py       -- depth guard + target cap
-                   platform.py    -- WSL detection
+ACP runtime        src/rutherford/acp/
+                   descriptors.py -- AgentDescriptor + DescriptorRegistry + HIGH_FIDELITY
+                   roster.py      -- build_registry(): built-ins + config + local detect
+                   session.py     -- ACPSession, run_acp_turn (the core primitive)
+                   journal.py     -- EventJournal (event-sourced turn record)
+                   client.py      -- the ACP client callbacks (permission, fs, terminal)
+                   permission.py  -- PermissionPolicy (safety mode -> ACP decisions)
+                   launch.py      -- cross-platform launch resolution (Windows npm shims)
+                   teardown.py    -- reap an agent's orphaned descendant process tree
+                   conformance.py -- the doctor probe (does an agent really drive?)
+                   local_detect.py-- zero-config Ollama / LM Studio detection
         |
 domain + config    src/rutherford/domain/   models, enums, errors, error_codes
-                   src/rutherford/config/   schema, loader
+                   src/rutherford/config/   schema, loader, acp_json
                    src/rutherford/io/       serialize.py (TOON seam)
 ```
 
-Dependencies point inward. The domain layer imports nothing from any other layer. Adapters import
-from domain, runtime, and config but not from services. Services import from adapters (via the
-`AdapterRegistry` interface), runtime, and domain. The tool layer imports only from services and
-domain. Nothing in the core imports a concrete adapter by class name; all adapter access goes
-through the registry.
+Dependencies point inward. The domain layer imports nothing from any other layer. The ACP runtime
+imports from domain and config. Services import from the ACP runtime and domain. The tool layer
+imports only from services, the ACP runtime (for the registry), and domain. Nothing in the core
+imports a concrete agent by name; all agent access goes through the descriptor registry.
 
 ---
 
-## The two interfaces
+## The agent descriptor and registry
 
-### CLIAdapter (`adapters/base.py`)
+`acp/descriptors.py` defines `AgentDescriptor`, the small frozen declaration that replaces a
+hand-written subprocess adapter:
 
-`CLIAdapter` is a `Protocol`. The core depends only on this interface; no concrete adapter class
-is imported anywhere outside `registry.py`. The contract has two load-bearing methods:
+| field | meaning |
+| --- | --- |
+| `id` | the agent id callers use (`goose`, `claude_code`, ...) |
+| `display_name` | the human label |
+| `command` | the argv that launches this agent as an ACP server (e.g. `("goose", "acp")`) |
+| `provider` | the fixed model vendor when known, else `None` for bring-your-own-model |
+| `env_passthrough` | which inherited env vars to pass through; `None` passes the full environment |
+| `default_model` | the model used when a call names none; `None` means the agent's own default |
+| `handshake_timeout_s` | seconds allotted for `initialize` + `new_session` before it is judged failed |
+| `env_overrides` | env vars to set for the subprocess (e.g. a local-runtime provider env) |
 
-- `build_invocation(req, ctx) -> InvocationSpec` -- pure function. Given a normalized
-  `DelegationRequest` and an `InvocationContext`, returns an `InvocationSpec` with an `argv`
-  list, an `env` overlay, a `cwd`, and an optional stdin payload. It never builds a shell string.
-  Role preamble injection is the adapter's responsibility: use a native system-prompt flag where
-  the CLI has one, or call `_compose_prompt` to prepend it to the prompt.
+`DescriptorRegistry` is an immutable id → descriptor mapping with fail-fast lookup, mirroring the v2
+adapter registry's closed-mapping contract. `HIGH_FIDELITY` is the 16-agent built-in roster. There is
+no per-agent code: a descriptor plus the shared ACP runtime is the whole integration.
 
-- `parse_output(raw, ctx) -> DelegationResult` -- maps the raw `ProcessResult` to the normalized
-  envelope, including on non-zero exit. All CLI-specific quirks live here and must not leak
-  upward. The Antigravity adapter's transcript read is the canonical example; see the section
-  on CLI quirks below.
+`acp/roster.py:build_registry(config)` assembles the live registry in precedence order:
 
-The other methods (`detect`, `check_auth`, `available_models`, `capabilities`, `map_safety`) are
-used by the `capabilities` and `doctor` tools and by `DelegationService` for the binary-present
-check and safety mapping.
+1. The built-in `HIGH_FIDELITY` descriptors.
+2. Auto-detected local-model agents (lowest precedence — a built-in or explicit config of the same id
+   always wins), when `auto_detect_local_models` is on.
+3. Config `[agents.<id>]` entries: override a built-in's fields, disable one with `enabled = false`,
+   define a brand-new agent, or clone a built-in with `base` and point it at a local runtime via
+   `backend`.
+4. The `enabled_agents` allowlist filter, when set.
 
-`BaseCLIAdapter` is an abstract base class that provides default implementations of `detect`
-(via an injected `CommandProbe`) and `available_models` (from a static model tuple), plus small
-helpers (`_detect_version`, `_with_files`, `_compose_prompt`, `_auth_from_env_or_command`).
-Concrete adapters implement only what is genuinely CLI-specific.
-
-**Why it exists.** The `CLIAdapter` interface is what makes the core testable: every service
-takes an `AdapterRegistry` (not any concrete adapter), so unit tests use `FakeAdapter` with no
-real CLI subprocess. Adding a new CLI is additive and requires no changes to services or tools.
-
-### ProcessRunner (`runtime/process.py`)
-
-`ProcessRunner` is a `Protocol` with one async method: `run(spec, timeout_s, on_progress)`.
-
-The real implementation, `AsyncProcessRunner`, uses `asyncio.create_subprocess_exec` (never a
-shell), feeds stdin, streams stderr lines to `on_progress` as they arrive, enforces the timeout
-with `asyncio.wait_for`, and on timeout or cancellation kills the entire process tree with
-`psutil` (agents spawn child processes; killing only the direct child would orphan them).
-
-`CommandProbe` is a separate, synchronous interface for the short metadata calls (`which`,
-`--version`, auth status checks). `SystemProbe` backs it with `subprocess.run`. These metadata
-calls are distinct from the orchestration path and never mutate.
-
-**Why two runner types.** `ProcessRunner` is async and handles the full lifecycle for long-running
-agent invocations. `CommandProbe` is synchronous and used only for brief, read-only metadata
-queries. Both are injected, so neither the service layer nor any adapter depends on a real
-subprocess in tests.
+See [adding-an-agent.md](adding-an-agent.md) for the config-driven workflow.
 
 ---
 
-## Request/result flow: a single delegate call
+## The ACP session: the core primitive
+
+`acp/session.py` defines `ACPSession`, a live conversation with one agent: open once, run many prompt
+turns, close. This is what makes a debate possible — the old subprocess model re-spawned and re-sent
+the whole transcript every round; here each voice holds one session, so a later round sends only the
+delta and the agent remembers its own prior reasoning in-session.
+
+`ACPSession.open()`:
+
+1. Resolves the launch argv for the platform (`launch.py` — see below) and spawns the agent as an ACP
+   server with a clean stdio transport (the stdin read limit is raised from asyncio's 64 KiB default
+   to 16 MiB so a large `session/update` does not drop the connection).
+2. Performs `initialize` and `new_session(cwd, mcp_servers=[])`, each bounded by the descriptor's
+   handshake timeout. ACP requires an absolute `cwd`, so it is resolved once here.
+3. A spawn failure raises `ACPHandshakeError(ACP_SPAWN_FAILED, ...)`; a handshake failure raises
+   `ACPHandshakeError(ACP_HANDSHAKE_FAILED, ...)`. Both are pre-prompt, so re-execution-safe.
+
+`ACPSession.prompt(text, timeout_s)` runs one turn on the live session and reduces it to a normalized
+`DelegationResult`. It never raises for an operational failure — a timeout, refusal, empty answer, or
+transport error becomes a failed result carrying the ACP error code and a re-execution-safety
+classification. The result reduction reads everything from the turn's event journal (below), never
+from raw stdout.
+
+`run_acp_turn(...)` is the one-shot wrapper (open, one turn, close) used by `delegate` and each
+`consensus` voice. `ACPSession.close()` tears the connection down and reaps the agent's orphaned
+descendant process tree (`teardown.py`): a wrapper adapter spawns the underlying CLI as a child, and
+the SDK transport terminates only the direct child, so the descendants are snapshotted before
+teardown and reaped after.
+
+---
+
+## The event journal
+
+`acp/journal.py` defines `EventJournal`, the event-sourced record of one prompt turn. A synchronous
+stream observer (registered on the ACP transport) appends a `JournalEvent` for each incoming
+`session/update` notification in receive order, alongside the client's own decisions (permission
+grants, fs reads/writes, terminal denials). Because the observer is synchronous and inline in the
+SDK's read loop, the journal is complete the moment the prompt response resolves the turn.
+
+The reducer derives the normalized result from the journal:
+
+- `message_text()` — the answer, every `agent_message_chunk` concatenated in order.
+- `usage()` — the latest reported token usage as a `Cost`.
+- `tool_call_count()` — distinct tool calls the agent reported (the real topology, not a process
+  count).
+- `saw_side_effect()` / `saw_tool_activity()` — whether a served `fs/write` or terminal ran, and
+  whether any tool call or permission request happened. These classify how unsafe a re-run is after
+  the prompt was accepted (`ReexecutionSafety`).
+
+---
+
+## The permission engine
+
+`acp/permission.py` defines `PermissionPolicy`, the safety mode rendered as ACP decisions. Rutherford
+is the permission authority at the moment of each tool call:
+
+- Reads are always served — the answer needs to see the code.
+- Filesystem writes and terminal execution are allowed only in `write` / `yolo`.
+- A tool-call permission request is granted in `write` / `yolo` and rejected otherwise. `select_permission`
+  picks the agent's `allow_*` option for a mutating mode (preferring the one-shot `_once` form) or a
+  `reject_*` option otherwise, declining the tool call rather than cancelling the whole turn.
+
+This governs what the agent routes through ACP. An OS-level sandbox (worktree isolation) is a later
+layer, so the optional `verify_read_only` git check still belongs above this for defense in depth.
+
+---
+
+## Request flow: a single delegate call
 
 ```
 MCP client calls delegate(cli="claude_code", prompt="...", safety_mode="read_only")
         |
         v
 delegate_tool (tools/delegate.py)
-  Build DelegationRequest(target=Target(cli, model), ...)
+  ensure_known_agent, resolve_safety_mode, resolve_run_mode
+  apply_role (prepend a named role's persona to the prompt)
+  build DelegationRequest(target=Target(cli, model), ...)
         |
         v
 DelegationService.delegate (services/delegation.py)
-  1. registry.get(cli)          -> CLIAdapter  (RegistryError if unknown)
-  2. ensure_within_depth(...)   -> raises DepthLimitError if depth >= max_depth
-  3. adapter.detect()           -> fail if binary absent
-  4. is_mutating(safety_mode)   -> trusted-workspace gate for write/yolo
-  5. roles.get(role)            -> inject role_preamble into InvocationContext
-  6. adapter.build_invocation(req, ctx)  -> InvocationSpec (pure, argv list)
-  7. spec.env overlay: RUTHERFORD_DEPTH = depth + 1
-  8. runner.run(spec, timeout)  -> ProcessResult
-  9. adapter.parse_output(raw, ctx)  -> DelegationResult
+  1. registry.has(cli)            -> UNKNOWN_TARGET if absent
+  2. is_mutating(safety_mode)     -> trusted-workspace gate for write/yolo (WORKSPACE_NOT_TRUSTED)
+  3. resolve cwd, timeout, files; build PermissionPolicy
+  4. run_acp_turn(descriptor, prompt, policy, cwd, timeout, model)
         |
         v
-tool_success(result)   ->   encode(result)   ->   TOON text block returned to MCP client
+tool_success(result)  ->  encode(result)  ->  TOON text block returned to the MCP client
 ```
 
-Operational failures at any step (unknown id, binary absent, timeout, non-zero exit, parse
-failure) become a structured `DelegationResult(ok=False, error=ErrorInfo(code, message))` rather
-than an exception, so a consensus panel never aborts on one bad voice.
+Operational failures (unknown id, spawn failure, handshake failure, timeout, refusal, empty answer,
+transport error) become a structured `DelegationResult(ok=False, error=ErrorInfo(code, message))`
+rather than an exception, so a consensus panel never aborts on one bad voice.
 
 ---
 
-## The DelegationResult envelope
+## Consensus and debate
 
-Every adapter's `parse_output` must return a `DelegationResult` regardless of outcome.
+**Consensus** (`services/consensus.py`) fans the prompt out to every target concurrently, each as its
+own one-shot ACP session via the delegation service, and returns every voice. One failing voice is a
+failed `DelegationResult` in the result, never an aborted panel. The per-call `max_targets` cap bounds
+the fan-out.
 
-| Field | Type | Notes |
-|---|---|---|
-| `target` | `Target` | The `(cli, model)` pair that was delegated to |
+**Debate** (`services/debate.py`) opens one persistent `ACPSession` per voice in parallel, then runs
+up to `rounds` rounds:
+
+- Round 1 sends each voice the full question (optionally with a stance). Later rounds send each voice
+  only the delta — the other voices' latest positions — and ask it to critique and revise; its own
+  session remembers its prior answer.
+- A voice that fails a round drops out of the active set. The debate stops early once fewer than two
+  voices remain to argue.
+- An optional closing synthesis (on by default) runs a final read-only pass over the last usable
+  round, performed by a named `judge` target (ideally a non-participant) or the first surviving
+  voice's agent on a fresh session. The result records `synthesis_by`.
+- Two voices that share a `(cli, model)` get distinct seat ids and disambiguated transcript labels
+  (`goose`, `goose#2`), so their positions never merge.
+
+All sessions are always closed at the end, even on an exception.
+
+---
+
+## The result envelope and the TOON seam
+
+Every turn reduces to a `DelegationResult`:
+
+| field | type | notes |
+| --- | --- | --- |
+| `target` | `Target` | the `(cli, model)` pair that answered |
 | `ok` | `bool` | `True` on success, `False` on any failure |
-| `exit_code` | `int \| None` | Raw process exit code; `None` on timeout |
-| `text` | `str` | The clean final answer (empty on failure) |
-| `raw` | `str \| None` | Combined stdout+stderr; only when `include_raw=True` |
-| `duration_s` | `float` | Wall-clock time in seconds |
-| `session_id` | `str \| None` | Opaque; round-trips to the CLI's resume mechanism |
-| `cost` | `Cost \| None` | Token counts and USD cost, where the CLI reports them |
-| `error` | `ErrorInfo \| None` | Structured error on failure; `None` on success |
-| `safety_mode` | `SafetyMode` | Echoes the mode that was used |
+| `text` | `str` | the clean final answer (empty on failure) |
+| `duration_s` | `float` | wall-clock seconds, rounded to milliseconds |
+| `session_id` | `str \| None` | the agent's ACP session id, for provenance / a later resume |
+| `cost` | `Cost \| None` | token counts where the agent reported usage |
+| `provenance` | `Provenance \| None` | provider, model, and a `confirmed` flag |
+| `partial` | `str \| None` | streamed answer text preserved when a turn was cut at its timeout |
+| `error` | `ErrorInfo \| None` | structured error on failure; `None` on success |
+| `safety_mode` | `SafetyMode` | echoes the mode the turn ran under |
 
-`ErrorInfo` carries a `code` from `domain/error_codes.py` (stable `StrEnum` members, never
-renamed), a human `message`, and an optional `details` dict. Clients may switch on `error.code`.
+`ErrorInfo` carries a `code` from `domain/error_codes.py` (stable `StrEnum` members, never renamed), a
+human `message`, optional `details`, and a `reexecution_safety` classification. Clients may switch on
+`error.code`.
 
-### toolSuccess / toolError and the TOON seam
-
-The tool layer calls `tool_success(data)` or `tool_error(code, message)` from `context.py`.
-Both funnel through `io/serialize.py:encode()`, which converts pydantic models to plain data
-(`model_dump(mode="json", exclude_none=True)`) and passes the result to the `toon` encoder.
-This is the single swap point for the serialization format: changing the encoder is a one-line
-change in `encode()` and has no effect on anything above or below it.
-
-The `toon` package used is `python-toon >= 0.1.3` (imported as `from toon import encode`).
-The PyPI packages `toon-format` and `toon-encoder` are not used.
+The tool layer calls `tool_success(data)` / `tool_error(code, message)` from `context.py`. Both funnel
+through `io/serialize.py:encode()`, which converts pydantic models to plain data and passes the result
+to the `toon` encoder (`python-toon >= 0.1.3`, imported as `from toon import encode`). This is the
+single swap point for the serialization format. The PyPI packages `toon-format` and `toon-encoder` are
+not used.
 
 ---
 
-## The adapter registry
+## ACP error codes and re-execution safety
 
-`adapters/registry.py` defines `AdapterRegistry`, an immutable `id -> CLIAdapter` mapping.
+The ACP transport contributes a focused set of stable codes (all in `domain/error_codes.py`):
 
-The built-in adapters are listed in `BUILTIN_ADAPTERS` as `(id, module_path, class_name)` tuples.
-The registry imports each class lazily via `importlib.import_module`, so loading the registry
-carries no import-time dependency on any concrete adapter. Adding a built-in adapter is a
-one-line addition to `BUILTIN_ADAPTERS`.
+| code | meaning | re-execution-safe? |
+| --- | --- | --- |
+| `ACP_SPAWN_FAILED` | the agent subprocess could not be launched | yes (pre-prompt) |
+| `ACP_HANDSHAKE_FAILED` | `initialize` / `new_session` failed | yes (pre-prompt) |
+| `ACP_TURN_TIMEOUT` | the prompt turn exceeded its timeout; the session was cancelled | no |
+| `ACP_REFUSED` | the agent ended the turn by refusing | no |
+| `ACP_EMPTY_ANSWER` | the agent ended cleanly with no answer text | no |
+| `ACP_TURN_ERROR` | an error surfaced after the prompt was accepted | no (ambiguous) |
 
-`build_registry(config)` assembles the final mapping:
-
-1. Load enabled built-ins (skipping any with `adapters.<id>.enabled = false` in config).
-2. If `enabled_adapters` is set, restrict to those ids and raise `RegistryError` on any unknown id.
-
-A duplicate adapter id or an unknown id in `enabled_adapters` raises `RegistryError` at startup
-(fail-fast). Looking up an unknown id during a tool call also raises `RegistryError`, which
-`DelegationService` converts to a structured failure result.
-
-Every CLI is a hand-written code adapter; there is no config-only path. See
-[docs/adding-a-cli.md](adding-a-cli.md) for the step-by-step instructions.
+`ReexecutionSafety` is distinct from "did a side effect happen": after a `session/prompt` is accepted,
+a turn can be filesystem-clean yet still unsafe to silently re-run, because cost may have accrued. Only
+a pre-prompt `SAFE` failure may enter a retry or cross-agent fallback path.
 
 ---
 
-## CLI quirks: parse_output
+## Launch resolution
 
-All CLI-specific output parsing is contained in each adapter's `parse_output`. Nothing leaks up.
-
-The current quirks, by adapter:
-
-| Adapter | Binary | parse_output notes |
-|---|---|---|
-| `claude_code` | `claude` | Reads the last line of stdout as a JSON object; fields: `result`, `session_id`, `is_error`, `total_cost_usd`, `usage` |
-| `codex` | `codex` | JSONL event stream; final answer is the last `item.completed` event with `item.details.type == "agent_message"`; session from `thread_id` in `thread.started` |
-| `opencode` | `opencode` | NDJSON stream with `-q`; final text from last `{"type":"text"}` part |
-| `goose` | `goose` | `--output-format json` emits a single JSON object; schema is not formally versioned -- parse defensively |
-| `kiro` | `kiro-cli` | Plain markdown to stdout; no JSON mode for the answer |
-| `antigravity` | `agy` | stdout is unreliable; `parse_output` reads the transcript file (see below) |
-| `cursor` | `cursor-agent` | `--output-format json`; final answer taken from the JSON result event |
-| `qwen` | `qwen` | `-o json` event array; answer from the last `result` event, else the last `assistant` message |
-| `ollama` | `ollama` | Plain text on stdout from `ollama run --hidethinking` (the flag keeps a reasoning model's chain-of-thought out of the answer); empty output is a `PARSE_ERROR` (local model, optional) |
-| `lmstudio` | `lms` | `lms chat <model> -p`; the model-load progress bar prints to stdout as carriage-return overwrites, so `parse_output` renders the CR away and strips a `<think>...</think>` block to leave the answer (local model, optional) |
-| `droid` | `droid` | `droid exec --output-format json`; Claude-Code-style envelope, answer from `result`, cost from the nested `usage` block |
-| `vibe` | `vibe` | `--output json` is a top-level array of messages; answer is the last `assistant` message's `content`; forces UTF-8 stdout via the child env |
-| `copilot` | `copilot` | `--output-format json` JSONL; answer from the last non-ephemeral `assistant.message` `data.content`; session from the terminal `result` event |
-
-### Antigravity transcript quirk
-
-`agy -p` does not reliably write the agent's final answer to stdout. `AntigravityAdapter.parse_output`
-reads it from a JSONL transcript file instead. The lookup sequence:
-
-1. Read `~/.gemini/antigravity-cli/cache/last_conversations.json` to map the working directory to
-   a conversation id.
-2. If the index misses, fall back to the most recently modified subdirectory of
-   `~/.gemini/antigravity-cli/brain/`.
-3. Read `brain/<conv-id>/.system_generated/logs/transcript.jsonl` and extract the last line with
-   `source == "MODEL"`, `status == "DONE"`, `type == "PLANNER_RESPONSE"`, and non-empty content.
-
-The transcript schema is community-reverse-engineered (verified against agy 1.0.2, 2026-05-30).
-Treat a schema change as a `TRANSCRIPT_NOT_FOUND` parse failure. Pin the agy version.
+`acp/launch.py` resolves an agent's launch command to a clean, directly-launchable process. The
+problem it solves is Windows: `asyncio.create_subprocess_exec` runs a real executable, but a Windows
+npm shim is not one. A `.cmd` shim launched via `cmd /c` and a `.ps1` shim via PowerShell both corrupt
+the raw JSON-RPC stdin the ACP transport needs. So for an npm shim, `prepare_argv` parses the shim and
+launches its real target (the bundled `.exe`, or `node <entry>.js`) directly with clean stdio. A
+non-npm shim falls back to the `.ps1` sibling via PowerShell, then `cmd /c`. On non-Windows platforms
+the resolved executable is launched directly.
 
 ---
 
-## Depth guard and target cap
+## Conformance probing (doctor)
 
-A CLI delegated to another CLI via the same Rutherford server creates a chain. To prevent
-unbounded recursion, `runtime/depth.py` tracks delegation depth across process boundaries:
+`acp/conformance.py` backs the `doctor` tool. Each descriptor is probed with a trivial read-only ACP
+turn in an isolated temp directory (so a conformance check never triggers an agent's heavyweight
+workspace setup against the real repo). The probe classifies the outcome:
 
-- `RUTHERFORD_DEPTH` environment variable carries the current depth to child processes.
-- When the server starts, `current_depth()` reads this variable to set `AppContext.base_depth`.
-- Before each delegation, `DelegationService` overlays `RUTHERFORD_DEPTH = depth + 1` on the
-  child's environment via `child_depth_env()`.
-- `ensure_within_depth(depth, max_depth)` refuses to spawn if `depth >= max_depth`. The default
-  `max_depth` is 3 (configurable in `RutherfordConfig`).
+| status | meaning |
+| --- | --- |
+| `ok` | handshake succeeded and the agent answered |
+| `no_answer` | handshake succeeded but the agent answered empty or refused |
+| `handshake_failed` | installed, but `initialize` / `new_session` failed |
+| `not_installed` | the launch command was not found |
+| `error` | some other failure |
 
-`ensure_within_target_cap(count, max_targets)` caps the number of targets in a single consensus
-call. The default `max_targets` is 8.
-
-Both raise typed exceptions (`DepthLimitError`, `RutherfordError`) that `DelegationService`
-converts to structured failure results with stable error codes (`MAX_DEPTH_EXCEEDED`,
-`TOO_MANY_TARGETS`).
-
----
-
-## Roles
-
-Roles are named personas that inject a system prompt preamble into a delegation. The built-in
-roles ship inside the package at `src/rutherford/roles/`:
-
-| Name | File |
-|---|---|
-| `codereviewer` | `roles/codereviewer.md` |
-| `debugger` | `roles/debugger.md` |
-| `planner` | `roles/planner.md` |
-| `security` | `roles/security.md` |
-
-Each file has a simple `key: value` frontmatter block (`name`, `display_name`, `description`)
-and a markdown body that becomes the `preamble`. Built-in roles are loaded via
-`importlib.resources` and work in all install modes (editable, wheel, zipapp). Additional role
-directories can be specified in `RutherfordConfig.role_dirs`; files there override built-ins by
-name. Editing a role never requires a code change.
-
-`DelegationService` resolves the role preamble and sets it on `InvocationContext.role_preamble`.
-The adapter's `build_invocation` injects it: via the CLI's native system-prompt flag where one
-exists, or by prepending to the prompt via `BaseCLIAdapter._compose_prompt`. The service does not
-double-inject it.
-
----
-
-## Safety modes and the trusted-workspace gate
-
-`SafetyMode` has four levels (all are `StrEnum` values that serialize cleanly):
-
-| Value | Meaning |
-|---|---|
-| `read_only` | Agent must not modify the workspace (default) |
-| `propose` | Agent may propose changes (e.g. a diff) but not apply them |
-| `write` | Agent may modify the workspace under the CLI's normal approval flow |
-| `yolo` | Agent may act without approval prompts (the CLI's bypass mode) |
-
-`write` and `yolo` are mutating. A mutating delegation requires either `trust_workspace=True` on
-the request or the `working_dir` to be at or under a path in `RutherfordConfig.trusted_workspaces`.
-Failing this check returns `WORKSPACE_NOT_TRUSTED`. No adapter ever defaults to its bypass flag;
-`SafetyMode.READ_ONLY` is the default everywhere.
-
-`adapter.map_safety(mode)` translates the universal mode to a `SafetyFlags(args, env, note)`
-specific to that CLI. Every adapter must return a value for every mode.
+This is the only trustworthy health signal for an ACP agent, since there is no cheap non-interactive
+auth check. `capabilities` is the cheap snapshot (just the registry); `doctor` makes a real call per
+agent.
 
 ---
 
 ## Cross-references
 
-- Configuration options and file locations: [docs/configuration.md](configuration.md)
-- Adding a new CLI (code adapter): [docs/adding-a-cli.md](adding-a-cli.md)
-- Trusted-workspace policy, secret handling, argv rules: [docs/security.md](security.md)
+- Configuration reference and file discovery: [configuration.md](configuration.md)
+- Adding or configuring an agent: [adding-an-agent.md](adding-an-agent.md)
+- Local models (Ollama / LM Studio): [local-models.md](local-models.md)
+- The safety model and the permission engine: [security.md](security.md)
