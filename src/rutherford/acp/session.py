@@ -40,6 +40,7 @@ from .descriptors import AgentDescriptor
 from .journal import EventJournal, journal_event_from_message
 from .launch import prepare_argv
 from .permission import PermissionPolicy
+from .teardown import reap, snapshot_descendants
 
 #: How Rutherford identifies itself to an agent at ``initialize``.
 _CLIENT_INFO = Implementation(name="rutherford-acp", version="3.0.0")
@@ -84,6 +85,7 @@ class ACPSession:
         self._stack = AsyncExitStack()
         self._conn: ClientSideConnection | None = None
         self._session_id: str | None = None
+        self._pid: int | None = None
 
     @property
     def target(self) -> Target:
@@ -117,7 +119,7 @@ class ACPSession:
                     self._journal.append(entry)
 
         try:
-            conn, _process = await self._stack.enter_async_context(
+            conn, process = await self._stack.enter_async_context(
                 spawn_agent_process(
                     self._client,
                     command,
@@ -136,6 +138,7 @@ class ACPSession:
                 ReexecutionSafety.SAFE,
             ) from exc
         self._conn = conn
+        self._pid = process.pid
         try:
             await asyncio.wait_for(
                 conn.initialize(protocol_version=PROTOCOL_VERSION, client_info=_CLIENT_INFO),
@@ -200,9 +203,21 @@ class ACPSession:
                 await self._conn.cancel(session_id=self._session_id)
 
     async def close(self) -> None:
-        """Tear down the agent connection (terminates the agent subprocess). Idempotent."""
-        await self._stack.aclose()
-        self._conn = None
+        """Tear down the connection and reap the agent's orphaned descendant processes. Idempotent.
+
+        The SDK transport terminates only the direct child (the adapter). The descendants it spawns -- the
+        underlying CLI a wrapper adapter fronts -- are snapshotted here *before* that termination (a dead
+        parent's children reparent and drop out of the walk) and reaped after, so no orphaned CLI process is
+        left holding the working directory. Best-effort: a teardown failure never propagates.
+        """
+        pid, self._pid = self._pid, None
+        descendants = await asyncio.to_thread(snapshot_descendants, pid) if pid is not None else []
+        try:
+            await self._stack.aclose()
+        finally:
+            if descendants:
+                await asyncio.to_thread(reap, descendants)
+            self._conn = None
 
 
 async def run_acp_turn(
