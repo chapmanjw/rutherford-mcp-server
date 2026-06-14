@@ -70,9 +70,9 @@ order the fields appear in `config/schema.py`.
 | `min_quorum` | `int` | `1` | Minimum parseable voices an aggregating consensus strategy needs (≥ 1) before it returns a decision. |
 | `min_distinct` | `int` | `2` | Distinct-identity floor below which a panel's answers are flagged `low_diversity` (≥ 1). |
 | `max_concurrency` | `int` | `max_targets` | Ceiling on live ACP sessions run at once across a panel (≥ 1); defaults to `max_targets`. Enforced by a semaphore the delegation primitive and the panel fan-out share, so a wide panel cannot exceed it on any path. |
-| `cooldown_threshold` | `int` | `3` | Unhealthy failures within `cooldown_window_s` before an agent is benched (≥ 0; `0` disables). |
+| `cooldown_threshold` | `int` | `3` | Unhealthy ACP failures within `cooldown_window_s` before an agent is benched (≥ 0; `0` disables cooldown). A benched agent is left out of an `expand_all` auto-panel and skipped as a fallback candidate, but an explicit `delegate` to it still runs. |
 | `cooldown_window_s` | `float` | `120.0` | The sliding window over which `cooldown_threshold` failures are counted (> 0). |
-| `cooldown_duration_s` | `float` | `60.0` | How long a benched agent stays benched (> 0). |
+| `cooldown_duration_s` | `float` | `60.0` | How long a benched agent stays benched before it is tried again (> 0). |
 | `trusted_workspaces` | `list[str]` | `[]` | Absolute paths under which `write` / `yolo` delegations are permitted. Resolved to absolute; a missing directory warns. |
 | `synthesize_default` | `bool` | `false` | Whether consensus synthesizes server-side by default. |
 | `verify_read_only` | `bool` | `false` | Intended opt-in: after a successful `read_only` / `propose` delegation in a git repo, fingerprint the tree before and after and fail with `READONLY_VIOLATED` if it changed. Not yet wired into the v3 delegation path (see the note below) — it validates and loads but performs no check today. |
@@ -87,8 +87,7 @@ order the fields appear in `config/schema.py`.
 
 > Several fields are part of the config contract but are **not yet wired** into the leaner v3
 > consensus / debate path — they validate and load, but have no effect today, and land as those features
-> are re-added over the ACP core. The not-yet-active set: `cooldown_threshold` / `cooldown_window_s` /
-> `cooldown_duration_s` (cooldown / quarantine); `verify_read_only` (the post-run git check);
+> are re-added over the ACP core. The not-yet-active set: `verify_read_only` (the post-run git check);
 > `probe_cache_ttl_s`, `probe_timeout_s` (metadata-probe caching); and `default_persistence`, `jobs_dir`
 > (durable on-disk jobs — v3 jobs are in-memory).
 >
@@ -99,8 +98,10 @@ order the fields appear in `config/schema.py`.
 > recursion guard, `MAX_DEPTH_EXCEEDED`), `max_concurrency` (the fan-out semaphore), `max_agents_advisory`
 > / `enforce_agent_cap` (the aggregate-agent cap — flags `Topology.over_cap`, or refuses with
 > `AGENT_CAP_EXCEEDED` when enforced), `min_quorum`, `min_distinct`, `synthesize_default` (consensus
-> aggregation / synthesis / diversity), `max_debate_rounds`, `role_dirs`, the in-memory job knobs
-> (`job_ttl_s`, `max_jobs`), and the logging fields.
+> aggregation / synthesis / diversity), `cooldown_threshold` / `cooldown_window_s` / `cooldown_duration_s`
+> (the F7 cooldown / quarantine — bench a flapping agent out of auto-selection and fallback),
+> `max_debate_rounds`, `role_dirs`, the in-memory job knobs (`job_ttl_s`, `max_jobs`), and the logging
+> fields.
 
 ### `AgentConfig` fields (under `[agents.<id>]`)
 
@@ -120,6 +121,7 @@ the Zed/Cline `acp.json` shape.
 | `timeout_s` | `float` or omitted | the global `default_timeout_s` | Per-agent run timeout (> 0) when a call names no `timeout_s`. |
 | `extra_args` | `list[str]` | `[]` | Extra arguments appended to the launch argv. |
 | `effort` | `string` or omitted | the global `default_effort` | Per-agent default reasoning-effort tier; a no-op for an agent with no effort knob. |
+| `fallback_model` | `string` or omitted | none | The model to retry with when the requested model is unavailable (F7 model fallback). `None` means this agent exposes no fallback model, so a model-unavailable failure does not retry it on another model. Most ACP agents cannot decline a named model, so this stays unset for them. |
 | `base` | `string` or omitted | none | Clone a *built-in* agent's launch command under this new id (e.g. `base = "goose"`). Mutually exclusive with `command`. |
 | `backend` | `"ollama"` / `"lmstudio"` or omitted | none | Point this agent at a local model runtime. Requires `model`. See [local-models.md](local-models.md). |
 | `model` | `string` or omitted | none | The model id served by `backend` (required when `backend` is set); becomes the agent's default model. |

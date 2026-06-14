@@ -58,6 +58,11 @@ class AgentConfig(BaseModel):
     #: Per-agent default reasoning-effort tier (F8a). Used when a call names no ``effort``; ``None``
     #: falls back to the global ``default_effort``. A no-op for an agent with no effort knob.
     effort: Effort | None = None
+    #: The model to retry with when the requested model is unavailable (F7 model fallback). ``None`` (the
+    #: default) means this agent exposes no fallback model, so a model-unavailable failure does not retry the
+    #: same agent on another model. Set it for an agent that can decline a named model and recover on a
+    #: known-good one (most ACP agents cannot, so this stays unset for them).
+    fallback_model: str | None = None
     #: Reuse a BUILT-IN agent's launch command under this new id (e.g. ``base = "goose"``). The convenient
     #: way to clone a built-in -- typically paired with ``backend`` to point it at a local model runtime,
     #: or with ``default_model`` to pin a model. Mutually exclusive with ``command``.

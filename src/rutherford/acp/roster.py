@@ -78,6 +78,7 @@ def _merge(agent_id: str, entry: AgentConfig, existing: AgentDescriptor | None) 
         if entry.handshake_timeout_s is not None
         else (source.handshake_timeout_s if source is not None else 30.0),
         env_overrides=tuple(env.items()),
+        fallback_model=_first(entry.fallback_model, source.fallback_model if source is not None else None),
     )
 
 

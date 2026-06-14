@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from rutherford.acp.descriptors import default_registry
+from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry, default_registry
 from rutherford.acp.permission import PermissionPolicy
 from rutherford.acp.session import run_acp_turn
 from rutherford.config.schema import RutherfordConfig
@@ -136,6 +136,34 @@ async def test_goose_consensus_topology_populated_live() -> None:
         f"expected a live observed floor >= 1, got {topology.observed_peak_agents}"
     )
     assert topology.over_cap is False
+
+
+async def test_fallback_chain_recovers_a_spawn_fail_on_a_real_agent() -> None:
+    """A real spawn-fail SAFE failure falls back to a live goose, recording the chain and the real answer (F7).
+
+    The primary ``broken`` agent is configured with a command that does not exist, so its turn fails
+    pre-prompt with ``ACP_SPAWN_FAILED`` / re-execution-SAFE; the fallback chain then drives the REAL goose
+    agent, which answers. Proves the whole reliability path end to end against a real agent: the SAFE gate
+    lets the fallback fire, ``fallback_chain`` shows the failed primary, ``delegation_call_count`` counts both
+    attempts, and the final answer is goose's "42".
+    """
+    broken = AgentDescriptor("broken", "Broken", ("this-binary-does-not-exist-xyz123",))
+    registry = DescriptorRegistry([broken, default_registry().get("goose")])
+    service = DelegationService(registry, RutherfordConfig())
+    result = await service.delegate(
+        DelegationRequest(
+            target=Target(cli="broken"),
+            prompt=_PROMPT,
+            working_dir=str(Path.cwd()),
+            timeout_s=120.0,
+            fallback=[Target(cli="goose")],
+        )
+    )
+    assert result.ok is True, f"fallback to goose failed: {result.error}"
+    assert "42" in result.text
+    assert result.target.cli == "goose"  # goose is whoever finally answered
+    assert result.fallback_chain == ["broken"]  # the failed primary leads the chain
+    assert result.delegation_call_count == 2  # the broken primary attempt + goose
 
 
 _VERDICT_PROMPT = (

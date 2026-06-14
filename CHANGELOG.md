@@ -8,6 +8,33 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- The reliability layer over ACP — ReexecutionSafety-gated fallback and per-agent cooldown / quarantine
+  (F7), ported from v2.
+  - Cross-target + model fallback. `delegate` gains a `fallback` parameter (an ordered list of `cli` /
+    `cli:model` alternates) and `allow_model_fallback` (on by default). On a FAILED turn whose
+    `error.reexecution_safety is SAFE` — only a pre-prompt spawn / handshake failure that never ran the
+    prompt, so it could not have spent cost or caused a side effect — Rutherford retries: first the SAME agent
+    on its configured `fallback_model` when the failure looks model-unavailable (most ACP agents declare none,
+    so this is a clean no-op), then each `fallback` alternate in turn until one answers. A DUPLICATE_COST /
+    AMBIGUOUS / SIDE_EFFECTED failure (a refusal, an empty answer, a timeout, a mid-turn transport drop) is
+    NEVER retried, and a write / yolo delegation never falls back (a partial mutation may have happened). The
+    result records `fallback_from` (the originally requested model), `fallback_chain` (the labels that failed
+    before the one that answered, a benched alternate shown as `<label> (benched)`), and bumps
+    `delegation_call_count` per attempt — which already feeds `Topology.realized_delegations`. The consensus /
+    debate voices benefit through the same primitive (fallback is opt-in per call).
+  - Cooldown / quarantine. A new `acp/cooldown.py` `CooldownTracker` (keyed per agent id, in-memory,
+    process-global on the `AppContext`) benches an agent after `cooldown_threshold` UNHEALTHY ACP failures
+    within `cooldown_window_s`, for `cooldown_duration_s` (`0` disables). A new `acp/failures.py` classifies
+    UNHEALTHY (the seat is broken: `ACP_SPAWN_FAILED` / `ACP_HANDSHAKE_FAILED` / `ACP_TURN_TIMEOUT` /
+    `ACP_TURN_ERROR` and the rate-limit / auth classes) vs CLEAN (the request's fault: a refusal, an empty
+    answer, a bad-prompt guard — these never bench a healthy agent). A benched agent is left OUT of an
+    `expand_all` auto-panel (recorded in `skipped` as `benched, Ns remaining`) and skipped as a fallback
+    candidate, but an EXPLICIT `delegate` to it STILL RUNS — cooldown shapes auto-selection, it never blocks a
+    direct request. The `cooldown_threshold` / `cooldown_window_s` / `cooldown_duration_s` config fields move
+    out of the "not yet wired" list in `docs/configuration.md`. An optional per-agent `fallback_model` config
+    field (and `AgentDescriptor` field) lets an agent that can decline a model recover on a known-good one; no
+    built-in agent declares one.
+
 - N1 topology, a per-voice live-activity stream, sync progress push, and the cross-cutting limits over ACP
   (item 3 + reliability), ported from v2.
   - Topology. `consensus` / `StrategyResult` / `debate` and a single `delegate` result now carry a populated

@@ -20,6 +20,7 @@ import logging
 import time
 from pathlib import Path
 
+from ..acp.cooldown import CooldownTracker
 from ..acp.descriptors import DescriptorRegistry
 from ..acp.permission import PermissionPolicy
 from ..acp.session import ACPHandshakeError, ACPSession, run_acp_turn
@@ -55,11 +56,22 @@ class ConsensusService:
     """Runs a consensus panel across ACP agents, with strategies, synthesis, and diversity scoring."""
 
     def __init__(
-        self, delegation: DelegationService, descriptors: DescriptorRegistry, config: RutherfordConfig
+        self,
+        delegation: DelegationService,
+        descriptors: DescriptorRegistry,
+        config: RutherfordConfig,
+        *,
+        cooldown: CooldownTracker | None = None,
     ) -> None:
         self._delegation = delegation
         self._descriptors = descriptors
         self._config = config
+        #: The per-agent cooldown tracker (F7): an auto-expanded (``expand_all``) panel leaves a benched agent
+        #: OUT (recorded in ``skipped`` with the time remaining), since auto-selection should not keep reaching
+        #: for a flapping seat. ``cooldown`` is injected so it is the SAME tracker the delegation primitive
+        #: records health into (the skip reflects the bench a delegation just set); ``None`` keeps cooldown out
+        #: of the way for a directly-constructed service (a disabled tracker -- no agent is ever benched).
+        self._cooldown = cooldown or CooldownTracker(threshold=0, window_s=1.0, duration_s=1.0)
 
     async def consensus(
         self,
@@ -548,12 +560,18 @@ class ConsensusService:
 
         This phase fans out to every registered descriptor at its default model -- a genuinely
         unavailable agent surfaces as a failed voice rather than being pre-filtered (a live doctor probe
-        per agent is a later refinement). Any agent past the ``max_targets`` cap is recorded in
-        ``skipped`` with its reason, so the full attempted panel is visible.
+        per agent is a later refinement). A BENCHED agent (on cooldown, F7) is left OUT -- auto-selection
+        should not keep reaching for a seat that just flapped -- and recorded in ``skipped`` with the time
+        remaining. Any agent past the ``max_targets`` cap is also recorded in ``skipped`` with its reason, so
+        the full attempted panel is visible.
         """
         included: list[Target] = []
         skipped: list[SkippedTarget] = []
         for descriptor in self._descriptors.all():
+            if self._cooldown.is_benched(descriptor.id):
+                remaining = self._cooldown.remaining_s(descriptor.id)
+                skipped.append(SkippedTarget(cli=descriptor.id, reason=f"benched, {remaining:.0f}s remaining"))
+                continue
             if len(included) >= self._config.max_targets:
                 skipped.append(
                     SkippedTarget(cli=descriptor.id, reason=f"over max_targets ({self._config.max_targets})")

@@ -142,6 +142,8 @@ async def delegate(
     trust_workspace: bool = False,
     role: str | None = None,
     effort: str | None = None,
+    fallback: list[Any] | None = None,
+    allow_model_fallback: bool = True,
     mode: str = "sync",
 ) -> str:
     """Delegate a task to one ACP agent and return its normalized result.
@@ -153,8 +155,13 @@ async def delegate(
     `list_roles`) whose system prompt is prepended to `prompt`. `effort` (low | medium | high | xhigh) asks
     the agent to spend more reasoning where it has a knob (codex/cursor via the model id, cline via
     --thinking, junie via env); a reported no-op for an agent with none. Omitted, the configured
-    `default_effort` (per-agent or global) applies. `mode="async"` runs the turn as a background job and
-    returns a `job_id` (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
+    `default_effort` (per-agent or global) applies. `fallback` is an ordered list of alternate targets
+    (`cli` / `cli:model` strings or `{cli, model}` objects) tried when the primary fails on a
+    re-execution-safe failure (a spawn/handshake failure that never ran the prompt); a benched alternate is
+    skipped and `fallback_chain` records the path. A write/yolo delegation never falls back.
+    `allow_model_fallback` (default true) first retries the same agent on its configured fallback model on a
+    model-unavailable failure, where it has one. `mode="async"` runs the turn as a background job and returns
+    a `job_id` (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
     """
     return await _guarded(
         delegate_tool(
@@ -169,6 +176,8 @@ async def delegate(
             trust_workspace=trust_workspace,
             role=role,
             effort=effort,
+            fallback=fallback,
+            allow_model_fallback=allow_model_fallback,
             mode=mode,
         )
     )

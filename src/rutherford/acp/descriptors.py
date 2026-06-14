@@ -36,6 +36,11 @@ class AgentDescriptor:
     #: inherited / allowlisted environment. Sourced from a config ``[agents.<id>] env`` block. A tuple of
     #: pairs (not a dict) so the descriptor stays a frozen, hashable value object.
     env_overrides: tuple[tuple[str, str], ...] = ()
+    #: The model to retry with when the requested model is unavailable (F7 model fallback). ``None`` -- the
+    #: default for every built-in agent -- means the agent exposes no fallback model, so the model-fallback
+    #: path is a clean no-op for it (it is NOT invented). Set per agent in config (``[agents.<id>]
+    #: fallback_model``) for an agent whose plan can decline a named model and fall back to a known-good one.
+    fallback_model: str | None = None
 
 
 class DescriptorRegistry:

@@ -15,6 +15,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from .acp.cooldown import CooldownTracker
 from .acp.descriptors import DescriptorRegistry
 from .acp.roster import build_registry
 from .config.loader import load_config
@@ -77,8 +78,16 @@ def build_app_context(
     """
     resolved_config = config if config is not None else load_config()
     resolved_descriptors = descriptors if descriptors is not None else build_registry(resolved_config)
-    delegation = DelegationService(resolved_descriptors, resolved_config)
-    consensus = ConsensusService(delegation, resolved_descriptors, resolved_config)
+    # The cooldown tracker (F7) is process-global state shared by the delegation primitive (which records each
+    # turn's health) and the consensus service (which skips a benched agent in an auto-expanded panel), so it
+    # is built once here and injected into both -- the two paths must read the SAME bench state.
+    cooldown = CooldownTracker(
+        threshold=resolved_config.cooldown_threshold,
+        window_s=resolved_config.cooldown_window_s,
+        duration_s=resolved_config.cooldown_duration_s,
+    )
+    delegation = DelegationService(resolved_descriptors, resolved_config, cooldown=cooldown)
+    consensus = ConsensusService(delegation, resolved_descriptors, resolved_config, cooldown=cooldown)
     debate = DebateService(resolved_descriptors, resolved_config, delegation)
     jobs = JobStore(max_jobs=resolved_config.max_jobs, job_ttl_s=resolved_config.job_ttl_s)
     roles = RoleStore(role_dirs=resolved_config.role_dirs)
