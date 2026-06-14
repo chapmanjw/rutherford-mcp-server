@@ -26,6 +26,7 @@ htmlcov/
 
 # Working dirs a delegated CLI drops in the repo when run here (e.g. Antigravity/agy)
 .antigravitycli/
+.junie/
 
 # Per-user Claude Code settings
 .claude/settings.local.json
