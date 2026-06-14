@@ -116,14 +116,35 @@ def test_explicit_env_overrides_the_backend_default() -> None:
     assert dict(build_registry(config).get("local").env_overrides)["OLLAMA_HOST"] == "box:9999"
 
 
+def test_backend_qwen_uses_openai_compatible_env() -> None:
+    config = RutherfordConfig(agents={"q": AgentConfig(base="qwen", backend="ollama", model="m")})
+    env = dict(build_registry(config).get("q").env_overrides)
+    assert env == {"OPENAI_BASE_URL": "http://localhost:11434/v1", "OPENAI_API_KEY": "local", "OPENAI_MODEL": "m"}
+
+
+def test_backend_qwen_lmstudio_points_at_1234() -> None:
+    config = RutherfordConfig(agents={"q": AgentConfig(base="qwen", backend="lmstudio", model="m")})
+    assert dict(build_registry(config).get("q").env_overrides)["OPENAI_BASE_URL"] == "http://localhost:1234/v1"
+
+
+def test_backend_claude_code_uses_anthropic_compatible_env() -> None:
+    config = RutherfordConfig(agents={"c": AgentConfig(base="claude_code", backend="ollama", model="m")})
+    env = dict(build_registry(config).get("c").env_overrides)
+    assert env["ANTHROPIC_BASE_URL"] == "http://localhost:11434" and env["ANTHROPIC_MODEL"] == "m"
+
+
 def test_backend_without_a_base_is_an_error() -> None:
     with pytest.raises(ConfigError, match="no 'base'"):
         build_registry(RutherfordConfig(agents={"floaty": AgentConfig(backend="ollama", model="m")}))
 
 
-def test_backend_only_supports_a_goose_base_today() -> None:
-    with pytest.raises(ConfigError, match="only supported with base"):
-        build_registry(RutherfordConfig(agents={"x": AgentConfig(base="opencode", backend="ollama", model="m")}))
+def test_unsupported_base_backend_pair_is_an_error() -> None:
+    # a vendor-locked base has no local backend...
+    with pytest.raises(ConfigError, match="does not support"):
+        build_registry(RutherfordConfig(agents={"x": AgentConfig(base="cursor", backend="ollama", model="m")}))
+    # ...and claude_code can't use LM Studio (OpenAI-only; claude_code needs an Anthropic-compatible endpoint)
+    with pytest.raises(ConfigError, match="does not support"):
+        build_registry(RutherfordConfig(agents={"y": AgentConfig(base="claude_code", backend="lmstudio", model="m")}))
 
 
 def test_unknown_base_is_an_error() -> None:

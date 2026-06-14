@@ -13,6 +13,8 @@ that, under ACP, replaces a hand-written adapter.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from ..config.schema import AgentConfig, RutherfordConfig
 from ..domain.errors import ConfigError
 from .descriptors import HIGH_FIDELITY, AgentDescriptor, DescriptorRegistry
@@ -76,28 +78,19 @@ def _resolve_source(agent_id: str, entry: AgentConfig, existing: AgentDescriptor
             raise ConfigError(f"agent '{agent_id}' has base '{entry.base}', which is not a built-in agent")
         return _BUILTINS[entry.base]
     if entry.backend is not None and existing is None:
-        raise ConfigError(
-            f"agent '{agent_id}' sets a local 'backend' but has no 'base'; add e.g. base = \"goose\""
-        )
+        raise ConfigError(f"agent '{agent_id}' sets a local 'backend' but has no 'base'; add e.g. base = \"goose\"")
     return existing
 
 
-def _backend_env(agent_id: str, entry: AgentConfig, source: AgentDescriptor | None) -> dict[str, str]:
-    """The provider env that points the ``base`` agent at a local model runtime (Ollama / LM Studio).
+#: The default endpoint per local backend (``host:port``).
+_LOCAL_DEFAULT_HOST = {"ollama": "localhost:11434", "lmstudio": "localhost:1234"}
 
-    Only ``goose`` is supported as a base today: it reaches Ollama natively and LM Studio (and any
-    OpenAI-compatible server) via its ``openai`` provider with a custom host. ``model`` is validated
-    non-empty by the schema.
-    """
-    base_id = entry.base or agent_id
-    model = entry.model or ""
-    if base_id != "goose":
-        raise ConfigError(
-            f"agent '{agent_id}': a local 'backend' is only supported with base = \"goose\" today (got '{base_id}')"
-        )
-    if entry.backend == "ollama":
-        return {"GOOSE_PROVIDER": "ollama", "GOOSE_MODEL": model, "OLLAMA_HOST": entry.host or "localhost:11434"}
-    host = entry.host or "localhost:1234"  # lmstudio / OpenAI-compatible
+
+def _goose_native(model: str, host: str) -> dict[str, str]:
+    return {"GOOSE_PROVIDER": "ollama", "GOOSE_MODEL": model, "OLLAMA_HOST": host}
+
+
+def _goose_openai(model: str, host: str) -> dict[str, str]:
     return {
         "GOOSE_PROVIDER": "openai",
         "GOOSE_MODEL": model,
@@ -105,6 +98,51 @@ def _backend_env(agent_id: str, entry: AgentConfig, source: AgentDescriptor | No
         "OPENAI_BASE_PATH": "v1/chat/completions",
         "OPENAI_API_KEY": "local",
     }
+
+
+def _openai_compatible(model: str, host: str) -> dict[str, str]:
+    return {"OPENAI_BASE_URL": f"http://{host}/v1", "OPENAI_API_KEY": "local", "OPENAI_MODEL": model}
+
+
+def _anthropic_compatible(model: str, host: str) -> dict[str, str]:
+    return {
+        "ANTHROPIC_BASE_URL": f"http://{host}",
+        "ANTHROPIC_AUTH_TOKEN": "local",
+        "ANTHROPIC_MODEL": model,
+        "ANTHROPIC_SMALL_FAST_MODEL": model,
+    }
+
+
+#: How each supported (base agent, backend) pair is pointed at a local runtime, all proven live (receipt 14).
+#: ``goose`` reaches Ollama natively and LM Studio via its openai provider. ``qwen`` uses the OpenAI-compatible
+#: endpoint both runtimes expose (Ollama ``/v1``, LM Studio ``/v1``). ``claude_code`` needs an
+#: Anthropic-compatible endpoint, which Ollama provides (``/v1/messages``) but LM Studio (OpenAI-only) does
+#: not -- so ``claude_code`` supports ``ollama`` only.
+_BACKEND_ENV: dict[tuple[str, str], Callable[[str, str], dict[str, str]]] = {
+    ("goose", "ollama"): _goose_native,
+    ("goose", "lmstudio"): _goose_openai,
+    ("qwen", "ollama"): _openai_compatible,
+    ("qwen", "lmstudio"): _openai_compatible,
+    ("claude_code", "ollama"): _anthropic_compatible,
+}
+
+
+def _backend_env(agent_id: str, entry: AgentConfig, source: AgentDescriptor | None) -> dict[str, str]:
+    """The provider env that points the ``base`` agent at a local model runtime (Ollama / LM Studio).
+
+    Keyed by ``(base, backend)``: an unsupported pair (e.g. ``claude_code`` + ``lmstudio``) is a clear
+    config error. ``model`` is validated non-empty by the schema.
+    """
+    base_id = entry.base or agent_id
+    backend = entry.backend or ""
+    builder = _BACKEND_ENV.get((base_id, backend))
+    if builder is None:
+        supported = ", ".join(sorted(f"{base}+{kind}" for base, kind in _BACKEND_ENV))
+        raise ConfigError(
+            f"agent '{agent_id}': base '{base_id}' does not support the '{backend}' local backend; "
+            f"supported pairs: {supported}"
+        )
+    return builder(entry.model or "", entry.host or _LOCAL_DEFAULT_HOST[backend])
 
 
 def _first(*values: str | None) -> str | None:
