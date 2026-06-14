@@ -56,3 +56,42 @@ def test_prepare_argv_ps1_uses_powershell(tmp_path: Path, monkeypatch: Any) -> N
     monkeypatch.setattr("rutherford.acp.launch.shutil.which", lambda name: str(ps1))
     out = prepare_argv(("tool3",))
     assert out[0] == "powershell.exe" and str(ps1) in out
+
+
+@_NT_ONLY
+def test_npm_shim_resolves_to_native_exe(tmp_path: Path, monkeypatch: Any) -> None:
+    exe = tmp_path / "node_modules" / "pkg" / "bin" / "tool.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("x", encoding="utf-8")
+    cmd = tmp_path / "tool.cmd"
+    cmd.write_text('@echo off\n"%dp0%\\node_modules\\pkg\\bin\\tool.exe" %*\n', encoding="utf-8")
+    monkeypatch.setattr("rutherford.acp.launch.shutil.which", lambda name: str(cmd))
+    assert prepare_argv(("tool", "acp")) == [str(exe), "acp"]
+
+
+@_NT_ONLY
+def test_npm_shim_resolves_extensionless_node_script(tmp_path: Path, monkeypatch: Any) -> None:
+    script = tmp_path / "node_modules" / "pkg" / "bin" / "tool"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    node = tmp_path / "node.exe"
+    node.write_text("n", encoding="utf-8")
+    cmd = tmp_path / "tool2.cmd"
+    cmd.write_text(
+        '@echo off\nSET "_prog=node"\n"%_prog%" "%dp0%\\node_modules\\pkg\\bin\\tool" %*\n', encoding="utf-8"
+    )
+
+    def which(name: str) -> str | None:
+        return {"tool2": str(cmd), "node": str(node)}.get(name)
+
+    monkeypatch.setattr("rutherford.acp.launch.shutil.which", which)
+    assert prepare_argv(("tool2", "--acp")) == [str(node), str(script), "--acp"]
+
+
+@_NT_ONLY
+def test_npm_shim_missing_target_falls_back(tmp_path: Path, monkeypatch: Any) -> None:
+    cmd = tmp_path / "tool4.cmd"
+    cmd.write_text('@echo off\n"%dp0%\\node_modules\\pkg\\bin\\gone.exe" %*\n', encoding="utf-8")
+    (tmp_path / "tool4.ps1").write_text("# ps", encoding="utf-8")
+    monkeypatch.setattr("rutherford.acp.launch.shutil.which", lambda name: str(cmd))
+    assert prepare_argv(("tool4",))[0] == "powershell.exe"

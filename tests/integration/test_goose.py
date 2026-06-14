@@ -37,6 +37,17 @@ async def test_goose_delegate_turn() -> None:
     assert result.session_id is not None
 
 
+@pytest.mark.parametrize("agent_id", ["goose", "vibe", "junie", "opencode"])
+async def test_working_agent_answers(agent_id: str) -> None:
+    """The agents that drive cleanly over ACP-stdio on this machine each answer a trivial prompt."""
+    descriptor = default_registry().get(agent_id)
+    result = await run_acp_turn(
+        descriptor, _PROMPT, policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd=str(Path.cwd()), timeout_s=120.0
+    )
+    assert result.ok is True, f"{agent_id} failed: {result.error}"
+    assert "42" in result.text
+
+
 async def test_goose_consensus_two_voices() -> None:
     config = RutherfordConfig()
     service = ConsensusService(DelegationService(default_registry(), config), config)
