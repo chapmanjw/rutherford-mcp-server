@@ -25,6 +25,12 @@ All notable changes to this project are documented in this file. The format is b
   project's `.rutherford/`, folding its `agent_servers` into the agents config the way Zed/Cline read it.
   The native TOML wins over an imported `acp.json` at the same scope; an import never overrides a built-in
   or blocks startup when malformed.
+- Local-model backends (Ollama / LM Studio) as first-class ACP voices. An `[agents.<id>]` entry with
+  `base` (a built-in to clone), `backend` (`ollama` / `lmstudio`), `model` (and optional `host`) points an
+  agent at a local runtime — Rutherford fills in the provider env. Supported pairs (all proven live):
+  `goose` × ollama/lmstudio, `qwen` × ollama/lmstudio, `claude_code` × ollama (Ollama's
+  Anthropic-compatible endpoint; LM Studio is OpenAI-only). The model must support tool-calling. See
+  `docs/local-models.md`.
 
 ### Fixed
 
