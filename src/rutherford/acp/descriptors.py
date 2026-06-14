@@ -71,9 +71,9 @@ class DescriptorRegistry:
 
 #: The high-fidelity native-ACP roster (research receipt 02-synthesis): the agents Rutherford drives
 #: directly as ACP servers, in initial-onboarding order. ``goose``, ``opencode``, ``vibe``, ``junie``,
-#: ``codex``, ``claude_code``, ``copilot``, ``qwen``, ``droid``, ``cursor`` and ``kiro`` are confirmed live
-#: on this machine; the rest (``cline``, ``kimi``, ``openhands``) carry their researched launch command and
-#: are gated by the conformance harness before they are trusted.
+#: ``codex``, ``claude_code``, ``copilot``, ``qwen``, ``droid``, ``cursor``, ``kiro``, ``pi``, ``hermes``
+#: and ``cline`` are confirmed live on this machine; the rest (``kimi``, ``openhands``) carry their
+#: researched launch command and are gated by the conformance harness before they are trusted.
 #:
 #: ``codex`` and ``claude_code`` use the official Zed adapters -- ``codex-acp`` and ``claude-agent-acp`` (npm
 #: ``@agentclientprotocol/*``) -- which front the Codex and Claude Code CLIs as ACP servers. Both honor the
@@ -85,9 +85,11 @@ class DescriptorRegistry:
 #: and ``hermes`` carry their vendor as an unconfirmed guess. ``cursor``'s ``acp`` subcommand is real but
 #: hidden from ``--help``; ``kiro``'s ACP binary is ``kiro-cli`` (the ``kiro`` binary is the IDE launcher);
 #: ``pi`` runs through the ``pi-acp`` wrapper (``npm i -g pi-acp``), which spawns ``pi --mode rpc``;
-#: ``hermes`` depends on the configured Nous model (a slow one can blow a turn budget). (``kilo`` is not
-#: here: its ``Auto Kilo Free Gateway`` works only in the interactive TUI, not a headless spawn -- it needs
-#: a real ``kilo auth`` credential. Receipts 12/13.)
+#: ``hermes`` depends on the configured Nous model (a slow one can blow a turn budget); ``cline`` drives
+#: over ACP only with Cline's own service auth -- a ChatGPT-subscription or OpenRouter provider set in the
+#: desktop app is NOT reached by the headless ``--acp`` path (it returns an empty turn). (``kilo`` is not
+#: here: handshake works on OpenRouter, but the turn never completes headless; ``kimi``'s only ACP auth is
+#: an interactive terminal device-code login. Receipts 12/13.)
 HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("goose", "Goose", ("goose", "acp")),
     AgentDescriptor("opencode", "OpenCode", ("opencode", "acp")),

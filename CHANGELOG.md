@@ -33,6 +33,11 @@ All notable changes to this project are documented in this file. The format is b
   across `doctor` probes. The session now reaps the agent's descendant tree on close.
 - A relative `working_dir` is resolved to an absolute path before `session/new` (ACP requires absolute);
   a `working_dir` that points at a file now fails cleanly as a spawn failure instead of an internal error.
+- The ACP stdin buffer is raised from asyncio's 64 KiB default to 16 MiB. A single `session/update` larger
+  than the limit (e.g. kilo enumerating hundreds of OpenRouter models, or a large file read) previously
+  raised "Separator is found, but chunk is longer than limit" and dropped the connection.
+- `cline` now drives over ACP, but only with Cline's own service auth — a ChatGPT-subscription or
+  OpenRouter provider configured in the desktop app does not reach the headless `--acp` path.
 
 ### Changed
 

@@ -37,9 +37,13 @@ async def test_goose_delegate_turn() -> None:
     assert result.session_id is not None
 
 
-@pytest.mark.parametrize("agent_id", ["goose", "vibe", "junie", "opencode"])
+@pytest.mark.parametrize("agent_id", ["goose", "vibe", "junie", "opencode", "cline"])
 async def test_working_agent_answers(agent_id: str) -> None:
-    """The agents that drive cleanly over ACP-stdio on this machine each answer a trivial prompt."""
+    """The agents that drive cleanly over ACP-stdio on this machine each answer a trivial prompt.
+
+    cline answers only with Cline's own service auth -- a ChatGPT-subscription or OpenRouter provider set in
+    the desktop app does not reach the headless `--acp` path (it returns an empty turn).
+    """
     descriptor = default_registry().get(agent_id)
     result = await run_acp_turn(
         descriptor, _PROMPT, policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd=str(Path.cwd()), timeout_s=120.0
