@@ -198,6 +198,17 @@ class DelegationService:
         except RutherfordError as exc:
             return _fail(req, exc.code, exc.message, details=exc.details)
 
+        # A sandboxed mode (propose / write / yolo) MUST have a working_dir: it is the tree the sandbox is
+        # built from. Without one there is nothing to isolate and the turn would fall through to the direct
+        # path in the server's own cwd with writes allowed -- an unsandboxed write into Rutherford's directory.
+        # So require it up front (this also closes a trust_workspace=true + no-working_dir bypass).
+        if runs_sandboxed(req.safety_mode) and not req.working_dir:
+            return _fail(
+                req,
+                ErrorCode.INVALID_INPUT,
+                f"{req.safety_mode.value} mode needs a working_dir to sandbox into: without one there is no "
+                "tree to isolate. Pass the absolute path of the workspace the agent should operate on.",
+            )
         if is_mutating(req.safety_mode) and not self._workspace_trusted(req):
             return _fail(
                 req,
@@ -299,7 +310,10 @@ class DelegationService:
                 base_depth=base_depth,
                 parent_run_id=req.parent_run_id,
             )
-        if verify and result.ok and before is not None:
+        # Check the fingerprint whether or not the turn SUCCEEDED: a read-only agent that mutated the tree and
+        # then failed (or returned empty) still broke the read-only promise, and the side effect is the signal
+        # that matters -- the caller should see READONLY_VIOLATED, not an ordinary failure that hides the write.
+        if verify and before is not None:
             after = _git_fingerprint(cwd)
             if after is not None and after != before:
                 return _readonly_violated(req, result)
@@ -325,8 +339,18 @@ class DelegationService:
         over the copy guard) becomes a failed result rather than an unsandboxed run -- write mode never silently
         runs against the user's tree.
         """
+        # Open under a shield so a cancellation mid-open cannot strand a half-built worktree / temp copy: the
+        # open runs in a thread (which cannot be cancelled), so on a cancel we still await the shielded open to
+        # recover the handle, clean it up, then propagate -- otherwise the dir (and a git worktree admin entry)
+        # would leak because the ``finally`` below never sees a ``sandbox``.
+        open_task = asyncio.ensure_future(asyncio.to_thread(self._sandbox.open, cwd))
         try:
-            sandbox = await asyncio.to_thread(self._sandbox.open, cwd)
+            sandbox = await asyncio.shield(open_task)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                stranded = await open_task
+                await asyncio.to_thread(stranded.cleanup)
+            raise
         except RutherfordError as exc:
             return _fail(req, exc.code, exc.message, details=exc.details)
         policy = PermissionPolicy(mode=req.safety_mode, sandboxed=True)

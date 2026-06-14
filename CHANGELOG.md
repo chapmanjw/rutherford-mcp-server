@@ -277,6 +277,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Write-sandbox hardening** (found by a second, deeper Codex-via-Rutherford safety review of the
+  delegation / sandbox paths):
+  - A sandboxed mode (`propose` / `write` / `yolo`) **with no `working_dir`** is now refused up front
+    (`INVALID_INPUT`). Previously such a call fell through to the direct, un-sandboxed path and ran in the
+    server's own cwd with writes allowed — and `trust_workspace=true` passed the trust gate regardless of
+    `working_dir`, so this was a real unsandboxed-write bypass. A sandbox needs a tree to isolate; the call
+    must name one.
+  - The sandbox **apply-back is now containment-checked**: each changed/deleted path is resolved and refused
+    unless it stays within the resolved `working_dir`. Without this, a symlink inside the workspace
+    (`link -> /outside`) could redirect an applied edit to a file *outside* the trusted tree — a write escape.
+  - `verify_read_only` now fingerprints the tree **whether or not the turn succeeded**. A read-only turn that
+    mutated the tree and then failed (or returned empty) is now surfaced as `READONLY_VIOLATED` instead of an
+    ordinary failure that hid the side effect.
+  - The **non-git temp-copy sandbox now detects deletions**: a `write` / `yolo` agent that removes a file in
+    the sandbox has the deletion applied back to the real tree, matching the git-worktree path (previously the
+    non-git path lost deletions entirely).
+  - The sandbox `open()` now runs **under a shield** so a cancellation mid-open cannot strand a half-built
+    worktree (and its git admin entry) or temp copy — on a cancel the open is drained and cleaned up before
+    the cancellation propagates.
+  - Known, accepted limitation (unchanged, and documented in `acp/sandbox.py` + the security docs): the
+    sandbox confines a *cooperative* agent's ACP `fs`/terminal activity by cwd + the path-escape guard; it is
+    NOT an OS jail. A write/yolo agent's own process (or a terminal command it runs) can still write an
+    absolute path outside the sandbox. Full OS containment (Job Objects / ACLs) remains deferred. This is
+    strictly safer than v2, which ran agents directly in the user's tree with no Rutherford-side sandbox.
 - **Safety: `consensus` and `debate` now refuse a mutating / sandboxed `safety_mode`** (`propose` / `write` /
   `yolo`) and run read-only. A debate drives its voices over persistent ACP sessions, and a budgeted consensus
   drives its harvest sessions, **directly in the real `working_dir` with no per-turn worktree** — so a mutating

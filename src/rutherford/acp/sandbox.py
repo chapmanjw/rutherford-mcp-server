@@ -105,8 +105,7 @@ class Sandbox:
         if self._is_git:
             diff, changed, deleted = self._git_changes()
         else:
-            diff, changed = self._copy_changes()
-            deleted = []
+            diff, changed, deleted = self._copy_changes()
         all_changed = sorted({*changed, *deleted})
         if not all_changed:
             return SandboxResult()
@@ -159,36 +158,67 @@ class Sandbox:
     def _delete_back(self, deleted: list[str]) -> None:
         """Remove from the real ``working_dir`` each file the agent deleted in the sandbox (write/yolo apply)."""
         for rel in deleted:
-            target = self._working_dir / rel
-            if target.is_file():
+            target = self._contained_target(rel)
+            if target is not None and target.is_file():
                 target.unlink()
+
+    def _contained_target(self, rel: str) -> Path | None:
+        """The real-tree path for ``rel``, or ``None`` if it would escape ``working_dir`` (symlink guard).
+
+        Apply-back and delete-back resolve ``working_dir / rel`` and refuse it unless it stays within the
+        resolved ``working_dir``. Without this a symlink inside the workspace (e.g. ``link -> /etc``) would let
+        an edit to ``link/x`` follow the symlink and overwrite a file OUTSIDE the tree the user trusted -- a
+        write escape. A path that resolves outside is skipped (logged), never written.
+        """
+        base = self._working_dir.resolve()
+        try:
+            resolved = (self._working_dir / rel).resolve()
+        except OSError:
+            return None
+        if resolved == base or resolved.is_relative_to(base):
+            return self._working_dir / rel
+        _log.warning("sandbox apply-back skipped %s: it resolves outside the working_dir (symlink escape)", rel)
+        return None
 
     # --- non-git temp-copy strategy -----------------------------------------
 
-    def _copy_changes(self) -> tuple[str, list[str]]:
-        """Diff the temp copy against the original: list created/edited files and build a text unified diff.
+    def _copy_changes(self) -> tuple[str, list[str], list[str]]:
+        """Diff the temp copy against the original: created/edited files, DELETED files, and a text diff.
 
-        The diff is best-effort text (binary files are listed but rendered as a one-line marker), since the
-        non-git path has no git to produce a binary patch; the authoritative output for this path is the
-        changed-file list, which the apply-back uses.
+        Returns ``(diff, changed, deleted)``. ``changed`` is every file in the copy whose bytes differ from
+        (or are new vs) the original; ``deleted`` is every original file (minus the excluded dirs) that is GONE
+        from the copy -- so a write/yolo agent that removed a file in the sandbox has that deletion applied back,
+        matching the git path (previously the non-git path lost deletions entirely). The diff is best-effort
+        text (binary files are listed but rendered as a one-line marker), since this path has no git to produce
+        a binary patch; the authoritative output is the changed/deleted lists the apply-back uses.
         """
         changed: list[str] = []
         diff_parts: list[str] = []
+        in_copy: set[str] = set()
         for path in _walk_files(self._root):
             rel = path.relative_to(self._root)
+            in_copy.add(rel.as_posix())
             original = self._working_dir / rel
             new_bytes = path.read_bytes()
             if original.is_file() and original.read_bytes() == new_bytes:
                 continue
             changed.append(rel.as_posix())
             diff_parts.append(_text_file_diff(rel.as_posix(), original, new_bytes))
-        return "\n".join(diff_parts), sorted(changed)
+        deleted: list[str] = []
+        for path in _walk_files(self._working_dir):
+            original_rel = path.relative_to(self._working_dir).as_posix()
+            if original_rel not in in_copy:
+                deleted.append(original_rel)
+                diff_parts.append(f"--- a/{original_rel}\n+++ /dev/null\n(file deleted)")
+        return "\n".join(diff_parts), sorted(changed), sorted(deleted)
 
     def _copy_apply(self, changed: list[str]) -> None:
-        """Copy each changed/created file from the temp copy back into the real ``working_dir``."""
+        """Copy each changed/created file from the temp copy back into the real ``working_dir`` (contained)."""
         for rel in changed:
+            dst = self._contained_target(rel)
+            if dst is None:
+                continue  # would escape the working_dir via a symlink -- refused
             src = self._root / rel
-            dst = self._working_dir / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
 

@@ -471,3 +471,119 @@ async def test_sandboxed_read_confined_to_root_rejects_escape(tmp_path: Path) ->
     with pytest.raises(RequestError):
         await client.read_text_file(str(outside), "s")
     assert "fs_read_denied" in journal.kinds()
+
+
+# --- hardening (found by the Codex-via-Rutherford safety review) -------------
+
+
+@pytest.mark.parametrize("mode", [SafetyMode.PROPOSE, SafetyMode.WRITE, SafetyMode.YOLO])
+async def test_sandboxed_mode_without_a_working_dir_is_refused(tmp_path: Path, mode: SafetyMode) -> None:
+    """A sandboxed mode (propose/write/yolo) with NO working_dir is refused -- never run unsandboxed in cwd.
+
+    Without a working_dir there is no tree to build the sandbox from, so the turn would fall through to the
+    direct path in the server's own cwd with writes allowed. ``trust_workspace=True`` is set to prove the guard
+    is independent of the trust gate (the gate alone passes trust_workspace through, working_dir or not).
+    """
+    service = _service()
+    req = DelegationRequest(
+        target=Target(cli="fake"),
+        prompt="WRITE=escape.txt:nope",
+        safety_mode=mode,
+        trust_workspace=True,
+        timeout_s=30.0,
+    )
+    result = await service.delegate(req)
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.INVALID_INPUT
+    assert "working_dir" in result.error.message
+
+
+def test_apply_back_refuses_a_relpath_that_climbs_out_of_the_working_dir(tmp_path: Path) -> None:
+    """The apply-back containment guard refuses a relpath that resolves outside the working_dir (`..` climb)."""
+    from rutherford.acp.sandbox import Sandbox
+
+    work = tmp_path / "work"
+    work.mkdir()
+    sandbox = Sandbox(manager=SandboxManager(), working_dir=work.resolve(), root=work, is_git=False)
+    assert sandbox._contained_target("../evil.txt") is None  # climbs out -> refused
+    inside = sandbox._contained_target("sub/ok.txt")
+    assert inside is not None and inside.name == "ok.txt"  # a normal nested path is allowed
+
+
+def test_apply_back_refuses_writing_through_a_symlink_escape(tmp_path: Path) -> None:
+    """The containment guard refuses an apply-back path that resolves outside the tree via a symlink.
+
+    Without the guard, a symlink inside the workspace (``link -> /outside``) would let an edit to ``link/x``
+    follow the symlink and overwrite a file OUTSIDE the tree the user trusted -- a write escape.
+    """
+    from rutherford.acp.sandbox import Sandbox
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    try:
+        (work / "link").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not creatable on this platform / without the privilege")
+    sandbox = Sandbox(manager=SandboxManager(), working_dir=work.resolve(), root=work, is_git=False)
+    assert sandbox._contained_target("link/evil.txt") is None  # follows the symlink outside -> refused
+    assert not (outside / "evil.txt").exists()
+
+
+def test_non_git_copy_detects_and_applies_a_deletion(tmp_path: Path) -> None:
+    """The non-git copy path now detects a file deleted in the sandbox and applies the deletion back.
+
+    Previously the non-git temp-copy diff only saw created/edited files, so a write/yolo agent that DELETED a
+    file in the sandbox had the deletion silently lost. It now mirrors the git path: the original file gone
+    from the copy is reported as deleted and removed from the real tree on apply.
+    """
+    (tmp_path / "keep.txt").write_text("keep\n", encoding="utf-8")
+    (tmp_path / "doomed.txt").write_text("bye\n", encoding="utf-8")
+    manager = SandboxManager()
+    sandbox = manager.open(str(tmp_path))  # non-git -> temp copy
+    (Path(sandbox.root) / "doomed.txt").unlink()  # the agent removes it in the sandbox
+    try:
+        outcome = sandbox.finish(SafetyMode.WRITE)
+    finally:
+        sandbox.cleanup()
+    assert "doomed.txt" in outcome.changed_files
+    assert outcome.applied is True
+    assert not (tmp_path / "doomed.txt").exists(), "the non-git deletion was not applied back"
+    assert (tmp_path / "keep.txt").exists(), "an unrelated file must survive the deletion apply"
+
+
+async def test_verify_read_only_flags_a_change_even_on_a_failed_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """verify_read_only fingerprints the tree whether or not the turn SUCCEEDED.
+
+    A read-only turn that mutated the tree and then failed (or returned empty) still broke the read-only
+    promise; the side effect is the signal that matters, so it must surface as READONLY_VIOLATED rather than an
+    ordinary failure that hides the write. The DEAD agent fails at handshake; a fingerprint that differs across
+    the turn stands in for the out-of-band mutation.
+    """
+    _git_repo(tmp_path)
+    dead = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.exit(0)"))
+    service = DelegationService(DescriptorRegistry([dead]), RutherfordConfig(verify_read_only=True))
+    from rutherford.services import delegation as delegation_mod
+
+    calls = {"n": 0}
+    real = delegation_mod._git_fingerprint
+
+    def _fingerprint(working_dir: str) -> str | None:
+        calls["n"] += 1
+        base = real(working_dir)
+        return base if calls["n"] == 1 else (base or "") + "\nMUTATED"  # after-snapshot differs
+
+    monkeypatch.setattr(delegation_mod, "_git_fingerprint", _fingerprint)
+    req = DelegationRequest(
+        target=Target(cli="dead"),
+        prompt="17 + 25",
+        working_dir=str(tmp_path),
+        safety_mode=SafetyMode.READ_ONLY,
+        timeout_s=30.0,
+    )
+    result = await service.delegate(req)
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.READONLY_VIOLATED
