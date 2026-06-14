@@ -617,3 +617,77 @@ async def test_write_apply_allows_an_unrelated_uncommitted_edit(tmp_path: Path) 
     assert result.ok is True, f"an unrelated dirty file must not block the apply: {result.error}"
     assert (tmp_path / "newfile.txt").read_text(encoding="utf-8") == "agent content"
     assert (tmp_path / "README.md").read_text(encoding="utf-8") == "user editing the readme\n"  # preserved
+
+
+def test_git_rename_applies_as_delete_plus_add(tmp_path: Path) -> None:
+    """A rename in the worktree is applied as remove-old + add-new even under diff.renames=true (--no-renames).
+
+    With rename detection on, ``--name-status`` would emit ``R old new`` and the old path would be left behind;
+    forcing ``--no-renames`` makes it a delete + an add, so the old path is removed and the new one created.
+    """
+    _git_repo(tmp_path)
+    (tmp_path / "old.txt").write_text("contents to move\n", encoding="utf-8")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "add old")
+    _git(tmp_path, "config", "diff.renames", "true")  # the config that would otherwise emit an R line
+    manager = SandboxManager()
+    sandbox = manager.open(str(tmp_path))
+    root = Path(sandbox.root)
+    (root / "old.txt").rename(root / "new.txt")  # the agent renames the file in the sandbox
+    try:
+        outcome = sandbox.finish(SafetyMode.WRITE)
+    finally:
+        sandbox.cleanup()
+    assert "new.txt" in outcome.changed_files and "old.txt" in outcome.changed_files
+    assert (tmp_path / "new.txt").read_text(encoding="utf-8") == "contents to move\n"
+    assert not (tmp_path / "old.txt").exists(), "the old path of a rename was left behind"
+
+
+def test_non_git_apply_refuses_a_concurrent_edit(tmp_path: Path) -> None:
+    """A non-git apply is refused if a file the agent changed was edited in the real tree DURING the turn.
+
+    The temp copy is an open-time snapshot; if the user edits the real file concurrently, applying the sandbox
+    version would silently overwrite that edit, so the apply is refused.
+    """
+    from rutherford.domain.errors import RutherfordError
+
+    (tmp_path / "shared.txt").write_text("original\n", encoding="utf-8")
+    manager = SandboxManager()
+    sandbox = manager.open(str(tmp_path))  # non-git -> temp copy + baseline
+    # The agent edits shared.txt in the sandbox...
+    (Path(sandbox.root) / "shared.txt").write_text("agent edit\n", encoding="utf-8")
+    # ...and meanwhile the user edits the SAME file in the real tree (concurrent edit).
+    (tmp_path / "shared.txt").write_text("user concurrent edit\n", encoding="utf-8")
+    try:
+        with pytest.raises(RutherfordError) as exc:
+            sandbox.finish(SafetyMode.WRITE)
+    finally:
+        sandbox.cleanup()
+    assert exc.value.code is ErrorCode.WORKSPACE_NOT_TRUSTED
+    assert "concurrent" in exc.value.message
+    # The user's concurrent edit is preserved (the apply did not run).
+    assert (tmp_path / "shared.txt").read_text(encoding="utf-8") == "user concurrent edit\n"
+
+
+def test_non_git_copy_skips_symlinks(tmp_path: Path) -> None:
+    """The non-git copy skips symlinks: outside bytes are never dereferenced into the sandbox, and the real
+    symlink is left untouched by the apply-back."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("outside secret\n", encoding="utf-8")
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "real.txt").write_text("inside\n", encoding="utf-8")
+    try:
+        (work / "link").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not creatable on this platform / without the privilege")
+    manager = SandboxManager()
+    sandbox = manager.open(str(work))  # non-git -> temp copy (symlinks skipped)
+    root = Path(sandbox.root)
+    try:
+        assert (root / "real.txt").is_file(), "a regular file must still be copied"
+        assert not (root / "link").exists(), "a symlink must not be copied (no dereferenced outside bytes)"
+    finally:
+        sandbox.cleanup()
+    assert (work / "link").is_symlink(), "the real symlink must be left untouched"

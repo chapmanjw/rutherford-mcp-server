@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import hashlib
 import logging
 import shutil
 import subprocess
@@ -83,11 +84,24 @@ class Sandbox:
     and then :meth:`cleanup` in a ``finally`` (always). The user's ``working_dir`` is never the agent's cwd.
     """
 
-    def __init__(self, *, manager: SandboxManager, working_dir: Path, root: Path, is_git: bool) -> None:
+    def __init__(
+        self,
+        *,
+        manager: SandboxManager,
+        working_dir: Path,
+        root: Path,
+        is_git: bool,
+        baseline: dict[str, str] | None = None,
+    ) -> None:
         self._manager = manager
         self._working_dir = working_dir
         self._root = root
         self._is_git = is_git
+        #: For the non-git temp-copy path: ``{relpath: sha256}`` of the working_dir AS IT WAS at open time, so
+        #: change detection is agent-relative (a file the agent edited, not one that merely differs from the
+        #: live tree) and a concurrent user edit during the turn can be detected and refused at apply. ``None``
+        #: for the git path (which diffs the worktree against HEAD instead).
+        self._baseline = baseline if baseline is not None else {}
         self._cleaned = False
 
     @property
@@ -111,13 +125,14 @@ class Sandbox:
             return SandboxResult()
         apply = mode in (SafetyMode.WRITE, SafetyMode.YOLO)
         if apply:
-            # A git worktree starts from HEAD, so a changed file carries HEAD + the agent's edit, NOT any
-            # uncommitted edit the user has in the real tree. Applying it back would silently clobber that local
-            # work, so refuse first if any path the apply touches is dirty vs HEAD (the user commits or stashes,
-            # then retries). The non-git temp copy starts from the real tree's current bytes, so it has no such
-            # gap and needs no guard.
+            # Refuse to clobber the user's work before touching the real tree. Git: a worktree is off HEAD, so a
+            # changed file is HEAD + the agent's edit, NOT any uncommitted edit the user has -- refuse if a
+            # touched path is dirty vs HEAD. Non-git: the temp copy is a snapshot at open time, so refuse if a
+            # touched path changed in the real tree DURING the turn (a concurrent edit the apply would lose).
             if self._is_git:
                 self._refuse_if_clobbering([*changed, *deleted])
+            else:
+                self._refuse_if_concurrently_edited([*changed, *deleted])
             # Apply by COPYING the changed files byte-for-byte from the sandbox (and removing the deleted
             # ones), not via ``git apply``: a patch round-trip is at the mercy of the repo's line-ending
             # normalization (``core.autocrlf`` on Windows injects ``\r`` into the applied file), so copying is
@@ -125,6 +140,33 @@ class Sandbox:
             self._copy_apply(changed)
             self._delete_back(deleted)
         return SandboxResult(diff=diff, changed_files=all_changed, applied=apply)
+
+    def _refuse_if_concurrently_edited(self, paths: list[str]) -> None:
+        """Refuse a non-git apply if a touched path changed in the real tree since the sandbox opened.
+
+        The temp copy is a snapshot of ``working_dir`` at open time (the baseline). If the user edited (or
+        created, or deleted) one of the files the apply would write or delete WHILE the agent was running, the
+        real file no longer matches the baseline -- applying the sandbox version would silently overwrite that
+        concurrent edit. So the whole apply is refused with a clear, actionable error rather than racing.
+        """
+        conflicts = [rel for rel in paths if self._real_hash(rel) != self._baseline.get(rel)]
+        if conflicts:
+            raise RutherfordError(
+                ErrorCode.WORKSPACE_NOT_TRUSTED,
+                "the working directory changed under the delegation ("
+                f"{', '.join(sorted(conflicts))}); the apply was refused to avoid overwriting a concurrent "
+                "edit. Retry with the directory quiescent.",
+            )
+
+    def _real_hash(self, rel: str) -> str | None:
+        """The sha256 of ``working_dir/rel`` now, or ``None`` if it does not exist (the non-git baseline key)."""
+        target = self._working_dir / rel
+        if not target.is_file():
+            return None
+        try:
+            return _sha256(target.read_bytes())
+        except OSError:
+            return None
 
     def _refuse_if_clobbering(self, paths: list[str]) -> None:
         """Refuse a git apply-back that would overwrite or delete an UNCOMMITTED local edit (worktree is off HEAD).
@@ -169,11 +211,13 @@ class Sandbox:
         Returns ``(diff, changed, deleted)``: the full ``git diff --cached --binary`` patch, the paths that
         were added or modified (copied back on apply), and the paths that were deleted (removed on apply).
         ``--name-status`` distinguishes a delete (``D``) so an agent that removed a file is honoured, not just
-        an agent that added one.
+        an agent that added one. ``--no-renames`` forces a rename to surface as a delete + an add (so the OLD
+        path is removed and the NEW one copied) regardless of the repo's ``diff.renames`` config -- otherwise a
+        user with rename detection on would get an ``R old new`` line whose old path was silently left behind.
         """
         self._manager.run_git(self._root, "add", "-A")
-        diff = self._manager.run_git(self._root, "diff", "--cached", "--binary")
-        status = self._manager.run_git(self._root, "diff", "--cached", "--name-status")
+        diff = self._manager.run_git(self._root, "diff", "--cached", "--binary", "--no-renames")
+        status = self._manager.run_git(self._root, "diff", "--cached", "--name-status", "--no-renames")
         changed: list[str] = []
         deleted: list[str] = []
         for line in status.splitlines():
@@ -183,21 +227,27 @@ class Sandbox:
             code, path = parts[0].strip(), parts[-1].strip()
             if code.startswith("D"):
                 deleted.append(path)
-            else:  # A (add), M (modify), R (rename target), C (copy): all land as a copy of the new path
+            else:  # A (add), M (modify): land as a copy of the new path (--no-renames removes the R/C cases)
                 changed.append(path)
         return diff, changed, deleted
 
     def _delete_back(self, deleted: list[str]) -> None:
-        """Remove from the real ``working_dir`` each file the agent deleted in the sandbox (write/yolo apply)."""
+        """Remove from the real ``working_dir`` each entry the agent deleted in the sandbox (write/yolo apply).
+
+        Uses the PARENT-resolved guard, not the fully-resolved one: a deleted entry that is itself a symlink is
+        removed as the LINK (``unlink`` never follows it), so deleting a workspace symlink that points outside
+        removes the link and not its external target -- while a path whose parent dir escapes the working_dir is
+        still refused.
+        """
         for rel in deleted:
-            target = self._contained_target(rel)
-            if target is not None and target.is_file():
-                target.unlink()
+            entry = self._contained_entry(rel)
+            if entry is not None and (entry.is_file() or entry.is_symlink()):
+                entry.unlink()
 
     def _contained_target(self, rel: str) -> Path | None:
-        """The real-tree path for ``rel``, or ``None`` if it would escape ``working_dir`` (symlink guard).
+        """The real-tree path for a WRITE of ``rel``, or ``None`` if it resolves outside ``working_dir``.
 
-        Apply-back and delete-back resolve ``working_dir / rel`` and refuse it unless it stays within the
+        Fully resolves ``working_dir / rel`` (following any symlink) and refuses it unless it stays within the
         resolved ``working_dir``. Without this a symlink inside the workspace (e.g. ``link -> /etc``) would let
         an edit to ``link/x`` follow the symlink and overwrite a file OUTSIDE the tree the user trusted -- a
         write escape. A path that resolves outside is skipped (logged), never written.
@@ -212,36 +262,52 @@ class Sandbox:
         _log.warning("sandbox apply-back skipped %s: it resolves outside the working_dir (symlink escape)", rel)
         return None
 
+    def _contained_entry(self, rel: str) -> Path | None:
+        """The real-tree entry for a DELETE of ``rel``, or ``None`` if its PARENT dir escapes ``working_dir``.
+
+        For a delete we resolve only the parent directory (not the final component), so a symlink entry is
+        removed as the link itself rather than followed; a path whose parent traverses a symlink out of the
+        working_dir is still refused.
+        """
+        base = self._working_dir.resolve()
+        candidate = self._working_dir / rel
+        try:
+            parent = candidate.parent.resolve()
+        except OSError:
+            return None
+        if parent == base or parent.is_relative_to(base):
+            return candidate
+        _log.warning("sandbox delete-back skipped %s: its parent resolves outside the working_dir", rel)
+        return None
+
     # --- non-git temp-copy strategy -----------------------------------------
 
     def _copy_changes(self) -> tuple[str, list[str], list[str]]:
-        """Diff the temp copy against the original: created/edited files, DELETED files, and a text diff.
+        """Diff the temp copy against the OPEN-TIME baseline: created/edited files, deleted files, and a text diff.
 
-        Returns ``(diff, changed, deleted)``. ``changed`` is every file in the copy whose bytes differ from
-        (or are new vs) the original; ``deleted`` is every original file (minus the excluded dirs) that is GONE
-        from the copy -- so a write/yolo agent that removed a file in the sandbox has that deletion applied back,
-        matching the git path (previously the non-git path lost deletions entirely). The diff is best-effort
-        text (binary files are listed but rendered as a one-line marker), since this path has no git to produce
-        a binary patch; the authoritative output is the changed/deleted lists the apply-back uses.
+        Returns ``(diff, changed, deleted)``. ``changed`` is every file in the copy whose bytes differ from the
+        baseline snapshot taken at open (or that is new vs it) -- i.e. what the AGENT changed, NOT what merely
+        differs from the live tree, so a concurrent user edit to an untouched file is never mis-attributed.
+        ``deleted`` is every baseline path now gone from the copy. The diff is best-effort text (binary files
+        are listed but rendered as a one-line marker), since this path has no git to produce a binary patch; the
+        authoritative output is the changed/deleted lists the apply-back uses.
         """
         changed: list[str] = []
         diff_parts: list[str] = []
         in_copy: set[str] = set()
         for path in _walk_files(self._root):
-            rel = path.relative_to(self._root)
-            in_copy.add(rel.as_posix())
-            original = self._working_dir / rel
+            rel = path.relative_to(self._root).as_posix()
+            in_copy.add(rel)
             new_bytes = path.read_bytes()
-            if original.is_file() and original.read_bytes() == new_bytes:
-                continue
-            changed.append(rel.as_posix())
-            diff_parts.append(_text_file_diff(rel.as_posix(), original, new_bytes))
+            if self._baseline.get(rel) == _sha256(new_bytes):
+                continue  # unchanged vs the open-time baseline -- the agent did not touch it
+            changed.append(rel)
+            diff_parts.append(_text_file_diff(rel, self._working_dir / rel, new_bytes))
         deleted: list[str] = []
-        for path in _walk_files(self._working_dir):
-            original_rel = path.relative_to(self._working_dir).as_posix()
-            if original_rel not in in_copy:
-                deleted.append(original_rel)
-                diff_parts.append(f"--- a/{original_rel}\n+++ /dev/null\n(file deleted)")
+        for rel in self._baseline:
+            if rel not in in_copy:
+                deleted.append(rel)
+                diff_parts.append(f"--- a/{rel}\n+++ /dev/null\n(file deleted)")
         return "\n".join(diff_parts), sorted(changed), sorted(deleted)
 
     def _copy_apply(self, changed: list[str]) -> None:
@@ -276,7 +342,11 @@ class SandboxManager:
             root = self._add_worktree(resolved)
             return Sandbox(manager=self, working_dir=resolved, root=root, is_git=True)
         root = self._copy_tree(resolved)
-        return Sandbox(manager=self, working_dir=resolved, root=root, is_git=False)
+        # Snapshot the copied tree's content hashes as the open-time baseline, so the non-git change detection
+        # is agent-relative and a concurrent edit during the turn is caught at apply (the copy == the real tree
+        # right now, so this is the real tree's state at open time).
+        baseline = {path.relative_to(root).as_posix(): _sha256(path.read_bytes()) for path in _walk_files(root)}
+        return Sandbox(manager=self, working_dir=resolved, root=root, is_git=False, baseline=baseline)
 
     # --- git plumbing --------------------------------------------------------
 
@@ -376,12 +446,15 @@ class SandboxManager:
     # --- non-git temp-copy plumbing -----------------------------------------
 
     def _copy_tree(self, working_dir: Path) -> Path:
-        """Copy ``working_dir`` (minus the excluded dirs) into a temp dir, enforcing the size guard first.
+        """Copy ``working_dir`` (minus the excluded dirs and any symlinks) into a temp dir, size-guarded first.
 
         Refuses a tree whose copyable content exceeds :data:`_MAX_COPY_BYTES` with a clear error -- write mode
         on a huge non-git dir should use a git working_dir, not a slow, unreliable copy. The excluded dirs
         (``.git`` is absent here by definition, plus ``node_modules`` / virtualenvs / caches) are skipped so
-        the copy is the source, not its regenerable artifacts.
+        the copy is the source, not its regenerable artifacts. SYMLINKS are skipped entirely: copying them as
+        links would need an OS privilege (Windows), and dereferencing them (copytree's default) would pull the
+        bytes of a file OUTSIDE the working_dir into the sandbox -- so they are simply not copied, and the real
+        symlinks are left untouched by the apply-back.
         """
         total = _tree_size(working_dir)
         if total > _MAX_COPY_BYTES:
@@ -393,14 +466,38 @@ class SandboxManager:
             )
         temp = Path(tempfile.mkdtemp(prefix="rutherford-sbx-"))
         copy = temp / "copy"
-        shutil.copytree(working_dir, copy, ignore=shutil.ignore_patterns(*_COPY_EXCLUDES), dirs_exist_ok=True)
+        shutil.copytree(working_dir, copy, ignore=_copy_ignore, dirs_exist_ok=True)
         return copy
 
 
+def _copy_ignore(directory: str, names: list[str]) -> set[str]:
+    """``shutil.copytree`` ignore callback: skip the excluded dirs AND any symlink entry.
+
+    Returning the symlink names here means a symlink in the working_dir is neither dereferenced (which would
+    copy outside bytes into the sandbox) nor recreated (which needs an OS privilege on Windows) -- it is simply
+    absent from the copy, and the real symlink is left untouched.
+    """
+    skip = {name for name in names if name in _COPY_EXCLUDES}
+    base = Path(directory)
+    skip.update(name for name in names if (base / name).is_symlink())
+    return skip
+
+
+def _sha256(data: bytes) -> str:
+    """The hex sha256 of ``data`` -- the non-git baseline's per-file content fingerprint."""
+    return hashlib.sha256(data).hexdigest()
+
+
 def _walk_files(root: Path) -> list[Path]:
-    """Every regular file under ``root``, skipping the excluded dirs, sorted for a deterministic diff."""
+    """Every regular file under ``root``, skipping the excluded dirs and symlinks, sorted (deterministic diff).
+
+    Symlinks are skipped (``is_symlink``) so a link is never followed into content outside the tree and never
+    mistaken for a regular file the agent edited.
+    """
     files: list[Path] = []
     for path in root.rglob("*"):
+        if path.is_symlink():
+            continue
         if path.is_dir():
             continue
         if any(part in _COPY_EXCLUDES for part in path.relative_to(root).parts):

@@ -302,6 +302,17 @@ All notable changes to this project are documented in this file. The format is b
     dirty vs `HEAD` in the real tree (checked under the repo's own `autocrlf` policy, so a CRLF-checked-out file
     is not falsely flagged), the apply is refused with a clear "commit or stash first" error. An uncommitted
     edit to an unrelated file does not block. (A second-pass review finding.)
+  - Further sandbox-robustness fixes (a third review pass of the apply-back):
+    - The non-git temp-copy path now diffs the agent's edits against an **open-time content baseline** (per-file
+      hashes), not the live tree — so a concurrent user edit to an *untouched* file is no longer mis-attributed
+      as an agent change, and a concurrent edit to a file the agent *did* change is detected and the apply is
+      refused (rather than silently overwriting it).
+    - A git **rename is applied as delete-old + add-new** (`--no-renames` on the diff), so a repo with
+      `diff.renames` enabled no longer leaves the renamed-from path behind.
+    - The non-git copy now **skips symlinks** entirely instead of dereferencing them, so a symlink pointing
+      outside the workspace can't pull external bytes into the sandbox; the real symlink is left untouched.
+    - Delete-back resolves only a path's **parent** (not the final component), so deleting a workspace symlink
+      removes the link itself rather than following it (or being wrongly skipped).
   - Known, accepted limitation (unchanged, and documented in `acp/sandbox.py` + the security docs): the
     sandbox confines a *cooperative* agent's ACP `fs`/terminal activity by cwd + the path-escape guard; it is
     NOT an OS jail. A write/yolo agent's own process (or a terminal command it runs) can still write an
