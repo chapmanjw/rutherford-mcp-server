@@ -58,6 +58,30 @@ class AgentConfig(BaseModel):
     #: Per-agent default reasoning-effort tier (F8a). Used when a call names no ``effort``; ``None``
     #: falls back to the global ``default_effort``. A no-op for an agent with no effort knob.
     effort: Effort | None = None
+    #: Reuse a BUILT-IN agent's launch command under this new id (e.g. ``base = "goose"``). The convenient
+    #: way to clone a built-in -- typically paired with ``backend`` to point it at a local model runtime,
+    #: or with ``default_model`` to pin a model. Mutually exclusive with ``command``.
+    base: str | None = None
+    #: Point this agent at a LOCAL model runtime: ``"ollama"`` or ``"lmstudio"``. Rutherford fills in the
+    #: right provider env for the ``base`` agent (only ``goose`` is supported as a base today), so a local
+    #: model becomes a first-class ACP voice. Requires ``model``; ``base`` defaults to the built-in matching
+    #: this id when unset. See ``host`` for a non-default endpoint.
+    backend: Literal["ollama", "lmstudio"] | None = None
+    #: The model id served by ``backend`` (e.g. ``"gemma3:12b"`` for Ollama, ``"openai/gpt-oss-120b"`` for
+    #: LM Studio). Required when ``backend`` is set; becomes the agent's default model.
+    model: str | None = None
+    #: The ``backend`` endpoint as ``host:port``; defaults to ``localhost:11434`` (Ollama) or
+    #: ``localhost:1234`` (LM Studio).
+    host: str | None = None
+
+    @model_validator(mode="after")
+    def _check_backend(self) -> AgentConfig:
+        """A local-backend agent needs a model; ``backend`` and a raw ``command`` are mutually exclusive."""
+        if self.backend is not None and not self.model:
+            raise ValueError("a local 'backend' agent requires 'model' (the model id the runtime serves)")
+        if self.command is not None and (self.base is not None or self.backend is not None):
+            raise ValueError("'command' cannot be combined with 'base'/'backend' (choose a raw command OR a base)")
+        return self
 
 
 class RutherfordConfig(BaseModel):

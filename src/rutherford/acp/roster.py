@@ -32,25 +32,81 @@ def build_registry(config: RutherfordConfig) -> DescriptorRegistry:
     return DescriptorRegistry(resolved.values())
 
 
-def _merge(agent_id: str, entry: AgentConfig, base: AgentDescriptor | None) -> AgentDescriptor:
-    """Build a descriptor for ``agent_id`` from a config ``entry`` over an optional built-in ``base``."""
-    command = tuple(entry.command) if entry.command is not None else (base.command if base is not None else ())
-    if not command:
+#: Built-in agents by id, for resolving ``base`` / built-in overrides.
+_BUILTINS: dict[str, AgentDescriptor] = {descriptor.id: descriptor for descriptor in HIGH_FIDELITY}
+
+
+def _merge(agent_id: str, entry: AgentConfig, existing: AgentDescriptor | None) -> AgentDescriptor:
+    """Build a descriptor for ``agent_id`` from a config ``entry``, inheriting from a built-in when one applies.
+
+    The launch command comes from ``entry.command``, else the ``base`` built-in (clone), else the built-in
+    of the same id (override). A ``backend`` layers the local-runtime provider env on top.
+    """
+    source = _resolve_source(agent_id, entry, existing)
+    if entry.command is not None:
+        command = tuple(entry.command)
+    elif source is not None:
+        command = source.command
+    else:
         raise ConfigError(
-            f"agent '{agent_id}' is not a built-in agent and has no 'command' to launch it; "
-            "add a command (the ACP-server launch argv) or remove the entry"
+            f"agent '{agent_id}' is not a built-in agent and has no 'command' or 'base' to launch it; "
+            "add a command (the ACP-server launch argv), a base (a built-in to clone), or remove the entry"
         )
+    env = _backend_env(agent_id, entry, source) if entry.backend is not None else {}
+    env.update(entry.env)  # an explicit env wins over the backend defaults
     return AgentDescriptor(
         id=agent_id,
-        display_name=base.display_name if base is not None else agent_id,
+        display_name=source.display_name if source is not None else agent_id,
         command=(*command, *entry.extra_args),
-        provider=entry.provider if entry.provider is not None else (base.provider if base is not None else None),
-        env_passthrough=base.env_passthrough if base is not None else None,
-        default_model=entry.default_model
-        if entry.default_model is not None
-        else (base.default_model if base is not None else None),
+        provider=_first(entry.provider, entry.backend, source.provider if source is not None else None),
+        env_passthrough=source.env_passthrough if source is not None else None,
+        default_model=_first(entry.model, entry.default_model, source.default_model if source is not None else None),
         handshake_timeout_s=entry.handshake_timeout_s
         if entry.handshake_timeout_s is not None
-        else (base.handshake_timeout_s if base is not None else 30.0),
-        env_overrides=tuple(entry.env.items()),
+        else (source.handshake_timeout_s if source is not None else 30.0),
+        env_overrides=tuple(env.items()),
     )
+
+
+def _resolve_source(agent_id: str, entry: AgentConfig, existing: AgentDescriptor | None) -> AgentDescriptor | None:
+    """The built-in descriptor this entry inherits launch + quirks from: an explicit ``base``, else the
+    same-id built-in being overridden, else ``None`` for a brand-new agent."""
+    if entry.base is not None:
+        if entry.base not in _BUILTINS:
+            raise ConfigError(f"agent '{agent_id}' has base '{entry.base}', which is not a built-in agent")
+        return _BUILTINS[entry.base]
+    if entry.backend is not None and existing is None:
+        raise ConfigError(
+            f"agent '{agent_id}' sets a local 'backend' but has no 'base'; add e.g. base = \"goose\""
+        )
+    return existing
+
+
+def _backend_env(agent_id: str, entry: AgentConfig, source: AgentDescriptor | None) -> dict[str, str]:
+    """The provider env that points the ``base`` agent at a local model runtime (Ollama / LM Studio).
+
+    Only ``goose`` is supported as a base today: it reaches Ollama natively and LM Studio (and any
+    OpenAI-compatible server) via its ``openai`` provider with a custom host. ``model`` is validated
+    non-empty by the schema.
+    """
+    base_id = entry.base or agent_id
+    model = entry.model or ""
+    if base_id != "goose":
+        raise ConfigError(
+            f"agent '{agent_id}': a local 'backend' is only supported with base = \"goose\" today (got '{base_id}')"
+        )
+    if entry.backend == "ollama":
+        return {"GOOSE_PROVIDER": "ollama", "GOOSE_MODEL": model, "OLLAMA_HOST": entry.host or "localhost:11434"}
+    host = entry.host or "localhost:1234"  # lmstudio / OpenAI-compatible
+    return {
+        "GOOSE_PROVIDER": "openai",
+        "GOOSE_MODEL": model,
+        "OPENAI_HOST": f"http://{host}",
+        "OPENAI_BASE_PATH": "v1/chat/completions",
+        "OPENAI_API_KEY": "local",
+    }
+
+
+def _first(*values: str | None) -> str | None:
+    """The first non-None value, or ``None``."""
+    return next((value for value in values if value is not None), None)

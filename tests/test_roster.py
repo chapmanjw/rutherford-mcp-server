@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from rutherford.acp.descriptors import HIGH_FIDELITY
 from rutherford.acp.roster import build_registry
@@ -78,3 +79,58 @@ def test_enabled_agents_can_include_a_newly_defined_one() -> None:
         agents={"extra": AgentConfig(command=["extra-acp"])},
     )
     assert build_registry(config).ids() == ["extra", "goose"]
+
+
+def test_base_clones_a_builtin_launch() -> None:
+    agent = build_registry(RutherfordConfig(agents={"my-goose": AgentConfig(base="goose")})).get("my-goose")
+    assert agent.command == ("goose", "acp")
+    assert agent.display_name == "Goose"
+
+
+def test_backend_ollama_fills_goose_env() -> None:
+    config = RutherfordConfig(agents={"local": AgentConfig(base="goose", backend="ollama", model="gemma3:12b")})
+    agent = build_registry(config).get("local")
+    assert agent.command == ("goose", "acp")
+    assert dict(agent.env_overrides) == {
+        "GOOSE_PROVIDER": "ollama",
+        "GOOSE_MODEL": "gemma3:12b",
+        "OLLAMA_HOST": "localhost:11434",
+    }
+    assert agent.provider == "ollama" and agent.default_model == "gemma3:12b"
+
+
+def test_backend_lmstudio_uses_openai_compatible_env_and_host() -> None:
+    config = RutherfordConfig(
+        agents={"lm": AgentConfig(base="goose", backend="lmstudio", model="openai/gpt-oss-120b", host="localhost:4321")}
+    )
+    env = dict(build_registry(config).get("lm").env_overrides)
+    assert env["GOOSE_PROVIDER"] == "openai" and env["GOOSE_MODEL"] == "openai/gpt-oss-120b"
+    assert env["OPENAI_HOST"] == "http://localhost:4321" and env["OPENAI_BASE_PATH"] == "v1/chat/completions"
+    assert build_registry(config).get("lm").provider == "lmstudio"
+
+
+def test_explicit_env_overrides_the_backend_default() -> None:
+    config = RutherfordConfig(
+        agents={"local": AgentConfig(base="goose", backend="ollama", model="m", env={"OLLAMA_HOST": "box:9999"})}
+    )
+    assert dict(build_registry(config).get("local").env_overrides)["OLLAMA_HOST"] == "box:9999"
+
+
+def test_backend_without_a_base_is_an_error() -> None:
+    with pytest.raises(ConfigError, match="no 'base'"):
+        build_registry(RutherfordConfig(agents={"floaty": AgentConfig(backend="ollama", model="m")}))
+
+
+def test_backend_only_supports_a_goose_base_today() -> None:
+    with pytest.raises(ConfigError, match="only supported with base"):
+        build_registry(RutherfordConfig(agents={"x": AgentConfig(base="opencode", backend="ollama", model="m")}))
+
+
+def test_unknown_base_is_an_error() -> None:
+    with pytest.raises(ConfigError, match="not a built-in"):
+        build_registry(RutherfordConfig(agents={"x": AgentConfig(base="nope")}))
+
+
+def test_backend_without_model_is_rejected_by_the_schema() -> None:
+    with pytest.raises(ValidationError):
+        AgentConfig(base="goose", backend="ollama")
