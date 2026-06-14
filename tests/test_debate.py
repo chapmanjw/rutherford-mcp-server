@@ -14,11 +14,11 @@ from rutherford import server
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import AppContext, build_app_context
-from rutherford.domain.enums import Effort
+from rutherford.domain.enums import Effort, Stance
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import DebateRequest, Target
-from rutherford.services.debate import DebateService, _disambiguate
+from rutherford.domain.models import DebateContribution, DebateRequest, DebateRound, Target
+from rutherford.services.debate import DebateService, _disambiguate, _Voice, _with_later_stance
 from rutherford.services.delegation import DelegationService
 from rutherford.tools.debate import debate_tool
 
@@ -119,6 +119,44 @@ async def test_debate_without_synthesis() -> None:
 def test_disambiguate_labels() -> None:
     assert _disambiguate(["a", "b"]) == ["a", "b"]
     assert _disambiguate(["a", "a", "b"]) == ["a#1", "a#2", "b"]
+
+
+def test_with_later_stance_helper() -> None:
+    assert _with_later_stance("x", Stance.FOR).endswith("Keep arguing in favor of the proposition.")
+    assert _with_later_stance("x", Stance.AGAINST).endswith("Keep arguing against the proposition.")
+    assert _with_later_stance("x", None) == "x"  # an unsteered voice gets no reminder
+
+
+def test_stance_is_re_embedded_every_round_not_just_round_one() -> None:
+    # Item 17 (v2 parity): a FOR/AGAINST voice keeps its stance reminder on the later-round delta prompt;
+    # without it a multi-round debate drifts to the center as each voice accommodates the others.
+    service = _service()
+    voice = _Voice(index=0, target=Target(cli="fake"), label="Pro", stance=Stance.FOR)
+    req = _two_fakes(rounds=3)
+
+    opening = service._round_prompt(req, voice, None)
+    assert "Argue in favor of the proposition." in opening  # round 1 opens with the stance
+
+    other = DebateContribution(
+        label="Con",
+        seat_id="1:Con",
+        target=Target(cli="fake"),
+        round_index=1,
+        stance=Stance.AGAINST,
+        ok=True,
+        text="No, the opposite is true.",
+    )
+    later = service._round_prompt(req, voice, DebateRound(index=1, contributions=[other]))
+    assert "Keep arguing in favor of the proposition." in later  # the stance is restated each round
+    assert "No, the opposite is true." in later  # the other voice's latest position rides the delta
+
+
+def test_unsteered_later_round_prompt_has_no_stance_reminder() -> None:
+    service = _service()
+    voice = _Voice(index=0, target=Target(cli="fake"), label="Neutral", stance=None)
+    other = DebateContribution(label="Other", target=Target(cli="fake"), round_index=1, ok=True, text="point")
+    later = service._round_prompt(_two_fakes(rounds=2), voice, DebateRound(index=1, contributions=[other]))
+    assert "Keep arguing" not in later
 
 
 async def test_debate_tool_and_server_wrapper(monkeypatch: Any) -> None:

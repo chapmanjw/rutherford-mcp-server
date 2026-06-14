@@ -36,6 +36,8 @@ def _starter_config(config: RutherfordConfig, *, trust_workspace: bool, cwd: Pat
     timeout = _format_number(config.default_timeout_s)
     auto_detect = "true" if config.auto_detect_local_models else "false"
     max_targets = config.max_targets
+    persistence = config.default_persistence
+    synthesize = "true" if config.synthesize_default else "false"
     lines = [
         "# Rutherford config -- a starter scaffold. Every setting below is OPTIONAL and shown at its",
         "# effective default; delete what you don't need or uncomment a line to change it. See the",
@@ -45,6 +47,12 @@ def _starter_config(config: RutherfordConfig, *, trust_workspace: bool, cwd: Pat
         f"default_timeout_s = {timeout}        # per-run wall-clock timeout, in seconds",
         f"auto_detect_local_models = {auto_detect}  # probe a running Ollama (:11434) / LM Studio (:1234) for voices",
         f"max_targets = {max_targets}             # most agents a single consensus call may fan out to",
+        "",
+        "# Durability (F2): persist runs to disk as replayable jobs. 'ephemeral' (default) keeps nothing",
+        "# unless a call passes persist=true; 'job' persists every run unless a call passes persist=false.",
+        f'default_persistence = "{persistence}"   # ephemeral | job',
+        '# jobs_dir = "/abs/path/to/jobs"   # where durable runs land (default: <cwd>/.rutherford/jobs)',
+        f"synthesize_default = {synthesize}        # have consensus write a combined answer across the voices",
         "",
         "# Absolute paths under which write/yolo delegations are permitted. Read_only/propose never need this.",
     ]
@@ -61,6 +69,10 @@ def _starter_config(config: RutherfordConfig, *, trust_workspace: bool, cwd: Pat
         '# base = "goose"        # the built-in agent to launch',
         '# backend = "ollama"    # ollama | lmstudio',
         '# model = "qwen3:8b"    # the model id the runtime serves (required)',
+        "",
+        "# Named multi-agent panels live in a sibling panels.toon (next to this file), not here. Each panel",
+        '# names its targets/strategy so a call can say panel = "<name>" instead of listing seats. After',
+        "# editing panels.toon, call the reload_panels tool. See docs/ for the panels.toon schema.",
         "",
     ]
     return "\n".join(lines)

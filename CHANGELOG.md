@@ -277,6 +277,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- A steered debate voice (stance `for` / `against`) now has its stance **re-embedded every round**, not just
+  round 1 (v2 parity). The later-round delta prompt re-appends "Keep arguing in favor of / against the
+  proposition."; without it a multi-round debate drifts toward the center as each voice accommodates the
+  others, so the assigned side has to be restated each round to hold the adversarial framing. (The v3 delta
+  still omits the voice's own prior position — the persistent session remembers it — which is the leaner
+  ACP-native shape; only the stance reminder was missing.)
 - Orphaned agent process trees. A wrapper adapter spawns the underlying CLI as a child; the ACP transport
   terminated only the direct child, leaving that CLI running, holding the working directory, and piling up
   across `doctor` probes. The session now reaps the agent's descendant tree on close.
@@ -296,6 +302,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- The `setup` starter `config.toml` now scaffolds the F2 durability knobs (`default_persistence`, a commented
+  `jobs_dir`) and `synthesize_default` at their effective defaults, and points at the sibling `panels.toon`
+  for named multi-agent panels (with a note to call `reload_panels` after editing it) — closing the v2-setup
+  parity gap where the scaffold only emitted the safety/timeout/roster basics.
 - Config: `AdapterConfig` → `AgentConfig` (gains `command`/`env`/`provider`/`handshake_timeout_s`),
   `adapters` → `agents`, `enabled_adapters` → `enabled_agents`.
 

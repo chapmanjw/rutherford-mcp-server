@@ -116,9 +116,20 @@ async def test_generated_toml_parses_and_validates_against_config(tmp_path, monk
 
 async def test_starter_reflects_effective_defaults(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
-    config = RutherfordConfig(default_timeout_s=120.0, max_targets=5, auto_detect_local_models=False)
+    config = RutherfordConfig(
+        default_timeout_s=120.0,
+        max_targets=5,
+        auto_detect_local_models=False,
+        default_persistence="job",
+        synthesize_default=True,
+    )
     data = decode(await setup_tool(_app(config), scope="project"))
     parsed = tomllib.loads(data["content"])
     assert parsed["default_timeout_s"] == 120
     assert parsed["max_targets"] == 5
     assert parsed["auto_detect_local_models"] is False
+    # The F2 durability + synthesis knobs are scaffolded at their effective defaults, and the panels.toon
+    # pointer is present so a reader knows where named panels live (v2 setup parity).
+    assert parsed["default_persistence"] == "job"
+    assert parsed["synthesize_default"] is True
+    assert "panels.toon" in data["content"]

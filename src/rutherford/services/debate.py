@@ -526,7 +526,10 @@ class DebateService:
         """Round 1 is the full question; later rounds send only the others' latest positions (a delta).
 
         The persistent session remembers this voice's own prior answer, so the delta does not re-send it --
-        the whole point of holding the session across rounds.
+        the whole point of holding the session across rounds. A steered voice's FOR/AGAINST stance is
+        re-embedded EVERY round, not just round 1 (v2 parity): without the reminder a multi-round debate
+        drifts toward the center as each voice accommodates the others, so the assigned side has to be
+        restated each round to hold the adversarial framing the stance is for.
         """
         if previous is None:
             return _with_stance(req.prompt, voice.stance)
@@ -536,10 +539,11 @@ class DebateService:
             if contribution.seat_id != _seat_id(voice) and contribution.ok and contribution.text.strip()
         ]
         block = "\n\n".join(f"## {label}\n{text}" for label, text in others) or "(no other positions)"
-        return (
+        prompt = (
             "This is the next round of our debate. Here are the other participants' latest positions:\n\n"
             f"{block}\n\nCritique them and revise or defend your own answer. End with your current best answer."
         )
+        return _with_later_stance(prompt, voice.stance)
 
     async def _synthesize(
         self, req: DebateRequest, rounds: list[DebateRound], cwd: str, timeout_s: float, base_depth: int
@@ -679,6 +683,15 @@ def _with_stance(prompt: str, stance: Stance | None) -> str:
         return f"{prompt}\n\nArgue in favor of the proposition."
     if stance is Stance.AGAINST:
         return f"{prompt}\n\nArgue against the proposition."
+    return prompt
+
+
+def _with_later_stance(prompt: str, stance: Stance | None) -> str:
+    """Re-embed a steered voice's stance on a later-round delta prompt (v2 parity: ``Keep arguing ...``)."""
+    if stance is Stance.FOR:
+        return f"{prompt}\n\nKeep arguing in favor of the proposition."
+    if stance is Stance.AGAINST:
+        return f"{prompt}\n\nKeep arguing against the proposition."
     return prompt
 
 
