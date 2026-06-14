@@ -7,10 +7,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.acp.journal import EventJournal, JournalEvent
 from rutherford.acp.permission import PermissionPolicy
-from rutherford.acp.session import _post_prompt_safety, run_acp_turn
+from rutherford.acp.session import ACPHandshakeError, ACPSession, _post_prompt_safety, run_acp_turn
 from rutherford.config.schema import RutherfordConfig
 from rutherford.domain.enums import ReexecutionSafety, SafetyMode
 from rutherford.domain.error_codes import ErrorCode
@@ -124,3 +126,23 @@ async def test_run_turn_handshake_failure() -> None:
     assert result.ok is False and result.error is not None
     assert result.error.code is ErrorCode.ACP_HANDSHAKE_FAILED
     assert result.error.reexecution_safety is ReexecutionSafety.SAFE
+
+
+async def test_acp_session_reuses_one_live_session_across_turns() -> None:
+    async with ACPSession(FAKE, policy=_READ_ONLY, cwd=str(REPO_ROOT)) as session:
+        session_id = session.session_id
+        assert session_id is not None and session.target.cli == "fake"
+        first = await session.prompt("EMPTY please", timeout_s=60.0)
+        assert first.ok is False  # the first turn produced no answer
+        second = await session.prompt("what is 17 + 25?", timeout_s=60.0)
+        assert second.ok is True and "42" in second.text  # second turn's journal is clean of the first
+        assert session.session_id == session_id  # the same live session, not a re-spawn
+
+
+async def test_acp_session_open_raises_on_bad_agent() -> None:
+    bad = AgentDescriptor("bad", "Bad", ("this-binary-does-not-exist-xyz123",))
+    session = ACPSession(bad, policy=_READ_ONLY, cwd=str(REPO_ROOT))
+    with pytest.raises(ACPHandshakeError) as exc:
+        await session.open()
+    assert exc.value.code is ErrorCode.ACP_SPAWN_FAILED
+    assert exc.value.safety is ReexecutionSafety.SAFE

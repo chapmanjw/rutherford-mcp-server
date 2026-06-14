@@ -25,6 +25,7 @@ from .domain.errors import ConfigError, RutherfordError
 from .runtime.logging import configure_logging
 from .tools.capabilities import capabilities_tool
 from .tools.consensus import consensus_tool
+from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
 
 mcp: FastMCP = FastMCP(
@@ -120,6 +121,40 @@ async def consensus(
             working_dir=working_dir,
             files=files,
             safety_mode=safety_mode,
+            timeout_s=timeout_s,
+        )
+    )
+
+
+@mcp.tool
+async def debate(
+    prompt: str,
+    targets: list[Any] | None = None,
+    rounds: int = 2,
+    judge: Any | None = None,
+    working_dir: str | None = None,
+    safety_mode: str | None = None,
+    synthesize: bool = True,
+    timeout_s: float | None = None,
+) -> str:
+    """Have several ACP agents argue a question across rounds and return the full transcript.
+
+    `targets` is a list of `{cli, model}` objects or `cli` / `cli:model` strings; a debate needs at least
+    two. Each voice keeps ONE persistent ACP session across all `rounds`: round one is each voice's
+    independent answer, and each later round shows a voice the others' latest positions and asks it to
+    revise -- the agent remembers its own prior reasoning in-session, so only the delta is sent.
+    `synthesize=true` (default) adds a closing summary; `judge` names a target to write it.
+    """
+    return await _guarded(
+        debate_tool(
+            get_app(),
+            prompt=prompt,
+            targets=targets,
+            rounds=rounds,
+            judge=judge,
+            working_dir=working_dir,
+            safety_mode=safety_mode,
+            synthesize=synthesize,
             timeout_s=timeout_s,
         )
     )

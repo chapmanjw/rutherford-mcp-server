@@ -22,6 +22,7 @@ from .domain.error_codes import ErrorCode
 from .domain.errors import RutherfordError
 from .io.serialize import encode
 from .services.consensus import ConsensusService
+from .services.debate import DebateService
 from .services.delegation import DelegationService
 
 
@@ -51,6 +52,7 @@ class AppContext:
     descriptors: DescriptorRegistry
     delegation: DelegationService
     consensus: ConsensusService
+    debate: DebateService
 
     def new_correlation_id(self) -> str:
         """Mint a short correlation id for a tool call."""
@@ -71,6 +73,11 @@ def build_app_context(
     resolved_descriptors = descriptors if descriptors is not None else default_registry()
     delegation = DelegationService(resolved_descriptors, resolved_config)
     consensus = ConsensusService(delegation, resolved_config)
+    debate = DebateService(resolved_descriptors, resolved_config)
     return AppContext(
-        config=resolved_config, descriptors=resolved_descriptors, delegation=delegation, consensus=consensus
+        config=resolved_config,
+        descriptors=resolved_descriptors,
+        delegation=delegation,
+        consensus=consensus,
+        debate=debate,
     )
