@@ -114,30 +114,51 @@ async def delegate(
 @mcp.tool
 async def consensus(
     prompt: str,
-    targets: list[Any] | None = None,
+    targets: list[Any] | str | None = None,
+    strategy: str | None = None,
+    verdict_schema: dict[str, Any] | None = None,
+    judge: Any | None = None,
+    stances: list[str] | None = None,
+    expand_all: bool = False,
     working_dir: str | None = None,
     files: list[str] | None = None,
     safety_mode: str | None = None,
+    synthesize: bool | None = None,
     timeout_s: float | None = None,
     role: str | None = None,
     mode: str = "sync",
 ) -> str:
-    """Ask the same prompt of several ACP agents in parallel and return every voice.
+    """Ask the same prompt of several ACP agents in parallel and reduce the voices.
 
     `targets` is a list of `{cli, model}` objects or `cli` / `cli:model` strings; each runs as its own ACP
-    session concurrently. `safety_mode` and `timeout_s` apply to every voice; one failing voice is returned
-    as a failed result, never an aborted panel. `role` names a persona (see `list_roles`) prepended to the
-    prompt every voice receives. `mode="async"` runs the panel as a background job and returns a `job_id`
-    (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
+    session concurrently. Omit `targets`, pass an empty list, pass the sentinel `"all"`, or set
+    `expand_all=true` to fan out to every registered agent (each at its default model, capped at
+    `max_targets`); the result's `skipped` field explains any agent left out. A `{cli, model}` target may
+    also carry per-seat `role` / `label` / `weight` / `parity` / `stance`. With a `strategy` other than
+    `all-voices` (`unanimous` | `majority` | `plurality` | `weighted` | `parity-pair`, optionally with a
+    `verdict_schema`), each voice is asked for a verdict and the panel collapses to one outcome
+    (`StrategyResult`) instead of every voice. Optional `stances` (parallel to `targets`) steer each voice
+    and cannot combine with the auto-expanded panel. `synthesize` (defaults to `synthesize_default`, off
+    out of the box) adds a server-side combined answer (`all-voices` only); `judge` names the seat that
+    writes it. `safety_mode` and `timeout_s` apply to every voice; one failing voice is a failed result,
+    never an aborted panel. `role` names a persona (see `list_roles`) prepended to the prompt every voice
+    receives. `mode="async"` runs the panel as a background job and returns a `job_id` (poll with
+    `job_status` / `job_result`); `mode="sync"` awaits it.
     """
     return await _guarded(
         consensus_tool(
             get_app(),
             prompt=prompt,
             targets=targets,
+            strategy=strategy,
+            verdict_schema=verdict_schema,
+            judge=judge,
+            stances=stances,
+            expand_all=expand_all,
             working_dir=working_dir,
             files=files,
             safety_mode=safety_mode,
+            synthesize=synthesize,
             timeout_s=timeout_s,
             role=role,
             mode=mode,

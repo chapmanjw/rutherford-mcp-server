@@ -11,12 +11,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import ValidationError
+
 from ..acp.descriptors import DescriptorRegistry
-from ..domain.enums import DelegationMode, SafetyMode
+from ..domain.enums import DelegationMode, SafetyMode, Stance, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import Target
 from ..services.roles import RoleStore
+
+#: The per-target metadata keys read from a target dict, beyond ``cli`` and ``model``.
+_TARGET_META_KEYS = ("role", "label", "weight", "parity", "stance")
 
 
 def parse_safety_mode(value: str | SafetyMode) -> SafetyMode:
@@ -59,6 +64,38 @@ def resolve_run_mode(value: str | DelegationMode) -> bool:
         raise RutherfordError(ErrorCode.INVALID_INPUT, f"unknown mode {value!r}; choose one of: {options}") from None
 
 
+def parse_strategy(value: str | Strategy) -> Strategy:
+    """Coerce a consensus-strategy string to :class:`Strategy`, or raise ``INVALID_INPUT``."""
+    if isinstance(value, Strategy):
+        return value
+    try:
+        return Strategy(value)
+    except ValueError:
+        options = ", ".join(strategy.value for strategy in Strategy)
+        raise RutherfordError(
+            ErrorCode.INVALID_INPUT, f"unknown strategy {value!r}; choose one of: {options}"
+        ) from None
+
+
+def parse_stances(values: list[str] | None) -> list[Stance] | None:
+    """Coerce a list of stance strings to :class:`Stance` values, or raise ``INVALID_INPUT``."""
+    if values is None:
+        return None
+    stances: list[Stance] = []
+    for value in values:
+        if isinstance(value, Stance):
+            stances.append(value)
+            continue
+        try:
+            stances.append(Stance(value))
+        except ValueError:
+            options = ", ".join(stance.value for stance in Stance)
+            raise RutherfordError(
+                ErrorCode.INVALID_INPUT, f"unknown stance {value!r}; choose one of: {options}"
+            ) from None
+    return stances
+
+
 def ensure_known_agent(descriptors: DescriptorRegistry, agent_id: str) -> None:
     """Raise ``UNKNOWN_TARGET`` if ``agent_id`` is not a registered ACP agent."""
     if not descriptors.has(agent_id):
@@ -67,15 +104,25 @@ def ensure_known_agent(descriptors: DescriptorRegistry, agent_id: str) -> None:
 
 
 def as_target(value: Target | dict[str, Any] | str) -> Target:
-    """Coerce a target into a :class:`Target`: a ``Target``, a ``cli`` / ``cli:model`` string, or a dict
-    with ``cli`` (required) and optional ``model``. Raises ``INVALID_INPUT`` on a malformed target."""
+    """Coerce a target into a :class:`Target`.
+
+    Accepts a :class:`Target`; a ``cli`` / ``cli:model`` string; or a dict with ``cli`` (required),
+    ``model``, and the optional per-seat metadata ``role`` / ``label`` / ``weight`` / ``parity`` /
+    ``stance``. An invalid metadata value (e.g. an unknown stance, a negative weight) raises
+    ``INVALID_INPUT``.
+    """
     if isinstance(value, Target):
         return value
     if isinstance(value, dict):
         cli = value.get("cli")
         if not cli:
             raise RutherfordError(ErrorCode.INVALID_INPUT, "each target needs a 'cli' field")
-        return Target(cli=str(cli), model=value.get("model"))
+        fields: dict[str, Any] = {"cli": str(cli), "model": value.get("model")}
+        fields.update({key: value[key] for key in _TARGET_META_KEYS if key in value})
+        try:
+            return Target(**fields)
+        except ValidationError as exc:
+            raise RutherfordError(ErrorCode.INVALID_INPUT, f"invalid target {value!r}: {exc}") from exc
     if isinstance(value, str):
         cli, _, model = value.partition(":")
         if not cli:

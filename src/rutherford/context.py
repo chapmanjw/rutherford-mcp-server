@@ -78,7 +78,7 @@ def build_app_context(
     resolved_config = config if config is not None else load_config()
     resolved_descriptors = descriptors if descriptors is not None else build_registry(resolved_config)
     delegation = DelegationService(resolved_descriptors, resolved_config)
-    consensus = ConsensusService(delegation, resolved_config)
+    consensus = ConsensusService(delegation, resolved_descriptors, resolved_config)
     debate = DebateService(resolved_descriptors, resolved_config)
     jobs = JobStore(max_jobs=resolved_config.max_jobs, job_ttl_s=resolved_config.job_ttl_s)
     roles = RoleStore(role_dirs=resolved_config.role_dirs)

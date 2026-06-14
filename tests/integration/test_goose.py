@@ -16,8 +16,8 @@ from rutherford.acp.descriptors import default_registry
 from rutherford.acp.permission import PermissionPolicy
 from rutherford.acp.session import run_acp_turn
 from rutherford.config.schema import RutherfordConfig
-from rutherford.domain.enums import SafetyMode
-from rutherford.domain.models import ConsensusRequest, DebateRequest, Target
+from rutherford.domain.enums import SafetyMode, Strategy
+from rutherford.domain.models import ConsensusRequest, ConsensusResult, DebateRequest, StrategyResult, Target
 from rutherford.services.consensus import ConsensusService
 from rutherford.services.debate import DebateService
 from rutherford.services.delegation import DelegationService
@@ -91,16 +91,53 @@ async def test_second_wave_agent_answers(agent_id: str) -> None:
     assert "42" in result.text
 
 
+def _consensus_service(config: RutherfordConfig | None = None) -> ConsensusService:
+    resolved = config or RutherfordConfig()
+    registry = default_registry()
+    return ConsensusService(DelegationService(registry, resolved), registry, resolved)
+
+
 async def test_goose_consensus_two_voices() -> None:
-    config = RutherfordConfig()
-    service = ConsensusService(DelegationService(default_registry(), config), config)
     request = ConsensusRequest(
         targets=[Target(cli="goose"), Target(cli="goose")], prompt=_PROMPT, working_dir=str(Path.cwd()), timeout_s=120.0
     )
-    result = await service.consensus(request)
+    result = await _consensus_service().consensus(request)
+    assert isinstance(result, ConsensusResult)  # the all-voices path returns every voice
+    voices = result.voices
+    assert len(voices) == 2
+    assert any(voice.ok for voice in voices), f"all voices failed: {[v.error for v in voices]}"
+    assert all("42" in voice.text for voice in voices if voice.ok)
+
+
+_VERDICT_PROMPT = (
+    "Is 17 + 25 equal to 42? Answer with a final line that is exactly 'VERDICT: yes' if it is equal, "
+    "or exactly 'VERDICT: no' if it is not."
+)
+
+
+async def test_goose_consensus_majority_strategy_live() -> None:
+    """A real majority-strategy consensus across two goose voices on a crisp yes/no verdict prompt.
+
+    Drives the full aggregating path against a real agent: each voice answers with a VERDICT line, the
+    strategy extracts each verdict and reduces the panel to one outcome. Asserts a real StrategyResult
+    with a sensible outcome (a majority on the true proposition, or no_majority/split if a voice drifts).
+    """
+    request = ConsensusRequest(
+        targets=[Target(cli="goose"), Target(cli="goose")],
+        prompt=_VERDICT_PROMPT,
+        strategy=Strategy.MAJORITY,
+        working_dir=str(Path.cwd()),
+        timeout_s=120.0,
+    )
+    result = await _consensus_service().consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.strategy is Strategy.MAJORITY
     assert len(result.voices) == 2
-    assert any(voice.ok for voice in result.voices), f"all voices failed: {[v.error for v in result.voices]}"
-    assert all("42" in voice.text for voice in result.voices if voice.ok)
+    parsed = [voice for voice in result.voices if voice.verdict is not None]
+    assert parsed, f"no voice produced a parseable verdict: {[(v.label, v.text[:80]) for v in result.voices]}"
+    assert result.outcome in {"majority", "no_majority", "no_quorum"}
+    if result.outcome == "majority":
+        assert result.decision == "yes"
 
 
 async def test_goose_debate_persistent_sessions() -> None:

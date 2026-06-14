@@ -8,6 +8,40 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Consensus aggregation over ACP, ported from v2. `consensus` regains the capabilities the v3 fan-out had
+  dropped, all behaviorally equivalent to v2 and computed as pure post-processing over the voices the ACP
+  turns already return:
+  - Strategies. A `strategy` other than `all-voices` (`unanimous` | `majority` | `plurality` | `weighted`
+    | `parity-pair`) asks each voice for a verdict and reduces the panel to one outcome
+    (`StrategyResult`), instead of returning every voice. `majority` / `weighted` require a *true* >50%
+    share of all eligible voices (a failed or unparseable voice stays in the denominator, so an outcome
+    cannot be certified off the one voice that answered); `plurality` is the lenient top-scorer rule (a
+    top tie is `tied`); `unanimous` needs every voice to weigh in and agree (a failure vetoes it, `split`);
+    `parity-pair` compares the proposer against every parity counterweight and escalates on disagreement.
+    Outcomes: `unanimous` / `majority` / `no_majority` / `plurality` / `tied` / `split` / `agree` /
+    `escalate` / `no_quorum`. `all-voices` still returns the every-voice shape.
+  - Verdict extraction. Each voice's verdict is read the v2 way — the last `VERDICT: <token>` line
+    (case-insensitive) by default, or the last JSON object carrying a non-empty `verdict` field when a
+    `verdict_schema` is given (a balanced-brace scan, so a trailing footer object or a truncated array
+    cannot steal the vote). A voice with no extractable verdict is `unparseable` — recorded with a reason,
+    never silently dropped, and kept in the denominator.
+  - Server-side synthesis. `synthesize` (tri-state, defaulting to `synthesize_default`, off out of the
+    box) runs a combining pass for an `all-voices` panel on a fresh read-only ACP turn — the nominated
+    `judge` if named, else the first successful voice — and records `synthesis` / `synthesis_by`.
+  - Diversity scoring. A `DiversityReport` is computed from the answering voices' provenance —
+    answered-voice count, distinct models, distinct providers, unknowns — and flags `low_diversity` when
+    at least two voices resolve but collapse below `min_distinct` distinct models *or* providers.
+  - `min_quorum` / `no_quorum`. An aggregating strategy with fewer than `min_quorum` usable (ok +
+    parseable) voices returns `no_quorum` instead of a decision.
+  - `expand_all` / auto-panel. Omit `targets`, pass an empty list, pass the sentinel `"all"`, or set
+    `expand_all=true` to fan out to every registered agent (capped at `max_targets`), with each excluded
+    agent recorded in `skipped` with its reason.
+  - Per-seat `Target` metadata. A `{cli, model}` target may carry `role` (a per-seat role override),
+    `weight` (for `weighted`), `parity` / `stance` (for `parity-pair` and steering); the strategies read
+    the seat's metadata even though the ACP turn rebuilds the result's bare `(cli, model)` target.
+  - The dropped `consensus` parameters are back: `strategy`, `verdict_schema`, `judge`, `stances`,
+    `synthesize`, and `expand_all`, alongside the existing ones. `mode="async"` runs the same aggregating
+    path off the request path.
 - An `activity` tool: a focused snapshot of the background work in flight right now. Where `list_jobs`
   enumerates every tracked job of every status, `activity` returns only the running and pending jobs —
   `{active: [...], count}`, each row `{job_id, tool, status, summary, started_at, elapsed_s}` with a live
