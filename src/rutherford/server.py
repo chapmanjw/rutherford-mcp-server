@@ -29,6 +29,7 @@ from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
 from .tools.jobs import cancel_job_tool, job_result_tool, job_status_tool, list_jobs_tool
 from .tools.roles import list_roles_tool
+from .tools.setup import setup_tool
 
 mcp: FastMCP = FastMCP(
     "rutherford",
@@ -38,7 +39,8 @@ mcp: FastMCP = FastMCP(
         "Delegations default to the configured default_safety_mode (read_only out of the box); write and "
         "yolo are explicit opt-in behind a trusted workspace. Long tasks can run as background jobs "
         "(mode=async), enumerated with `list_jobs`, polled with `job_status` / `job_result`, and cancelled "
-        "with `cancel_job`."
+        "with `cancel_job`. First time here? `setup` shows where config lives and scaffolds a starter "
+        "config.toml."
     ),
 )
 
@@ -198,6 +200,20 @@ async def list_roles() -> str:
     `role_dirs` directory can add or override one.
     """
     return await _guarded(list_roles_tool(get_app()))
+
+
+@mcp.tool
+async def setup(scope: str = "project", write: bool = False, trust_workspace: bool = False) -> str:
+    """Show where config lives and scaffold a starter `config.toml`; the first-run helper.
+
+    `scope` is `project` (`<cwd>/.rutherford/config.toml`) or `global` (the platform config dir's
+    `config.toml`). It returns the proposed starter `content` (the most useful settings at their effective
+    defaults) and the resolved `path`, plus a snapshot of the agents you already have. Pass `write=true` to
+    create the file -- it never overwrites an existing one (`already_exists=true`, `written=false`).
+    `trust_workspace=true` adds the current directory to `trusted_workspaces` so write/yolo delegations are
+    permitted there.
+    """
+    return await _guarded(setup_tool(get_app(), scope=scope, write=write, trust_workspace=trust_workspace))
 
 
 @mcp.tool

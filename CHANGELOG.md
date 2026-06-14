@@ -8,6 +8,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- A `setup` first-run helper (the "good duck" getting-started surface). It resolves the config path for a
+  scope — `project` (`<cwd>/.rutherford/config.toml`) or `global` (the platform config dir's
+  `config.toml`) — and returns a sensible commented starter `config.toml` at the effective defaults
+  (`default_safety_mode`, `default_timeout_s`, `auto_detect_local_models`, `max_targets`, a commented-out
+  `[agents.local-goose]` local-model example, and a `trusted_workspaces` line), plus a snapshot of the
+  agents already registered. With `write=true` it creates the file but never clobbers an existing one
+  (`already_exists=true`, `written=false`); with `write=false` (default) it returns the proposed `content`
+  and `path` without touching disk. `trust_workspace=true` adds the current directory to
+  `trusted_workspaces`. The generated TOML round-trips through `tomllib` and validates against
+  `RutherfordConfig`. An invalid scope fails on the request path with `INVALID_INPUT`.
 - Role personas (the "good duck" role surface, over the ACP core). A `role="<id>"` argument on
   `delegate` / `consensus` / `debate` prepends a reusable system prompt to the caller's task (the role
   text, a `---` delimiter, then the prompt). Five substantive built-ins ship as package data:
