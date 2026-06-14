@@ -98,6 +98,7 @@ class ACPSession:
         effort: Effort | None = None,
         base_depth: int = 0,
         parent_run_id: str | None = None,
+        sandbox_root: str | None = None,
     ) -> None:
         self._descriptor = descriptor
         self._policy = policy
@@ -120,8 +121,14 @@ class ACPSession:
         self._effort = effort
         self._override = effort_overrides(descriptor, effort, model=resolved_model)
         self._target = Target(cli=descriptor.id, model=self._override.model or resolved_model)
+        # The FileGateway / TerminalBroker confinement root for a mutating sandbox (the worktree / temp copy);
+        # None for a non-sandboxed session, where reads are served anywhere and terminal stays denied. Resolved
+        # so the client's path-escape guard compares against a canonical absolute root.
+        self._sandbox_root = str(Path(sandbox_root).resolve()) if sandbox_root is not None else None
         self._journal = EventJournal()
-        self._client = RutherfordACPClient(journal=self._journal, policy=policy, cwd=self._cwd)
+        self._client = RutherfordACPClient(
+            journal=self._journal, policy=policy, cwd=self._cwd, sandbox_root=self._sandbox_root
+        )
         self._stack = AsyncExitStack()
         self._conn: ClientSideConnection | None = None
         self._session_id: str | None = None
@@ -354,6 +361,10 @@ class ACPSession:
         """
         pid, self._pid = self._pid, None
         descendants = await asyncio.to_thread(snapshot_descendants, pid) if pid is not None else []
+        # Tear down any brokered terminal the agent left running BEFORE the transport closes, so a write-mode
+        # command (a build/test the agent kicked off) is killed and reaped rather than orphaned in the sandbox.
+        with contextlib.suppress(Exception):
+            await self._client.shutdown_terminals()
         try:
             await self._stack.aclose()
         finally:
@@ -373,13 +384,15 @@ async def run_acp_turn(
     effort: Effort | None = None,
     base_depth: int = 0,
     parent_run_id: str | None = None,
+    sandbox_root: str | None = None,
 ) -> DelegationResult:
     """Open a one-shot session, run a single prompt turn, and return the normalized result.
 
     The spawn-per-delegation path for ``delegate`` / ``consensus``. ``effort`` is the reasoning-effort tier to
     apply over ACP (per-agent env / args / a model-id rewrite); it is echoed on the result as ``effort`` and
     ``effort_applied`` (F8a, 2-L). ``base_depth`` / ``parent_run_id`` are the N1 lineage signal layered onto
-    the agent's environment so a Rutherford-driving-Rutherford chain is bounded. Never raises for an
+    the agent's environment so a Rutherford-driving-Rutherford chain is bounded. ``sandbox_root`` confines the
+    agent's file/terminal callbacks to an isolated worktree / copy for a mutating run. Never raises for an
     operational failure; a handshake/spawn failure becomes a failed :class:`DelegationResult`
     (re-execution-safe), still carrying the requested effort.
     """
@@ -392,6 +405,7 @@ async def run_acp_turn(
         effort=effort,
         base_depth=base_depth,
         parent_run_id=parent_run_id,
+        sandbox_root=sandbox_root,
     )
     try:
         async with session:

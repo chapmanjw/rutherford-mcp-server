@@ -14,20 +14,26 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
 from ..acp.cooldown import CooldownTracker
-from ..acp.descriptors import DescriptorRegistry
+from ..acp.descriptors import AgentDescriptor, DescriptorRegistry
 from ..acp.failures import indicates_unhealthy, is_model_unavailable
 from ..acp.permission import PermissionPolicy
+from ..acp.sandbox import SandboxManager
 from ..acp.session import run_acp_turn
 from ..config.schema import RutherfordConfig
-from ..domain.enums import ActivityEventKind, Effort, ReexecutionSafety, is_mutating
+from ..domain.enums import ActivityEventKind, Effort, ReexecutionSafety, is_mutating, runs_sandboxed
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import ActivityEvent, DelegationRequest, DelegationResult, ErrorInfo, Target
 from ..runtime.depth import ensure_within_depth
+
+#: How long the ``verify_read_only`` git fingerprint may take before it is abandoned (its check skipped). A
+#: fingerprint is two cheap git reads; the bound exists only so a wedged git can never stall a delegation.
+_FINGERPRINT_TIMEOUT_S = 30.0
 
 #: The structured live-activity sink (N1, item 3): lifecycle :class:`ActivityEvent`s a service emits as a run
 #: progresses (a voice starting/finishing, a panel boundary, a budget cut). A sync tool maps each to an MCP
@@ -121,6 +127,10 @@ class DelegationService:
             window_s=config.cooldown_window_s,
             duration_s=config.cooldown_duration_s,
         )
+        #: Builds the isolated execution root (git worktree, or temp copy for a non-git tree) a mutating
+        #: delegation runs in, so an agent's write/yolo/propose edits land in a throwaway tree and only a
+        #: reviewed diff is applied back. Stateless across calls.
+        self._sandbox = SandboxManager()
 
     @property
     def semaphore(self) -> asyncio.Semaphore:
@@ -219,31 +229,112 @@ class DelegationService:
     async def _run_turn(self, req: DelegationRequest, base_depth: int) -> DelegationResult:
         """Run one ACP turn for ``req`` (gated on the semaphore) and feed the cooldown tracker its health.
 
-        The single-turn primitive the primary and every fallback re-run bottom out in. Recording health here
-        means each agent the chain touches counts its OWN turn toward (or clears) its OWN bench -- a benched
-        alternate is recorded against itself, not the primary.
+        The single-turn primitive the primary and every fallback re-run bottom out in. A mutating mode
+        (``propose`` / ``write`` / ``yolo``) with a working directory runs inside an isolated SANDBOX -- the
+        agent never touches the user's tree; ``propose`` discards the worktree and returns the diff, ``write``
+        / ``yolo`` apply the diff back. A ``read_only`` (or un-sandboxable) run executes directly in ``cwd``,
+        optionally fingerprinted by ``verify_read_only``. Recording health here means each agent the chain
+        touches counts its OWN turn toward (or clears) its OWN bench.
         """
         descriptor = self._descriptors.get(req.target.cli)
         cwd = req.working_dir or str(Path.cwd())
         timeout = req.timeout_s or self._config.timeout_for(req.target.cli) or self._config.default_timeout_s
-        policy = PermissionPolicy(mode=req.safety_mode)
         prompt = _compose_prompt(req.prompt, req.files)
-        # Gate the ACP turn on the global concurrency semaphore so a wide panel cannot launch more than
-        # ``max_concurrency`` live sessions at once. Held only around the turn, not the pure guards above.
+        if runs_sandboxed(req.safety_mode) and req.working_dir:
+            result = await self._run_sandboxed(req, descriptor, prompt, cwd, timeout_s=timeout, base_depth=base_depth)
+        else:
+            result = await self._run_direct(req, descriptor, prompt, cwd, timeout_s=timeout, base_depth=base_depth)
+        result.delegation_call_count = 1
+        self._record_health(req.target.cli, result)
+        return result
+
+    async def _run_direct(
+        self,
+        req: DelegationRequest,
+        descriptor: AgentDescriptor,
+        prompt: str,
+        cwd: str,
+        *,
+        timeout_s: float,
+        base_depth: int,
+    ) -> DelegationResult:
+        """Run the turn directly in ``cwd`` (no sandbox), with the optional ``verify_read_only`` fingerprint.
+
+        The path for ``read_only`` (and any mutating mode with no ``working_dir`` to isolate, where the policy
+        already denies writes). When ``verify_read_only`` is on and ``cwd`` is a git repo, the tree under it is
+        fingerprinted before and after a SUCCESSFUL turn; a change fails the result with ``READONLY_VIOLATED``
+        -- the agent's read-only promise made a checked invariant rather than a trusted one.
+        """
+        policy = PermissionPolicy(mode=req.safety_mode, sandboxed=False)
+        verify = self._config.verify_read_only and not is_mutating(req.safety_mode)
+        before = _git_fingerprint(cwd) if verify else None
         async with self._semaphore:
             result = await run_acp_turn(
                 descriptor,
                 prompt,
                 policy=policy,
                 cwd=cwd,
-                timeout_s=timeout,
+                timeout_s=timeout_s,
                 model=req.target.model,
                 effort=self.resolve_effort(req.target.cli, req.effort),
                 base_depth=base_depth,
                 parent_run_id=req.parent_run_id,
             )
-        result.delegation_call_count = 1
-        self._record_health(req.target.cli, result)
+        if verify and result.ok and before is not None:
+            after = _git_fingerprint(cwd)
+            if after is not None and after != before:
+                return _readonly_violated(req, result)
+        return result
+
+    async def _run_sandboxed(
+        self,
+        req: DelegationRequest,
+        descriptor: AgentDescriptor,
+        prompt: str,
+        cwd: str,
+        *,
+        timeout_s: float,
+        base_depth: int,
+    ) -> DelegationResult:
+        """Run a mutating turn inside an isolated worktree / temp copy; capture (and for write/yolo apply) the diff.
+
+        The agent's spawn cwd, ACP ``session/new`` cwd, and file/terminal confinement root are all the sandbox
+        root, so its edits land in the throwaway tree, never the user's. After the turn the changed set is
+        computed: ``propose`` discards it (the real tree is untouched, the diff is the deliverable); ``write`` /
+        ``yolo`` apply it back to ``working_dir``. The sandbox is always cleaned up in the ``finally``, and the
+        agent's process tree is reaped by the session teardown. A sandbox setup failure (e.g. a non-git tree
+        over the copy guard) becomes a failed result rather than an unsandboxed run -- write mode never silently
+        runs against the user's tree.
+        """
+        try:
+            sandbox = await asyncio.to_thread(self._sandbox.open, cwd)
+        except RutherfordError as exc:
+            return _fail(req, exc.code, exc.message, details=exc.details)
+        policy = PermissionPolicy(mode=req.safety_mode, sandboxed=True)
+        try:
+            async with self._semaphore:
+                result = await run_acp_turn(
+                    descriptor,
+                    prompt,
+                    policy=policy,
+                    cwd=sandbox.root,
+                    timeout_s=timeout_s,
+                    model=req.target.model,
+                    effort=self.resolve_effort(req.target.cli, req.effort),
+                    base_depth=base_depth,
+                    parent_run_id=req.parent_run_id,
+                    sandbox_root=sandbox.root,
+                )
+            if result.ok:
+                try:
+                    outcome = await asyncio.to_thread(sandbox.finish, req.safety_mode)
+                except RutherfordError as exc:
+                    return _fail(req, exc.code, f"sandbox apply failed: {exc.message}", details=exc.details)
+                result.changed_files = outcome.changed_files
+                result.diff = outcome.diff or None
+                result.changes_applied = outcome.applied
+        finally:
+            await asyncio.to_thread(sandbox.cleanup)
         return result
 
     def _emit_started(
@@ -440,3 +531,66 @@ def _fail(
         error=ErrorInfo(code=code, message=message, details=details),
         safety_mode=req.safety_mode,
     )
+
+
+def _readonly_violated(req: DelegationRequest, result: DelegationResult) -> DelegationResult:
+    """Turn an otherwise-ok read-only/propose result into a ``READONLY_VIOLATED`` failure (verify_read_only).
+
+    The turn ran clean but the git fingerprint before/after the working_dir differs, so the agent broke its
+    read-only promise. The successful answer is discarded for a loud failure -- a read-only delegation that
+    mutated the tree is not a result to trust. ``SIDE_EFFECTED`` re-execution-safety records that a side effect
+    occurred (never silently re-run elsewhere).
+    """
+    return DelegationResult(
+        target=result.target,
+        ok=False,
+        duration_s=result.duration_s,
+        error=ErrorInfo(
+            code=ErrorCode.READONLY_VIOLATED,
+            message=f"{req.safety_mode.value} delegation to {req.target.cli} modified its git working tree "
+            "(verify_read_only); the agent did not keep the read-only promise",
+            reexecution_safety=ReexecutionSafety.SIDE_EFFECTED,
+        ),
+        cost=result.cost,
+        safety_mode=req.safety_mode,
+        provenance=result.provenance,
+        observed_peak_agents=result.observed_peak_agents,
+    )
+
+
+def _git_fingerprint(working_dir: str) -> str | None:
+    """A fingerprint of the git tree under ``working_dir`` (status + staged/unstaged diffs), or ``None``.
+
+    Combines ``git status --porcelain`` (catches a new, deleted, or renamed path -- including a gitignored
+    write, via ``--ignored=matching``) with the unstaged and staged diffs (catches an in-place content edit to
+    an already-tracked, already-dirty file that status alone would miss), all SCOPED to ``working_dir`` so an
+    unrelated change elsewhere in the repo is not mis-attributed. ``None`` when ``working_dir`` is not a git
+    repo or git is unavailable -- the caller then skips the check rather than failing a legitimate run.
+    """
+    status = _git_read(working_dir, "status", "--porcelain", "--ignored=matching", "--", ".")
+    if status is None:
+        return None
+    unstaged = _git_read(working_dir, "diff", "--", ".") or ""
+    staged = _git_read(working_dir, "diff", "--cached", "--", ".") or ""
+    return f"{status}\n--unstaged--\n{unstaged}\n--staged--\n{staged}"
+
+
+def _git_read(working_dir: str, *args: str) -> str | None:
+    """Run a read-only git subcommand in ``working_dir``; return stdout, or ``None`` on any failure.
+
+    Best-effort and never raising: a non-git dir, a missing git, or a non-zero exit all map to ``None`` so the
+    ``verify_read_only`` fingerprint degrades to "could not check" rather than failing a clean delegation.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "-C", working_dir, *args],
+            capture_output=True,
+            text=True,
+            timeout=_FINGERPRINT_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout

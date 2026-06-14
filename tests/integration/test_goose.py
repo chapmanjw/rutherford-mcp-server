@@ -8,6 +8,7 @@ a real agent, not the fake one. Slow (real model calls); deselected by default.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -337,3 +338,75 @@ async def test_goose_plan_live() -> None:
     assert result.ok is True, f"plan failed: {result.error}"
     assert result.safety_mode is SafetyMode.READ_ONLY  # planning is clamped to read-only
     assert result.text.strip(), "the plan produced no text"
+
+
+# --- write/propose sandbox: a real goose mutating a fresh temp git repo ------
+
+
+def _git(path: Path, *args: str) -> str:
+    """Run a git command in ``path`` (a sync helper, so async tests do not trip the blocking-call lint)."""
+    return subprocess.run(["git", *args], cwd=path, capture_output=True, text=True, check=True).stdout
+
+
+def _temp_git_repo(path: Path) -> None:
+    """Initialise a temp git repo with one commit, the trusted workspace a real write delegation runs in."""
+    _git(path, "init", "-q")
+    _git(path, "config", "user.email", "t@example.com")
+    _git(path, "config", "user.name", "Rutherford Test")
+    (path / "README.md").write_text("seed\n", encoding="utf-8")
+    _git(path, "add", "-A")
+    _git(path, "commit", "-q", "-m", "seed")
+
+
+async def test_goose_write_mode_creates_a_file_in_the_real_repo(tmp_path: Path) -> None:
+    """A real WRITE-mode delegate to goose in a fresh temp git repo creates hello.txt and applies it back.
+
+    The live proof that an agent can do real write work safely over ACP: goose runs in an isolated worktree,
+    its edit is computed as a diff and applied back to the real repo, ``changed_files`` lists the file, and the
+    user's working_dir ends up holding exactly the content asked for. ``trust_workspace=True`` opts the temp
+    repo past the trusted-workspace gate.
+    """
+    _temp_git_repo(tmp_path)
+    service = DelegationService(default_registry(), RutherfordConfig())
+    request = DelegationRequest(
+        target=Target(cli="goose"),
+        prompt="Create a file named hello.txt containing exactly this text and nothing else: hello world",
+        working_dir=str(tmp_path),
+        safety_mode=SafetyMode.WRITE,
+        trust_workspace=True,
+        timeout_s=180.0,
+    )
+    result = await service.delegate(request)
+    assert result.ok is True, f"goose write failed: {result.error}"
+    landed = tmp_path / "hello.txt"
+    assert landed.is_file(), f"hello.txt did not land in the real repo; changed_files={result.changed_files}"
+    assert "hello world" in landed.read_text(encoding="utf-8")
+    assert result.changed_files is not None and "hello.txt" in result.changed_files
+    assert result.changes_applied is True
+
+
+async def test_goose_propose_mode_leaves_the_real_repo_unchanged(tmp_path: Path) -> None:
+    """A real PROPOSE-mode delegate to goose returns a patch / changed_files but never touches the real repo.
+
+    The agent edits a throwaway worktree; Rutherford captures the diff and discards the worktree, so the user's
+    working_dir is byte-for-byte unchanged. Asserts the proposed file is NOT on disk and the git tree is clean,
+    while the result still carries the proposed change.
+    """
+    _temp_git_repo(tmp_path)
+    service = DelegationService(default_registry(), RutherfordConfig())
+    request = DelegationRequest(
+        target=Target(cli="goose"),
+        prompt="Create a file named proposal.txt containing exactly this text and nothing else: a proposal",
+        working_dir=str(tmp_path),
+        safety_mode=SafetyMode.PROPOSE,
+        trust_workspace=True,
+        timeout_s=180.0,
+    )
+    result = await service.delegate(request)
+    assert result.ok is True, f"goose propose failed: {result.error}"
+    # The real repo is untouched: the proposed file is not on disk and the tree is clean.
+    assert not (tmp_path / "proposal.txt").exists(), "propose mode wrote to the real repo"
+    assert _git(tmp_path, "status", "--porcelain").strip() == "", "propose left the real tree dirty"
+    assert result.changes_applied is False  # nothing applied
+    # The proposal is still captured (changed_files and/or a diff), so the work was not lost.
+    assert (result.changed_files and "proposal.txt" in result.changed_files) or (result.diff and result.diff.strip())

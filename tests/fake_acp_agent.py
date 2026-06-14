@@ -17,6 +17,15 @@ agent stream a short partial line and then sleep for ``<seconds>`` before finish
 shorter than the sleep cuts the voice in flight (and harvests the streamed partial). A bare ``SLEEP`` (no
 ``=``) sleeps a long default. The partial is streamed as an ``agent_message_chunk`` BEFORE the sleep, so a
 cut voice's :attr:`~rutherford.acp.session.ACPSession.partial_text` is non-empty.
+
+To drive the WRITE/PROPOSE sandbox a test needs the agent to actually route a file write (or run a command)
+through the ACP client callbacks. A ``WRITE=<path>:<content>`` token makes the agent call ``fs/write`` with
+that path and content (the content runs to end-of-line, with ``\\n`` decoded to a newline), so the sandbox
+path -- worktree create, diff, apply, the FileGateway path-escape guard -- is exercised without a real model.
+A ``RUN=<command>`` token makes the agent spawn a terminal for that command and wait for its exit, so the
+TerminalBroker (write/yolo) or its denial (read_only/propose) is exercised. The agent answers with what
+happened (``wrote <path>`` / ``write denied`` / ``ran <cmd> exit <code>`` / ``terminal denied``), so a test
+can assert the callback's outcome from the answer text too.
 """
 
 from __future__ import annotations
@@ -25,7 +34,7 @@ import asyncio
 import os
 from typing import Any
 
-from acp import PROTOCOL_VERSION, run_agent
+from acp import PROTOCOL_VERSION, RequestError, run_agent
 from acp.helpers import update_agent_message_text, update_agent_thought_text
 from acp.schema import InitializeResponse, ModelInfo, NewSessionResponse, PromptResponse, SessionModelState
 
@@ -97,6 +106,36 @@ def _sleep_seconds(text: str) -> float | None:
     return 30.0
 
 
+def _write_request(text: str) -> tuple[str, str] | None:
+    """The ``(path, content)`` a ``WRITE=<path>:<content>`` token dictates, or ``None`` when absent.
+
+    The token runs to end-of-line; the first ``:`` splits path from content (so a Windows path's drive colon
+    is not a separator -- callers pass a relative path), and a literal ``\\n`` in the content is decoded to a
+    real newline so a test can plant a multi-line file on one prompt line.
+    """
+    marker = "WRITE="
+    start = text.find(marker)
+    if start == -1:
+        return None
+    rest = text[start + len(marker) :]
+    line, _, _ = rest.partition("\n")
+    path, sep, content = line.partition(":")
+    if not sep:
+        return None
+    return path.strip(), content.replace("\\n", "\n")
+
+
+def _run_command(text: str) -> str | None:
+    """The command a ``RUN=<command>`` token dictates (the rest of that line), or ``None`` when absent."""
+    marker = "RUN="
+    start = text.find(marker)
+    if start == -1:
+        return None
+    rest = text[start + len(marker) :]
+    line, _, _ = rest.partition("\n")
+    return line.strip() or None
+
+
 def _advertised_models() -> SessionModelState | None:
     """The models this fake advertises at ``new_session``, from ``RUTHERFORD_FAKE_MODELS`` (comma-separated).
 
@@ -159,6 +198,16 @@ class FakeAgent:
             # RUTHERFORD_LINEAGE into the spawned agent. Returns before any sleep -- it is a pure env echo.
             await self._client.session_update(session_id, update_agent_message_text(env_answer))
             return PromptResponse(stop_reason="end_turn")
+        write = _write_request(text)
+        if write is not None:
+            outcome = await self._do_write(session_id, *write)
+            await self._client.session_update(session_id, update_agent_message_text(outcome))
+            return PromptResponse(stop_reason="end_turn")
+        run = _run_command(text)
+        if run is not None:
+            ran = await self._do_run(session_id, run)
+            await self._client.session_update(session_id, update_agent_message_text(ran))
+            return PromptResponse(stop_reason="end_turn")
         sleep_for = _sleep_seconds(text)
         if sleep_for is not None:
             # Stream a partial answer BEFORE the long sleep, so a panel deadline that cuts this voice has a
@@ -171,6 +220,29 @@ class FakeAgent:
         await self._client.session_update(session_id, update_agent_thought_text("thinking"))
         await self._client.session_update(session_id, update_agent_message_text(answer))
         return PromptResponse(stop_reason="end_turn")
+
+    async def _do_write(self, session_id: str, path: str, content: str) -> str:
+        """Route a ``fs/write`` through the ACP client; answer with what happened (wrote / denied / escaped)."""
+        try:
+            await self._client.write_text_file(content=content, path=path, session_id=session_id)
+        except RequestError as exc:
+            return f"write denied: {exc}"
+        return f"wrote {path}"
+
+    async def _do_run(self, session_id: str, command: str) -> str:
+        """Route a terminal command through the ACP client; answer with the exit code (or the denial reason)."""
+        parts = command.split()
+        head, args = parts[0], parts[1:]
+        try:
+            created = await self._client.create_terminal(command=head, session_id=session_id, args=args)
+            exit_resp = await self._client.wait_for_terminal_exit(
+                session_id=session_id, terminal_id=created.terminal_id
+            )
+            output = await self._client.terminal_output(session_id=session_id, terminal_id=created.terminal_id)
+            await self._client.release_terminal(session_id=session_id, terminal_id=created.terminal_id)
+        except RequestError as exc:
+            return f"terminal denied: {exc}"
+        return f"ran {command} exit {exit_resp.exit_code} output {output.output.strip()[:80]}"
 
 
 async def _main() -> None:

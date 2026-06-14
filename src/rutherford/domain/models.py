@@ -451,12 +451,22 @@ class DelegationResult(BaseModel):
     #: The effective provider/model/CLI-version that actually answered (F3). ``None`` when none could
     #: be determined, so the field is absent from the wire rather than reported as a guess.
     provenance: Provenance | None = None
-    #: The git working-tree changes under ``working_dir`` captured *after* a mutating (write/yolo) run,
-    #: best-effort and only when the run is **persisted** (it feeds the run record). The jobs directory
-    #: is excluded. ``None`` when not captured (read-only run, ephemeral run, not a git repo, or git
-    #: unavailable). Caveat: in a tree that was already dirty before the run, this reflects the current
-    #: worktree state, not strictly this run's delta -- it is "what changed", not a proven attribution.
+    #: The files a mutating (``write`` / ``propose`` / ``yolo``) run changed, computed from the isolated
+    #: SANDBOX the agent ran in (an ephemeral git worktree, or a temp copy for a non-git working_dir) -- the
+    #: created and edited paths, repo-relative. Sound per-delegation: the sandbox starts clean from the repo's
+    #: ``HEAD``, so this is strictly this run's delta, not the current dirty state of a shared tree. For
+    #: ``write`` / ``yolo`` these are the files applied back to the real ``working_dir``; for ``propose`` they
+    #: are what the discarded worktree contained (nothing was applied). ``None`` for a read-only run.
     changed_files: list[str] | None = None
+    #: The unified diff a sandboxed mutating run produced (the worktree's ``git diff --cached --binary``, or a
+    #: text diff for a non-git copy). For ``propose`` this is the deliverable -- the patch is returned and the
+    #: real ``working_dir`` is left untouched; for ``write`` / ``yolo`` it is the patch that was applied back.
+    #: ``None`` for a read-only run, a non-sandboxed run, or a mutating run that changed nothing.
+    diff: str | None = None
+    #: Whether a sandboxed mutating run's changes were APPLIED back to the real ``working_dir``: ``True`` for
+    #: ``write`` / ``yolo`` (the patch was applied), ``False`` for ``propose`` (nothing applied -- the diff is
+    #: a proposal). ``None`` for a read-only or non-sandboxed run.
+    changes_applied: bool | None = None
     #: The directory this run was persisted to when it was run as a durable job
     #: (``<jobs_dir>/<run_id>``). ``None`` for an ephemeral run (Model A: nothing on disk unless asked).
     run_dir: str | None = None

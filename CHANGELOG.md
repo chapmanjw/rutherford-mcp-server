@@ -8,6 +8,36 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- The write/propose sandbox substrate, so Rutherford can safely delegate file-writing work to an agent over
+  ACP. A mutating delegation (`write` / `propose` / `yolo`) with a `working_dir` no longer runs the agent in
+  the user's tree — it runs in an isolated execution root and only a reviewed diff is ever applied back.
+  - SandboxManager (`acp/sandbox.py`). For a git `working_dir`, a mutating turn runs in an ephemeral detached
+    git worktree off the repo's current `HEAD` (the agent's spawn cwd, the ACP `session/new` cwd, and the
+    file/terminal confinement root are all the worktree). After the turn the changed set is computed
+    (`git diff --cached --binary` for the patch plus `--name-status` for the created / edited / deleted
+    paths): `propose` discards the worktree and returns the diff with nothing applied; `write` / `yolo` apply
+    the changes back to the real `working_dir` by copying the changed files byte-for-byte (and removing the
+    deleted ones) — copying rather than `git apply` so the result is byte-faithful on Windows (no `core.autocrlf`
+    `\r` injection). A non-git `working_dir` runs in a bounded temp copy and copies the changed files back; a
+    tree over the copy-size guard is refused with a clear "write mode needs a git working_dir" error rather than
+    run unsandboxed. The worktree / copy is always cleaned up and the agent's process tree reaped.
+  - FileGateway (`acp/client.py`). In a sandbox, `write_text_file` (always) and `read_text_file` (in a
+    mutating sandbox) are confined to the sandbox root: a path that escapes it (`..`, an absolute path outside,
+    a symlink out) is rejected with a clean `RequestError` and journaled (`fs_write_denied` / `fs_read_denied`),
+    so a sandboxed agent cannot reach the rest of the disk through the ACP file callbacks.
+  - TerminalBroker (`acp/client.py`). `write` / `yolo` implement the ACP terminal callbacks for real — the
+    command runs with its cwd pinned to the sandbox root (a sanitized argv, no shell), with a bounded timeout
+    and an output-size cap, and its process tree is reaped on kill / release / session close. `read_only` and
+    `propose` keep denying terminal execution (propose may edit the throwaway worktree to produce a diff but
+    must not run commands).
+  - `verify_read_only` is now wired (gap 13). When the config flag is on and a successful `read_only`
+    delegation ran in a git `working_dir`, the tree under it is fingerprinted (status + the staged and unstaged
+    diffs, scoped to that subtree) before and after the turn; a change fails the result with
+    `READONLY_VIOLATED` (`SIDE_EFFECTED`), catching an agent that touched the disk out of band.
+  - The `DelegationResult` now carries `diff` (the sandboxed run's patch — for `propose`, the deliverable)
+    and `changes_applied` (`True` for an applied `write` / `yolo`, `False` for a `propose`), and
+    `changed_files` is now sourced from the sandbox (the per-delegation delta off `HEAD`, sound rather than
+    the current dirty state).
 - Named panels, the `review` / `plan` tools, and config-scope role layering, ported from v2 onto the
   ACP-native core.
   - Saved panels. A `panels.toon` file defines named, reusable rosters

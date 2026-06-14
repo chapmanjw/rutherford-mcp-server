@@ -31,9 +31,20 @@ class SafetyMode(StrEnum):
 def is_mutating(mode: SafetyMode) -> bool:
     """Return whether a safety mode can modify the workspace (``write`` or ``yolo``).
 
-    Read-only and propose are non-mutating, so they need no trusted-workspace check.
+    Read-only and propose are non-mutating -- propose's edits land in a disposable sandbox and are never
+    applied -- so they need no trusted-workspace check.
     """
     return mode in (SafetyMode.WRITE, SafetyMode.YOLO)
+
+
+def runs_sandboxed(mode: SafetyMode) -> bool:
+    """Whether a mode runs the agent inside an isolated SANDBOX (worktree / temp copy) rather than ``cwd``.
+
+    ``write`` / ``yolo`` (the agent mutates the sandbox, the reviewed diff is applied back) and ``propose``
+    (the agent mutates the sandbox, the diff is captured and discarded). ``read_only`` runs directly in the
+    working directory -- there is nothing to isolate.
+    """
+    return mode in (SafetyMode.PROPOSE, SafetyMode.WRITE, SafetyMode.YOLO)
 
 
 class AuthState(StrEnum):
