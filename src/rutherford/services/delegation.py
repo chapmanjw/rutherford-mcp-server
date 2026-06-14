@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import subprocess
+import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -25,11 +27,13 @@ from ..acp.permission import PermissionPolicy
 from ..acp.sandbox import SandboxManager
 from ..acp.session import run_acp_turn
 from ..config.schema import RutherfordConfig
-from ..domain.enums import ActivityEventKind, Effort, ReexecutionSafety, is_mutating, runs_sandboxed
+from ..domain.enums import ActivityEventKind, Effort, JobStatus, ReexecutionSafety, is_mutating, runs_sandboxed
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
-from ..domain.models import ActivityEvent, DelegationRequest, DelegationResult, ErrorInfo, Target
+from ..domain.models import ActivityEvent, DelegationRequest, DelegationResult, ErrorInfo, RunRecord, Target, Topology
+from ..io.ledger import RunLedger
 from ..runtime.depth import ensure_within_depth
+from ..runtime.logging import log_event
 
 #: How long the ``verify_read_only`` git fingerprint may take before it is abandoned (its check skipped). A
 #: fingerprint is two cheap git reads; the bound exists only so a wedged git can never stall a delegation.
@@ -110,9 +114,16 @@ class DelegationService:
         config: RutherfordConfig,
         *,
         cooldown: CooldownTracker | None = None,
+        ledger: RunLedger | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._descriptors = descriptors
         self._config = config
+        #: The durable run ledger (F2). ``None`` disables persistence entirely (e.g. a test with no jobs dir
+        #: configured); when set, a run opting into persistence is written under its root as a leaf record.
+        self._ledger = ledger
+        #: Wall-clock source for run-record timestamps, injectable so persistence is testable.
+        self._clock = clock
         #: Bounds how many ACP agent sessions run at once across every panel that shares this service
         #: (the consensus fan-out, a debate's rounds, a nested self-delegation), so panel width does not
         #: become unbounded host process pressure (N1 / reliability). Held only around the ACP turn.
@@ -177,6 +188,7 @@ class DelegationService:
         ``delegation_call_count`` counts every subprocess attempt (the primary plus each fallback re-run), so a
         panel's realized fan-out includes the fallbacks.
         """
+        created_at = self._clock()
         if not self._descriptors.has(req.target.cli):
             known = ", ".join(self._descriptors.ids()) or "(none)"
             return _fail(req, ErrorCode.UNKNOWN_TARGET, f"unknown agent id {req.target.cli!r}; known agents: {known}")
@@ -215,6 +227,9 @@ class DelegationService:
             recovered, alternate_attempts = await self._fallback_chain(req, result, correlation_id, base_depth)
             attempts += alternate_attempts
             if recovered is not None:
+                # The winning alternate persisted its OWN leaf record inside its recursive ``delegate`` call
+                # (it ran through this same path), and the failed primary is not persisted -- matching v2: a
+                # cross-target fallback's leaf ``state.toon`` records the run that answered, not the whole chain.
                 recovered.delegation_call_count = attempts
                 emit_activity(on_activity, _voice_finished_event(recovered, req.role, base_depth, correlation_id))
                 return recovered
@@ -223,6 +238,10 @@ class DelegationService:
         # fallback re-run plus every cross-target alternate tried (win or lose) -- so a panel's realized
         # fan-out counts the fallback re-runs.
         result.delegation_call_count = attempts
+        # F2: persist this run as a durable leaf job when the call opts in -- best-effort, off-thread (file
+        # I/O), and never failing the run that already produced an answer. A no-op for an ephemeral run.
+        if self._ledger is not None and self._should_persist(req):
+            await asyncio.to_thread(self._maybe_persist, req, result, created_at)
         emit_activity(on_activity, _voice_finished_event(result, req.role, base_depth, correlation_id))
         return result
 
@@ -480,6 +499,74 @@ class DelegationService:
             if target_dir == root or target_dir.is_relative_to(root):
                 return True
         return False
+
+    def _should_persist(self, req: DelegationRequest) -> bool:
+        """Whether this run should be kept as a durable job (F2); see ``RutherfordConfig.wants_persist``."""
+        return self._config.wants_persist(req.persist)
+
+    def _maybe_persist(self, req: DelegationRequest, result: DelegationResult, created_at: float) -> None:
+        """Persist this run as a durable leaf job (F2) when the call opts in -- best-effort, in place.
+
+        Resolution: an explicit ``req.persist`` wins; ``None`` follows the configured ``default_persistence``
+        (Model A: ``ephemeral`` out of the box, so nothing is written unless asked). Nothing happens when
+        persistence is off or no ledger is wired.
+
+        Boundary: only a run that reached execution is recorded here. A run refused by an up-front guard
+        (unknown target, depth, untrusted workspace) returns before the persist hook and is *not* persisted --
+        the corpus is post-launch outcomes (success and runtime failure), not pre-flight refusals. The record
+        pins the resolved launch ``argv`` (carried up on the result), the requested-vs-resolved model, the
+        prompt/role/files/cwd, and the outcome (changed files + the sandbox diff for a write run), so the run
+        recomposes from ``state.toon`` alone. ``env`` is NEVER persisted (it can hold secrets). A filesystem
+        failure is swallowed -- a run that already produced an answer must never fail because its record could
+        not be written -- leaving the result without ``run_dir``. ``req.parent_run_id`` links a voice's record
+        to its panel parent.
+        """
+        if not self._should_persist(req) or self._ledger is None:
+            return
+        record = RunRecord(
+            run_id=uuid.uuid4().hex,
+            kind="delegate",
+            status=JobStatus.SUCCEEDED if result.ok else JobStatus.FAILED,
+            created_at=created_at,
+            finished_at=self._clock(),
+            duration_s=result.duration_s,
+            parent_run_id=req.parent_run_id,
+            cli=req.target.cli,
+            requested_model=req.target.model,  # pre-fallback; result.target.model is the resolved one
+            model=result.target.model,
+            provenance=result.provenance,
+            safety_mode=req.safety_mode,
+            # F8a: the effort requested for this run and the tier the agent actually applied (post-clamp).
+            requested_effort=result.effort,
+            effort_applied=result.effort_applied,
+            # F2: the resolved launch argv carried up on the result (None only when nothing launched).
+            argv=list(result.argv) if result.argv is not None else [],
+            cwd=req.working_dir or str(Path.cwd()),
+            prompt=req.prompt,
+            role=req.role,
+            files=list(req.files),
+            ok=result.ok,
+            error_code=result.error.code if result.error is not None else None,
+            # The sandbox already computed this run's per-delegation delta off HEAD (sound, not the dirty tree).
+            changed_files=result.changed_files or [],
+            cost=result.cost,
+            # F8a: a leaf harvested at a panel budget carries its stop_reason so the child agrees with the
+            # parent's harvest disposition. ``None`` on a clean finish.
+            stop_reason=result.stop_reason,
+            # N1 (item 3): a single delegation declares width 1; realized counts the subprocess delegations it
+            # launched, INCLUDING a model fallback re-run (3-A). ``observed_peak_agents`` is the sampled peak.
+            topology=Topology(
+                declared=1,
+                realized_delegations=result.delegation_call_count,
+                observed_peak_agents=result.observed_peak_agents,
+            ),
+        )
+        try:
+            run_dir = self._ledger.write(record, answer=result.text, diff=result.diff)
+        except Exception as exc:  # persistence is best-effort; never fail a produced answer over a bad write
+            log_event("run_persist_failed", run_id=record.run_id, error_type=type(exc).__name__, error=str(exc))
+            return
+        result.run_dir = str(run_dir)
 
 
 def _voice_finished_event(result: DelegationResult, role: str | None, depth: int, correlation_id: str) -> ActivityEvent:

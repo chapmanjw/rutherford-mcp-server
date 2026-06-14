@@ -28,6 +28,7 @@ from rutherford.domain.models import (
     StrategyResult,
     Target,
 )
+from rutherford.io.ledger import RunLedger
 from rutherford.io.serialize import decode
 from rutherford.services.consensus import ConsensusService
 from rutherford.services.debate import DebateService
@@ -142,6 +143,45 @@ async def test_goose_consensus_topology_populated_live() -> None:
         f"expected a live observed floor >= 1, got {topology.observed_peak_agents}"
     )
     assert topology.over_cap is False
+
+
+async def test_goose_consensus_persists_to_disk_live(tmp_path: Path) -> None:
+    """A real two-goose consensus with persist=True lands a parent + two child records and voice artifacts (F2).
+
+    Drives the full F2 stack against a real agent: each voice persists its own leaf record, and the panel
+    writes a parent state.toon linking both children plus a voices/voice-N.md per voice with the real answers.
+    """
+    config = RutherfordConfig()
+    registry = default_registry()
+    ledger = RunLedger(tmp_path / "jobs")
+    delegation = DelegationService(registry, config, ledger=ledger)
+    service = ConsensusService(delegation, registry, config, ledger=ledger)
+    request = ConsensusRequest(
+        targets=[Target(cli="goose"), Target(cli="goose")],
+        prompt=_PROMPT,
+        working_dir=str(Path.cwd()),
+        timeout_s=120.0,
+        persist=True,
+    )
+    result = await service.consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.run_dir is not None, "the persisted consensus carried no run_dir"
+    parent_dir = Path(result.run_dir)
+    parent_state = (parent_dir / "state.toon").read_text(encoding="utf-8")
+    assert "kind: consensus" in parent_state
+    # The parent's state.toon parses (scalar fields; goose's launch argv is the clean "goose acp", so the
+    # parent record has no colon-bearing inline array and decodes fully).
+    decoded = decode(parent_state)
+    assert decoded["kind"] == "consensus"
+    assert len(decoded["child_run_ids"]) == 2, "the parent did not link two child records"
+    # Two child leaf records exist on disk.
+    child_dirs = [d for d in (tmp_path / "jobs").iterdir() if d.is_dir() and d != parent_dir]
+    assert len(child_dirs) == 2
+    # The per-voice artifacts carry the real answers.
+    voice1 = (parent_dir / "artifacts" / "voices" / "voice-1.md").read_text(encoding="utf-8")
+    voice2 = (parent_dir / "artifacts" / "voices" / "voice-2.md").read_text(encoding="utf-8")
+    assert "42" in voice1 and "42" in voice2, f"voice artifacts missing the answer:\n{voice1}\n---\n{voice2}"
+    assert (parent_dir / "artifacts" / "answer.md").is_file()
 
 
 async def test_fallback_chain_recovers_a_spawn_fail_on_a_real_agent() -> None:

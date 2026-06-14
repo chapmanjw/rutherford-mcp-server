@@ -36,6 +36,7 @@ async def delegate_tool(
     effort: str | None = None,
     fallback: list[Any] | None = None,
     allow_model_fallback: bool = True,
+    persist: bool | None = None,
     mode: str = "sync",
 ) -> str:
     """Validate the request, drive one ACP turn (with fallback), and return the TOON-encoded result envelope.
@@ -55,6 +56,11 @@ async def delegate_tool(
     delegation never falls back (a partial mutation may have happened). ``allow_model_fallback`` (on by
     default) lets a model-unavailable failure retry the SAME agent on its configured ``fallback_model`` first,
     where it has one (most ACP agents do not -- a clean no-op).
+
+    ``persist`` keeps this run as a durable job under ``<jobs_dir>/<run_id>/`` (F2: ``state.toon`` plus the
+    answer / diff artifacts), so it survives the process. ``None`` follows the configured
+    ``default_persistence`` (``ephemeral`` out of the box -- nothing on disk unless asked); ``True`` / ``False``
+    force it for this one call. The persisted result carries its ``run_dir``.
     """
     ensure_known_agent(app.descriptors, cli)
     safety = resolve_safety_mode(safety_mode, app.config.default_safety_mode)
@@ -74,6 +80,7 @@ async def delegate_tool(
         effort=parse_effort(effort),
         fallback=fallback_targets,
         allow_model_fallback=allow_model_fallback,
+        persist=persist,
     )
 
     async def run(on_activity: ActivityCallback | None = None) -> str:

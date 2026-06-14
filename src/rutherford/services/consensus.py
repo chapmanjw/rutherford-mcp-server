@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from ..acp.cooldown import CooldownTracker
@@ -37,6 +39,8 @@ from ..domain.models import (
     DelegationResult,
     DiversityReport,
     ErrorInfo,
+    PanelInputs,
+    PanelTarget,
     Provenance,
     RunRollup,
     SkippedTarget,
@@ -45,8 +49,10 @@ from ..domain.models import (
     Topology,
     VoiceVerdict,
 )
+from ..io.ledger import RunLedger
 from ..runtime.depth import ensure_within_aggregate_cap
 from .delegation import ActivityCallback, DelegationService, PanelLifecycle, emit_activity
+from .persistence import PanelVoice, render_panel_voice_files, write_panel_record
 from .strategies import aggregate, apply_stance, effective_diversity, extract_verdict, verdict_instruction
 
 _log = logging.getLogger("rutherford.services.consensus")
@@ -62,10 +68,17 @@ class ConsensusService:
         config: RutherfordConfig,
         *,
         cooldown: CooldownTracker | None = None,
+        ledger: RunLedger | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._delegation = delegation
         self._descriptors = descriptors
         self._config = config
+        #: The durable run ledger (F2) for the panel's parent record; ``None`` disables persistence. The
+        #: per-voice child records are written by the delegation service as each voice runs.
+        self._ledger = ledger
+        #: Wall-clock source for parent-record timestamps, injectable so persistence is testable.
+        self._clock = clock
         #: The per-agent cooldown tracker (F7): an auto-expanded (``expand_all``) panel leaves a benched agent
         #: OUT (recorded in ``skipped`` with the time remaining), since auto-selection should not keep reaching
         #: for a flapping seat. ``cooldown`` is injected so it is the SAME tracker the delegation primitive
@@ -116,6 +129,11 @@ class ConsensusService:
         synthesis and a diversity report) is returned. Either shape carries ``stop_reason`` + a ``rollup``
         when a budget governed the run, and a populated :class:`Topology`.
         """
+        created_at = self._clock()
+        persist = self._config.wants_persist(req.persist)
+        # When persisting, mint the parent id up front so each voice can be written as its child (F2). When not
+        # persisting (or no ledger), the voices never self-persist (no orphan per-voice records).
+        parent_run_id = uuid.uuid4().hex if persist and self._ledger is not None else None
         targets, skipped = self._resolve_targets(req)
 
         # N1 (item 3): the declared fan-out width. Check it against the advisory aggregate-agent cap up front
@@ -143,7 +161,9 @@ class ConsensusService:
         )
 
         budget = req.time_budget_s if req.time_budget_s is not None else self._config.default_time_budget_s
-        voices, cut, stop_reason, elapsed_s = await self._fan_out(req, targets, budget, base_depth, on_activity)
+        voices, cut, stop_reason, elapsed_s = await self._fan_out(
+            req, targets, budget, base_depth, on_activity, parent_run_id
+        )
 
         if stop_reason == "budget":
             usable = sum(1 for voice in voices if voice.ok and voice.text.strip())
@@ -168,10 +188,16 @@ class ConsensusService:
         rollup = self._rollup(req, voices, cut, budget, stop_reason, elapsed_s) if budget is not None else None
         topology = self._topology(declared, voices, over_cap)
 
+        effective_synthesize = req.synthesize if req.synthesize is not None else self._config.synthesize_default
         if req.strategy is not Strategy.ALL_VOICES:
-            result: ConsensusResult | StrategyResult = self._aggregate(req, targets, voices, skipped)
+            strategy_result = self._aggregate(req, targets, voices, skipped)
+            # The parent record's headline answer for a strategy panel is the decision (or, absent one, the
+            # outcome category) so a reader opening state.toon sees the panel's verdict, not "(no synthesis)".
+            answer = strategy_result.decision or strategy_result.outcome
+            result: ConsensusResult | StrategyResult = strategy_result
         else:
             synthesis, synthesis_by = await self._maybe_synthesize(req, voices, base_depth)
+            answer = synthesis or "(no synthesis -- see the linked voice records)"
             result = ConsensusResult(
                 voices=voices,
                 synthesis=synthesis,
@@ -182,6 +208,21 @@ class ConsensusService:
         result.stop_reason = stop_reason
         result.rollup = rollup
         result.topology = topology
+
+        if parent_run_id is not None and self._ledger is not None:
+            result.run_dir = await asyncio.to_thread(
+                self._write_parent,
+                req,
+                parent_run_id,
+                voices,
+                skipped,
+                answer,
+                created_at,
+                effective_synthesize,
+                stop_reason,
+                rollup,
+                topology,
+            )
 
         lifecycle.mark_closed(
             ActivityEvent(
@@ -195,6 +236,66 @@ class ConsensusService:
             )
         )
         return result
+
+    def _write_parent(
+        self,
+        req: ConsensusRequest,
+        parent_run_id: str,
+        voices: list[DelegationResult],
+        skipped: list[SkippedTarget],
+        answer: str,
+        created_at: float,
+        synthesize: bool,
+        stop_reason: str | None,
+        rollup: RunRollup | None,
+        topology: Topology,
+    ) -> str | None:
+        """Write the panel's parent record linking each voice's child record, plus the voice artifacts (F2).
+
+        The parent's status derives from the voices, and one ``voices/voice-N.md`` per voice (plus
+        ``skipped.md`` for an auto-panel's left-out agents) makes the parent auditable without every child
+        record still on disk. :class:`PanelInputs` captures the resolved orchestration config (roster +
+        per-seat stance, the aggregation strategy, whether a synthesis ran, any judge) so the panel replays
+        from here. Best-effort: a write failure returns ``None`` and the panel keeps its answer. Runs
+        off-thread (file I/O) via :meth:`_consensus_impl`.
+        """
+        assert self._ledger is not None  # guarded by the caller (parent_run_id set only when ledger present)
+        panel_voices = [_panel_voice(voice) for voice in voices]
+        skipped_pairs = [(entry.cli, entry.reason) for entry in skipped]
+        panel_inputs = PanelInputs(
+            targets=[
+                PanelTarget(
+                    cli=voice.target.cli,
+                    model=voice.target.model,
+                    stance=_stance_for(voice.target, req.stances, index),
+                    session_id=voice.session_id,
+                )
+                for index, voice in enumerate(voices)
+            ],
+            strategy=req.strategy.value,
+            synthesize=synthesize,
+            judge=req.judge.display_label if req.judge else None,
+        )
+        return write_panel_record(
+            self._ledger,
+            run_id=parent_run_id,
+            kind="consensus",
+            prompt=req.prompt,
+            clis=sorted({voice.target.cli for voice in voices}),
+            voices=panel_voices,
+            answer=answer,
+            created_at=created_at,
+            finished_at=self._clock(),
+            safety_mode=req.safety_mode,
+            cwd=req.working_dir,
+            files=req.files,
+            role=req.role,
+            panel=panel_inputs,
+            stop_reason=stop_reason,
+            rollup=rollup,
+            topology=topology,
+            extra_artifacts=render_panel_voice_files(panel_voices, skipped_pairs),
+        )
 
     def _topology(self, declared: int, voices: list[DelegationResult], over_cap: bool) -> Topology:
         """The panel's observed process/agent fan-out (N1, item 3).
@@ -222,6 +323,7 @@ class ConsensusService:
         budget: float | None,
         base_depth: int,
         on_activity: ActivityCallback | None,
+        parent_run_id: str | None,
     ) -> tuple[list[DelegationResult], set[int], str | None, float]:
         """Run every voice, returning ``(voices, cut, stop_reason, elapsed_s)``, budget-aware.
 
@@ -229,13 +331,17 @@ class ConsensusService:
         to completion) this is the plain parallel fan-out and ``stop_reason`` is ``None`` (a clean finish). With
         a binding budget it owns one :class:`~rutherford.acp.session.ACPSession` per voice, races them under an
         :func:`asyncio.wait` deadline, cuts the ones still in flight (harvesting each cut voice's streamed
-        partial), and returns ``stop_reason="budget"`` with the cut indices.
+        partial), and returns ``stop_reason="budget"`` with the cut indices. ``parent_run_id`` (when the panel
+        persists) makes each un-budgeted voice persist as a child of the panel parent (F2).
         """
         on_budget = req.on_budget if req.on_budget is not None else self._config.default_on_budget
         if budget is None or on_budget == "continue":
             voices = list(
                 await asyncio.gather(
-                    *(self._delegate_voice(req, i, t, base_depth, on_activity) for i, t in enumerate(targets))
+                    *(
+                        self._delegate_voice(req, i, t, base_depth, on_activity, parent_run_id)
+                        for i, t in enumerate(targets)
+                    )
                 )
             )
             return voices, set(), None, 0.0
@@ -248,12 +354,14 @@ class ConsensusService:
         target: Target,
         base_depth: int,
         on_activity: ActivityCallback | None,
+        parent_run_id: str | None,
     ) -> DelegationResult:
         """Run one voice through the delegation primitive (the un-budgeted / continue path).
 
         The delegation emits this voice's own ``voice_started`` / ``voice_finished`` activity events under a
         stable per-voice correlation id, gates the ACP turn on the shared concurrency semaphore, and layers
-        the lineage/depth env -- so the panel's fan-out is both bounded and visible.
+        the lineage/depth env -- so the panel's fan-out is both bounded and visible. When the panel persists
+        (``parent_run_id`` set), the voice is written as a child leaf record of the parent (F2).
         """
         request = DelegationRequest(
             target=target,
@@ -265,6 +373,10 @@ class ConsensusService:
             safety_mode=req.safety_mode,
             timeout_s=req.timeout_s,
             effort=req.effort,  # the panel's producer-effort cap flows to every voice (F8a)
+            # When the panel persists, each voice is a child record under the parent (F2); when it does not,
+            # the voice never self-persists (no orphan per-voice records).
+            persist=parent_run_id is not None,
+            parent_run_id=parent_run_id,
         )
         return await self._delegation.delegate(
             request, correlation_id=f"voice:{index}", base_depth=base_depth, on_activity=on_activity
@@ -733,3 +845,18 @@ def _stance_for(target: Target, stances: list[Stance] | None, index: int) -> Sta
     if target.stance is not None:
         return target.stance
     return stances[index] if stances else None
+
+
+def _panel_voice(voice: DelegationResult) -> PanelVoice:
+    """Project one consensus voice into the panel-parent's :class:`PanelVoice` summary (status + child link)."""
+    return PanelVoice(
+        label=voice.target.display_label,
+        ok=voice.ok,
+        run_id=Path(voice.run_dir).name if voice.run_dir else None,
+        text=voice.text,
+        error=voice.error.message if voice.error else None,
+        cost=voice.cost,
+        changed_files=tuple(voice.changed_files or []),
+        partial=voice.partial,
+        session_id=voice.session_id,
+    )

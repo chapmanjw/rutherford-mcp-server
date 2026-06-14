@@ -147,6 +147,7 @@ async def delegate(
     effort: str | None = None,
     fallback: list[Any] | None = None,
     allow_model_fallback: bool = True,
+    persist: bool | None = None,
     mode: str = "sync",
 ) -> str:
     """Delegate a task to one ACP agent and return its normalized result.
@@ -163,8 +164,10 @@ async def delegate(
     re-execution-safe failure (a spawn/handshake failure that never ran the prompt); a benched alternate is
     skipped and `fallback_chain` records the path. A write/yolo delegation never falls back.
     `allow_model_fallback` (default true) first retries the same agent on its configured fallback model on a
-    model-unavailable failure, where it has one. `mode="async"` runs the turn as a background job and returns
-    a `job_id` (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
+    model-unavailable failure, where it has one. `persist` keeps this run as a durable job under
+    `<jobs_dir>/<run_id>/` (`state.toon` + answer / diff artifacts); `None` follows `default_persistence`
+    (`ephemeral` out of the box), `true` / `false` force it. `mode="async"` runs the turn as a background job
+    and returns a `job_id` (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
     """
     return await _guarded(
         delegate_tool(
@@ -181,6 +184,7 @@ async def delegate(
             effort=effort,
             fallback=fallback,
             allow_model_fallback=allow_model_fallback,
+            persist=persist,
             mode=mode,
         )
     )
@@ -206,6 +210,7 @@ async def consensus(
     effort: str | None = None,
     time_budget_s: float | None = None,
     on_budget: str | None = None,
+    persist: bool | None = None,
     mode: str = "sync",
     ctx: Context | None = None,
 ) -> str:
@@ -229,7 +234,9 @@ async def consensus(
     knob. `time_budget_s` is a wall-clock deadline for the WHOLE panel (distinct from each voice's
     `timeout_s`): at the deadline answered voices are kept, in-flight ones cut, and the panel aggregates over
     the harvest if `min_quorum` usable remain (`stop_reason="budget"`, with a `rollup`); below `min_quorum`
-    is `BUDGET_EXHAUSTED`. `on_budget` is harvest | continue | resume (default `default_on_budget`).
+    is `BUDGET_EXHAUSTED`. `on_budget` is harvest | continue | resume (default `default_on_budget`). `persist`
+    keeps the panel as a durable job (F2): a parent `state.toon` linking a child record per voice, plus
+    `voices/voice-N.md` artifacts; `None` follows `default_persistence`, `true` / `false` force it.
     `mode="async"` runs the panel as a background job and returns a `job_id` (poll with `job_status` /
     `job_result`); `mode="sync"` awaits it.
     """
@@ -254,6 +261,7 @@ async def consensus(
             effort=effort,
             time_budget_s=time_budget_s,
             on_budget=on_budget,
+            persist=persist,
             mode=mode,
             # N1 (item 3): on a sync call, push live progress as voices finish (gated on the client's
             # progressToken; silent otherwise). An async job polls ``activity`` instead, so no pusher.
@@ -278,6 +286,7 @@ async def debate(
     effort: str | None = None,
     time_budget_s: float | None = None,
     on_budget: str | None = None,
+    persist: bool | None = None,
     mode: str = "sync",
     ctx: Context | None = None,
 ) -> str:
@@ -295,8 +304,10 @@ async def debate(
     wall-clock deadline for the WHOLE debate enforced at round boundaries: a round still in flight at the
     deadline is cut and the transcript so far is finalized (`stop_reason="budget"`, with a `rollup`);
     `on_budget` is harvest | continue | resume (default `default_on_budget`; `continue` runs every round to
-    completion). `mode="async"` runs the debate as a background job and returns a `job_id` (poll with
-    `job_status` / `job_result`); `mode="sync"` awaits it.
+    completion). `persist` keeps the debate as a durable job (F2): a parent `state.toon` plus the full
+    `transcript.md`; `None` follows `default_persistence`, `true` / `false` force it. `mode="async"` runs the
+    debate as a background job and returns a `job_id` (poll with `job_status` / `job_result`); `mode="sync"`
+    awaits it.
     """
     return await _guarded(
         debate_tool(
@@ -315,6 +326,7 @@ async def debate(
             effort=effort,
             time_budget_s=time_budget_s,
             on_budget=on_budget,
+            persist=persist,
             mode=mode,
             on_activity=make_progress_pusher(ctx) if ctx is not None else None,
         )

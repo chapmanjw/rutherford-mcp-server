@@ -121,6 +121,11 @@ class ACPSession:
         self._effort = effort
         self._override = effort_overrides(descriptor, effort, model=resolved_model)
         self._target = Target(cli=descriptor.id, model=self._override.model or resolved_model)
+        # F2 replay-completeness: the LOGICAL launch argv (the agent's ACP-server command plus any
+        # effort-override extra args), pinned here so a persisted run records what it was issued with. Kept
+        # distinct from the platform-resolved spawn argv (``prepare_argv`` below), whose npm-shim resolution
+        # bakes in machine-specific absolute paths a replay on another host could not reuse.
+        self._launch_argv = [*descriptor.command, *self._override.extra_args]
         # The FileGateway / TerminalBroker confinement root for a mutating sandbox (the worktree / temp copy);
         # None for a non-sandboxed session, where reads are served anywhere and terminal stays denied. Resolved
         # so the client's path-escape guard compares against a canonical absolute root.
@@ -148,6 +153,11 @@ class ACPSession:
     def target(self) -> Target:
         """The resolved ``(cli, model)`` this session answers under."""
         return self._target
+
+    @property
+    def launch_argv(self) -> list[str]:
+        """The logical launch argv this session was issued with (F2 replay-completeness; see __init__)."""
+        return list(self._launch_argv)
 
     @property
     def session_id(self) -> str | None:
@@ -183,7 +193,7 @@ class ACPSession:
             **self._override.env_dict,
             **child_env(self._base_depth, parent_run_id=self._parent_run_id),
         }
-        command, *args = prepare_argv((*self._descriptor.command, *self._override.extra_args))
+        command, *args = prepare_argv(tuple(self._launch_argv))
 
         def _observe(event: StreamEvent) -> None:
             # SYNCHRONOUS observer: inline in receive order, so each turn's journal is complete before its
@@ -338,11 +348,13 @@ class ACPSession:
 
         ``effort`` / ``effort_applied`` echo what was requested and what the agent applied after clamping;
         ``observed_peak_agents`` carries the live sampler's high-water mark up so a panel can roll it into
-        its :class:`~rutherford.domain.models.Topology` (a floor, ``None`` when nothing was sampled).
+        its :class:`~rutherford.domain.models.Topology` (a floor, ``None`` when nothing was sampled); ``argv``
+        pins the logical launch for an F2 replay.
         """
         result.effort = self._effort
         result.effort_applied = self._override.applied
         result.observed_peak_agents = self._observed_peak_agents
+        result.argv = list(self._launch_argv)
         return result
 
     async def cancel(self) -> None:
@@ -414,6 +426,7 @@ async def run_acp_turn(
         result = _failed(session.target, policy, start, exc.code, exc.message, exc.safety)
         result.effort = effort
         result.effort_applied = session.effort_applied
+        result.argv = session.launch_argv  # F2: a spawn-failed leaf still records the argv it tried
         return result
 
 

@@ -467,6 +467,15 @@ class DelegationResult(BaseModel):
     #: ``write`` / ``yolo`` (the patch was applied), ``False`` for ``propose`` (nothing applied -- the diff is
     #: a proposal). ``None`` for a read-only or non-sandboxed run.
     changes_applied: bool | None = None
+    #: The resolved launch argv this run was issued with (F2 replay-completeness): the agent's ACP-server
+    #: command plus any effort-override extra args -- the LOGICAL launch, not the platform-resolved npm-shim
+    #: path (which carries machine-specific absolute paths). With ``target.model``, ``safety_mode``, the
+    #: prompt/role/files, and ``cwd`` it is enough to recompose and re-issue the run. ``None`` when nothing
+    #: launched (an up-front guard refused the run before a session was built). EXCLUDED from the serialized
+    #: result envelope (``exclude=True``): it is an internal carrier to the F2 persistence layer (which pins
+    #: it on the ``RunRecord``), not part of the normalized result a client reads -- and keeping it off the
+    #: wire avoids carrying a colon-bearing inline array the TOON reader cannot round-trip into every result.
+    argv: list[str] | None = Field(default=None, exclude=True)
     #: The directory this run was persisted to when it was run as a durable job
     #: (``<jobs_dir>/<run_id>``). ``None`` for an ephemeral run (Model A: nothing on disk unless asked).
     run_dir: str | None = None
@@ -797,6 +806,11 @@ class DebateContribution(BaseModel):
     #: The files this turn changed (a write-mode debate), carried from the voice's result so the parent
     #: rolls up the panel's changed-file union (decision 1-D), mirroring consensus. Empty for a read run.
     changed_files: list[str] = Field(default_factory=list)
+    #: The resolved launch argv this turn was issued with (F2 replay-completeness), carried from the voice's
+    #: result so each turn's record pins its own invocation. ``None`` when nothing launched. EXCLUDED from
+    #: the serialized envelope (an internal carrier to the F2 persistence layer, not part of the transcript a
+    #: client reads).
+    argv: list[str] | None = Field(default=None, exclude=True)
     #: The directory this turn was persisted to when the debate was kept as a job (the child record of
     #: the panel parent). ``None`` for an ephemeral debate.
     run_dir: str | None = None

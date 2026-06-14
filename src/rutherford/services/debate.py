@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,12 +35,16 @@ from ..domain.models import (
     DebateRound,
     DelegationResult,
     ErrorInfo,
+    PanelInputs,
+    PanelTarget,
     RunRollup,
     Target,
     Topology,
 )
+from ..io.ledger import RunLedger
 from ..runtime.depth import ensure_within_aggregate_cap
 from .delegation import ActivityCallback, DelegationService, PanelLifecycle, emit_activity
+from .persistence import PanelVoice, write_panel_record
 
 _log = logging.getLogger("rutherford.services.debate")
 
@@ -57,13 +63,25 @@ class DebateService:
     """Runs a multi-round debate across ACP agents, each on a persistent session, and returns the transcript."""
 
     def __init__(
-        self, descriptors: DescriptorRegistry, config: RutherfordConfig, delegation: DelegationService
+        self,
+        descriptors: DescriptorRegistry,
+        config: RutherfordConfig,
+        delegation: DelegationService,
+        *,
+        ledger: RunLedger | None = None,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._descriptors = descriptors
         self._config = config
         #: The delegation service is shared so a debate's turns gate on the SAME concurrency semaphore as
         #: every other path that spawns an agent (a wide debate cannot exceed ``max_concurrency`` live turns).
         self._delegation = delegation
+        #: The durable run ledger (F2) for the debate's parent record; ``None`` disables persistence. A debate
+        #: drives its turns over persistent :class:`ACPSession`s (not via ``delegate``), so there are no
+        #: per-turn child records -- the transcript and the parent record carry the run (decision 1-D).
+        self._ledger = ledger
+        #: Wall-clock source for parent-record timestamps, injectable so persistence is testable.
+        self._clock = clock
 
     async def debate(
         self,
@@ -102,6 +120,8 @@ class DebateService:
         completion. A harvest that leaves fewer than ``min_quorum`` usable positions in the last round is
         ``BUDGET_EXHAUSTED`` (F8a).
         """
+        created_at = self._clock()
+        persist = self._config.wants_persist(req.persist)
         voices = self._resolve_voices(req)
         rounds_cap = self._resolve_rounds(req)
         cwd = req.working_dir or str(Path.cwd())
@@ -181,6 +201,19 @@ class DebateService:
             topology = self._topology(declared, rounds, over_cap)
             usable_round = _last_usable_round(rounds)
             usable = sum(1 for c in usable_round.contributions if c.ok and c.text.strip()) if usable_round else 0
+            run_dir: str | None = None
+            if persist and self._ledger is not None:
+                run_dir = await asyncio.to_thread(
+                    self._write_parent,
+                    req,
+                    voices,
+                    rounds,
+                    final,
+                    created_at,
+                    stop_reason if budget is not None else None,
+                    rollup,
+                    topology,
+                )
             lifecycle.mark_closed(
                 ActivityEvent(
                     kind=ActivityEventKind.PANEL_FINISHED,
@@ -200,9 +233,69 @@ class DebateService:
                 stop_reason=stop_reason if budget is not None else None,
                 rollup=rollup,
                 topology=topology,
+                run_dir=run_dir,
             )
         finally:
             await asyncio.gather(*(session.close() for session in sessions.values()), return_exceptions=True)
+
+    def _write_parent(
+        self,
+        req: DebateRequest,
+        voices: list[_Voice],
+        rounds: list[DebateRound],
+        final: str | None,
+        created_at: float,
+        stop_reason: str | None,
+        rollup: RunRollup | None,
+        topology: Topology,
+    ) -> str | None:
+        """Write the debate's parent record plus the ``transcript.md`` artifact (F2). Best-effort.
+
+        A debate drives its turns over persistent sessions (not via ``delegate``), so there are no per-turn
+        child records -- ``transcript.md`` inlines every turn and the parent record carries the run. The
+        parent's status derives from the turns (succeeded when any voice ever answered); :class:`PanelInputs`
+        captures the resolved roster (each seat + its latest resume handle), the round count, whether a closing
+        synthesis ran, and any judge so the debate replays from ``state.toon``. Runs off-thread (file I/O).
+        """
+        assert self._ledger is not None  # guarded by the caller (persist + ledger present)
+        contributions = [c for round_ in rounds for c in round_.contributions]
+        clis = sorted({c.target.cli for c in contributions})
+        # Each seat's latest resume handle across the rounds, recorded in the parent state.toon (F8a, 2-I).
+        seat_sessions: dict[str, str] = {c.seat_id: c.session_id for c in contributions if c.session_id is not None}
+        panel_inputs = PanelInputs(
+            targets=[
+                PanelTarget(
+                    cli=voice.target.cli,
+                    model=voice.target.model,
+                    stance=voice.stance,
+                    session_id=seat_sessions.get(_seat_id(voice)),
+                )
+                for voice in voices
+            ],
+            synthesize=req.synthesize,
+            rounds=req.rounds,
+            judge=req.judge.display_label if req.judge else None,
+        )
+        return write_panel_record(
+            self._ledger,
+            run_id=uuid.uuid4().hex,
+            kind="debate",
+            prompt=req.prompt,
+            clis=clis,
+            voices=[_panel_voice(c) for c in contributions],
+            answer=final or "(no closing synthesis -- see the transcript)",
+            created_at=created_at,
+            finished_at=self._clock(),
+            safety_mode=req.safety_mode,
+            cwd=req.working_dir,
+            files=req.files,
+            role=req.role,
+            panel=panel_inputs,
+            stop_reason=stop_reason,
+            rollup=rollup,
+            topology=topology,
+            extra_artifacts={"transcript.md": _render_transcript(req.prompt, rounds)},
+        )
 
     def _topology(self, declared: int, rounds: list[DebateRound], over_cap: bool) -> Topology:
         """The debate's observed process/agent fan-out (N1, item 3), summed across every turn of every round.
@@ -609,6 +702,7 @@ def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) 
         # its panel Topology (a floor for observed; one delegation per turn).
         observed_peak_agents=result.observed_peak_agents,
         delegation_call_count=result.delegation_call_count,
+        argv=result.argv,  # F2: the turn's resolved launch argv, carried for replay completeness
     )
 
 
@@ -659,6 +753,38 @@ def _last_usable_round(rounds: list[DebateRound]) -> DebateRound | None:
         if any(c.ok and c.text.strip() for c in round_.contributions):
             return round_
     return None
+
+
+def _panel_voice(contribution: DebateContribution) -> PanelVoice:
+    """Project one debate turn into the panel-parent's :class:`PanelVoice` summary (status + rollup)."""
+    return PanelVoice(
+        label=contribution.label,
+        ok=contribution.ok,
+        run_id=Path(contribution.run_dir).name if contribution.run_dir else None,
+        text=contribution.text,
+        error=contribution.error.message if contribution.error else None,
+        cost=contribution.cost,
+        changed_files=tuple(contribution.changed_files),
+    )
+
+
+def _render_transcript(prompt: str, rounds: list[DebateRound]) -> str:
+    """Render the full debate as a Markdown ``transcript.md`` artifact for a persisted panel (F2)."""
+    lines = [f"# Debate transcript\n\n**Question:** {prompt}\n"]
+    for round_ in rounds:
+        lines.append(f"\n## Round {round_.index}\n")
+        for contribution in round_.contributions:
+            status = "" if contribution.ok else " (failed)"
+            body = (
+                contribution.text.strip()
+                if contribution.ok and contribution.text.strip()
+                else (contribution.error.message if contribution.error else "(no answer)")
+            )
+            # A turn cut at the time budget keeps the text it streamed before the cut as a trace (F8a, 2-F).
+            if not contribution.ok and contribution.partial and contribution.partial.strip():
+                body += f"\n\n#### Partial output (streamed before the cut)\n\n{contribution.partial.strip()}"
+            lines.append(f"\n### {contribution.label}{status}\n\n{body}\n")
+    return "".join(lines)
 
 
 def _sum_contribution_cost(contributions: list[DebateContribution]) -> Cost | None:

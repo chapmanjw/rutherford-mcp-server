@@ -8,6 +8,29 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Durable runs (F2): a `delegate` / `consensus` / `debate` call can now be kept as a job on disk. Each of
+  the three tools takes a `persist` flag (`true` / `false`, or `None` to follow the configured
+  `default_persistence` — `ephemeral` out of the box, so nothing is written unless asked), and the
+  previously-inert `default_persistence` / `jobs_dir` config is now wired. A persisted run is written under
+  `<jobs_dir>/<run_id>/` (`jobs_dir` defaults to `<cwd>/.rutherford/jobs`):
+  - `state.toon` — a versioned, replay-complete `RunRecord` (TOON-encoded through the `io/serialize` seam):
+    the resolved launch `argv`, requested-vs-resolved model, provenance, safety mode, requested/applied
+    effort, topology, `cwd`, prompt, role, files, ok / error code, changed files, cost, stop reason, and a
+    rollup. The child process `env` is **never** persisted (it can carry secrets); replay recomposes it.
+  - `artifacts/answer.md` (the answer / synthesis) and, for a write run, `artifacts/diff.md` (the sandbox
+    diff, including created / untracked files).
+  - A persisted `consensus` writes a parent record linking a child record per voice (`child_run_ids`), with
+    one `artifacts/voices/voice-N.md` per voice and a `voices/skipped.md` for an auto-panel's left-out agents;
+    the parent rolls up status / cost / changed-file union and carries the resolved `PanelInputs` (roster +
+    per-seat stance + session handle, strategy, synthesize, judge). A persisted `debate` writes a parent
+    record plus the full `artifacts/transcript.md` (a debate drives its turns over persistent sessions, so the
+    transcript carries the run rather than per-turn child records).
+  - `io/ledger.py` (`RunLedger`) is the one writer of the jobs directory; persistence is best-effort — a write
+    failure logs and degrades to an unpersisted result, never failing a run that already produced an answer.
+  - Known limitation (carried from v2): python-toon 0.1.x cannot round-trip an inline array whose elements are
+    quoted (a colon-bearing `argv` element such as a Windows path or `gemma3:12b`), so a record with such an
+    `argv` is content-complete on disk but not yet machine-re-readable via `decode`. The clean-input fields
+    (prompt, model, cwd, a colon-free `argv`) round-trip; an `xfail` tracks the codec fix.
 - The write/propose sandbox substrate, so Rutherford can safely delegate file-writing work to an agent over
   ACP. A mutating delegation (`write` / `propose` / `yolo`) with a `working_dir` no longer runs the agent in
   the user's tree — it runs in an isolated execution root and only a reviewed diff is ever applied back.

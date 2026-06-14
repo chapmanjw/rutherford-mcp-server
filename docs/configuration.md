@@ -85,24 +85,24 @@ order the fields appear in `config/schema.py`.
 | `log_level` | `string` | `"info"` | Structured-log verbosity (`debug` / `info` / `warning` / `error`). Logs go to stderr as JSON. |
 | `log_format` | `string` | `"json"` | Structured-log format (`json` / `off`). stdout is the MCP channel and is never written to. |
 
-> Several fields are part of the config contract but are **not yet wired** into the leaner v3
-> consensus / debate path — they validate and load, but have no effect today, and land as those features
-> are re-added over the ACP core. The not-yet-active set: `probe_cache_ttl_s`, `probe_timeout_s`
-> (metadata-probe caching); and `default_persistence`, `jobs_dir` (durable on-disk jobs — v3 jobs are
-> in-memory).
+> Two fields are part of the config contract but are **not yet wired** into the leaner v3 path — they
+> validate and load, but have no effect today, and land as those features are re-added over the ACP core.
+> The not-yet-active set: `probe_cache_ttl_s`, `probe_timeout_s` (metadata-probe caching).
 >
 > What **is** active today: the roster fields (`agents`, `enabled_agents`, `auto_detect_local_models`),
 > `default_safety_mode` and `trusted_workspaces` (read_only is the default and the write/yolo trust gate
 > is enforced; `write` / `propose` / `yolo` run in an isolated git-worktree sandbox and `verify_read_only`
 > checks a `read_only` run did not mutate its git tree), `default_timeout_s`, `default_effort`,
-> `default_time_budget_s`, `default_on_budget` (time budget / effort), `max_targets`, `max_depth` (the
-> recursion guard, `MAX_DEPTH_EXCEEDED`), `max_concurrency` (the fan-out semaphore), `max_agents_advisory`
-> / `enforce_agent_cap` (the aggregate-agent cap — flags `Topology.over_cap`, or refuses with
-> `AGENT_CAP_EXCEEDED` when enforced), `min_quorum`, `min_distinct`, `synthesize_default` (consensus
-> aggregation / synthesis / diversity), `cooldown_threshold` / `cooldown_window_s` / `cooldown_duration_s`
-> (the F7 cooldown / quarantine — bench a flapping agent out of auto-selection and fallback),
-> `max_debate_rounds`, `role_dirs`, the in-memory job knobs (`job_ttl_s`, `max_jobs`), and the logging
-> fields.
+> `default_time_budget_s`, `default_on_budget` (time budget / effort), `default_persistence` / `jobs_dir`
+> (F2 durable on-disk jobs — a `persist=true` `delegate` / `consensus` / `debate` writes a `state.toon`
+> record plus Markdown artifacts under `jobs_dir`; the in-memory `JobStore` is the separate async-job
+> runtime), `max_targets`, `max_depth` (the recursion guard, `MAX_DEPTH_EXCEEDED`), `max_concurrency` (the
+> fan-out semaphore), `max_agents_advisory` / `enforce_agent_cap` (the aggregate-agent cap — flags
+> `Topology.over_cap`, or refuses with `AGENT_CAP_EXCEEDED` when enforced), `min_quorum`, `min_distinct`,
+> `synthesize_default` (consensus aggregation / synthesis / diversity), `cooldown_threshold` /
+> `cooldown_window_s` / `cooldown_duration_s` (the F7 cooldown / quarantine — bench a flapping agent out of
+> auto-selection and fallback), `max_debate_rounds`, `role_dirs`, the in-memory job knobs (`job_ttl_s`,
+> `max_jobs`), and the logging fields.
 
 ### `AgentConfig` fields (under `[agents.<id>]`)
 

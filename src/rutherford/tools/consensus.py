@@ -46,6 +46,7 @@ async def consensus_tool(
     effort: str | None = None,
     time_budget_s: float | None = None,
     on_budget: str | None = None,
+    persist: bool | None = None,
     mode: str = "sync",
     on_activity: ActivityCallback | None = None,
 ) -> str:
@@ -70,7 +71,9 @@ async def consensus_tool(
     ``default_on_budget``) chooses the deadline behavior. ``mode="async"`` submits the panel as a background
     job and returns a ``job_id``; ``mode="sync"`` (the default) awaits it. Validation always runs on the
     request path, so a bad panel fails there rather than inside a job. A named ``role`` has its persona
-    prepended to the prompt every voice receives; ``UNKNOWN_ROLE`` if the id is not a known role.
+    prepended to the prompt every voice receives; ``UNKNOWN_ROLE`` if the id is not a known role. ``persist``
+    keeps the panel as a durable job (F2): a parent ``state.toon`` linking a child record per voice, plus
+    ``voices/voice-N.md`` artifacts; ``None`` follows ``default_persistence``, ``True`` / ``False`` force it.
     """
     parsed: list[Target]
     parsed_stances = parse_stances(stances)
@@ -118,6 +121,7 @@ async def consensus_tool(
         effort=parse_effort(effort),
         time_budget_s=time_budget_s,
         on_budget=parse_on_budget(on_budget),
+        persist=persist,
     )
 
     async def run(job_activity: ActivityCallback | None = None) -> str:

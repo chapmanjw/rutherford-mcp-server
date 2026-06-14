@@ -39,6 +39,7 @@ async def debate_tool(
     effort: str | None = None,
     time_budget_s: float | None = None,
     on_budget: str | None = None,
+    persist: bool | None = None,
     mode: str = "sync",
     on_activity: ActivityCallback | None = None,
 ) -> str:
@@ -55,7 +56,9 @@ async def debate_tool(
     spend more reasoning where it has a knob. ``time_budget_s`` is a wall-clock deadline for the WHOLE debate
     enforced at round boundaries: a round still in flight at the deadline is cut, the transcript so far is
     finalized (``stop_reason="budget"``), and ``on_budget`` (harvest|continue|resume, default
-    ``default_on_budget``) chooses the behavior -- ``continue`` runs every round to completion.
+    ``default_on_budget``) chooses the behavior -- ``continue`` runs every round to completion. ``persist``
+    keeps the debate as a durable job (F2): a parent ``state.toon`` plus the full ``transcript.md``; ``None``
+    follows ``default_persistence``, ``True`` / ``False`` force it.
     """
     if panel is not None:
         # A saved panel supplies the seats (each carrying its own stance); ``rounds`` / ``judge`` stay call
@@ -81,6 +84,7 @@ async def debate_tool(
         effort=parse_effort(effort),
         time_budget_s=time_budget_s,
         on_budget=parse_on_budget(on_budget),
+        persist=persist,
     )
 
     async def run(job_activity: ActivityCallback | None = None) -> str:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .acp.cooldown import CooldownTracker
@@ -23,6 +24,7 @@ from .config.panels import PanelCache, load_panels
 from .config.schema import RutherfordConfig
 from .domain.error_codes import ErrorCode
 from .domain.errors import RutherfordError
+from .io.ledger import RunLedger
 from .io.serialize import encode
 from .services.consensus import ConsensusService
 from .services.debate import DebateService
@@ -88,9 +90,14 @@ def build_app_context(
         window_s=resolved_config.cooldown_window_s,
         duration_s=resolved_config.cooldown_duration_s,
     )
-    delegation = DelegationService(resolved_descriptors, resolved_config, cooldown=cooldown)
-    consensus = ConsensusService(delegation, resolved_descriptors, resolved_config, cooldown=cooldown)
-    debate = DebateService(resolved_descriptors, resolved_config, delegation)
+    # The durable run ledger (F2): the one writer of the jobs directory, shared by the delegation primitive
+    # (leaf records) and the panels (parent records). ``jobs_dir`` defaults to ``<cwd>/.rutherford/jobs`` so
+    # kept runs live with the project. The directory is created lazily on the first persisted write, so an
+    # all-ephemeral workspace never grows a ``.rutherford/jobs`` tree.
+    ledger = RunLedger(_resolve_jobs_dir(resolved_config))
+    delegation = DelegationService(resolved_descriptors, resolved_config, cooldown=cooldown, ledger=ledger)
+    consensus = ConsensusService(delegation, resolved_descriptors, resolved_config, cooldown=cooldown, ledger=ledger)
+    debate = DebateService(resolved_descriptors, resolved_config, delegation, ledger=ledger)
     jobs = JobStore(max_jobs=resolved_config.max_jobs, job_ttl_s=resolved_config.job_ttl_s)
     roles = RoleStore(role_dirs=resolved_config.role_dirs)
     # Panels are validated against the LIVE registry ids, so a panel naming an unknown agent fails to load.
@@ -107,3 +114,15 @@ def build_app_context(
         roles=roles,
         panels=panels,
     )
+
+
+def _resolve_jobs_dir(config: RutherfordConfig) -> Path:
+    """The durable-jobs root (F2): the configured ``jobs_dir``, else ``<cwd>/.rutherford/jobs``.
+
+    A configured path is taken as-is (absolute or resolved relative to the cwd); when unset, jobs live under
+    the project's own ``.rutherford/`` dir -- with the project, not the user's home -- matching where config
+    and panels live.
+    """
+    if config.jobs_dir:
+        return Path(config.jobs_dir).expanduser()
+    return Path.cwd() / ".rutherford" / "jobs"
