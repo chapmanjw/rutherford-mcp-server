@@ -8,6 +8,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Async background jobs. `delegate` / `consensus` / `debate` take `mode="async"` to run the work off the
+  request path: the call returns a small `{job_id, status, tool}` envelope immediately and the work runs as
+  an in-memory `asyncio` task. Four tools manage them — `list_jobs` (light listing, newest first),
+  `job_status` (status + timings), `job_result` (the finished run's envelope, byte-for-byte the same as the
+  sync path, or a structured error when failed/cancelled/not-done), and `cancel_job` (kill a running job).
+  The store is bounded by `max_jobs` (evict the oldest finished, else `TOO_MANY_JOBS`) and `job_ttl_s`
+  (finished jobs expire on access); a background task captures any exception so it can never crash the
+  server. In-memory only — jobs clear on restart (durable, replayable runs are the separate F2 corpus).
 - Nine more agents in the ACP-native roster (v3): `codex` and `claude_code` via the official Zed adapters
   `codex-acp` / `claude-agent-acp` (both reuse the existing CLI login over ACP — no API key — keeping the
   ChatGPT and Claude Code logins, correcting the earlier research note that flagged them as possibly

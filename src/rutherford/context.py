@@ -25,6 +25,7 @@ from .io.serialize import encode
 from .services.consensus import ConsensusService
 from .services.debate import DebateService
 from .services.delegation import DelegationService
+from .services.jobs import JobStore
 
 
 def tool_success(data: Any) -> str:
@@ -54,6 +55,7 @@ class AppContext:
     delegation: DelegationService
     consensus: ConsensusService
     debate: DebateService
+    jobs: JobStore
 
     def new_correlation_id(self) -> str:
         """Mint a short correlation id for a tool call."""
@@ -76,10 +78,12 @@ def build_app_context(
     delegation = DelegationService(resolved_descriptors, resolved_config)
     consensus = ConsensusService(delegation, resolved_config)
     debate = DebateService(resolved_descriptors, resolved_config)
+    jobs = JobStore(max_jobs=resolved_config.max_jobs, job_ttl_s=resolved_config.job_ttl_s)
     return AppContext(
         config=resolved_config,
         descriptors=resolved_descriptors,
         delegation=delegation,
         consensus=consensus,
         debate=debate,
+        jobs=jobs,
     )

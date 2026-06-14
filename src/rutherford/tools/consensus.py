@@ -8,7 +8,8 @@ from typing import Any
 
 from ..context import AppContext, tool_success
 from ..domain.models import ConsensusRequest
-from .common import as_target, ensure_known_targets, resolve_safety_mode
+from .common import as_target, ensure_known_targets, resolve_run_mode, resolve_safety_mode
+from .jobs import make_summary, submit_job
 
 
 async def consensus_tool(
@@ -20,18 +21,32 @@ async def consensus_tool(
     files: list[str] | None = None,
     safety_mode: str | None = None,
     timeout_s: float | None = None,
+    mode: str = "sync",
 ) -> str:
-    """Validate the panel, fan the prompt out across the targets, and return the TOON-encoded voices."""
+    """Validate the panel, fan the prompt out across the targets, and return the TOON-encoded voices.
+
+    ``mode="async"`` submits the panel as a background job and returns a ``job_id`` immediately;
+    ``mode="sync"`` (the default) awaits and returns every voice. Target/safety/mode validation always
+    runs synchronously, so a bad panel fails on the request path rather than inside a job.
+    """
     parsed = [as_target(target) for target in (targets or [])]
     ensure_known_targets(app.descriptors, parsed)
-    mode = resolve_safety_mode(safety_mode, app.config.default_safety_mode)
+    safety = resolve_safety_mode(safety_mode, app.config.default_safety_mode)
+    run_async = resolve_run_mode(mode)
     request = ConsensusRequest(
         targets=parsed,
         prompt=prompt,
         working_dir=working_dir,
         files=list(files) if files else [],
-        safety_mode=mode,
+        safety_mode=safety,
         timeout_s=timeout_s,
     )
-    result = await app.consensus.consensus(request)
-    return tool_success(result)
+
+    async def run() -> str:
+        result = await app.consensus.consensus(request)
+        return tool_success(result)
+
+    if run_async:
+        roster = ", ".join(target.display_label for target in parsed)
+        return await submit_job(app, "consensus", run, summary=make_summary("consensus", target=roster, prompt=prompt))
+    return await run()

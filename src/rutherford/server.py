@@ -27,6 +27,7 @@ from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
 from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
+from .tools.jobs import cancel_job_tool, job_result_tool, job_status_tool, list_jobs_tool
 
 mcp: FastMCP = FastMCP(
     "rutherford",
@@ -34,7 +35,9 @@ mcp: FastMCP = FastMCP(
         "Rutherford orchestrates other agentic coding agents over the Agent Client Protocol (ACP). Use "
         "`delegate` to hand a task to one agent and `capabilities` to see which agents are available. "
         "Delegations default to the configured default_safety_mode (read_only out of the box); write and "
-        "yolo are explicit opt-in behind a trusted workspace."
+        "yolo are explicit opt-in behind a trusted workspace. Long tasks can run as background jobs "
+        "(mode=async), enumerated with `list_jobs`, polled with `job_status` / `job_result`, and cancelled "
+        "with `cancel_job`."
     ),
 )
 
@@ -75,13 +78,15 @@ async def delegate(
     safety_mode: str | None = None,
     timeout_s: float | None = None,
     trust_workspace: bool = False,
+    mode: str = "sync",
 ) -> str:
     """Delegate a task to one ACP agent and return its normalized result.
 
     `cli` is an agent id (see `capabilities`); `model` is optional (the agent's default otherwise).
     `safety_mode` is read_only | propose | write | yolo; when omitted, the configured `default_safety_mode`
     applies (read_only out of the box). write and yolo also need a trusted workspace (`trust_workspace=true`
-    or a configured allowlist). `files` lists paths to put in scope.
+    or a configured allowlist). `files` lists paths to put in scope. `mode="async"` runs the turn as a
+    background job and returns a `job_id` (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
     """
     return await _guarded(
         delegate_tool(
@@ -94,6 +99,7 @@ async def delegate(
             safety_mode=safety_mode,
             timeout_s=timeout_s,
             trust_workspace=trust_workspace,
+            mode=mode,
         )
     )
 
@@ -106,12 +112,14 @@ async def consensus(
     files: list[str] | None = None,
     safety_mode: str | None = None,
     timeout_s: float | None = None,
+    mode: str = "sync",
 ) -> str:
     """Ask the same prompt of several ACP agents in parallel and return every voice.
 
     `targets` is a list of `{cli, model}` objects or `cli` / `cli:model` strings; each runs as its own ACP
     session concurrently. `safety_mode` and `timeout_s` apply to every voice; one failing voice is returned
-    as a failed result, never an aborted panel.
+    as a failed result, never an aborted panel. `mode="async"` runs the panel as a background job and
+    returns a `job_id` (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
     """
     return await _guarded(
         consensus_tool(
@@ -122,6 +130,7 @@ async def consensus(
             files=files,
             safety_mode=safety_mode,
             timeout_s=timeout_s,
+            mode=mode,
         )
     )
 
@@ -136,6 +145,7 @@ async def debate(
     safety_mode: str | None = None,
     synthesize: bool = True,
     timeout_s: float | None = None,
+    mode: str = "sync",
 ) -> str:
     """Have several ACP agents argue a question across rounds and return the full transcript.
 
@@ -143,7 +153,9 @@ async def debate(
     two. Each voice keeps ONE persistent ACP session across all `rounds`: round one is each voice's
     independent answer, and each later round shows a voice the others' latest positions and asks it to
     revise -- the agent remembers its own prior reasoning in-session, so only the delta is sent.
-    `synthesize=true` (default) adds a closing summary; `judge` names a target to write it.
+    `synthesize=true` (default) adds a closing summary; `judge` names a target to write it. `mode="async"`
+    runs the debate as a background job and returns a `job_id` (poll with `job_status` / `job_result`);
+    `mode="sync"` awaits it.
     """
     return await _guarded(
         debate_tool(
@@ -156,6 +168,7 @@ async def debate(
             safety_mode=safety_mode,
             synthesize=synthesize,
             timeout_s=timeout_s,
+            mode=mode,
         )
     )
 
@@ -175,6 +188,47 @@ async def doctor(agent: str | None = None, timeout_s: float = 60.0) -> str:
     a real call per agent); run it to see which of the roster actually drive on this machine.
     """
     return await _guarded(doctor_tool(get_app(), agent=agent, timeout_s=timeout_s))
+
+
+@mcp.tool
+async def list_jobs() -> str:
+    """List the background jobs Rutherford is tracking (id, tool, status, summary, timestamps), newest first.
+
+    The light listing -- no heavy result. Fetch a finished job's result with `job_result`. Jobs are
+    in-memory: a finished one is evicted after `job_ttl_s`, and a restart clears them all.
+    """
+    return await _guarded(list_jobs_tool(get_app()))
+
+
+@mcp.tool
+async def job_status(job_id: str) -> str:
+    """Report one background job's status and timings (no heavy result); `JOB_NOT_FOUND` if the id is unknown.
+
+    `status` is pending | running | succeeded | failed | cancelled. Poll this, then call `job_result` once
+    the job is `succeeded` (or to read the failure of a `failed` / `cancelled` job).
+    """
+    return await _guarded(job_status_tool(get_app(), job_id=job_id))
+
+
+@mcp.tool
+async def job_result(job_id: str) -> str:
+    """Return a finished background job's result envelope -- identical to the sync tool's envelope.
+
+    A `succeeded` job returns its stored result verbatim; a `failed` job returns its error; a `cancelled`
+    or still-running job returns a structured error (poll `job_status` and retry); an unknown id is
+    `JOB_NOT_FOUND`.
+    """
+    return await _guarded(job_result_tool(get_app(), job_id=job_id))
+
+
+@mcp.tool
+async def cancel_job(job_id: str) -> str:
+    """Cancel a running background job (killing its work) and return `{job_id, status}`; `JOB_NOT_FOUND` if unknown.
+
+    Cancelling an already-finished job is a no-op that returns its current status. The job's process tree
+    is torn down on the next cancellation point.
+    """
+    return await _guarded(cancel_job_tool(get_app(), job_id=job_id))
 
 
 def main() -> None:

@@ -8,7 +8,8 @@ from typing import Any
 
 from ..context import AppContext, tool_success
 from ..domain.models import DebateRequest
-from .common import as_target, ensure_known_targets, resolve_safety_mode
+from .common import as_target, ensure_known_targets, resolve_run_mode, resolve_safety_mode
+from .jobs import make_summary, submit_job
 
 
 async def debate_tool(
@@ -22,21 +23,35 @@ async def debate_tool(
     safety_mode: str | None = None,
     synthesize: bool = True,
     timeout_s: float | None = None,
+    mode: str = "sync",
 ) -> str:
-    """Validate the panel, run the multi-round debate over persistent sessions, and return the transcript."""
+    """Validate the panel, run the multi-round debate over persistent sessions, and return the transcript.
+
+    ``mode="async"`` submits the debate as a background job and returns a ``job_id`` immediately;
+    ``mode="sync"`` (the default) awaits and returns the full transcript. Target/judge/safety/mode
+    validation always runs synchronously, so a bad panel fails on the request path rather than in a job.
+    """
     parsed = [as_target(target) for target in (targets or [])]
     ensure_known_targets(app.descriptors, parsed)
-    mode = resolve_safety_mode(safety_mode, app.config.default_safety_mode)
+    safety = resolve_safety_mode(safety_mode, app.config.default_safety_mode)
+    run_async = resolve_run_mode(mode)
     judge_target = as_target(judge) if judge is not None else None
     request = DebateRequest(
         targets=parsed,
         prompt=prompt,
         rounds=rounds,
         working_dir=working_dir,
-        safety_mode=mode,
+        safety_mode=safety,
         synthesize=synthesize,
         timeout_s=timeout_s,
         judge=judge_target,
     )
-    result = await app.debate.debate(request)
-    return tool_success(result)
+
+    async def run() -> str:
+        result = await app.debate.debate(request)
+        return tool_success(result)
+
+    if run_async:
+        roster = ", ".join(target.display_label for target in parsed)
+        return await submit_job(app, "debate", run, summary=make_summary("debate", target=roster, prompt=prompt))
+    return await run()

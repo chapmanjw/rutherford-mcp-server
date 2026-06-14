@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..acp.descriptors import DescriptorRegistry
-from ..domain.enums import SafetyMode
+from ..domain.enums import DelegationMode, SafetyMode
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import Target
@@ -40,6 +40,22 @@ def resolve_safety_mode(value: str | SafetyMode | None, default: SafetyMode) -> 
     if value is None:
         return default
     return parse_safety_mode(value)
+
+
+def resolve_run_mode(value: str | DelegationMode) -> bool:
+    """Coerce a run-mode string to a boolean ``run_async``, or raise ``INVALID_INPUT``.
+
+    ``"sync"`` (the default) runs the work on the request path; ``"async"`` submits it as a background
+    job. Returns ``True`` for async so the caller can branch on one bool. A typoed mode fails here, on
+    the request path, rather than being silently treated as sync.
+    """
+    if isinstance(value, DelegationMode):
+        return value is DelegationMode.ASYNC
+    try:
+        return DelegationMode(value) is DelegationMode.ASYNC
+    except ValueError:
+        options = ", ".join(item.value for item in DelegationMode)
+        raise RutherfordError(ErrorCode.INVALID_INPUT, f"unknown mode {value!r}; choose one of: {options}") from None
 
 
 def ensure_known_agent(descriptors: DescriptorRegistry, agent_id: str) -> None:
