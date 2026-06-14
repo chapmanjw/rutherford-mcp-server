@@ -18,6 +18,7 @@ import contextlib
 import os
 import time
 from contextlib import AsyncExitStack
+from pathlib import Path
 
 from acp import PROTOCOL_VERSION, spawn_agent_process, text_block
 from acp.client.connection import ClientSideConnection
@@ -78,10 +79,13 @@ class ACPSession:
     ) -> None:
         self._descriptor = descriptor
         self._policy = policy
-        self._cwd = cwd
+        # ACP requires an absolute cwd in session/new (a relative one, e.g. ".", is rejected by agents like
+        # goose). Resolve once here so every path -- delegate, consensus, debate, the conformance probe --
+        # hands the agent an absolute working directory.
+        self._cwd = str(Path(cwd).resolve())
         self._target = Target(cli=descriptor.id, model=model or descriptor.default_model)
         self._journal = EventJournal()
-        self._client = RutherfordACPClient(journal=self._journal, policy=policy, cwd=cwd)
+        self._client = RutherfordACPClient(journal=self._journal, policy=policy, cwd=self._cwd)
         self._stack = AsyncExitStack()
         self._conn: ClientSideConnection | None = None
         self._session_id: str | None = None

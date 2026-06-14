@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from acp import RequestError
 from acp.schema import PermissionOption
@@ -12,6 +14,7 @@ from rutherford.acp.client import RutherfordACPClient
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry, default_registry
 from rutherford.acp.journal import EventJournal, JournalEvent, journal_event_from_message
 from rutherford.acp.permission import PermissionPolicy
+from rutherford.acp.session import ACPSession
 from rutherford.domain.enums import SafetyMode
 
 
@@ -83,6 +86,12 @@ def test_descriptor_registry() -> None:
         registry.get("nope")
     with pytest.raises(ValueError, match="duplicate"):
         DescriptorRegistry([AgentDescriptor("x", "X", ("x",)), AgentDescriptor("x", "X2", ("y",))])
+
+
+def test_session_resolves_relative_cwd_to_absolute() -> None:
+    # ACP requires an absolute cwd in session/new; a relative one must be resolved before open().
+    session = ACPSession(default_registry().get("goose"), policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd=".")
+    assert Path(session._cwd).is_absolute()
 
 
 def test_official_adapter_descriptors() -> None:
