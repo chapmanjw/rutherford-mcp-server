@@ -1,6 +1,0 @@
-{"type":"thread.started","thread_id":"th_01HZX9Q2K3M4N5P6R7S8T9V0W3"}
-{"type":"turn.started"}
-{"type":"error","message":"stream disconnected before completion; retrying request"}
-{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"item_1","type":"agent_message","details":{"type":"agent_message","text":"The capital of France is Paris."}}}
-{"type":"turn.completed","usage":{"input_tokens":900,"output_tokens":31}}

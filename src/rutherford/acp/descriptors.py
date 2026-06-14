@@ -1,0 +1,82 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Chapman
+"""Agent descriptors: the small declaration that replaces a hand-written subprocess adapter.
+
+Under ACP the protocol negotiates output parsing, system prompts, file context, and resume, so an agent is
+described by *how to launch it as an ACP server* plus a few quirks -- not a per-CLI parser. The registry is
+a closed mapping that fails fast on an unknown id, mirroring the old adapter registry's contract.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class AgentDescriptor:
+    """How Rutherford launches and identifies one ACP agent."""
+
+    id: str
+    display_name: str
+    #: The argv that launches this agent as an ACP server over stdio (e.g. ``("goose", "acp")``).
+    command: tuple[str, ...]
+    #: The model vendor when fixed (``"mistral"``), else ``None`` for a bring-your-own-model agent.
+    provider: str | None = None
+    #: Environment variables passed to the agent subprocess; ``None`` means the full inherited environment
+    #: (the v1 default, so the agent's own credential discovery works). A curated allowlist replaces this
+    #: once each agent's subprocess credential discovery is characterized by the conformance harness.
+    env_passthrough: tuple[str, ...] | None = None
+    #: The model id used when a call names none; ``None`` means the agent's own default.
+    default_model: str | None = None
+
+
+class DescriptorRegistry:
+    """An immutable id -> descriptor mapping with fail-fast lookup."""
+
+    def __init__(self, descriptors: Iterable[AgentDescriptor]) -> None:
+        mapping: dict[str, AgentDescriptor] = {}
+        for descriptor in descriptors:
+            if descriptor.id in mapping:
+                raise ValueError(f"duplicate agent id {descriptor.id!r}")
+            mapping[descriptor.id] = descriptor
+        self._by_id = mapping
+
+    def get(self, agent_id: str) -> AgentDescriptor:
+        """Return the descriptor for ``agent_id`` or raise :class:`KeyError`."""
+        return self._by_id[agent_id]
+
+    def has(self, agent_id: str) -> bool:
+        """Whether ``agent_id`` is registered."""
+        return agent_id in self._by_id
+
+    def ids(self) -> list[str]:
+        """The registered agent ids, sorted."""
+        return sorted(self._by_id)
+
+    def all(self) -> list[AgentDescriptor]:
+        """Every descriptor, ordered by id."""
+        return [self._by_id[agent_id] for agent_id in self.ids()]
+
+    def __len__(self) -> int:
+        return len(self._by_id)
+
+
+#: The high-fidelity native-ACP roster (research receipt 02-synthesis): the agents Rutherford drives
+#: directly as ACP servers, in initial-onboarding order. ``goose`` and ``opencode`` are confirmed live on
+#: this machine; the rest carry their researched launch command and are gated by the conformance harness
+#: before they are trusted.
+HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
+    AgentDescriptor("goose", "Goose", ("goose", "acp")),
+    AgentDescriptor("opencode", "OpenCode", ("opencode", "acp")),
+    AgentDescriptor("vibe", "Mistral Vibe", ("vibe-acp",), provider="mistral"),
+    AgentDescriptor("cline", "Cline", ("cline", "--acp")),
+    AgentDescriptor("junie", "Junie", ("junie", "--acp=true")),
+    AgentDescriptor("kimi", "Kimi Code", ("kimi", "acp"), provider="moonshot"),
+    AgentDescriptor("openhands", "OpenHands", ("openhands", "acp")),
+)
+
+
+def default_registry() -> DescriptorRegistry:
+    """Build the registry from the high-fidelity roster."""
+    return DescriptorRegistry(HIGH_FIDELITY)

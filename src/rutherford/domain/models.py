@@ -22,6 +22,7 @@ from .enums import (
     Effort,
     JobStatus,
     OutputMode,
+    ReexecutionSafety,
     Runtime,
     SafetyMode,
     Stance,
@@ -195,6 +196,11 @@ class ErrorInfo(BaseModel):
     code: ErrorCode
     message: str
     details: dict[str, Any] | None = None
+    #: For an ACP failure, whether the turn may be silently re-issued (transport/model/cross-agent
+    #: fallback). Only ``SAFE`` may enter a retry path -- the finer gate that replaces a bare
+    #: ``is_retryable`` check once a turn could have produced cost or side effects. ``None`` for
+    #: non-ACP errors or where re-execution safety is not yet classified.
+    reexecution_safety: ReexecutionSafety | None = None
 
 
 # --- Adapter value objects ---------------------------------------------------

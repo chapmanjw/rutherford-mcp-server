@@ -145,6 +145,26 @@ class Effort(StrEnum):
 EFFORT_ORDER: tuple[Effort, ...] = (Effort.LOW, Effort.MEDIUM, Effort.HIGH, Effort.XHIGH)
 
 
+class ReexecutionSafety(StrEnum):
+    """Whether a failed ACP turn may be silently re-issued (transport / model / cross-agent fallback).
+
+    Distinct from "did a side effect happen": after a ``session/prompt`` is accepted a turn can be
+    filesystem-clean yet still unsafe to silently re-run, because cost may have accrued and the agent's
+    state is ambiguous. Only :attr:`SAFE` may enter a retry/fallback path (the gate replaces a bare
+    ``is_retryable`` check). Ordered least to most dangerous.
+    """
+
+    #: A pre-prompt failure (spawn / handshake). The request never ran; re-issuing it elsewhere is safe.
+    SAFE = "safe"
+    #: The prompt was accepted with no observed external side effect, but cost may have accrued and the
+    #: agent saw context, so a silent re-run would double-spend.
+    DUPLICATE_COST = "duplicate_cost"
+    #: It is unknown whether the prompt or a tool call ran (e.g. an ambiguous transport drop).
+    AMBIGUOUS = "ambiguous"
+    #: A known external side effect occurred (``fs/write`` or a terminal command). Never auto-retry.
+    SIDE_EFFECTED = "side_effected"
+
+
 class ActivityEventKind(StrEnum):
     """What happened in a run's live activity stream (N1, item 3): the kinds of an :class:`ActivityEvent`.
 

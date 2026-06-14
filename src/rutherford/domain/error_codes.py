@@ -87,5 +87,21 @@ class ErrorCode(StrEnum):
     #: reserved for the genuine empty harvest. Not retryable and not cooldown-counting (it is a budget
     #: outcome, not an unhealthy adapter).
     BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
+    #: ACP transport: the agent subprocess could not be launched (binary missing, exec error). Pre-prompt,
+    #: so the failure is re-execution-safe (a different agent may answer).
+    ACP_SPAWN_FAILED = "ACP_SPAWN_FAILED"
+    #: ACP transport: the initialize/new_session handshake failed (protocol, auth, or version). Pre-prompt,
+    #: so re-execution-safe.
+    ACP_HANDSHAKE_FAILED = "ACP_HANDSHAKE_FAILED"
+    #: An ACP prompt turn exceeded its timeout; its session was cancelled and any streamed partial is
+    #: preserved. Post-prompt, so NOT re-execution-safe.
+    ACP_TURN_TIMEOUT = "ACP_TURN_TIMEOUT"
+    #: The agent ended the turn by refusing (``stopReason`` refusal). Post-prompt; not re-execution-safe.
+    ACP_REFUSED = "ACP_REFUSED"
+    #: The agent ended the turn cleanly but produced no answer text. Post-prompt; not re-execution-safe.
+    ACP_EMPTY_ANSWER = "ACP_EMPTY_ANSWER"
+    #: An error surfaced from the ACP connection after the prompt was accepted (a transport drop, a protocol
+    #: error mid-turn). Ambiguous, so NOT re-execution-safe by default.
+    ACP_TURN_ERROR = "ACP_TURN_ERROR"
     #: An unexpected internal error.
     INTERNAL = "INTERNAL"

@@ -1,3 +1,0 @@
-{"type":"user.message","data":{"content":"summarize the repo"}}
-{"type":"error","data":{"message":"model request failed: rate limited"}}
-{"type":"result","sessionId":"err-session-1","exitCode":1,"usage":{"premiumRequests":0}}

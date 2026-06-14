@@ -1,6 +1,0 @@
-{"type":"session.tools_updated","data":{"model":"claude-haiku-4.5"},"ephemeral":true}
-{"type":"user.message","data":{"content":"Reply with exactly the word OK and nothing else."}}
-{"type":"assistant.reasoning_delta","data":{"reasoningId":"r1","deltaContent":"The user wants OK."},"ephemeral":true}
-{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":"OK"},"ephemeral":true}
-{"type":"assistant.message","data":{"messageId":"m1","model":"claude-haiku-4.5","content":"OK","toolRequests":[],"outputTokens":67}}
-{"type":"result","timestamp":"2026-06-12T05:55:43.512Z","sessionId":"43cae225-8c4c-42ad-ae01-37aadce41a34","exitCode":0,"usage":{"premiumRequests":0.33,"totalApiDurationMs":2398}}

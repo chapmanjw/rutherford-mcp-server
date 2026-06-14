@@ -1,331 +1,101 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""Tests for the thin tool layer (delegate, consensus, jobs)."""
+"""Tests for the thin layers: common parsers, context helpers, the tools, and the FastMCP server."""
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
-from toon import decode
+from fastmcp.exceptions import ToolError
 
+from rutherford import server
+from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
-from rutherford.domain.enums import AuthState
+from rutherford.context import AppContext, build_app_context, error_payload_from, tool_error, tool_success
+from rutherford.domain.enums import SafetyMode
+from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import InvocationSpec, ProcessResult
-from rutherford.tools.consensus import consensus_tool
-from rutherford.tools.debate import debate_tool
+from rutherford.io.serialize import decode
+from rutherford.tools.capabilities import capabilities_tool
+from rutherford.tools.common import ensure_known_agent, parse_safety_mode, resolve_safety_mode
 from rutherford.tools.delegate import delegate_tool
-from rutherford.tools.jobs import job_result_tool, job_status_tool
-from tests.fakes import FakeAdapter, FakeProcessRunner, make_app
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+FAKE = AgentDescriptor("fake", "Fake", (sys.executable, "-m", "tests.fake_acp_agent"))
 
 
-def _decode(toon_text: str) -> Any:
-    return decode(toon_text)
+def _app() -> AppContext:
+    return build_app_context(config=RutherfordConfig(), descriptors=DescriptorRegistry([FAKE]))
 
 
-async def test_delegate_tool_sync_returns_envelope() -> None:
-    app = make_app(
-        adapters=[FakeAdapter("fake")], runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="answer"))
-    )
-    out = await delegate_tool(app, cli="fake", prompt="question")
-    data = _decode(out)
-    assert data["ok"] is True
-    assert data["text"] == "answer"
-    assert data["target"]["cli"] == "fake"
+def test_common_parsers() -> None:
+    assert parse_safety_mode("write") is SafetyMode.WRITE
+    assert parse_safety_mode(SafetyMode.YOLO) is SafetyMode.YOLO
+    assert resolve_safety_mode(None, SafetyMode.READ_ONLY) is SafetyMode.READ_ONLY
+    assert resolve_safety_mode("yolo", SafetyMode.READ_ONLY) is SafetyMode.YOLO
+    with pytest.raises(RutherfordError):
+        parse_safety_mode("bogus")
+    registry = DescriptorRegistry([FAKE])
+    ensure_known_agent(registry, "fake")
+    with pytest.raises(RutherfordError):
+        ensure_known_agent(registry, "nope")
 
 
-async def test_delegate_tool_unknown_target_is_failed_result() -> None:
-    app = make_app(adapters=[FakeAdapter("fake")])
-    out = await delegate_tool(app, cli="ghost", prompt="q")
-    data = _decode(out)
-    assert data["ok"] is False
-    assert data["error"]["code"] == "UNKNOWN_TARGET"
+def test_envelope_helpers() -> None:
+    assert "1" in tool_success({"a": 1})
+    error = decode(tool_error(ErrorCode.INTERNAL, "boom", {"k": "v"}))
+    assert error["error"]["code"] == "INTERNAL" and error["error"]["details"]["k"] == "v"
+    assert "INVALID_INPUT" in error_payload_from(RutherfordError(ErrorCode.INVALID_INPUT, "bad"))
 
 
-async def test_delegate_tool_bad_safety_mode_raises() -> None:
-    app = make_app(adapters=[FakeAdapter("fake")])
-    with pytest.raises(RutherfordError, match="safety_mode"):
-        await delegate_tool(app, cli="fake", prompt="q", safety_mode="bogus")
+async def test_capabilities_tool_lists_agents() -> None:
+    data = decode(await capabilities_tool(_app()))
+    assert any(agent["id"] == "fake" for agent in data["agents"])
 
 
-async def test_omitted_safety_mode_applies_the_configured_default() -> None:
-    # The documented contract for default_safety_mode: it fills the field ONLY when the caller
-    # omits it. propose is non-mutating, so no trusted-workspace gate interferes here.
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    config = RutherfordConfig(default_safety_mode="propose")  # type: ignore[arg-type]
-    app = make_app(adapters=[FakeAdapter("fake")], runner=runner, config=config)
-    out = await delegate_tool(app, cli="fake", prompt="q")
-    assert _decode(out)["safety_mode"] == "propose"
-    spec, _ = runner.calls[0]
-    assert "--safety=propose" in spec.argv  # the mode actually reached the adapter
+async def test_delegate_tool_ok_and_unknown() -> None:
+    out = await delegate_tool(_app(), cli="fake", prompt="what is 17 + 25?", working_dir=str(REPO_ROOT))
+    assert "42" in out
+    with pytest.raises(RutherfordError):
+        await delegate_tool(_app(), cli="nope", prompt="x")
 
 
-async def test_explicit_safety_mode_beats_the_configured_default() -> None:
-    # An explicit read_only is a choice, not an omission -- config must not override it.
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    config = RutherfordConfig(default_safety_mode="propose")  # type: ignore[arg-type]
-    app = make_app(adapters=[FakeAdapter("fake")], runner=runner, config=config)
-    out = await delegate_tool(app, cli="fake", prompt="q", safety_mode="read_only")
-    assert _decode(out)["safety_mode"] == "read_only"
+async def test_server_guarded_paths() -> None:
+    async def ok() -> str:
+        return "fine"
+
+    assert await server._guarded(ok()) == "fine"
+
+    async def rutherford_error() -> str:
+        raise RutherfordError(ErrorCode.INVALID_INPUT, "no")
+
+    with pytest.raises(ToolError):
+        await server._guarded(rutherford_error())
+
+    async def crash() -> str:
+        raise ValueError("boom")
+
+    with pytest.raises(ToolError):
+        await server._guarded(crash())
 
 
-async def test_delegate_tool_effort_reaches_the_invocation() -> None:
-    # F8a: the tool-level effort string is parsed to the Effort tier, resolved, and applied -- it must
-    # reach the adapter's argv and be reported as applied on the result.
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    app = make_app(adapters=[FakeAdapter("fake")], runner=runner)
-    out = await delegate_tool(app, cli="fake", prompt="q", effort="high")
-    assert _decode(out)["effort_applied"] == "high"
-    spec, _ = runner.calls[0]
-    assert "--effort=high" in spec.argv
+async def test_server_tool_wrappers(monkeypatch: Any) -> None:
+    monkeypatch.setattr(server, "_APP", _app())
+    out = await server.delegate(cli="fake", prompt="what is 17 + 25?", working_dir=str(REPO_ROOT))
+    assert "42" in out
+    caps = await server.capabilities()
+    assert "fake" in caps
 
 
-async def test_delegate_tool_bad_effort_raises() -> None:
-    app = make_app(adapters=[FakeAdapter("fake")])
-    with pytest.raises(RutherfordError, match="effort"):
-        await delegate_tool(app, cli="fake", prompt="q", effort="turbo")
-
-
-async def test_consensus_tool_bad_on_budget_raises() -> None:
-    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")])
-    with pytest.raises(RutherfordError, match="on_budget"):
-        await consensus_tool(app, targets=["a", "b"], prompt="q", on_budget="abandon")
-
-
-class _SlowToolRunner:
-    """A runner that sleeps per cli, so a tool-level time budget can harvest the fast voice."""
-
-    async def run(
-        self,
-        spec: InvocationSpec,
-        timeout_s: float,
-        on_progress: Callable[[str], None] | None = None,
-        on_stdout: Callable[[str], None] | None = None,
-    ) -> ProcessResult:
-        cli = spec.argv[0]
-        await asyncio.sleep(0.0 if cli == "a" else 5.0)
-        return ProcessResult(exit_code=0, stdout=f"{cli} answered")
-
-
-async def test_consensus_tool_threads_the_time_budget_into_a_harvest() -> None:
-    # The tool plumbs time_budget_s into the request: a slow voice is cut at the deadline and the result
-    # is flagged as a budget harvest. (Asserted on the raw TOON: the `toon` strict decoder cannot
-    # round-trip a heterogeneous ok/failed voice array -- a pre-existing quirk, not an item-2 regression.)
-    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")], runner=_SlowToolRunner())  # type: ignore[arg-type]
-    out = await consensus_tool(app, targets=["a", "b"], prompt="q", time_budget_s=0.3)
-    assert "stop_reason: budget" in out  # the harvest reached the result, so time_budget_s was threaded
-    assert "BUDGET_EXHAUSTED" in out  # the slow voice was cut at the deadline
-    assert "rollup:" in out  # the budget rollup is surfaced on the result
-
-
-async def test_consensus_omitted_safety_mode_applies_the_configured_default() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    config = RutherfordConfig(default_safety_mode="propose")  # type: ignore[arg-type]
-    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")], runner=runner, config=config)
-    await consensus_tool(app, targets=["a", "b"], prompt="q")
-    # Every fanned-out delegation carried the configured default to its adapter.
-    assert len(runner.calls) == 2
-    assert all("--safety=propose" in spec.argv for spec, _ in runner.calls)
-
-
-async def test_config_defaulted_write_still_hits_the_trusted_workspace_gate() -> None:
-    # The safety-critical composition: a mutating mode arriving via the CONFIG default (not an
-    # explicit argument) must still be stopped by the trusted-workspace gate. If the resolved
-    # default bypassed the gate, setting default_safety_mode="write" would silently grant every
-    # omitted-mode call write access anywhere.
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    config = RutherfordConfig(default_safety_mode="write")  # type: ignore[arg-type]
-    app = make_app(adapters=[FakeAdapter("fake")], runner=runner, config=config)
-    out = await delegate_tool(app, cli="fake", prompt="q", working_dir="/untrusted/dir")
-    data = _decode(out)
-    assert data["ok"] is False
-    assert data["error"]["code"] == "WORKSPACE_NOT_TRUSTED"
-    assert runner.calls == []  # nothing spawned
-
-
-async def test_debate_omitted_safety_mode_applies_the_configured_default() -> None:
-    # The third of the three tools carrying the None sentinel; each resolves independently, so
-    # each needs its own pin (delegate and consensus alone would not catch a debate regression).
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
-    config = RutherfordConfig(default_safety_mode="propose")  # type: ignore[arg-type]
-    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")], runner=runner, config=config)
-    await debate_tool(app, targets=["a", "b"], prompt="q", rounds=1, synthesize=False)
-    assert len(runner.calls) == 2
-    assert all("--safety=propose" in spec.argv for spec, _ in runner.calls)
-
-
-async def test_consensus_tool_unknown_target_is_a_clean_boundary_error() -> None:
-    # An unknown CLI in a fan-out tool is one clean UNKNOWN_TARGET, not a buried failed voice.
-    app = make_app(adapters=[FakeAdapter("fake")])
-    with pytest.raises(RutherfordError) as info:
-        await consensus_tool(app, targets=[{"cli": "fake"}, {"cli": "ghost"}], prompt="q")
-    assert info.value.code == "UNKNOWN_TARGET"
-
-
-async def test_consensus_tool_unknown_judge_is_a_clean_boundary_error() -> None:
-    # A typo'd judge is a clean UNKNOWN_TARGET, not a silent no-synthesis.
-    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")])
-    with pytest.raises(RutherfordError) as info:
-        await consensus_tool(
-            app, targets=[{"cli": "a"}, {"cli": "b"}], prompt="q", synthesize=True, judge={"cli": "ghost"}
-        )
-    assert info.value.code == "UNKNOWN_TARGET"
-
-
-async def test_debate_tool_unknown_judge_is_a_clean_boundary_error() -> None:
-    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")])
-    with pytest.raises(RutherfordError) as info:
-        await debate_tool(app, prompt="q", targets=["a", "b"], judge={"cli": "ghost"})
-    assert info.value.code == "UNKNOWN_TARGET"
-
-
-async def test_delegate_tool_async_returns_job_then_result() -> None:
-    app = make_app(
-        adapters=[FakeAdapter("fake")], runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="bg-answer"))
-    )
-    submitted = _decode(await delegate_tool(app, cli="fake", prompt="q", mode="async"))
-    job_id = submitted["job_id"]
-
-    # Poll on REAL time, not asyncio.sleep(0): the job body awaits a thread-pool hop (adapter.detect),
-    # and a zero-delay busy-yield can exhaust its budget before that round-trip completes on a loaded
-    # CI runner -- which surfaced as a flaky KeyError('ok') when the still-running result was read.
-    status = {"status": "pending"}
-    for _ in range(500):
-        status = _decode(await job_status_tool(app, job_id=job_id))
-        if status["status"] in ("succeeded", "failed"):
-            break
-        await asyncio.sleep(0.005)
-    assert status["status"] == "succeeded", f"job did not finish: {status}"  # fail at the poll, not on a missing key
-
-    result = _decode(await job_result_tool(app, job_id=job_id))
-    assert result["ok"] is True
-    assert result["text"] == "bg-answer"
-
-
-async def test_async_consensus_submit_carries_a_persistence_notice(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # 1-J: a non-trivial run started as a background job still gets the persistence notice, even though
-    # the async path returns at submit time (before any result), where it used to be silently skipped.
-    monkeypatch.chdir(tmp_path)  # no .rutherford -> ephemeral default + first-run hint
-    app = make_app(
-        adapters=[FakeAdapter("a"), FakeAdapter("b")],
-        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
-    )
-    submitted = _decode(await consensus_tool(app, targets=[{"cli": "a"}, {"cli": "b"}], prompt="q", mode="async"))
-    assert submitted["job_id"]
-    assert submitted["notice"]  # the suggest-a-job / first-run hint rides the async submit envelope
-
-
-async def test_async_submit_omits_notice_when_external_tracking(monkeypatch: pytest.MonkeyPatch) -> None:
-    # external_tracking=true (an orchestrator already tracks the run) suppresses the suggestion; with a
-    # config dir present there is no first-run hint either, so the envelope carries no notice key.
-    app = make_app(
-        adapters=[FakeAdapter("a"), FakeAdapter("b")],
-        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
-    )
-    app.setup_hint_emitted = True  # suppress the first-run hint regardless of cwd
-    submitted = _decode(
-        await consensus_tool(
-            app, targets=[{"cli": "a"}, {"cli": "b"}], prompt="q", mode="async", external_tracking=True
-        )
-    )
-    assert submitted["job_id"]
-    assert "notice" not in submitted
-
-
-async def test_fallback_chain_triggers_suggest_a_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # 1-J: a read-only delegate with a fallback chain names alternate targets -- a multi-target run, no
-    # longer "plain single-target read-only" -- so it should get the suggest-a-job nudge.
-    monkeypatch.chdir(tmp_path)
-    app = make_app(
-        adapters=[FakeAdapter("a"), FakeAdapter("b")],
-        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
-    )
-    app.setup_hint_emitted = True  # isolate from the first-run hint
-    out = _decode(await delegate_tool(app, cli="a", prompt="q", fallback=["b"]))
-    assert out["notice"] and "persist=true" in out["notice"]
-
-
-async def test_plain_read_only_delegate_stays_quiet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # The other side of 1-J: a plain single-target read-only delegation (no fallback) gets no notice.
-    monkeypatch.chdir(tmp_path)
-    app = make_app(adapters=[FakeAdapter("a")], runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")))
-    app.setup_hint_emitted = True
-    out = _decode(await delegate_tool(app, cli="a", prompt="q"))
-    assert out.get("notice") is None
-
-
-async def test_consensus_tool_returns_voices() -> None:
-    app = make_app(
-        adapters=[FakeAdapter("a"), FakeAdapter("b")],
-        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
-    )
-    out = await consensus_tool(app, targets=[{"cli": "a"}, {"cli": "b"}], prompt="best editor?")
-    # The consensus envelope is a TOON array of non-uniform voice objects; assert on the encoded
-    # text (python-toon's decoder does not round-trip nested object arrays, but the server only
-    # ever encodes, and the output is what an LLM client reads).
-    assert "voices[2]" in out
-    assert "cli: a" in out
-    assert "cli: b" in out
-    assert out.count("ok: true") == 2
-
-
-async def test_consensus_tool_target_cap_raises() -> None:
-    app = make_app(
-        adapters=[FakeAdapter("a")],
-        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
-        config=RutherfordConfig(max_targets=1),
-    )
-    with pytest.raises(RutherfordError, match="cap"):
-        await consensus_tool(app, targets=[{"cli": "a"}, {"cli": "a"}], prompt="q")
-
-
-async def test_consensus_tool_expands_when_targets_omitted() -> None:
-    app = make_app(
-        adapters=[FakeAdapter("a"), FakeAdapter("b")],
-        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
-    )
-    out = await consensus_tool(app, prompt="best editor?")  # no targets -> full authenticated panel
-    assert "voices[2]" in out
-    assert "cli: a" in out and "cli: b" in out
-
-
-async def test_consensus_tool_all_sentinel_expands_and_reports_skips() -> None:
-    app = make_app(
-        adapters=[FakeAdapter("a"), FakeAdapter("b", auth_state=AuthState.NEEDS_LOGIN)],
-        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
-    )
-    out = await consensus_tool(app, targets="all", prompt="q")
-    assert "voices[1]" in out  # only the authenticated adapter answers
-    assert "skipped" in out and "b" in out  # the skipped adapter is reported
-
-
-async def test_consensus_tool_empty_list_expands() -> None:
-    app = make_app(
-        adapters=[FakeAdapter("a")],
-        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
-    )
-    out = await consensus_tool(app, targets=[], prompt="q")  # [] also means the full panel
-    assert "voices[1]" in out
-    assert "cli: a" in out
-
-
-async def test_consensus_tool_accepts_a_single_target_string() -> None:
-    app = make_app(
-        adapters=[FakeAdapter("a"), FakeAdapter("b")],
-        runner=FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok")),
-    )
-    out = await consensus_tool(app, targets="a", prompt="q")  # an explicit single CLI, not "all"
-    assert "voices[1]" in out
-    assert "cli: a" in out
-
-
-async def test_job_status_unknown_raises() -> None:
-    app = make_app(adapters=[FakeAdapter("fake")])
-    with pytest.raises(RutherfordError, match="unknown job"):
-        await job_status_tool(app, job_id="nope")
+def test_get_app_and_main(monkeypatch: Any) -> None:
+    monkeypatch.setattr(server, "_APP", None)
+    app = server.get_app()
+    assert app is not None
+    assert server.get_app() is app  # cached on the second call
+    monkeypatch.setattr(server, "_APP", None)
+    monkeypatch.setattr(server.mcp, "run", lambda **kwargs: None)
+    server.main()
+    assert server._APP is not None
