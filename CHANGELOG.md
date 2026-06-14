@@ -8,6 +8,35 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Named panels, the `review` / `plan` tools, and config-scope role layering, ported from v2 onto the
+  ACP-native core.
+  - Saved panels. A `panels.toon` file defines named, reusable rosters
+    (`Panel{name, description, strategy, targets:[{cli, model, role, label, weight, parity, stance}]}`),
+    discovered across the same scopes as the rest of the config — `~/.rutherford/panels.toon`, the project
+    `.rutherford/panels.toon`, then `$RUTHERFORD_CONFIG_DIR` — and merged by name, the closest scope winning.
+    The store loads lazily and is cached on the `AppContext`; every discovered file is validated in one pass
+    against the live agent registry, so a panel naming an unknown agent, a bad strategy, an empty target list,
+    or a negative weight raises `PANEL_INVALID` reporting every problem at once. `consensus` and `debate` gain
+    a `panel` parameter (plus `panel_overrides`, a shallow merge re-validated through the same model): the
+    saved seats and the panel's aggregation `strategy` replace explicit `targets`, and naming both is rejected
+    (`targets` / `stances` are mutually exclusive with `panel`). An unknown panel is `PANEL_NOT_FOUND`. A new
+    `reload_panels` tool re-reads the files and returns `{reloaded, count, panels:[{name, description,
+    target_count}]}`.
+  - The `review` tool. A read-only `consensus` over a code diff or a set of files under the
+    `principal-reviewer` persona, synthesize on by default. `review(targets|panel, paths=None, diff=None,
+    role="principal-reviewer", synthesize=True, ...)` builds the review prompt from the inlined `diff` or the
+    in-scope `paths`, runs every voice read-only (the tool takes no `safety_mode`, so an inspection-named tool
+    can never mutate), and returns the consensus envelope.
+  - The `plan` tool. A read-only `delegate` under the `architect` persona: `plan(cli, goal, model=None,
+    working_dir=None, files=None, timeout_s=None)` asks one agent to design an approach (not implement it),
+    clamped to read-only, returning the delegation envelope.
+  - Role-scope layering. The role store now layers custom roles across the v2 scope order — built-in (package)
+    → each `config.role_dirs` → `~/.rutherford/roles/` → the project `./.rutherford/roles/` →
+    `$RUTHERFORD_CONFIG_DIR` — the closest scope winning by id, so a workspace can override a built-in. Role
+    files may be markdown (the body is the prompt) or TOON (a `prompt` / `system_prompt` field). Each `Role`
+    records its `source` (`built-in` | a `role_dirs` path | `user` | `project` | `env`), surfaced in
+    `list_roles`. Loading stays tolerant: a malformed or unreadable role file is logged and skipped, never a
+    startup crash.
 - The reliability layer over ACP — ReexecutionSafety-gated fallback and per-agent cooldown / quarantine
   (F7), ported from v2.
   - Cross-target + model fallback. `delegate` gains a `fallback` parameter (an ordered list of `cli` /

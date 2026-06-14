@@ -34,6 +34,9 @@ from .tools.consensus import consensus_tool
 from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
 from .tools.jobs import activity_tool, cancel_job_tool, job_result_tool, job_status_tool, list_jobs_tool
+from .tools.panels import reload_panels_tool
+from .tools.plan import plan_tool
+from .tools.review import review_tool
 from .tools.roles import list_roles_tool
 from .tools.setup import setup_tool
 
@@ -187,6 +190,8 @@ async def delegate(
 async def consensus(
     prompt: str,
     targets: list[Any] | str | None = None,
+    panel: str | None = None,
+    panel_overrides: dict[str, Any] | None = None,
     strategy: str | None = None,
     verdict_schema: dict[str, Any] | None = None,
     judge: Any | None = None,
@@ -209,7 +214,9 @@ async def consensus(
     `targets` is a list of `{cli, model}` objects or `cli` / `cli:model` strings; each runs as its own ACP
     session concurrently. Omit `targets`, pass an empty list, pass the sentinel `"all"`, or set
     `expand_all=true` to fan out to every registered agent (each at its default model, capped at
-    `max_targets`); the result's `skipped` field explains any agent left out. A `{cli, model}` target may
+    `max_targets`); the result's `skipped` field explains any agent left out. Or name a saved `panel` (with
+    optional `panel_overrides`) to reuse a stored roster + strategy instead of `targets`; they are mutually
+    exclusive (see `reload_panels`). A `{cli, model}` target may
     also carry per-seat `role` / `label` / `weight` / `parity` / `stance`. With a `strategy` other than
     `all-voices` (`unanimous` | `majority` | `plurality` | `weighted` | `parity-pair`, optionally with a
     `verdict_schema`), each voice is asked for a verdict and the panel collapses to one outcome
@@ -231,6 +238,8 @@ async def consensus(
             get_app(),
             prompt=prompt,
             targets=targets,
+            panel=panel,
+            panel_overrides=panel_overrides,
             strategy=strategy,
             verdict_schema=verdict_schema,
             judge=judge,
@@ -257,6 +266,8 @@ async def consensus(
 async def debate(
     prompt: str,
     targets: list[Any] | None = None,
+    panel: str | None = None,
+    panel_overrides: dict[str, Any] | None = None,
     rounds: int = 2,
     judge: Any | None = None,
     working_dir: str | None = None,
@@ -273,7 +284,9 @@ async def debate(
     """Have several ACP agents argue a question across rounds and return the full transcript.
 
     `targets` is a list of `{cli, model}` objects or `cli` / `cli:model` strings; a debate needs at least
-    two. Each voice keeps ONE persistent ACP session across all `rounds`: round one is each voice's
+    two. Or name a saved `panel` (with optional `panel_overrides`) for a stored roster instead of `targets`;
+    they are mutually exclusive (`rounds` / `judge` stay call args). Each voice keeps ONE persistent ACP
+    session across all `rounds`: round one is each voice's
     independent answer, and each later round shows a voice the others' latest positions and asks it to
     revise -- the agent remembers its own prior reasoning in-session, so only the delta is sent.
     `synthesize=true` (default) adds a closing summary; `judge` names a target to write it. `role` names a
@@ -290,6 +303,8 @@ async def debate(
             get_app(),
             prompt=prompt,
             targets=targets,
+            panel=panel,
+            panel_overrides=panel_overrides,
             rounds=rounds,
             judge=judge,
             working_dir=working_dir,
@@ -321,6 +336,85 @@ async def list_roles() -> str:
     `role_dirs` directory can add or override one.
     """
     return await _guarded(list_roles_tool(get_app()))
+
+
+@mcp.tool
+async def review(
+    targets: list[Any] | None = None,
+    panel: str | None = None,
+    panel_overrides: dict[str, Any] | None = None,
+    paths: list[str] | None = None,
+    diff: str | None = None,
+    role: str = "principal-reviewer",
+    working_dir: str | None = None,
+    synthesize: bool | None = None,
+    timeout_s: float | None = None,
+) -> str:
+    """Review a diff or a set of files across one or more ACP agents (read-only). Provide `diff` or `paths`.
+
+    A read-only `consensus` under the `principal-reviewer` persona: each agent reviews the code and the
+    panel returns every voice plus a combined verdict. `targets` is a list of `{cli, model}` objects (or
+    `cli` / `cli:model` strings); or name a saved `panel` (with optional `panel_overrides`) instead -- the
+    two are mutually exclusive. Provide `diff` (a unified diff, inlined into the prompt) or `paths` (files put
+    in scope for the agents to read). `synthesize` defaults on (the combined verdict); pass `false` for the
+    raw per-voice reviews. Always read-only -- a review never mutates the tree.
+    """
+    return await _guarded(
+        review_tool(
+            get_app(),
+            targets=list(targets) if targets is not None else None,
+            panel=panel,
+            panel_overrides=panel_overrides,
+            paths=paths,
+            diff=diff,
+            role=role,
+            working_dir=working_dir,
+            synthesize=synthesize,
+            timeout_s=timeout_s,
+        )
+    )
+
+
+@mcp.tool
+async def plan(
+    cli: str,
+    goal: str,
+    model: str | None = None,
+    role: str = "architect",
+    working_dir: str | None = None,
+    files: list[str] | None = None,
+    timeout_s: float | None = None,
+) -> str:
+    """Ask one ACP agent for an implementation plan for `goal` under the `architect` persona (read-only).
+
+    A read-only `delegate` with the `architect` (planner) persona prepended: the agent designs an approach
+    rather than implementing it. `cli` is an agent id (see `capabilities`); `model` is optional. `files`
+    lists paths to put in scope. Always read-only -- planning never mutates the tree; implementing the plan
+    is `delegate` in write mode.
+    """
+    return await _guarded(
+        plan_tool(
+            get_app(),
+            cli=cli,
+            goal=goal,
+            model=model,
+            role=role,
+            working_dir=working_dir,
+            files=files,
+            timeout_s=timeout_s,
+        )
+    )
+
+
+@mcp.tool
+async def reload_panels() -> str:
+    """Re-read saved panels from disk (after editing a `panels.toon`) and list those now available.
+
+    Returns `{reloaded, count, panels: [{name, description, target_count}]}`. Panels are discovered under
+    `~/.rutherford/panels.toon`, the project `.rutherford/panels.toon`, and `$RUTHERFORD_CONFIG_DIR`, merged
+    by name (closest scope wins). A malformed panels file raises `PANEL_INVALID` naming the file and seat.
+    """
+    return await _guarded(reload_panels_tool(get_app()))
 
 
 @mcp.tool

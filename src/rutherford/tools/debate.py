@@ -19,6 +19,7 @@ from .common import (
     resolve_safety_mode,
 )
 from .jobs import make_summary, submit_job
+from .panels import panel_for_call
 
 
 async def debate_tool(
@@ -26,6 +27,8 @@ async def debate_tool(
     *,
     prompt: str,
     targets: list[Any] | None = None,
+    panel: str | None = None,
+    panel_overrides: dict[str, Any] | None = None,
     rounds: int = 2,
     judge: Any | None = None,
     working_dir: str | None = None,
@@ -41,8 +44,11 @@ async def debate_tool(
 ) -> str:
     """Validate the panel, run the multi-round debate over persistent sessions, and return the transcript.
 
-    ``mode="async"`` submits the debate as a background job and returns a ``job_id`` immediately;
-    ``mode="sync"`` (the default) awaits and returns the full transcript. Target/judge/safety/mode/role/
+    ``targets`` is a list of ``{cli, model}`` objects (or ``cli`` / ``cli:model`` strings); a debate needs at
+    least two. Alternatively name a saved ``panel`` (with optional ``panel_overrides``) instead of
+    ``targets``; the two are mutually exclusive and the panel supplies the seats (``rounds`` / ``judge`` stay
+    call arguments). ``mode="async"`` submits the debate as a background job and returns a ``job_id``
+    immediately; ``mode="sync"`` (the default) awaits and returns the full transcript. Target/judge/safety/mode/role/
     effort/on_budget validation always runs synchronously, so a bad panel fails on the request path rather
     than in a job. A named ``role`` has its persona prepended to the opening prompt every voice argues from;
     ``UNKNOWN_ROLE`` if the id is not a known role. ``effort`` (low|medium|high|xhigh) asks every voice to
@@ -51,7 +57,12 @@ async def debate_tool(
     finalized (``stop_reason="budget"``), and ``on_budget`` (harvest|continue|resume, default
     ``default_on_budget``) chooses the behavior -- ``continue`` runs every round to completion.
     """
-    parsed = [as_target(target) for target in (targets or [])]
+    if panel is not None:
+        # A saved panel supplies the seats (each carrying its own stance); ``rounds`` / ``judge`` stay call
+        # args. ``stances`` is not a debate-tool param, so only ``targets`` is the mutual-exclusion guard.
+        parsed = panel_for_call(app, panel, panel_overrides, targets, None).to_targets()
+    else:
+        parsed = [as_target(target) for target in (targets or [])]
     ensure_known_targets(app.descriptors, parsed)
     safety = resolve_safety_mode(safety_mode, app.config.default_safety_mode)
     run_async = resolve_run_mode(mode)

@@ -19,6 +19,7 @@ from .acp.cooldown import CooldownTracker
 from .acp.descriptors import DescriptorRegistry
 from .acp.roster import build_registry
 from .config.loader import load_config
+from .config.panels import PanelCache, load_panels
 from .config.schema import RutherfordConfig
 from .domain.error_codes import ErrorCode
 from .domain.errors import RutherfordError
@@ -59,6 +60,7 @@ class AppContext:
     debate: DebateService
     jobs: JobStore
     roles: RoleStore
+    panels: PanelCache
 
     def new_correlation_id(self) -> str:
         """Mint a short correlation id for a tool call."""
@@ -91,6 +93,10 @@ def build_app_context(
     debate = DebateService(resolved_descriptors, resolved_config, delegation)
     jobs = JobStore(max_jobs=resolved_config.max_jobs, job_ttl_s=resolved_config.job_ttl_s)
     roles = RoleStore(role_dirs=resolved_config.role_dirs)
+    # Panels are validated against the LIVE registry ids, so a panel naming an unknown agent fails to load.
+    # Loading is lazy (PanelCache loads on first use / reload), so a malformed panels file does not break
+    # startup until a panel is actually used or ``reload_panels`` is called.
+    panels = PanelCache(lambda: load_panels(resolved_descriptors.ids()))
     return AppContext(
         config=resolved_config,
         descriptors=resolved_descriptors,
@@ -99,4 +105,5 @@ def build_app_context(
         debate=debate,
         jobs=jobs,
         roles=roles,
+        panels=panels,
     )

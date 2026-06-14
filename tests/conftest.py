@@ -29,3 +29,22 @@ def _no_live_local_backends(request: pytest.FixtureRequest, monkeypatch: pytest.
 
     monkeypatch.setattr("urllib.request.urlopen", _refuse)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config_scopes(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the on-disk config scopes (roles + panels) at an EMPTY tmp home so the suite is hermetic.
+
+    Roles and panels are discovered under ``~/.rutherford`` / ``<cwd>/.rutherford`` / ``$RUTHERFORD_CONFIG_DIR``
+    (see :mod:`rutherford.config.locations`). The role store loads those scopes eagerly at
+    ``build_app_context``, so without this a developer's real ``~/.rutherford/roles`` would override a built-in
+    mid-test and a real ``panels.toon`` would leak in. This anchors the user scope at a fresh empty dir and
+    clears ``RUTHERFORD_CONFIG_DIR`` for every test. A test that drives its own scopes passes ``env`` / ``cwd``
+    to ``RoleStore`` / ``load_panels`` directly -- the injected mapping wins over the process env, so this
+    fixture never interferes with those explicit-scope tests.
+    """
+    home = tmp_path_factory.mktemp("hermetic-home")
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("RUTHERFORD_CONFIG_DIR", raising=False)
+    # The project scope keys off the process cwd; the repo root has no .rutherford/, so it stays empty.

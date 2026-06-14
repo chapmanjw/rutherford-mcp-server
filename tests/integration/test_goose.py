@@ -16,18 +16,23 @@ from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry, defa
 from rutherford.acp.permission import PermissionPolicy
 from rutherford.acp.session import run_acp_turn
 from rutherford.config.schema import RutherfordConfig
+from rutherford.context import AppContext, build_app_context
 from rutherford.domain.enums import Effort, SafetyMode, Strategy
 from rutherford.domain.models import (
     ConsensusRequest,
     ConsensusResult,
     DebateRequest,
     DelegationRequest,
+    DelegationResult,
     StrategyResult,
     Target,
 )
+from rutherford.io.serialize import decode
 from rutherford.services.consensus import ConsensusService
 from rutherford.services.debate import DebateService
 from rutherford.services.delegation import DelegationService
+from rutherford.tools.plan import plan_tool
+from rutherford.tools.review import review_tool
 
 pytestmark = pytest.mark.integration
 
@@ -270,3 +275,65 @@ async def test_codex_delegate_effort_high_applies() -> None:
     assert result.effort is Effort.HIGH
     assert result.effort_applied is Effort.HIGH, f"effort_applied not set: {result.effort_applied!r}"
     assert result.target.model == "gpt-5.5[high]"  # the effort-rewritten id the agent was switched to
+
+
+# --- review / plan: read-only role-driven tools against real goose -----------
+
+#: A three-line patch with a clear, intentional bug (subtract where it should add), so a real reviewer has
+#: something concrete to flag.
+_REVIEW_DIFF = """--- a/calc.py
++++ b/calc.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a + b
++    return a - b
+"""
+
+
+def _review_app() -> AppContext:
+    """An AppContext over the real registry, for driving the review / plan tools end to end."""
+    config = RutherfordConfig()
+    return build_app_context(config=config, descriptors=default_registry())
+
+
+async def test_goose_review_over_a_diff_live() -> None:
+    """A real ``review`` across two goose voices over a tiny diff returns a read-only consensus (both answer).
+
+    Drives the whole read-only review path against a real agent: the principal-reviewer persona is prepended,
+    two goose voices review the patch in parallel, and the result is a ConsensusResult with both voices
+    answering -- read-only, synthesized by default. The diff carries an obvious bug (subtract not add), so the
+    reviewers have a real defect to find; the assertion only requires both voices to answer (a model's exact
+    wording is not contractual).
+    """
+    out = await review_tool(
+        _review_app(),
+        targets=["goose", "goose"],
+        diff=_REVIEW_DIFF,
+        working_dir=str(Path.cwd()),
+        timeout_s=120.0,
+    )
+    # The all-voices envelope is a quoted-array TOON the python-toon decoder cannot round-trip, so assert on the
+    # encoded string: two read-only voices answered and a synthesis was produced.
+    assert out.count("ok: true") >= 2, f"expected two answering goose voices, got: {out[:400]}"
+    assert "safety_mode: read_only" in out  # the review ran read-only
+    assert "synthesis" in out  # synthesize defaults on for review
+
+
+async def test_goose_plan_live() -> None:
+    """A real ``plan`` to goose for a small goal returns an ok read-only architect delegate.
+
+    The read-only planning path against a real agent: the architect persona is prepended, goose designs an
+    approach (rather than implementing it), and the result is an ok DelegationResult with safety clamped to
+    read_only. Asserts only ok + read-only + non-empty text -- the plan's content is the model's, not a fixture.
+    """
+    out = await plan_tool(
+        _review_app(),
+        cli="goose",
+        goal="Add a small in-memory LRU cache to a function that recomputes an expensive value.",
+        working_dir=str(Path.cwd()),
+        timeout_s=120.0,
+    )
+    result = DelegationResult.model_validate(decode(out))
+    assert result.ok is True, f"plan failed: {result.error}"
+    assert result.safety_mode is SafetyMode.READ_ONLY  # planning is clamped to read-only
+    assert result.text.strip(), "the plan produced no text"
