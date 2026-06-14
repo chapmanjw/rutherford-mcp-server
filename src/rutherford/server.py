@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import sys
 from collections.abc import Awaitable
+from typing import Any
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -23,6 +24,7 @@ from .domain.error_codes import ErrorCode
 from .domain.errors import ConfigError, RutherfordError
 from .runtime.logging import configure_logging
 from .tools.capabilities import capabilities_tool
+from .tools.consensus import consensus_tool
 from .tools.delegate import delegate_tool
 
 mcp: FastMCP = FastMCP(
@@ -91,6 +93,34 @@ async def delegate(
             safety_mode=safety_mode,
             timeout_s=timeout_s,
             trust_workspace=trust_workspace,
+        )
+    )
+
+
+@mcp.tool
+async def consensus(
+    prompt: str,
+    targets: list[Any] | None = None,
+    working_dir: str | None = None,
+    files: list[str] | None = None,
+    safety_mode: str | None = None,
+    timeout_s: float | None = None,
+) -> str:
+    """Ask the same prompt of several ACP agents in parallel and return every voice.
+
+    `targets` is a list of `{cli, model}` objects or `cli` / `cli:model` strings; each runs as its own ACP
+    session concurrently. `safety_mode` and `timeout_s` apply to every voice; one failing voice is returned
+    as a failed result, never an aborted panel.
+    """
+    return await _guarded(
+        consensus_tool(
+            get_app(),
+            prompt=prompt,
+            targets=targets,
+            working_dir=working_dir,
+            files=files,
+            safety_mode=safety_mode,
+            timeout_s=timeout_s,
         )
     )
 

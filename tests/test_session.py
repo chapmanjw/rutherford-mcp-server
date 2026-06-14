@@ -111,7 +111,7 @@ def test_post_prompt_safety_classification() -> None:
     assert _post_prompt_safety(EventJournal()) is ReexecutionSafety.DUPLICATE_COST
 
 
-async def test_run_turn_with_model_sets_session_model() -> None:
+async def test_run_turn_records_requested_model() -> None:
     result = await run_acp_turn(
         FAKE, "what is 17 + 25?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="fake-model"
     )

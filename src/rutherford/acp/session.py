@@ -100,9 +100,9 @@ async def run_acp_turn(
                     ReexecutionSafety.SAFE,
                 )
             session_id = session.session_id
-            if model:
-                with contextlib.suppress(Exception):
-                    await conn.set_session_model(model_id=model, session_id=session_id)
+            # The requested model is recorded on the target for provenance; pushing it to the agent over
+            # ACP's set_session_model is deferred (it is an unstable-protocol method) -- model selection is
+            # wired properly in a later phase. Most agents take the model from their own config meanwhile.
             blocks: list[PromptBlock] = [text_block(prompt)]
             try:
                 response = await asyncio.wait_for(conn.prompt(prompt=blocks, session_id=session_id), timeout=timeout_s)

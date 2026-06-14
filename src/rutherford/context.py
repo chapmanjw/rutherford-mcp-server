@@ -21,6 +21,7 @@ from .config.schema import RutherfordConfig
 from .domain.error_codes import ErrorCode
 from .domain.errors import RutherfordError
 from .io.serialize import encode
+from .services.consensus import ConsensusService
 from .services.delegation import DelegationService
 
 
@@ -49,6 +50,7 @@ class AppContext:
     config: RutherfordConfig
     descriptors: DescriptorRegistry
     delegation: DelegationService
+    consensus: ConsensusService
 
     def new_correlation_id(self) -> str:
         """Mint a short correlation id for a tool call."""
@@ -68,4 +70,7 @@ def build_app_context(
     resolved_config = config if config is not None else load_config()
     resolved_descriptors = descriptors if descriptors is not None else default_registry()
     delegation = DelegationService(resolved_descriptors, resolved_config)
-    return AppContext(config=resolved_config, descriptors=resolved_descriptors, delegation=delegation)
+    consensus = ConsensusService(delegation, resolved_config)
+    return AppContext(
+        config=resolved_config, descriptors=resolved_descriptors, delegation=delegation, consensus=consensus
+    )
