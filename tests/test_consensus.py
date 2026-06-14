@@ -14,7 +14,7 @@ from rutherford import server
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import AppContext, build_app_context
-from rutherford.domain.enums import Effort, Stance, Strategy
+from rutherford.domain.enums import Effort, SafetyMode, Stance, Strategy
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import ConsensusRequest, ConsensusResult, StrategyResult, Target
@@ -91,6 +91,19 @@ async def test_consensus_enforces_target_cap() -> None:
     with pytest.raises(RutherfordError) as exc:
         await _service(config).consensus(ConsensusRequest(targets=[Target(cli="fake"), Target(cli="fake")], prompt="x"))
     assert exc.value.code is ErrorCode.TOO_MANY_TARGETS
+
+
+@pytest.mark.parametrize("mode", [SafetyMode.PROPOSE, SafetyMode.WRITE, SafetyMode.YOLO])
+async def test_consensus_rejects_a_sandboxed_safety_mode(mode: SafetyMode) -> None:
+    # A consensus asks many agents one question; there is no coherent merge of edits from several of them into
+    # one tree, and the budgeted-harvest path drives sessions directly in the real working_dir with no per-turn
+    # sandbox. So a sandboxed (propose/write/yolo) mode is refused in the service; writes go through delegate.
+    with pytest.raises(RutherfordError) as exc:
+        await _service().consensus(
+            ConsensusRequest(targets=[Target(cli="fake")], prompt="x", safety_mode=mode, working_dir=str(REPO_ROOT))
+        )
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+    assert "read-only" in exc.value.message and "delegate" in exc.value.message
 
 
 async def test_consensus_diversity_is_low_for_same_model() -> None:

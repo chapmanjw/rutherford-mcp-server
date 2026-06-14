@@ -14,7 +14,7 @@ from rutherford import server
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import AppContext, build_app_context
-from rutherford.domain.enums import Effort, Stance
+from rutherford.domain.enums import Effort, SafetyMode, Stance
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import DebateContribution, DebateRequest, DebateRound, Target
@@ -114,6 +114,17 @@ async def test_debate_handshake_failure_becomes_a_failed_contribution() -> None:
 async def test_debate_without_synthesis() -> None:
     result = await _service().debate(_two_fakes(rounds=1, synthesize=False))
     assert result.final is None
+
+
+@pytest.mark.parametrize("mode", [SafetyMode.PROPOSE, SafetyMode.WRITE, SafetyMode.YOLO])
+async def test_debate_rejects_a_sandboxed_safety_mode(mode: SafetyMode) -> None:
+    # A debate runs its voices over PERSISTENT sessions directly in the real working_dir -- there is no
+    # per-turn worktree to isolate writes into, so a sandboxed (propose/write/yolo) mode would let an agent
+    # write straight into the user's tree. The service refuses it; write/propose work goes through delegate.
+    with pytest.raises(RutherfordError) as exc:
+        await _service().debate(_two_fakes(rounds=1, safety_mode=mode))
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+    assert "read-only" in exc.value.message and "delegate" in exc.value.message
 
 
 def test_disambiguate_labels() -> None:

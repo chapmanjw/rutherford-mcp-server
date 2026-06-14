@@ -23,7 +23,7 @@ from ..acp.descriptors import DescriptorRegistry
 from ..acp.permission import PermissionPolicy
 from ..acp.session import ACPHandshakeError, ACPSession, run_acp_turn
 from ..config.schema import RutherfordConfig
-from ..domain.enums import EFFORT_ORDER, ActivityEventKind, Effort, SafetyMode, Stance, is_mutating
+from ..domain.enums import EFFORT_ORDER, ActivityEventKind, Effort, SafetyMode, Stance, runs_sandboxed
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import (
@@ -124,10 +124,21 @@ class DebateService:
         persist = self._config.wants_persist(req.persist)
         voices = self._resolve_voices(req)
         rounds_cap = self._resolve_rounds(req)
+        # A panel is deliberation, not file work: a debate cannot run a sandboxed (propose / write / yolo)
+        # mode. It drives its voices over PERSISTENT sessions held across rounds, directly in the real
+        # working_dir -- there is no per-turn worktree to isolate writes into, and no coherent way to merge
+        # edits from several arguing agents, so a mutating mode would let an agent write straight into the
+        # user's tree. Writes go through delegate (one agent, one worktree sandbox, the reviewed diff applied
+        # back). Enforced in the service so the boundary holds no matter which caller set the mode.
+        if runs_sandboxed(req.safety_mode):
+            raise RutherfordError(
+                ErrorCode.INVALID_INPUT,
+                f"debate runs read-only: it cannot run '{req.safety_mode.value}'. A debate is several agents "
+                "arguing a question, not file work; use delegate (a single sandboxed agent) for write / "
+                "propose work.",
+            )
         cwd = req.working_dir or str(Path.cwd())
         policy = PermissionPolicy(mode=req.safety_mode)
-        if is_mutating(req.safety_mode) and not req.working_dir:
-            raise RutherfordError(ErrorCode.WORKSPACE_NOT_TRUSTED, f"{req.safety_mode.value} mode needs a working_dir")
         timeout_s = req.timeout_s or self._config.default_timeout_s
         budget = req.time_budget_s if req.time_budget_s is not None else self._config.default_time_budget_s
         on_budget = req.on_budget if req.on_budget is not None else self._config.default_on_budget

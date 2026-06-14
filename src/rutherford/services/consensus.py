@@ -27,7 +27,7 @@ from ..acp.descriptors import DescriptorRegistry
 from ..acp.permission import PermissionPolicy
 from ..acp.session import ACPHandshakeError, ACPSession, run_acp_turn
 from ..config.schema import RutherfordConfig
-from ..domain.enums import EFFORT_ORDER, ActivityEventKind, SafetyMode, Stance, Strategy
+from ..domain.enums import EFFORT_ORDER, ActivityEventKind, SafetyMode, Stance, Strategy, runs_sandboxed
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import (
@@ -129,6 +129,19 @@ class ConsensusService:
         synthesis and a diversity report) is returned. Either shape carries ``stop_reason`` + a ``rollup``
         when a budget governed the run, and a populated :class:`Topology`.
         """
+        # A consensus panel is read-only deliberation: it fans ONE question out to MANY agents. A sandboxed
+        # (propose / write / yolo) mode has no coherent panel semantics -- there is no defined merge of edits
+        # from several agents to one working tree -- and the budgeted-harvest path drives sessions directly in
+        # the real working_dir with no per-turn sandbox, so a mutating mode there would write straight into the
+        # user's tree. So a mutating mode is refused here (the service is the security boundary, not the tool);
+        # writes go through delegate, which isolates a single agent in a worktree and applies the diff back.
+        if runs_sandboxed(req.safety_mode):
+            raise RutherfordError(
+                ErrorCode.INVALID_INPUT,
+                f"consensus runs read-only: it cannot run '{req.safety_mode.value}'. It asks many agents the "
+                "same question; there is no coherent way to apply edits from several of them to one tree. Use "
+                "delegate (a single sandboxed agent) for write / propose work.",
+            )
         created_at = self._clock()
         persist = self._config.wants_persist(req.persist)
         # When persisting, mint the parent id up front so each voice can be written as its child (F2). When not

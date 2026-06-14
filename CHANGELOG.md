@@ -277,6 +277,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Safety: `consensus` and `debate` now refuse a mutating / sandboxed `safety_mode`** (`propose` / `write` /
+  `yolo`) and run read-only. A debate drives its voices over persistent ACP sessions, and a budgeted consensus
+  drives its harvest sessions, **directly in the real `working_dir` with no per-turn worktree** — so a mutating
+  mode on those paths would let an agent write straight into the user's tree, unsandboxed. Beyond the leak,
+  there is no coherent way to merge edits from several agents into one working tree (the same reason delegation
+  already refuses a mutating cross-target fallback). The guard lives in the *services* (the security boundary,
+  not just the tool wrapper), so it holds no matter which caller set the mode; the error points the caller at
+  `delegate`, which isolates a single agent in a worktree sandbox and applies the reviewed diff back. Write /
+  propose work belongs to `delegate`; panels (`consensus` / `debate` / `review` / `plan`) are read-only
+  deliberation. (Found by the Codex-via-Rutherford parity review.)
 - A steered debate voice (stance `for` / `against`) now has its stance **re-embedded every round**, not just
   round 1 (v2 parity). The later-round delta prompt re-appends "Keep arguing in favor of / against the
   proposition."; without it a multi-round debate drifts toward the center as each voice accommodates the

@@ -228,8 +228,11 @@ async def consensus(
     (`StrategyResult`) instead of every voice. Optional `stances` (parallel to `targets`) steer each voice
     and cannot combine with the auto-expanded panel. `synthesize` (defaults to `synthesize_default`, off
     out of the box) adds a server-side combined answer (`all-voices` only); `judge` names the seat that
-    writes it. `safety_mode` and `timeout_s` apply to every voice; one failing voice is a failed result,
-    never an aborted panel. `role` names a persona (see `list_roles`) prepended to the prompt every voice
+    writes it. `timeout_s` applies to every voice; one failing voice is a failed result, never an aborted
+    panel. Consensus is read-only deliberation: a `safety_mode` beyond `read_only` (`propose` / `write` /
+    `yolo`) is refused -- there is no coherent merge of edits from several agents into one tree -- so route
+    write / propose work through `delegate` (a single agent isolated in a worktree sandbox). `role` names a
+    persona (see `list_roles`) prepended to the prompt every voice
     receives. `effort` (low | medium | high | xhigh) asks every voice to spend more reasoning where it has a
     knob. `time_budget_s` is a wall-clock deadline for the WHOLE panel (distinct from each voice's
     `timeout_s`): at the deadline answered voices are kept, in-flight ones cut, and the panel aggregates over
@@ -298,7 +301,10 @@ async def debate(
     session across all `rounds`: round one is each voice's
     independent answer, and each later round shows a voice the others' latest positions and asks it to
     revise -- the agent remembers its own prior reasoning in-session, so only the delta is sent.
-    `synthesize=true` (default) adds a closing summary; `judge` names a target to write it. `role` names a
+    `synthesize=true` (default) adds a closing summary; `judge` names a target to write it. A debate is
+    read-only deliberation: a `safety_mode` beyond `read_only` (`propose` / `write` / `yolo`) is refused --
+    the voices run on persistent sessions in the working directory with no per-turn sandbox -- so route write /
+    propose work through `delegate` (a single agent isolated in a worktree sandbox). `role` names a
     persona (see `list_roles`) prepended to the opening prompt every voice argues from. `effort` (low |
     medium | high | xhigh) asks every voice to spend more reasoning where it has a knob. `time_budget_s` is a
     wall-clock deadline for the WHOLE debate enforced at round boundaries: a round still in flight at the
