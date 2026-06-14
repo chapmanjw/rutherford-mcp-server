@@ -83,7 +83,7 @@ def test_descriptor_registry() -> None:
     registry = default_registry()
     assert registry.has("goose") and "goose" in registry.ids()
     assert registry.get("goose").command == ("goose", "acp")
-    assert len(registry) == 12
+    assert len(registry) == 14
     with pytest.raises(KeyError):
         registry.get("nope")
     with pytest.raises(ValueError, match="duplicate"):
@@ -126,6 +126,15 @@ def test_second_wave_descriptors() -> None:
     assert registry.get("droid").command == ("droid", "exec", "--output-format", "acp")
     assert registry.get("droid").provider is None
     assert not registry.has("hermes")  # probed OK once but too slow on its free model; left to config
+
+
+def test_third_wave_descriptors() -> None:
+    """cursor/kiro (probed live with the docs-confirmed commands) launch over ACP."""
+    registry = default_registry()
+    # cursor's `acp` subcommand is hidden from --help but real; cursor-agent IS the `agent` binary.
+    assert registry.get("cursor").command == ("cursor-agent", "acp")
+    # kiro's ACP binary is kiro-cli (the `kiro` binary is the IDE launcher).
+    assert registry.get("kiro").command == ("kiro-cli", "acp")
 
 
 def test_journal_event_from_message() -> None:

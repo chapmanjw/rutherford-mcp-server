@@ -14,7 +14,7 @@ from rutherford.domain.errors import ConfigError
 
 def test_no_config_is_the_builtin_roster() -> None:
     registry = build_registry(RutherfordConfig())
-    assert len(registry) == len(HIGH_FIDELITY) == 12
+    assert len(registry) == len(HIGH_FIDELITY) == 14
     assert registry.get("goose").command == ("goose", "acp")
 
 
@@ -46,7 +46,7 @@ def test_env_overrides_flow_to_descriptor() -> None:
 def test_disable_a_builtin_agent() -> None:
     registry = build_registry(RutherfordConfig(agents={"openhands": AgentConfig(enabled=False)}))
     assert not registry.has("openhands")
-    assert len(registry) == 11
+    assert len(registry) == 13
 
 
 def test_define_a_new_agent() -> None:

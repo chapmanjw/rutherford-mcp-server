@@ -71,9 +71,9 @@ class DescriptorRegistry:
 
 #: The high-fidelity native-ACP roster (research receipt 02-synthesis): the agents Rutherford drives
 #: directly as ACP servers, in initial-onboarding order. ``goose``, ``opencode``, ``vibe``, ``junie``,
-#: ``codex``, ``claude_code``, ``copilot``, ``qwen`` and ``droid`` are confirmed live on this machine; the
-#: rest (``cline``, ``kimi``, ``openhands``) carry their researched launch command and are gated by the
-#: conformance harness before they are trusted.
+#: ``codex``, ``claude_code``, ``copilot``, ``qwen``, ``droid``, ``cursor`` and ``kiro`` are confirmed live
+#: on this machine; the rest (``cline``, ``kimi``, ``openhands``) carry their researched launch command and
+#: are gated by the conformance harness before they are trusted.
 #:
 #: ``codex`` and ``claude_code`` use the official Zed adapters -- ``codex-acp`` and ``claude-agent-acp`` (npm
 #: ``@agentclientprotocol/*``) -- which front the Codex and Claude Code CLIs as ACP servers. Both honor the
@@ -81,9 +81,10 @@ class DescriptorRegistry:
 #: (``~/.codex/auth.json``) and ``claude-agent-acp`` reuses the Claude Code login (receipt
 #: ``11-official-adapters-auth-test.md``). The launch command is the adapter shim, not the underlying CLI.
 #:
-#: ``copilot``/``droid`` are bring-your-own-model (provider ``None``); ``qwen`` carries its vendor as an
-#: unconfirmed guess. (``hermes`` probed OK once but blew a 180s turn on its free Nous model -- too slow to
-#: trust in a panel -- so it is left to config; ``kilo``/``kiro`` need work. Receipt 12.)
+#: ``copilot``/``droid``/``cursor``/``kiro`` are bring-your-own-model (provider ``None``); ``qwen`` carries
+#: its vendor as an unconfirmed guess. ``cursor``'s ``acp`` subcommand is real but hidden from ``--help``;
+#: ``kiro``'s ACP binary is ``kiro-cli`` (the ``kiro`` binary is the IDE launcher). (``hermes`` probed OK
+#: but blew a 180s turn on its free Nous model -- left to config; ``kilo`` needs work. Receipt 12.)
 HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("goose", "Goose", ("goose", "acp")),
     AgentDescriptor("opencode", "OpenCode", ("opencode", "acp")),
@@ -97,6 +98,8 @@ HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("copilot", "GitHub Copilot", ("copilot", "--acp")),
     AgentDescriptor("qwen", "Qwen Code", ("qwen", "--acp"), provider="alibaba"),
     AgentDescriptor("droid", "Factory Droid", ("droid", "exec", "--output-format", "acp")),
+    AgentDescriptor("cursor", "Cursor", ("cursor-agent", "acp")),
+    AgentDescriptor("kiro", "Kiro", ("kiro-cli", "acp")),
 )
 
 
