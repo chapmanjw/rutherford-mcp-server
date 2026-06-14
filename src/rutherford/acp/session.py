@@ -45,6 +45,12 @@ from .teardown import reap, snapshot_descendants
 
 #: How Rutherford identifies itself to an agent at ``initialize``.
 _CLIENT_INFO = Implementation(name="rutherford-acp", version="3.0.0")
+#: Max bytes in a single line of an agent's JSON-RPC stdout. asyncio's StreamReader default (64 KiB) is too
+#: small for real agents -- one ``session/update`` can carry a big model list (kilo on OpenRouter enumerates
+#: hundreds of models), a large file read, or a long tool output, and a line over the limit raises
+#: "Separator is found, but chunk is longer than limit" and drops the connection. 16 MiB is generous for any
+#: legitimate message while still bounding memory against a runaway agent.
+_STREAM_LIMIT = 16 * 1024 * 1024
 #: The ACP prompt content-block union (annotated so the single-text-block list types cleanly).
 PromptBlock = (
     TextContentBlock | ImageContentBlock | AudioContentBlock | ResourceContentBlock | EmbeddedResourceContentBlock
@@ -130,7 +136,7 @@ class ACPSession:
                     *args,
                     env=env,
                     cwd=self._cwd,
-                    transport_kwargs={"stderr": None},
+                    transport_kwargs={"stderr": None, "limit": _STREAM_LIMIT},
                     observers=[_observe],
                 )
             )
