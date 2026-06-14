@@ -8,6 +8,7 @@ from typing import Any
 
 from ..context import AppContext, tool_success
 from ..domain.models import DebateRequest
+from ..services.delegation import ActivityCallback
 from .common import (
     apply_role,
     as_target,
@@ -36,6 +37,7 @@ async def debate_tool(
     time_budget_s: float | None = None,
     on_budget: str | None = None,
     mode: str = "sync",
+    on_activity: ActivityCallback | None = None,
 ) -> str:
     """Validate the panel, run the multi-round debate over persistent sessions, and return the transcript.
 
@@ -70,8 +72,10 @@ async def debate_tool(
         on_budget=parse_on_budget(on_budget),
     )
 
-    async def run() -> str:
-        result = await app.debate.debate(request)
+    async def run(job_activity: ActivityCallback | None = None) -> str:
+        # N1 (item 3): the async path hands the debate the JOB's activity sink; the sync path uses
+        # ``on_activity`` (the MCP progress push). Exactly one is ever set.
+        result = await app.debate.debate(request, on_activity=job_activity or on_activity)
         return tool_success(result)
 
     if run_async:

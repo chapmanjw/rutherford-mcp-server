@@ -12,6 +12,7 @@ A voice that fails a round drops out; the sessions are always closed at the end.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,10 +21,11 @@ from ..acp.descriptors import DescriptorRegistry
 from ..acp.permission import PermissionPolicy
 from ..acp.session import ACPHandshakeError, ACPSession, run_acp_turn
 from ..config.schema import RutherfordConfig
-from ..domain.enums import EFFORT_ORDER, Effort, SafetyMode, Stance, is_mutating
+from ..domain.enums import EFFORT_ORDER, ActivityEventKind, Effort, SafetyMode, Stance, is_mutating
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import (
+    ActivityEvent,
     Cost,
     DebateContribution,
     DebateRequest,
@@ -33,7 +35,12 @@ from ..domain.models import (
     ErrorInfo,
     RunRollup,
     Target,
+    Topology,
 )
+from ..runtime.depth import ensure_within_aggregate_cap
+from .delegation import ActivityCallback, DelegationService, PanelLifecycle, emit_activity
+
+_log = logging.getLogger("rutherford.services.debate")
 
 
 @dataclass(frozen=True)
@@ -49,12 +56,44 @@ class _Voice:
 class DebateService:
     """Runs a multi-round debate across ACP agents, each on a persistent session, and returns the transcript."""
 
-    def __init__(self, descriptors: DescriptorRegistry, config: RutherfordConfig) -> None:
+    def __init__(
+        self, descriptors: DescriptorRegistry, config: RutherfordConfig, delegation: DelegationService
+    ) -> None:
         self._descriptors = descriptors
         self._config = config
+        #: The delegation service is shared so a debate's turns gate on the SAME concurrency semaphore as
+        #: every other path that spawns an agent (a wide debate cannot exceed ``max_concurrency`` live turns).
+        self._delegation = delegation
 
-    async def debate(self, req: DebateRequest) -> DebateResult:
+    async def debate(
+        self,
+        req: DebateRequest,
+        *,
+        base_depth: int = 0,
+        on_activity: ActivityCallback | None = None,
+    ) -> DebateResult:
         """Open one session per voice, run up to ``rounds`` rounds (delta prompts after round 1), and close.
+
+        Wraps the debate body in a :class:`PanelLifecycle` (N1, item 3) so the activity stream always closes
+        with exactly one terminal event. ``on_activity`` is the structured live stream; ``base_depth`` is how
+        deep the debate sits in a Rutherford-driving-Rutherford chain, layered onto every voice's session env.
+        """
+        lifecycle = PanelLifecycle("debate", base_depth, on_activity)
+        try:
+            return await self._debate_impl(req, lifecycle, base_depth=base_depth, on_activity=on_activity)
+        except asyncio.CancelledError:
+            lifecycle.on_cancel()
+            raise
+
+    async def _debate_impl(
+        self,
+        req: DebateRequest,
+        lifecycle: PanelLifecycle,
+        *,
+        base_depth: int = 0,
+        on_activity: ActivityCallback | None = None,
+    ) -> DebateResult:
+        """The debate body; the public :meth:`debate` wraps this with the lifecycle guard.
 
         A ``time_budget_s`` bounds the whole debate's wall-clock, enforced at round boundaries: each round runs
         under the REMAINING budget, a round still in flight at the deadline is cut (its turns finalized as
@@ -74,9 +113,31 @@ class DebateService:
         on_budget = req.on_budget if req.on_budget is not None else self._config.default_on_budget
         enforce = budget is not None and on_budget != "continue"
 
+        # N1 (item 3): the declared width (the panel's voices). Cap-check it up front -- refuse with
+        # AGENT_CAP_EXCEEDED when enforced, else flag ``over_cap`` -- then announce the panel as started.
+        declared = len(voices)
+        over_cap = ensure_within_aggregate_cap(
+            declared, self._config.max_agents_advisory, enforce=self._config.enforce_agent_cap
+        )
+        if over_cap:
+            _log.warning(
+                "debate declared width %d exceeds the aggregate-agent cap %d; watch the activity view",
+                declared,
+                self._config.max_agents_advisory,
+            )
+        lifecycle.mark_started(
+            ActivityEvent(
+                kind=ActivityEventKind.PANEL_STARTED,
+                tool="debate",
+                depth=base_depth,
+                declared=declared,
+                message=f"debate panel started: {declared} voice(s)",
+            )
+        )
+
         sessions: dict[int, ACPSession] = {}
         open_errors: dict[int, str] = {}
-        await self._open_sessions(req, voices, policy, cwd, sessions, open_errors)
+        await self._open_sessions(req, voices, policy, cwd, sessions, open_errors, base_depth)
         start = time.monotonic()
         stop_reason: str | None = None
         try:
@@ -93,7 +154,17 @@ class DebateService:
                         break
                 previous = rounds[-1] if rounds else None
                 contributions, round_cut = await self._run_round(
-                    req, voices, active, sessions, open_errors, round_index, previous, timeout_s, remaining
+                    req,
+                    voices,
+                    active,
+                    sessions,
+                    open_errors,
+                    round_index,
+                    previous,
+                    timeout_s,
+                    remaining,
+                    base_depth,
+                    on_activity,
                 )
                 rounds.append(DebateRound(index=round_index, contributions=contributions))
                 if round_cut:  # turns were cut in-flight at the deadline -- finalize over the transcript so far
@@ -103,10 +174,24 @@ class DebateService:
                 active = [voice for voice in active if _seat_id(voice) in survivors]
 
             if stop_reason == "budget":
-                self._check_quorum(req, rounds, budget)
-            final, synthesis_by = await self._synthesize(req, rounds, cwd, timeout_s)
+                self._check_quorum(req, rounds, budget, lifecycle, base_depth, declared)
+            final, synthesis_by = await self._synthesize(req, rounds, cwd, timeout_s, base_depth)
             elapsed_s = round(time.monotonic() - start, 3)
             rollup = self._rollup(req, rounds, budget, stop_reason, elapsed_s) if budget is not None else None
+            topology = self._topology(declared, rounds, over_cap)
+            usable_round = _last_usable_round(rounds)
+            usable = sum(1 for c in usable_round.contributions if c.ok and c.text.strip()) if usable_round else 0
+            lifecycle.mark_closed(
+                ActivityEvent(
+                    kind=ActivityEventKind.PANEL_FINISHED,
+                    tool="debate",
+                    depth=base_depth,
+                    declared=declared,
+                    done=usable,
+                    observed_agents=topology.observed_peak_agents,
+                    message=f"debate panel finished: {len(rounds)} round(s)",
+                )
+            )
             return DebateResult(
                 prompt=req.prompt,
                 rounds=rounds,
@@ -114,16 +199,59 @@ class DebateService:
                 synthesis_by=synthesis_by,
                 stop_reason=stop_reason if budget is not None else None,
                 rollup=rollup,
+                topology=topology,
             )
         finally:
             await asyncio.gather(*(session.close() for session in sessions.values()), return_exceptions=True)
 
-    def _check_quorum(self, req: DebateRequest, rounds: list[DebateRound], budget: float | None) -> None:
-        """Raise ``BUDGET_EXHAUSTED`` when a harvest left fewer than ``min_quorum`` usable last-round positions."""
+    def _topology(self, declared: int, rounds: list[DebateRound], over_cap: bool) -> Topology:
+        """The debate's observed process/agent fan-out (N1, item 3), summed across every turn of every round.
+
+        ``realized_delegations`` counts each turn's subprocess delegations (a round-1 + round-2 turn for the
+        same voice is two delegations -- a debate re-prompts the live session, but each prompt turn is its own
+        agent invocation here), so a multi-round debate's realized count exceeds the declared width by design.
+        ``observed_peak_agents`` is the max local descendant peak any turn sampled (a FLOOR), ``None`` when no
+        turn was sampled. ``over_cap`` flags a declared width over the advisory cap.
+        """
+        contributions = [c for round_ in rounds for c in round_.contributions]
+        observed = [c.observed_peak_agents for c in contributions if c.observed_peak_agents is not None]
+        realized = sum(c.delegation_call_count for c in contributions)
+        return Topology(
+            declared=declared,
+            realized_delegations=realized,
+            observed_peak_agents=max(observed) if observed else None,
+            over_cap=over_cap,
+        )
+
+    def _check_quorum(
+        self,
+        req: DebateRequest,
+        rounds: list[DebateRound],
+        budget: float | None,
+        lifecycle: PanelLifecycle,
+        base_depth: int,
+        declared: int,
+    ) -> None:
+        """Raise ``BUDGET_EXHAUSTED`` when a harvest left fewer than ``min_quorum`` usable last-round positions.
+
+        Closes the activity stream with a (failed) ``panel_finished`` before raising, so the stream/push has a
+        terminal event for the exhausted-harvest outcome rather than being left open (N1, item 3, decision 3-K).
+        """
         usable_round = _last_usable_round(rounds)
         usable = sum(1 for c in usable_round.contributions if c.ok and c.text.strip()) if usable_round else 0
         if usable < self._config.min_quorum:
             budget_s = budget if budget is not None else 0.0
+            lifecycle.mark_closed(
+                ActivityEvent(
+                    kind=ActivityEventKind.PANEL_FINISHED,
+                    tool="debate",
+                    depth=base_depth,
+                    declared=declared,
+                    done=usable,
+                    status="failed",
+                    message=f"debate budget exhausted: {usable} usable position(s), below quorum",
+                )
+            )
             raise RutherfordError(
                 ErrorCode.BUDGET_EXHAUSTED,
                 f"time budget ({budget_s:.0f}s) reached with {usable} usable debate position(s), below "
@@ -138,11 +266,13 @@ class DebateService:
         cwd: str,
         sessions: dict[int, ACPSession],
         open_errors: dict[int, str],
+        base_depth: int,
     ) -> None:
         """Open one ACP session per voice in parallel; record an unknown-agent or handshake failure.
 
-        Each session carries the debate's producer-effort cap (F8a), so every turn on it runs at the resolved
-        tier and reports ``effort_applied``.
+        Each session carries the debate's producer-effort cap (F8a) and the N1 lineage/depth signal
+        (``base_depth``), so every turn on it runs at the resolved tier and a Rutherford-host voice stays
+        bounded.
         """
 
         async def _open(voice: _Voice) -> None:
@@ -155,6 +285,7 @@ class DebateService:
                 cwd=cwd,
                 model=voice.target.model,
                 effort=req.effort,
+                base_depth=base_depth,
             )
             try:
                 await session.open()
@@ -176,31 +307,90 @@ class DebateService:
         previous: DebateRound | None,
         timeout_s: float,
         remaining_budget: float | None,
+        base_depth: int,
+        on_activity: ActivityCallback | None,
     ) -> tuple[list[DebateContribution], bool]:
         """Run one round in parallel; return ``(contributions, was_cut)``.
 
         Round 1 also emits a failed contribution for any voice whose session never opened, so the transcript
-        shows where a voice fell out. Later rounds run only the surviving active voices. When
-        ``remaining_budget`` is set the round's turns race under that wall-clock deadline: a turn still in
-        flight at the deadline is cut and finalized as a ``BUDGET_EXHAUSTED`` contribution (its streamed
-        partial preserved but NOT promoted to text -- a rebuttal assumes each voice saw the others' complete
-        positions), and ``was_cut`` is ``True``.
+        shows where a voice fell out. Later rounds run only the surviving active voices. Each turn gates on the
+        shared concurrency semaphore and emits its own ``voice_started`` / ``voice_finished`` activity events
+        (a correlation id per seat). When ``remaining_budget`` is set the round's turns race under that
+        wall-clock deadline: a turn still in flight at the deadline is cut and finalized as a
+        ``BUDGET_EXHAUSTED`` contribution (its streamed partial preserved but NOT promoted to text -- a
+        rebuttal assumes each voice saw the others' complete positions), and ``was_cut`` is ``True``.
         """
 
         async def _turn(voice: _Voice) -> DebateContribution:
             prompt = self._round_prompt(req, voice, previous)
-            result = await sessions[voice.index].prompt(prompt, timeout_s=timeout_s)
-            return _to_contribution(voice, round_index, result)
+            async with self._delegation.semaphore:
+                emit_activity(
+                    on_activity,
+                    ActivityEvent(
+                        kind=ActivityEventKind.VOICE_STARTED,
+                        correlation_id=_seat_id(voice),  # stable per-seat key across rounds
+                        cli=voice.target.cli,
+                        model=voice.target.model,
+                        role=req.role,
+                        depth=base_depth,
+                        status="started",
+                        message=f"{voice.label} (round {round_index}) started",
+                    ),
+                )
+                result = await sessions[voice.index].prompt(prompt, timeout_s=timeout_s)
+            contribution = _to_contribution(voice, round_index, result)
+            emit_activity(
+                on_activity,
+                ActivityEvent(
+                    kind=ActivityEventKind.VOICE_FINISHED,
+                    correlation_id=_seat_id(voice),
+                    cli=voice.target.cli,
+                    model=result.target.model,
+                    role=req.role,
+                    status="ok" if result.ok else "failed",
+                    elapsed_s=result.duration_s,
+                    observed_agents=result.observed_peak_agents,
+                    depth=base_depth,
+                    message=f"{voice.label} (round {round_index}) {'ok' if result.ok else 'failed'}",
+                ),
+            )
+            return contribution
 
         tasks = {voice.index: asyncio.create_task(_turn(voice)) for voice in active}
         cut_indices: set[int] = set()
         if remaining_budget is not None:
             _done, pending = await asyncio.wait(tasks.values(), timeout=max(0.0, remaining_budget))
             if pending:
+                emit_activity(
+                    on_activity,
+                    ActivityEvent(
+                        kind=ActivityEventKind.BUDGET_TICK,
+                        tool="debate",
+                        depth=base_depth,
+                        budget_left_s=0.0,
+                        message=f"time budget reached; cutting {len(pending)} turn(s) in round {round_index}",
+                    ),
+                )
+                seat_by_index = {voice.index: voice for voice in active}
                 for index, task in tasks.items():
                     if task in pending:
                         cut_indices.add(index)
                         task.cancel()
+                        seat = seat_by_index[index]
+                        emit_activity(
+                            on_activity,
+                            ActivityEvent(
+                                kind=ActivityEventKind.CUT,
+                                correlation_id=_seat_id(seat),
+                                tool="debate",
+                                cli=seat.target.cli,
+                                model=seat.target.model,
+                                role=req.role,
+                                depth=base_depth,
+                                status="cut",
+                                message=f"{seat.label} cut at the time budget (round {round_index})",
+                            ),
+                        )
                 await asyncio.gather(*pending, return_exceptions=True)
         else:
             await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -259,12 +449,12 @@ class DebateService:
         )
 
     async def _synthesize(
-        self, req: DebateRequest, rounds: list[DebateRound], cwd: str, timeout_s: float
+        self, req: DebateRequest, rounds: list[DebateRound], cwd: str, timeout_s: float, base_depth: int
     ) -> tuple[str | None, str | None]:
         """Run a closing pass over the final positions, or ``(None, None)`` when there is nothing to close.
 
         Uses the caller-named ``judge`` when given (ideally a non-participant), else the first surviving
-        voice's agent, on a fresh one-shot session.
+        voice's agent, on a fresh one-shot session one level deeper (so a Rutherford-host judge is bounded).
         """
         if not req.synthesize or not rounds:
             return None, None
@@ -292,6 +482,7 @@ class DebateService:
             cwd=cwd,
             timeout_s=timeout_s,
             model=judge.model,
+            base_depth=base_depth + 1,
         )
         if not result.ok or not result.text.strip():
             return None, None
@@ -414,6 +605,10 @@ def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) 
         cost=result.cost,
         effort_applied=result.effort_applied,
         partial=result.partial,
+        # N1 (item 3): carry the turn's observed peak and delegation count up so the debate rolls them into
+        # its panel Topology (a floor for observed; one delegation per turn).
+        observed_peak_agents=result.observed_peak_agents,
+        delegation_call_count=result.delegation_call_count,
     )
 
 
@@ -452,6 +647,10 @@ def _cut_contribution(voice: _Voice, round_index: int, session: ACPSession, budg
         session_id=session.session_id,
         partial=partial,
         effort_applied=session.effort_applied,
+        # N1 (item 3): a cut turn still spun up a subprocess (count 1) and carries the peak its session
+        # sampled before the cut, so the panel topology floor reflects the cut work too.
+        observed_peak_agents=session.observed_peak_agents,
+        delegation_call_count=1,
     )
 
 

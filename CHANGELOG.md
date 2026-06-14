@@ -8,6 +8,34 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- N1 topology, a per-voice live-activity stream, sync progress push, and the cross-cutting limits over ACP
+  (item 3 + reliability), ported from v2.
+  - Topology. `consensus` / `StrategyResult` / `debate` and a single `delegate` result now carry a populated
+    `Topology`: `declared` (the intended width), `realized_delegations` (Rutherford's own ACP delegations
+    summed across voices/turns, incl. any fallback re-runs), `observed_peak_agents` (a FLOOR sampled from the
+    live process tree — a coarse psutil timer walks each agent's descendants during a turn, reusing
+    `teardown`, and the panel takes the peak; a CLI's remote agents are invisible, hence "floor"), and
+    `over_cap`.
+  - Per-voice activity stream + the `activity` tool. The services emit one `ActivityEvent` stream from a
+    single source — a panel emits `panel_started`, a `voice_started` / `voice_finished` (or `cut`) per voice
+    under a stable correlation id, and `panel_finished`, guaranteed exactly one terminal event by a
+    `PanelLifecycle` wrapper. A background job buffers the stream on a bounded `JobRecord.activity[]`, and the
+    `activity` MCP tool now returns one row PER VOICE in flight (`{job_id, tool, cli, model, role, status,
+    elapsed_s, observed_agents, budget_left_s}`) instead of one row per job, still `{active, count}`.
+  - Sync progress push. A synchronous `consensus` / `debate` call pushes MCP progress notifications as voices
+    finish (a consensus-fraction `done`/`declared`), via a `make_progress_pusher` -> `Context.report_progress`
+    seam in `server.py`, gated on a client-supplied `progressToken` (silent otherwise). An async job is polled
+    via `activity` instead.
+  - Limits. A `max_concurrency` semaphore (held around every ACP turn by the delegation primitive and shared
+    with the consensus budget-harvest and a debate's round turns) bounds how many live ACP sessions a wide
+    panel launches at once. The aggregate-agent cap is wired: a panel whose declared width exceeds
+    `max_agents_advisory` flags `Topology.over_cap` and logs a warning, or — with `enforce_agent_cap=true` —
+    is refused up front with `AGENT_CAP_EXCEEDED`. A new `runtime/depth.py` propagates `RUTHERFORD_DEPTH`
+    (+ count-first `RUTHERFORD_LINEAGE` and `RUTHERFORD_PARENT_RUN`) into every spawned ACP agent's
+    environment and enforces `max_depth`, refusing a too-deep Rutherford-driving-Rutherford call with
+    `MAX_DEPTH_EXCEEDED`. The `max_concurrency`, `max_agents_advisory`, `enforce_agent_cap`, and `max_depth`
+    config fields move out of the "not yet wired" list in `docs/configuration.md`.
+
 - Reasoning-effort tiers and a whole-panel time budget with harvest over ACP (F8a), ported from v2.
   - Effort tiers. `delegate` / `consensus` / `debate` gain an `effort` (low | medium | high | xhigh)
     parameter, resolved per call as explicit `effort` -> per-agent `[agents.<id>] effort` -> global

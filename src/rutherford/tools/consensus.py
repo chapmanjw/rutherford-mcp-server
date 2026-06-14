@@ -8,6 +8,7 @@ from typing import Any
 
 from ..context import AppContext, tool_success
 from ..domain.models import ConsensusRequest, Target
+from ..services.delegation import ActivityCallback
 from .common import (
     apply_role,
     as_target,
@@ -43,6 +44,7 @@ async def consensus_tool(
     time_budget_s: float | None = None,
     on_budget: str | None = None,
     mode: str = "sync",
+    on_activity: ActivityCallback | None = None,
 ) -> str:
     """Validate the panel, fan the prompt out across the targets, and reduce the voices to a TOON envelope.
 
@@ -98,8 +100,11 @@ async def consensus_tool(
         on_budget=parse_on_budget(on_budget),
     )
 
-    async def run() -> str:
-        result = await app.consensus.consensus(request)
+    async def run(job_activity: ActivityCallback | None = None) -> str:
+        # N1 (item 3): the async path hands the panel the JOB's activity sink (the ``activity`` poll table);
+        # the sync path uses ``on_activity`` (the MCP progress push), supplied by server.py. Exactly one is
+        # ever set -- a sync call has no job buffer, an async call has no live caller to push to.
+        result = await app.consensus.consensus(request, on_activity=job_activity or on_activity)
         return tool_success(result)
 
     if run_async:

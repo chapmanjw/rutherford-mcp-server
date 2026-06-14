@@ -69,7 +69,7 @@ order the fields appear in `config/schema.py`.
 | `max_debate_rounds` | `int` | `4` | Maximum rounds a single `debate` call may run (1–10). |
 | `min_quorum` | `int` | `1` | Minimum parseable voices an aggregating consensus strategy needs (≥ 1) before it returns a decision. |
 | `min_distinct` | `int` | `2` | Distinct-identity floor below which a panel's answers are flagged `low_diversity` (≥ 1). |
-| `max_concurrency` | `int` | `max_targets` | Intended ceiling on agents run at once across a panel (≥ 1); defaults to `max_targets`. Not yet enforced in v3 (see the note below) — a panel currently fans out to every voice at once. |
+| `max_concurrency` | `int` | `max_targets` | Ceiling on live ACP sessions run at once across a panel (≥ 1); defaults to `max_targets`. Enforced by a semaphore the delegation primitive and the panel fan-out share, so a wide panel cannot exceed it on any path. |
 | `cooldown_threshold` | `int` | `3` | Unhealthy failures within `cooldown_window_s` before an agent is benched (≥ 0; `0` disables). |
 | `cooldown_window_s` | `float` | `120.0` | The sliding window over which `cooldown_threshold` failures are counted (> 0). |
 | `cooldown_duration_s` | `float` | `60.0` | How long a benched agent stays benched (> 0). |
@@ -87,19 +87,20 @@ order the fields appear in `config/schema.py`.
 
 > Several fields are part of the config contract but are **not yet wired** into the leaner v3
 > consensus / debate path — they validate and load, but have no effect today, and land as those features
-> are re-added over the ACP core. The not-yet-active set: `default_effort`, `default_time_budget_s`,
-> `default_on_budget` (time budget / effort); `max_agents_advisory`, `enforce_agent_cap` (topology cap);
-> `min_quorum`, `min_distinct`, `synthesize_default` (consensus aggregation / synthesis / diversity);
-> `max_concurrency` (no concurrency semaphore yet); `cooldown_threshold` / `cooldown_window_s` /
+> are re-added over the ACP core. The not-yet-active set: `cooldown_threshold` / `cooldown_window_s` /
 > `cooldown_duration_s` (cooldown / quarantine); `verify_read_only` (the post-run git check);
 > `probe_cache_ttl_s`, `probe_timeout_s` (metadata-probe caching); and `default_persistence`, `jobs_dir`
 > (durable on-disk jobs — v3 jobs are in-memory).
 >
 > What **is** active today: the roster fields (`agents`, `enabled_agents`, `auto_detect_local_models`),
 > `default_safety_mode` and `trusted_workspaces` (read_only is the default and the write/yolo trust gate
-> is enforced — but `verify_read_only` above is not), `default_timeout_s`, `max_targets`, `max_depth`,
-> `max_debate_rounds`, `role_dirs`, the in-memory job knobs (`job_ttl_s`, `max_jobs`), and the logging
-> fields.
+> is enforced — but `verify_read_only` above is not), `default_timeout_s`, `default_effort`,
+> `default_time_budget_s`, `default_on_budget` (time budget / effort), `max_targets`, `max_depth` (the
+> recursion guard, `MAX_DEPTH_EXCEEDED`), `max_concurrency` (the fan-out semaphore), `max_agents_advisory`
+> / `enforce_agent_cap` (the aggregate-agent cap — flags `Topology.over_cap`, or refuses with
+> `AGENT_CAP_EXCEEDED` when enforced), `min_quorum`, `min_distinct`, `synthesize_default` (consensus
+> aggregation / synthesis / diversity), `max_debate_rounds`, `role_dirs`, the in-memory job knobs
+> (`job_ttl_s`, `max_jobs`), and the logging fields.
 
 ### `AgentConfig` fields (under `[agents.<id>]`)
 

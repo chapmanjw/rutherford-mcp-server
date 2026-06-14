@@ -27,16 +27,24 @@ from dataclasses import dataclass, field
 from ..domain.enums import JobStatus
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
+from ..domain.models import ActivityEvent
+from .delegation import ActivityCallback
 
-#: A no-argument factory that builds the coroutine to run. A factory (not a bare coroutine) so the
-#: coroutine is created inside the background task, never awaited on the caller's path.
-CoroFactory = Callable[[], Awaitable[str]]
+#: A factory that builds the coroutine to run, given the job's live-activity sink (N1, item 3). A factory
+#: (not a bare coroutine) so the coroutine is created inside the background task, never awaited on the
+#: caller's path; it is handed the per-job ``on_activity`` sink so a panel's structured stream lands in this
+#: job's :class:`JobRecord.activity` buffer (the per-voice ``activity`` poll table).
+CoroFactory = Callable[[ActivityCallback], Awaitable[str]]
 
 #: The wall-clock source, injectable for tests (default :func:`time.time`).
 Clock = Callable[[], float]
 
 #: The job statuses that are finished (terminal): eligible for TTL eviction and cap-eviction.
 _TERMINAL: frozenset[JobStatus] = frozenset({JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED})
+
+#: Cap the per-job structured activity buffer so a long debate cannot grow it without bound; the activity
+#: tool only needs the latest per-voice state, comfortably within this recent-window cap (N1, item 3, 3-K).
+_MAX_ACTIVITY_EVENTS = 500
 
 
 @dataclass(slots=True)
@@ -66,6 +74,10 @@ class JobRecord:
     finished_at: float | None = None
     result: str | None = None
     error: JobError | None = None
+    #: The structured live-activity buffer (N1, item 3, decision 3-K): the same :class:`ActivityEvent`
+    #: stream the sync path pushes, captured here so the ``activity`` tool can render the per-voice in-flight
+    #: table (cli/model/role/status/observed/budget). Bounded to a recent window so a long run cannot grow it.
+    activity: list[ActivityEvent] = field(default_factory=list)
     #: The running asyncio task, so the store can cancel it. Never serialized.
     task: asyncio.Task[None] | None = field(default=None, repr=False)
 
@@ -125,6 +137,21 @@ class JobStore:
                 raise RutherfordError(ErrorCode.JOB_NOT_FOUND, f"no job with id {job_id!r}")
             return record
 
+    def append_activity(self, job_id: str, event: ActivityEvent) -> None:
+        """Buffer a structured :class:`ActivityEvent` on the job (N1, item 3, the poll sink of decision 3-K).
+
+        Kept to a bounded recent window so a long run cannot grow it without limit; the ``activity`` tool reads
+        only the latest per-voice state from it. Lock-free by design -- a list ``append`` and a bounded trim
+        are atomic enough for a single event-loop writer, and taking the store lock per event would serialize
+        every voice's emission against the store's own bookkeeping. A no-op for an unknown id.
+        """
+        record = self._jobs.get(job_id)
+        if record is None:
+            return
+        record.activity.append(event)
+        if len(record.activity) > _MAX_ACTIVITY_EVENTS:
+            del record.activity[: len(record.activity) - _MAX_ACTIVITY_EVENTS]
+
     async def list(self) -> list[JobRecord]:
         """Return every retained job, newest first, evicting expired jobs first."""
         async with self._lock:
@@ -164,8 +191,14 @@ class JobStore:
         async with self._lock:
             record.status = JobStatus.RUNNING
             record.started_at = self._clock()
+
+        def on_activity(event: ActivityEvent) -> None:
+            # N1 (decision 3-K): the structured stream feeds THIS job's poll buffer, so the ``activity`` tool
+            # can read the per-voice in-flight table while the job runs.
+            self.append_activity(record.job_id, event)
+
         try:
-            result = await coro_factory()
+            result = await coro_factory(on_activity)
         except asyncio.CancelledError:
             async with self._lock:
                 record.status = JobStatus.CANCELLED

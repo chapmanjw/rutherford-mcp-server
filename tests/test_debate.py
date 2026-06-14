@@ -19,6 +19,7 @@ from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import DebateRequest, Target
 from rutherford.services.debate import DebateService, _disambiguate
+from rutherford.services.delegation import DelegationService
 from rutherford.tools.debate import debate_tool
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -33,7 +34,8 @@ SLOW = AgentDescriptor(
 
 def _service(config: RutherfordConfig | None = None) -> DebateService:
     resolved = config or RutherfordConfig()
-    return DebateService(DescriptorRegistry([FAKE, DEAD, SLOW]), resolved)
+    registry = DescriptorRegistry([FAKE, DEAD, SLOW])
+    return DebateService(registry, resolved, DelegationService(registry, resolved))
 
 
 def _app() -> AppContext:

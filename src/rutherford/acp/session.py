@@ -37,13 +37,19 @@ from acp.schema import (
 from ..domain.enums import Effort, ReexecutionSafety
 from ..domain.error_codes import ErrorCode
 from ..domain.models import Cost, DelegationResult, ErrorInfo, Provenance, Target
+from ..runtime.depth import child_env
 from .client import RutherfordACPClient
 from .descriptors import AgentDescriptor
 from .effort import effort_overrides
 from .journal import EventJournal, journal_event_from_message
 from .launch import prepare_argv
 from .permission import PermissionPolicy
-from .teardown import reap, snapshot_descendants
+from .teardown import count_descendants, reap, snapshot_descendants
+
+#: How often the live observed-agent sampler walks the agent's process tree during a turn (N1, item 3). A
+#: coarse cadence: the sampler exists to catch a peak fan-out, not to track every transient process, and a
+#: tighter loop would add psutil overhead to every turn for no extra fidelity.
+_OBSERVE_INTERVAL_S = 0.5
 
 #: How Rutherford identifies itself to an agent at ``initialize``.
 _CLIENT_INFO = Implementation(name="rutherford-acp", version="3.0.0")
@@ -90,9 +96,19 @@ class ACPSession:
         cwd: str,
         model: str | None = None,
         effort: Effort | None = None,
+        base_depth: int = 0,
+        parent_run_id: str | None = None,
     ) -> None:
         self._descriptor = descriptor
         self._policy = policy
+        # N1 (item 3): how deep this run sits in a Rutherford-driving-Rutherford chain, and the panel parent
+        # to correlate a voice back to. Layered onto the agent's environment at open() so a nested host reads
+        # them back (the recursion guard) and an aggregate cap can reason across layers (count-first lineage).
+        self._base_depth = base_depth
+        self._parent_run_id = parent_run_id
+        #: The peak local descendant count psutil observed while a turn was live (N1, item 3): the agent
+        #: process plus its sub-processes, a FLOOR (remote agents invisible). ``None`` until a turn samples it.
+        self._observed_peak_agents: int | None = None
         # ACP requires an absolute cwd in session/new (a relative one, e.g. ".", is rejected by agents like
         # goose). Resolve once here so every path -- delegate, consensus, debate, the conformance probe --
         # hands the agent an absolute working directory.
@@ -115,6 +131,11 @@ class ACPSession:
     def effort_applied(self) -> Effort | None:
         """The effort tier this session actually applied (clamped), or ``None`` for a no-op (F8a, 2-L)."""
         return self._override.applied
+
+    @property
+    def observed_peak_agents(self) -> int | None:
+        """The peak local descendant count sampled while a turn ran (N1, item 3); a floor, ``None`` if unsampled."""
+        return self._observed_peak_agents
 
     @property
     def target(self) -> Target:
@@ -148,7 +169,13 @@ class ACPSession:
         # Layer this turn's effort override onto the launch: extra env on top of the resolved environment, and
         # extra args appended to the agent's own argv (e.g. cline's ``--thinking high``). A model-id-encoding
         # agent (codex/cursor) carries its effort in ``self._target.model`` instead, applied via set_model below.
-        env = {**_resolve_env(self._descriptor), **self._override.env_dict}
+        # N1 (item 3): the depth + count-first lineage env goes on last, so a spawned agent that is itself a
+        # Rutherford host reads where it sits (the recursion guard) and the aggregate cap counts across layers.
+        env = {
+            **_resolve_env(self._descriptor),
+            **self._override.env_dict,
+            **child_env(self._base_depth, parent_run_id=self._parent_run_id),
+        }
         command, *args = prepare_argv((*self._descriptor.command, *self._override.extra_args))
 
         def _observe(event: StreamEvent) -> None:
@@ -235,6 +262,10 @@ class ACPSession:
         self._client.journal = self._journal
         start = time.monotonic()
         blocks: list[PromptBlock] = [text_block(text)]
+        # N1 (item 3): sample the agent's local process tree on a coarse timer for the duration of the turn,
+        # keeping the peak descendant count -- a FLOOR for how many agents this voice spun up. Started here
+        # and always stopped in the finally, so a timeout/error path still records what it saw before the cut.
+        sampler = asyncio.create_task(self._sample_observed_agents())
         try:
             response = await asyncio.wait_for(
                 self._conn.prompt(prompt=blocks, session_id=self._session_id),
@@ -242,7 +273,7 @@ class ACPSession:
             )
         except TimeoutError:
             await self.cancel()
-            return self._stamp_effort(
+            return self._stamp(
                 _failed(
                     self._target,
                     self._policy,
@@ -254,7 +285,7 @@ class ACPSession:
                 )
             )
         except Exception as exc:
-            return self._stamp_effort(
+            return self._stamp(
                 _failed(
                     self._target,
                     self._policy,
@@ -264,13 +295,47 @@ class ACPSession:
                     ReexecutionSafety.AMBIGUOUS,
                 )
             )
+        finally:
+            # Stop the sampler and fold its final reading in, so even a timeout/error path records the peak it
+            # saw. Cancel-then-await keeps no sampler task dangling on the loop. Best-effort: never raises.
+            sampler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sampler
         result = _reduce(self._descriptor, self._target, self._policy, self._journal, response, self._session_id, start)
-        return self._stamp_effort(result)
+        return self._stamp(result)
 
-    def _stamp_effort(self, result: DelegationResult) -> DelegationResult:
-        """Echo the requested effort tier and the tier actually applied onto the result (F8a, 2-L)."""
+    async def _sample_observed_agents(self) -> None:
+        """Poll the agent's process tree on a coarse timer, keeping the peak descendant count (N1, item 3).
+
+        Runs off-thread (psutil is blocking) for the life of a turn; cancelled in :meth:`prompt`'s finally.
+        Each sample is the agent pid plus its recursive children -- a FLOOR, since a sample can lose the race
+        with a transient sub-process and psutil sees only local processes. A ``0`` sample (the pid already
+        gone) never lowers the peak. Best-effort: the loop swallows everything but a cancellation.
+        """
+        pid = self._pid
+        if pid is None:  # pragma: no cover - prompt() is guarded by a successful open() that set the pid
+            return
+        try:
+            while True:
+                count = await asyncio.to_thread(count_descendants, pid)
+                if count > 0 and (self._observed_peak_agents is None or count > self._observed_peak_agents):
+                    self._observed_peak_agents = count
+                await asyncio.sleep(_OBSERVE_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - a transparency sampler must never break the turn it observes
+            return
+
+    def _stamp(self, result: DelegationResult) -> DelegationResult:
+        """Stamp the per-turn metadata onto the result: the effort tiers (F8a) and the observed peak (N1).
+
+        ``effort`` / ``effort_applied`` echo what was requested and what the agent applied after clamping;
+        ``observed_peak_agents`` carries the live sampler's high-water mark up so a panel can roll it into
+        its :class:`~rutherford.domain.models.Topology` (a floor, ``None`` when nothing was sampled).
+        """
         result.effort = self._effort
         result.effort_applied = self._override.applied
+        result.observed_peak_agents = self._observed_peak_agents
         return result
 
     async def cancel(self) -> None:
@@ -306,16 +371,28 @@ async def run_acp_turn(
     timeout_s: float,
     model: str | None = None,
     effort: Effort | None = None,
+    base_depth: int = 0,
+    parent_run_id: str | None = None,
 ) -> DelegationResult:
     """Open a one-shot session, run a single prompt turn, and return the normalized result.
 
     The spawn-per-delegation path for ``delegate`` / ``consensus``. ``effort`` is the reasoning-effort tier to
     apply over ACP (per-agent env / args / a model-id rewrite); it is echoed on the result as ``effort`` and
-    ``effort_applied`` (F8a, 2-L). Never raises for an operational failure; a handshake/spawn failure becomes a
-    failed :class:`DelegationResult` (re-execution-safe), still carrying the requested effort.
+    ``effort_applied`` (F8a, 2-L). ``base_depth`` / ``parent_run_id`` are the N1 lineage signal layered onto
+    the agent's environment so a Rutherford-driving-Rutherford chain is bounded. Never raises for an
+    operational failure; a handshake/spawn failure becomes a failed :class:`DelegationResult`
+    (re-execution-safe), still carrying the requested effort.
     """
     start = time.monotonic()
-    session = ACPSession(descriptor, policy=policy, cwd=cwd, model=model, effort=effort)
+    session = ACPSession(
+        descriptor,
+        policy=policy,
+        cwd=cwd,
+        model=model,
+        effort=effort,
+        base_depth=base_depth,
+        parent_run_id=parent_run_id,
+    )
     try:
         async with session:
             return await session.prompt(prompt, timeout_s=timeout_s)

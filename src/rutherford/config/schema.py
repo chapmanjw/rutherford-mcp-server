@@ -138,11 +138,11 @@ class RutherfordConfig(BaseModel):
     #: its CLI count implied. Default 2 (two same-model or same-vendor voices flag); raise it to demand
     #: wider diversity.
     min_distinct: int = Field(default=2, ge=1)
-    #: Intended ceiling on how many agents Rutherford runs at once across a panel, to decouple panel
-    #: width from host pressure. NOT YET ENFORCED in v3: there is no concurrency semaphore in the
-    #: consensus/debate fan-out (they ``gather`` over every voice), so this validates and loads but has
-    #: no effect today. Defaults to ``max_targets`` (see the validator below). It is kept in the contract
-    #: for when the semaphore is wired into the delegation primitive.
+    #: Ceiling on how many live ACP agent sessions Rutherford runs at once across a panel, to decouple panel
+    #: width from host pressure (N1 / reliability). Enforced by an :class:`asyncio.Semaphore` the delegation
+    #: primitive holds around each ACP turn and that the consensus budget-harvest and a debate's round turns
+    #: also acquire, so a wide panel cannot spawn more than this many agents at once on any path. Defaults to
+    #: ``max_targets`` (see the validator below).
     max_concurrency: int = Field(default=8, ge=1)
     #: Cooldown (F7): how many *unhealthy* failures (down / throttled / mis-launching -- not a bad
     #: prompt) an adapter may have within ``cooldown_window_s`` before it is benched for

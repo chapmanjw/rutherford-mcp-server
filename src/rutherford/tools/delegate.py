@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from ..context import AppContext, tool_success
 from ..domain.models import DelegationRequest, Target
+from ..services.delegation import ActivityCallback
 from .common import apply_role, ensure_known_agent, parse_effort, resolve_run_mode, resolve_safety_mode
 from .jobs import make_summary, submit_job
 
@@ -51,8 +52,10 @@ async def delegate_tool(
         effort=parse_effort(effort),
     )
 
-    async def run() -> str:
-        result = await app.delegation.delegate(request)
+    async def run(on_activity: ActivityCallback | None = None) -> str:
+        # A standalone delegation emits one voice_started/voice_finished pair (N1, item 3): on the async path
+        # the job buffers them for the ``activity`` poll table; on the sync path there is no sink (None).
+        result = await app.delegation.delegate(request, correlation_id="voice:0", on_activity=on_activity)
         return tool_success(result)
 
     if run_async:

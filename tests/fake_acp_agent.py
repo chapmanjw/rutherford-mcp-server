@@ -50,6 +50,25 @@ def _planted_answer(text: str) -> str | None:
     return line.strip()
 
 
+def _env_answer(text: str) -> str | None:
+    """The agent's own value of the env var an ``ENV=<name>`` token names, or ``None`` when absent.
+
+    Lets a test assert Rutherford propagated a lineage/depth variable (``RUTHERFORD_DEPTH`` /
+    ``RUTHERFORD_LINEAGE`` / ``RUTHERFORD_PARENT_RUN``) into the spawned agent's environment: the agent
+    answers with ``<name>=<value>`` (or ``<name>=(unset)`` when the variable is absent).
+    """
+    marker = "ENV="
+    start = text.find(marker)
+    if start == -1:
+        return None
+    rest = text[start + len(marker) :]
+    name, _, _ = rest.partition("\n")
+    name = name.strip().split()[0] if name.strip() else ""
+    if not name:
+        return None
+    return f"{name}={os.environ.get(name, '(unset)')}"
+
+
 def _sleep_seconds(text: str) -> float | None:
     """The seconds to sleep before answering: the ``RUTHERFORD_FAKE_SLEEP`` env, else a ``SLEEP=<n>`` token.
 
@@ -132,6 +151,13 @@ class FakeAgent:
         if "REFUSE" in text:
             return PromptResponse(stop_reason="refusal")
         if "EMPTY" in text:
+            return PromptResponse(stop_reason="end_turn")
+        env_answer = _env_answer(text)
+        if env_answer is not None:
+            # ENV=<name> makes the agent answer with the value of that environment variable in its OWN
+            # subprocess environment, so a test can assert Rutherford propagated e.g. RUTHERFORD_DEPTH /
+            # RUTHERFORD_LINEAGE into the spawned agent. Returns before any sleep -- it is a pure env echo.
+            await self._client.session_update(session_id, update_agent_message_text(env_answer))
             return PromptResponse(stop_reason="end_turn")
         sleep_for = _sleep_seconds(text)
         if sleep_for is not None:

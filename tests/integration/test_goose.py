@@ -116,6 +116,28 @@ async def test_goose_consensus_two_voices() -> None:
     assert all("42" in voice.text for voice in voices if voice.ok)
 
 
+async def test_goose_consensus_topology_populated_live() -> None:
+    """A real two-goose consensus carries a populated Topology with a non-trivial observed agent floor (N1).
+
+    Drives the full N1 stack against a real agent: the psutil sampler walks each goose's process tree while
+    it runs, the panel sums the realized delegations, and the result reports declared/realized/observed.
+    A real goose agent spawns at least itself, so ``observed_peak_agents >= 1`` is the floor we can assert.
+    """
+    request = ConsensusRequest(
+        targets=[Target(cli="goose"), Target(cli="goose")], prompt=_PROMPT, working_dir=str(Path.cwd()), timeout_s=120.0
+    )
+    result = await _consensus_service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.topology is not None, "the consensus result carried no Topology"
+    topology = result.topology
+    assert topology.declared == 2
+    assert topology.realized_delegations == 2  # one subprocess delegation per voice, no fallback
+    assert topology.observed_peak_agents is not None and topology.observed_peak_agents >= 1, (
+        f"expected a live observed floor >= 1, got {topology.observed_peak_agents}"
+    )
+    assert topology.over_cap is False
+
+
 _VERDICT_PROMPT = (
     "Is 17 + 25 equal to 42? Answer with a final line that is exactly 'VERDICT: yes' if it is equal, "
     "or exactly 'VERDICT: no' if it is not."
@@ -149,7 +171,8 @@ async def test_goose_consensus_majority_strategy_live() -> None:
 
 async def test_goose_debate_persistent_sessions() -> None:
     config = RutherfordConfig()
-    service = DebateService(default_registry(), config)
+    registry = default_registry()
+    service = DebateService(registry, config, DelegationService(registry, config))
     request = DebateRequest(
         targets=[Target(cli="goose"), Target(cli="goose")],
         prompt=_PROMPT,

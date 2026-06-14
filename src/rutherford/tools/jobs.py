@@ -15,20 +15,24 @@ from __future__ import annotations
 from typing import TypedDict
 
 from ..context import AppContext, tool_error, tool_success
-from ..domain.enums import JobStatus
+from ..domain.enums import ActivityEventKind, JobStatus
 from ..domain.error_codes import ErrorCode
+from ..domain.models import ActivityEvent
 from ..services.jobs import CoroFactory, JobRecord
 
 
 class ActiveRow(TypedDict):
-    """One in-flight job's row in the ``activity`` snapshot (typed so ``elapsed_s`` sorts cleanly)."""
+    """One in-flight VOICE's row in the ``activity`` snapshot (N1, item 3, the per-voice columns of 3-H)."""
 
     job_id: str
     tool: str
-    status: str
-    summary: str
-    started_at: float | None
+    cli: str | None
+    model: str | None
+    role: str | None
+    status: str | None
     elapsed_s: float
+    observed_agents: int | None
+    budget_left_s: float | None
 
 
 #: How much of a prompt to keep in a job's one-line summary.
@@ -37,6 +41,17 @@ _SNIPPET_LEN = 60
 #: The statuses that count as "in flight" for the activity snapshot: work that is running now, plus work
 #: that is queued and about to run (a submitted job is ``pending`` until its task is scheduled).
 _IN_FLIGHT: frozenset[JobStatus] = frozenset({JobStatus.RUNNING, JobStatus.PENDING})
+
+#: The activity-event kinds that describe a single voice/turn (they carry a ``cli``), as opposed to the
+#: panel-level kinds (panel_started/finished, budget_tick, job_cancelled) that have no ``cli``.
+_VOICE_KINDS: frozenset[ActivityEventKind] = frozenset(
+    {
+        ActivityEventKind.VOICE_STARTED,
+        ActivityEventKind.VOICE_FINISHED,
+        ActivityEventKind.CUT,
+        ActivityEventKind.OBSERVED,
+    }
+)
 
 
 def make_summary(tool: str, *, target: str | None = None, prompt: str | None = None) -> str:
@@ -71,15 +86,26 @@ async def list_jobs_tool(app: AppContext) -> str:
 
 
 async def activity_tool(app: AppContext) -> str:
-    """Return a focused snapshot of the work IN FLIGHT right now: the running and pending jobs only.
+    """Return a focused snapshot of the work IN FLIGHT right now, one row PER VOICE (N1, item 3).
 
-    Distinct from ``list_jobs`` (which enumerates every tracked job of every status, finished ones
-    included): this is the "what is happening now" view -- only ``running`` / ``pending`` jobs, each with a
-    live ``elapsed_s`` measured against the store's clock, sorted longest-running first. Returns
-    ``{active: [], count: 0}`` when nothing is in flight.
+    The POLL half of N1's transparency (the PUSH half is MCP progress notifications on a synchronous call).
+    Distinct from ``list_jobs`` (which enumerates every tracked job of every status, finished ones included):
+    this is the "what is happening now" view -- across every in-flight (``running`` / ``pending``) job, one
+    row per voice/turn read from the same :class:`ActivityEvent` stream a sync call pushes (decision 3-K),
+    with the per-voice columns of decision 3-H: ``{job_id, tool, cli, model, role, status, elapsed_s,
+    observed_agents, budget_left_s}``, sorted longest-running first. A job that has not yet emitted a voice
+    event (it is still starting) contributes no rows. A synchronous call never appears here -- it has no job
+    record, and its liveness rides MCP progress notifications. Returns ``{active: [], count: 0}`` when empty.
     """
     now = app.jobs.now()
-    rows = [_active_row(record, now) for record in await app.jobs.list() if record.status in _IN_FLIGHT]
+    rows: list[ActiveRow] = []
+    for record in await app.jobs.list():
+        if record.status not in _IN_FLIGHT:
+            continue
+        budget_left = _latest_budget_left(record.activity)
+        job_age = round(max(now - (record.started_at or record.created_at), 0.0), 3)
+        for voice in _latest_voice_states(record.activity):
+            rows.append(_active_row(record, voice, job_age, budget_left))
     rows.sort(key=lambda row: row["elapsed_s"], reverse=True)
     return tool_success({"active": rows, "count": len(rows)})
 
@@ -142,21 +168,49 @@ def _listing(record: JobRecord) -> dict[str, object]:
     }
 
 
-def _active_row(record: JobRecord, now: float) -> ActiveRow:
-    """Project an in-flight job into one activity row, with a live elapsed measured to ``now``.
+def _active_row(record: JobRecord, voice: ActivityEvent, job_age: float, budget_left: float | None) -> ActiveRow:
+    """Project one in-flight voice into an activity row (N1, item 3, decision 3-H per-voice columns).
 
-    Elapsed runs from when the work actually started (``started_at``), falling back to ``created_at`` for a
-    job still ``pending`` (its task has not been scheduled yet). Rounded to milliseconds (matching the
-    delegation ``duration_s`` convention) and floored at zero so a clock that has not advanced never reads
-    negative.
+    A finished voice reports ITS OWN run time (carried on the terminal event); a still in-flight voice has no
+    elapsed yet, so it falls back to the job's age as a live estimate. ``observed_agents`` is a floor (psutil
+    sees local processes only); ``budget_left_s`` is the job's latest time-budget remaining, if any.
     """
-    started = record.started_at if record.started_at is not None else record.created_at
-    elapsed_s = round(max(now - started, 0.0), 3)
     return {
         "job_id": record.job_id,
         "tool": record.tool,
-        "status": record.status.value,
-        "summary": record.summary,
-        "started_at": record.started_at,
-        "elapsed_s": elapsed_s,
+        "cli": voice.cli,
+        "model": voice.model,
+        "role": voice.role,
+        # ``started`` means the voice launched and is still in flight; a terminal event carries ok/failed/cut.
+        "status": voice.status,
+        "elapsed_s": voice.elapsed_s if voice.elapsed_s is not None else job_age,
+        "observed_agents": voice.observed_agents,
+        "budget_left_s": budget_left,
     }
+
+
+def _latest_voice_states(events: list[ActivityEvent]) -> list[ActivityEvent]:
+    """The latest event per voice, in first-seen order -- each voice's current state (N1, item 3).
+
+    A voice emits ``voice_started`` when it launches and a terminal ``voice_finished`` / ``cut`` later;
+    keeping the last event per identity collapses that to the voice's current status (so the row shows the
+    resolved model and final status). The identity is the stable per-voice ``correlation_id`` -- robust to a
+    model change between started and finished -- falling back to ``(cli, model, role)`` only if a producer
+    left it unset. Panel-level events (no ``cli``) are skipped; they are not voices.
+    """
+    latest: dict[object, ActivityEvent] = {}
+    for event in events:
+        if event.cli is None or event.kind not in _VOICE_KINDS:
+            continue
+        key: object = event.correlation_id or (event.cli, event.model, event.role)
+        latest[key] = event
+    return list(latest.values())
+
+
+def _latest_budget_left(events: list[ActivityEvent]) -> float | None:
+    """The most recent time-budget remaining reported for this job (a ``budget_tick``), or ``None``."""
+    budget_left: float | None = None
+    for event in events:
+        if event.kind is ActivityEventKind.BUDGET_TICK and event.budget_left_s is not None:
+            budget_left = event.budget_left_s
+    return budget_left

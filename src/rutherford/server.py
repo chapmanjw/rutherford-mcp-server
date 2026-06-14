@@ -11,19 +11,24 @@ land first; ``consensus`` / ``debate`` and the rest are re-added over the same c
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import sys
 from collections.abc import Awaitable
 from typing import Any
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
 from .config.loader import load_config
 from .context import AppContext, build_app_context, error_payload_from, tool_error
+from .domain.enums import ActivityEventKind
 from .domain.error_codes import ErrorCode
 from .domain.errors import ConfigError, RutherfordError
+from .domain.models import ActivityEvent
 from .runtime.logging import configure_logging
+from .services.delegation import ActivityCallback
 from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
 from .tools.debate import debate_tool
@@ -70,6 +75,59 @@ async def _guarded(coro: Awaitable[str]) -> str:
     except Exception as exc:
         logging.getLogger("rutherford.server").exception("unexpected error in a tool call")
         raise ToolError(tool_error(ErrorCode.INTERNAL, "internal server error; see the server log")) from exc
+
+
+async def _report_progress(context: Context, progress: float, total: float | None, message: str | None) -> None:
+    """Send one MCP progress notification, swallowing any transport error (N1, item 3 push, best-effort).
+
+    A no-op on the client side unless the caller supplied a ``progressToken`` (FastMCP gates it), so this is
+    always safe to call; ``message`` is ``None`` when an event carried no text.
+    """
+    with contextlib.suppress(Exception):
+        await context.report_progress(progress, total, message)
+
+
+def make_progress_pusher(context: Context) -> ActivityCallback:
+    """Build the live-activity sink that pushes a sync call's :class:`ActivityEvent`s as MCP progress (N1).
+
+    The PUSH half of N1 (the ``activity`` tool is the poll half): each event becomes a ``report_progress``
+    notification so the caller sees a sync panel advance live. Only meaningful for a synchronous call -- an
+    async job returns a job id immediately, so its progress is polled, not pushed. ``progress`` counts the
+    voices finished and ``total`` the panel's declared width once known, so a client can show a real
+    fraction. The notification is fire-and-forget (scheduled, not awaited) so a slow client never stalls the
+    run; the tasks are tracked in a set so they are not garbage-collected before they send. FastMCP gates the
+    whole channel on a client-supplied ``progressToken``, so this is silent when the caller did not opt in.
+    """
+    total: int | None = None
+    done = 0
+    resolved: set[str] = set()  # correlation ids already counted, so a voice is counted at most once
+    pending: set[asyncio.Task[None]] = set()
+
+    def push(event: ActivityEvent) -> None:
+        nonlocal total, done
+        if event.kind is ActivityEventKind.PANEL_STARTED and event.declared:
+            # Only a consensus resolves exactly one voice per declared seat (each ends finished OR cut), so
+            # its done/declared is a true fraction. A debate resolves one per TURN across rounds (turns
+            # exceed the width, and the count varies with an early stop), so it stays indeterminate -- a total
+            # here would be passed and then overshot. The push fraction is consensus-only by design.
+            if event.tool == "consensus":
+                total = event.declared
+        elif event.kind in (ActivityEventKind.VOICE_FINISHED, ActivityEventKind.CUT):
+            # A voice is resolved either way -- it finished, or a budget deadline cut it. Count each voice
+            # ONCE, keyed by its correlation id, so a harvested voice does not double-count past the total.
+            cid = event.correlation_id
+            if cid is None or cid not in resolved:
+                if cid is not None:
+                    resolved.add(cid)
+                done += 1
+        elif event.kind is ActivityEventKind.PANEL_FINISHED and total is not None:
+            done = int(total)  # the panel is complete: snap to 100% regardless of any cut/escape accounting
+        cap = float(total) if total else None
+        task = asyncio.create_task(_report_progress(context, float(done), cap, event.message or None))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    return push
 
 
 @mcp.tool
@@ -135,6 +193,7 @@ async def consensus(
     time_budget_s: float | None = None,
     on_budget: str | None = None,
     mode: str = "sync",
+    ctx: Context | None = None,
 ) -> str:
     """Ask the same prompt of several ACP agents in parallel and reduce the voices.
 
@@ -178,6 +237,9 @@ async def consensus(
             time_budget_s=time_budget_s,
             on_budget=on_budget,
             mode=mode,
+            # N1 (item 3): on a sync call, push live progress as voices finish (gated on the client's
+            # progressToken; silent otherwise). An async job polls ``activity`` instead, so no pusher.
+            on_activity=make_progress_pusher(ctx) if ctx is not None else None,
         )
     )
 
@@ -197,6 +259,7 @@ async def debate(
     time_budget_s: float | None = None,
     on_budget: str | None = None,
     mode: str = "sync",
+    ctx: Context | None = None,
 ) -> str:
     """Have several ACP agents argue a question across rounds and return the full transcript.
 
@@ -229,6 +292,7 @@ async def debate(
             time_budget_s=time_budget_s,
             on_budget=on_budget,
             mode=mode,
+            on_activity=make_progress_pusher(ctx) if ctx is not None else None,
         )
     )
 

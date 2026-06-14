@@ -15,10 +15,12 @@ from rutherford import server
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import AppContext, build_app_context
-from rutherford.domain.enums import JobStatus
+from rutherford.domain.enums import ActivityEventKind, JobStatus
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
+from rutherford.domain.models import ActivityEvent
 from rutherford.io.serialize import decode
+from rutherford.services.delegation import ActivityCallback
 from rutherford.services.jobs import JobStore
 from rutherford.tools.consensus import consensus_tool
 from rutherford.tools.delegate import delegate_tool
@@ -57,7 +59,7 @@ async def _poll_until_done(store: JobStore, job_id: str, *, timeout_s: float = 5
 async def test_submit_runs_and_stores_result() -> None:
     store = JobStore()
 
-    async def work() -> str:
+    async def work(_on_activity: ActivityCallback | None = None) -> str:
         return "the-envelope"
 
     job_id = await store.submit("delegate", work, summary="delegate fake")
@@ -78,12 +80,12 @@ async def test_async_job_serves_the_sync_envelope_verbatim() -> None:
     """
     app = _app()
 
-    async def work() -> str:
+    async def work(_on_activity: ActivityCallback | None = None) -> str:
         return await delegate_tool(app, cli="fake", prompt="what is 17 + 25?", working_dir=str(REPO_ROOT))
 
     sync_envelope = await work()
 
-    async def fixed() -> str:
+    async def fixed(_on_activity: ActivityCallback | None = None) -> str:
         return sync_envelope
 
     job_id = await app.jobs.submit("delegate", fixed, summary="x")
@@ -97,7 +99,7 @@ async def test_async_delegation_envelope_matches_sync_shape() -> None:
     """A real async delegation yields the same envelope SHAPE as sync (only the duration float differs)."""
     app = _app()
 
-    async def work() -> str:
+    async def work(_on_activity: ActivityCallback | None = None) -> str:
         return await delegate_tool(app, cli="fake", prompt="what is 17 + 25?", working_dir=str(REPO_ROOT))
 
     sync = decode(await work())
@@ -116,7 +118,7 @@ async def test_async_delegation_envelope_matches_sync_shape() -> None:
 async def test_failing_coro_is_captured_as_failed() -> None:
     store = JobStore()
 
-    async def boom() -> str:
+    async def boom(_on_activity: ActivityCallback | None = None) -> str:
         raise RutherfordError(ErrorCode.INVALID_INPUT, "bad input")
 
     record = await _poll_until_done(store, await store.submit("delegate", boom, summary="x"))
@@ -129,7 +131,7 @@ async def test_failing_coro_is_captured_as_failed() -> None:
 async def test_unexpected_exception_becomes_internal_error() -> None:
     store = JobStore()
 
-    async def crash() -> str:
+    async def crash(_on_activity: ActivityCallback | None = None) -> str:
         raise ValueError("kaboom")
 
     record = await _poll_until_done(store, await store.submit("delegate", crash, summary="x"))
@@ -143,7 +145,7 @@ async def test_cancel_long_running_job() -> None:
     store = JobStore()
     started = asyncio.Event()
 
-    async def long_work() -> str:
+    async def long_work(_on_activity: ActivityCallback | None = None) -> str:
         started.set()
         await asyncio.sleep(30)
         return "never"
@@ -161,7 +163,7 @@ async def test_cancel_long_running_job() -> None:
 async def test_cancel_finished_job_is_a_noop() -> None:
     store = JobStore()
 
-    async def work() -> str:
+    async def work(_on_activity: ActivityCallback | None = None) -> str:
         return "done"
 
     job_id = await store.submit("delegate", work, summary="x")
@@ -182,7 +184,7 @@ async def test_list_is_newest_first() -> None:
     clock = _FakeClock()
     store = JobStore(clock=clock)
 
-    async def work() -> str:
+    async def work(_on_activity: ActivityCallback | None = None) -> str:
         return "ok"
 
     first = await store.submit("delegate", work, summary="first")
@@ -201,7 +203,7 @@ async def test_ttl_evicts_finished_jobs_on_access() -> None:
     clock = _FakeClock()
     store = JobStore(job_ttl_s=10.0, clock=clock)
 
-    async def work() -> str:
+    async def work(_on_activity: ActivityCallback | None = None) -> str:
         return "ok"
 
     job_id = await store.submit("delegate", work, summary="x")
@@ -216,7 +218,7 @@ async def test_cap_evicts_oldest_finished() -> None:
     clock = _FakeClock()
     store = JobStore(max_jobs=2, clock=clock)
 
-    async def work() -> str:
+    async def work(_on_activity: ActivityCallback | None = None) -> str:
         return "ok"
 
     a = await store.submit("delegate", work, summary="a")
@@ -237,7 +239,7 @@ async def test_cap_refuses_when_full_of_running() -> None:
     store = JobStore(max_jobs=1)
     hold = asyncio.Event()
 
-    async def blocked() -> str:
+    async def blocked(_on_activity: ActivityCallback | None = None) -> str:
         await hold.wait()
         return "ok"
 
@@ -255,7 +257,7 @@ async def test_cap_refuses_when_full_of_running() -> None:
 async def test_job_tools_status_result_list_shapes() -> None:
     app = _app()
 
-    async def work() -> str:
+    async def work(_on_activity: ActivityCallback | None = None) -> str:
         return "RESULT-ENVELOPE"
 
     submit = decode(await submit_job(app, "delegate", work, summary="delegate fake -- hi"))
@@ -281,7 +283,7 @@ async def test_job_tools_status_result_list_shapes() -> None:
 async def test_job_result_for_failed_and_cancelled_and_pending() -> None:
     app = _app()
 
-    async def boom() -> str:
+    async def boom(_on_activity: ActivityCallback | None = None) -> str:
         raise RutherfordError(ErrorCode.INVALID_INPUT, "nope")
 
     failed_id = decode(await submit_job(app, "delegate", boom, summary="x"))["job_id"]
@@ -292,7 +294,7 @@ async def test_job_result_for_failed_and_cancelled_and_pending() -> None:
 
     hold = asyncio.Event()
 
-    async def slow() -> str:
+    async def slow(_on_activity: ActivityCallback | None = None) -> str:
         await hold.wait()
         return "done"
 
@@ -388,29 +390,49 @@ async def test_activity_is_empty_when_idle() -> None:
     assert snapshot["active"] == []
 
 
-async def test_activity_shows_in_flight_job_with_positive_elapsed() -> None:
+def _voice_event(cli: str = "fake", *, model: str | None = "m", status: str = "started") -> ActivityEvent:
+    """A ``voice_started`` activity event, the per-voice row the activity tool projects (N1, item 3)."""
+    return ActivityEvent(
+        kind=ActivityEventKind.VOICE_STARTED, correlation_id="voice:0", cli=cli, model=model, status=status
+    )
+
+
+async def test_activity_shows_in_flight_voice_with_per_voice_columns() -> None:
     app = _app()
     hold = asyncio.Event()
     started = asyncio.Event()
 
-    async def in_flight() -> str:
+    async def in_flight(on_activity: ActivityCallback | None = None) -> str:
+        if on_activity is not None:
+            on_activity(_voice_event())  # the job emits one voice row, the per-voice activity shape
         started.set()
         await hold.wait()
         return "done"
 
-    job_id = await app.jobs.submit("delegate", in_flight, summary="delegate fake -- working")
+    job_id = await app.jobs.submit("consensus", in_flight, summary="consensus fake -- working")
     await asyncio.wait_for(started.wait(), timeout=2.0)
-    await asyncio.sleep(0.01)  # let a little wall-clock pass so elapsed is strictly positive
+    await asyncio.sleep(0.01)  # let a little wall-clock pass so the live elapsed is strictly positive
 
     snapshot = decode(await activity_tool(app))
     assert snapshot["count"] == 1
     row = snapshot["active"][0]
     assert row["job_id"] == job_id
-    assert row["tool"] == "delegate"
-    assert row["status"] == "running"
-    assert row["summary"] == "delegate fake -- working"
-    assert row["elapsed_s"] > 0.0
-    assert set(row) == {"job_id", "tool", "status", "summary", "started_at", "elapsed_s"}
+    assert row["tool"] == "consensus"
+    assert row["cli"] == "fake"
+    assert row["model"] == "m"
+    assert row["status"] == "started"  # the voice launched and is still in flight
+    assert row["elapsed_s"] > 0.0  # an in-flight voice falls back to the job's live age
+    assert set(row) == {
+        "job_id",
+        "tool",
+        "cli",
+        "model",
+        "role",
+        "status",
+        "elapsed_s",
+        "observed_agents",
+        "budget_left_s",
+    }
 
     hold.set()  # release the job so the loop unwinds cleanly
     await _poll_until_done(app.jobs, job_id)
@@ -419,7 +441,9 @@ async def test_activity_shows_in_flight_job_with_positive_elapsed() -> None:
 async def test_activity_excludes_finished_jobs() -> None:
     app = _app()
 
-    async def quick() -> str:
+    async def quick(on_activity: ActivityCallback | None = None) -> str:
+        if on_activity is not None:
+            on_activity(_voice_event())
         return "done"
 
     finished_id = await app.jobs.submit("delegate", quick, summary="finished")
@@ -428,7 +452,9 @@ async def test_activity_excludes_finished_jobs() -> None:
     hold = asyncio.Event()
     started = asyncio.Event()
 
-    async def in_flight() -> str:
+    async def in_flight(on_activity: ActivityCallback | None = None) -> str:
+        if on_activity is not None:
+            on_activity(_voice_event())
         started.set()
         await hold.wait()
         return "done"
@@ -450,14 +476,16 @@ async def test_activity_sorted_longest_running_first() -> None:
     app = _app()
     hold = asyncio.Event()
 
-    async def in_flight() -> str:
+    async def in_flight(on_activity: ActivityCallback | None = None) -> str:
+        if on_activity is not None:
+            on_activity(_voice_event())
         await hold.wait()
         return "done"
 
     first = await app.jobs.submit("delegate", in_flight, summary="first")
-    await asyncio.sleep(0.02)  # the first job accrues more elapsed than the second
+    await asyncio.sleep(0.05)  # the first job accrues more elapsed than the second
     second = await app.jobs.submit("consensus", in_flight, summary="second")
-    await asyncio.sleep(0.01)
+    await asyncio.sleep(0.02)
 
     snapshot = decode(await activity_tool(app))
     order = [row["job_id"] for row in snapshot["active"]]
@@ -474,12 +502,14 @@ async def test_server_activity_tool(monkeypatch: Any) -> None:
     hold = asyncio.Event()
     started = asyncio.Event()
 
-    async def in_flight() -> str:
+    async def in_flight(on_activity: ActivityCallback | None = None) -> str:
+        if on_activity is not None:
+            on_activity(_voice_event())
         started.set()
         await hold.wait()
         return "done"
 
-    job_id = await server.get_app().jobs.submit("delegate", in_flight, summary="x")
+    job_id = await server.get_app().jobs.submit("consensus", in_flight, summary="x")
     await asyncio.wait_for(started.wait(), timeout=2.0)
 
     snapshot = decode(await server.activity())

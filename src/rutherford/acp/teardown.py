@@ -30,6 +30,21 @@ def snapshot_descendants(pid: int) -> list[psutil.Process]:
         return []
 
 
+def count_descendants(pid: int) -> int:
+    """Count ``pid`` itself plus its live descendants (N1, item 3), a FLOOR for the observed agent count.
+
+    The same recursive walk :func:`snapshot_descendants` does, but reduced to a count and sampled while a
+    turn is live -- the agent process plus every sub-process it spawned (the underlying CLI a wrapper fronts,
+    and that CLI's own children). A FLOOR, not a ceiling: psutil sees only LOCAL processes, so an agent's
+    remote/cloud sub-agents are invisible. ``0`` when the pid is already gone or psutil cannot read it, so a
+    sample that loses the race never lowers a peak below a real one. Best-effort; never raises.
+    """
+    try:
+        return 1 + len(psutil.Process(pid).children(recursive=True))
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+        return 0
+
+
 def reap(procs: list[psutil.Process], *, grace_s: float = 2.0) -> None:
     """Terminate ``procs``, wait briefly, then kill any survivor. Best-effort; never raises."""
     if not procs:
