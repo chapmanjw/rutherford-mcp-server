@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Two more agents in the ACP-native roster (v3): `codex` and `claude_code`, driven through the official
+  Zed adapters `codex-acp` and `claude-agent-acp`. Both reuse the existing CLI login over ACP and need no
+  API key — `codex-acp` keeps the ChatGPT subscription, `claude-agent-acp` keeps the Claude Code login —
+  correcting the earlier research note that flagged them as possibly API-key-only. Roster: 9 descriptors.
+
 ## [1.7.0] - 2026-06-13
 
 ### Added

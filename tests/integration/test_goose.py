@@ -48,6 +48,22 @@ async def test_working_agent_answers(agent_id: str) -> None:
     assert "42" in result.text
 
 
+@pytest.mark.parametrize("agent_id", ["codex", "claude_code"])
+async def test_official_adapter_answers(agent_id: str) -> None:
+    """The official Zed adapters drive their CLI over ACP using the existing CLI login (no API key).
+
+    ``codex`` (codex-acp) reuses the ChatGPT login and ``claude_code`` (claude-agent-acp) reuses the Claude
+    Code login; both stream an answer end to end (receipt 11-official-adapters-auth-test.md). A longer budget
+    than the other agents because the first turn also negotiates the underlying CLI's auth.
+    """
+    descriptor = default_registry().get(agent_id)
+    result = await run_acp_turn(
+        descriptor, _PROMPT, policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd=str(Path.cwd()), timeout_s=180.0
+    )
+    assert result.ok is True, f"{agent_id} failed: {result.error}"
+    assert "42" in result.text
+
+
 async def test_goose_consensus_two_voices() -> None:
     config = RutherfordConfig()
     service = ConsensusService(DelegationService(default_registry(), config), config)

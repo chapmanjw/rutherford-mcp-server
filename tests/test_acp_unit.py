@@ -78,11 +78,20 @@ def test_descriptor_registry() -> None:
     registry = default_registry()
     assert registry.has("goose") and "goose" in registry.ids()
     assert registry.get("goose").command == ("goose", "acp")
-    assert len(registry) == 7
+    assert len(registry) == 9
     with pytest.raises(KeyError):
         registry.get("nope")
     with pytest.raises(ValueError, match="duplicate"):
         DescriptorRegistry([AgentDescriptor("x", "X", ("x",)), AgentDescriptor("x", "X2", ("y",))])
+
+
+def test_official_adapter_descriptors() -> None:
+    """The two official Zed adapters launch via their shim and carry the right fixed vendor."""
+    registry = default_registry()
+    codex = registry.get("codex")
+    assert codex.command == ("codex-acp",) and codex.provider == "openai"
+    claude = registry.get("claude_code")
+    assert claude.command == ("claude-agent-acp",) and claude.provider == "anthropic"
 
 
 def test_journal_event_from_message() -> None:

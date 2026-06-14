@@ -66,9 +66,15 @@ class DescriptorRegistry:
 
 
 #: The high-fidelity native-ACP roster (research receipt 02-synthesis): the agents Rutherford drives
-#: directly as ACP servers, in initial-onboarding order. ``goose`` and ``opencode`` are confirmed live on
-#: this machine; the rest carry their researched launch command and are gated by the conformance harness
-#: before they are trusted.
+#: directly as ACP servers, in initial-onboarding order. ``goose``, ``opencode``, ``vibe``, ``junie``,
+#: ``codex`` and ``claude_code`` are confirmed live on this machine; the rest carry their researched launch
+#: command and are gated by the conformance harness before they are trusted.
+#:
+#: ``codex`` and ``claude_code`` use the official Zed adapters -- ``codex-acp`` and ``claude-agent-acp`` (npm
+#: ``@agentclientprotocol/*``) -- which front the Codex and Claude Code CLIs as ACP servers. Both honor the
+#: existing CLI login over ACP and need no API key: ``codex-acp`` reuses the ChatGPT login
+#: (``~/.codex/auth.json``) and ``claude-agent-acp`` reuses the Claude Code login (receipt
+#: ``11-official-adapters-auth-test.md``). The launch command is the adapter shim, not the underlying CLI.
 HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("goose", "Goose", ("goose", "acp")),
     AgentDescriptor("opencode", "OpenCode", ("opencode", "acp")),
@@ -77,6 +83,8 @@ HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("junie", "Junie", ("junie", "--acp=true")),
     AgentDescriptor("kimi", "Kimi Code", ("kimi", "acp"), provider="moonshot"),
     AgentDescriptor("openhands", "OpenHands", ("openhands", "acp"), handshake_timeout_s=90.0),
+    AgentDescriptor("codex", "Codex", ("codex-acp",), provider="openai"),
+    AgentDescriptor("claude_code", "Claude Code", ("claude-agent-acp",), provider="anthropic"),
 )
 
 

@@ -102,5 +102,9 @@ async def probe_agent(
     """
     if cwd is not None:
         return await _probe_in(descriptor, cwd, timeout_s)
-    with tempfile.TemporaryDirectory(prefix="rutherford-acp-probe-") as probe_cwd:
+    # ignore_cleanup_errors: a working agent (e.g. codex-acp) can leave a grandchild process or open
+    # handle holding the probe cwd for a moment after the session closes, and Windows refuses to delete a
+    # directory still in use (WinError 32). The probe's job is to classify the agent, not to guarantee temp
+    # cleanup -- so a residual temp dir is left for the OS to reap rather than crashing a successful probe.
+    with tempfile.TemporaryDirectory(prefix="rutherford-acp-probe-", ignore_cleanup_errors=True) as probe_cwd:
         return await _probe_in(descriptor, probe_cwd, timeout_s)
