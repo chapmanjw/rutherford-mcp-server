@@ -64,6 +64,22 @@ async def test_official_adapter_answers(agent_id: str) -> None:
     assert "42" in result.text
 
 
+@pytest.mark.parametrize("agent_id", ["copilot", "qwen", "droid"])
+async def test_second_wave_agent_answers(agent_id: str) -> None:
+    """The second wave (probed live, receipt 12) each drive over ACP with the existing CLI auth.
+
+    copilot (GitHub Copilot plan), qwen (~/.qwen), droid (Factory -- separate billing). Each answers a
+    trivial prompt end to end. (hermes probed OK but blew a 180s turn on its free Nous model, so it is left
+    to config rather than shipped as a confirmed built-in.)
+    """
+    descriptor = default_registry().get(agent_id)
+    result = await run_acp_turn(
+        descriptor, _PROMPT, policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd=str(Path.cwd()), timeout_s=180.0
+    )
+    assert result.ok is True, f"{agent_id} failed: {result.error}"
+    assert "42" in result.text
+
+
 async def test_goose_consensus_two_voices() -> None:
     config = RutherfordConfig()
     service = ConsensusService(DelegationService(default_registry(), config), config)

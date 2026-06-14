@@ -71,14 +71,19 @@ class DescriptorRegistry:
 
 #: The high-fidelity native-ACP roster (research receipt 02-synthesis): the agents Rutherford drives
 #: directly as ACP servers, in initial-onboarding order. ``goose``, ``opencode``, ``vibe``, ``junie``,
-#: ``codex`` and ``claude_code`` are confirmed live on this machine; the rest carry their researched launch
-#: command and are gated by the conformance harness before they are trusted.
+#: ``codex``, ``claude_code``, ``copilot``, ``qwen`` and ``droid`` are confirmed live on this machine; the
+#: rest (``cline``, ``kimi``, ``openhands``) carry their researched launch command and are gated by the
+#: conformance harness before they are trusted.
 #:
 #: ``codex`` and ``claude_code`` use the official Zed adapters -- ``codex-acp`` and ``claude-agent-acp`` (npm
 #: ``@agentclientprotocol/*``) -- which front the Codex and Claude Code CLIs as ACP servers. Both honor the
 #: existing CLI login over ACP and need no API key: ``codex-acp`` reuses the ChatGPT login
 #: (``~/.codex/auth.json``) and ``claude-agent-acp`` reuses the Claude Code login (receipt
 #: ``11-official-adapters-auth-test.md``). The launch command is the adapter shim, not the underlying CLI.
+#:
+#: ``copilot``/``droid`` are bring-your-own-model (provider ``None``); ``qwen`` carries its vendor as an
+#: unconfirmed guess. (``hermes`` probed OK once but blew a 180s turn on its free Nous model -- too slow to
+#: trust in a panel -- so it is left to config; ``kilo``/``kiro`` need work. Receipt 12.)
 HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("goose", "Goose", ("goose", "acp")),
     AgentDescriptor("opencode", "OpenCode", ("opencode", "acp")),
@@ -89,6 +94,9 @@ HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("openhands", "OpenHands", ("openhands", "acp"), handshake_timeout_s=90.0),
     AgentDescriptor("codex", "Codex", ("codex-acp",), provider="openai"),
     AgentDescriptor("claude_code", "Claude Code", ("claude-agent-acp",), provider="anthropic"),
+    AgentDescriptor("copilot", "GitHub Copilot", ("copilot", "--acp")),
+    AgentDescriptor("qwen", "Qwen Code", ("qwen", "--acp"), provider="alibaba"),
+    AgentDescriptor("droid", "Factory Droid", ("droid", "exec", "--output-format", "acp")),
 )
 
 

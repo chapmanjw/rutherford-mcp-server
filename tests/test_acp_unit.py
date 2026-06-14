@@ -83,7 +83,7 @@ def test_descriptor_registry() -> None:
     registry = default_registry()
     assert registry.has("goose") and "goose" in registry.ids()
     assert registry.get("goose").command == ("goose", "acp")
-    assert len(registry) == 9
+    assert len(registry) == 12
     with pytest.raises(KeyError):
         registry.get("nope")
     with pytest.raises(ValueError, match="duplicate"):
@@ -115,6 +115,17 @@ def test_official_adapter_descriptors() -> None:
     assert codex.command == ("codex-acp",) and codex.provider == "openai"
     claude = registry.get("claude_code")
     assert claude.command == ("claude-agent-acp",) and claude.provider == "anthropic"
+
+
+def test_second_wave_descriptors() -> None:
+    """copilot/qwen/droid (probed live) launch with their verified ACP commands."""
+    registry = default_registry()
+    assert registry.get("copilot").command == ("copilot", "--acp")
+    assert registry.get("copilot").provider is None  # bring-your-own-model
+    assert registry.get("qwen").command == ("qwen", "--acp") and registry.get("qwen").provider == "alibaba"
+    assert registry.get("droid").command == ("droid", "exec", "--output-format", "acp")
+    assert registry.get("droid").provider is None
+    assert not registry.has("hermes")  # probed OK once but too slow on its free model; left to config
 
 
 def test_journal_event_from_message() -> None:

@@ -8,10 +8,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-- Two more agents in the ACP-native roster (v3): `codex` and `claude_code`, driven through the official
-  Zed adapters `codex-acp` and `claude-agent-acp`. Both reuse the existing CLI login over ACP and need no
-  API key — `codex-acp` keeps the ChatGPT subscription, `claude-agent-acp` keeps the Claude Code login —
-  correcting the earlier research note that flagged them as possibly API-key-only. Roster: 9 descriptors.
+- Five more agents in the ACP-native roster (v3): `codex` and `claude_code` via the official Zed adapters
+  `codex-acp` / `claude-agent-acp` (both reuse the existing CLI login over ACP — no API key — keeping the
+  ChatGPT and Claude Code logins, correcting the earlier research note that flagged them as possibly
+  API-key-only), plus `copilot` (`copilot --acp`), `qwen` (`qwen --acp`) and `droid`
+  (`droid exec --output-format acp`), each probed and driven live. Roster: 12 descriptors.
 - Config-driven agents. Under ACP an agent is just how to launch it plus a few quirks (no per-CLI parser),
   so the roster is now built from the curated built-in defaults plus a `[agents.<id>]` config section.
   A config entry overrides a built-in agent's command/env/provider/model/handshake, disables one with
