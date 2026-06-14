@@ -32,6 +32,10 @@ class AgentDescriptor:
     #: Seconds allotted for the initialize + new_session handshake before it is judged failed. A heavyweight
     #: agent that sets up a workspace/runtime on new_session (e.g. OpenHands) needs more than the default.
     handshake_timeout_s: float = 30.0
+    #: Environment variables to SET for the agent subprocess (name, value pairs), layered on top of the
+    #: inherited / allowlisted environment. Sourced from a config ``[agents.<id>] env`` block. A tuple of
+    #: pairs (not a dict) so the descriptor stays a frozen, hashable value object.
+    env_overrides: tuple[tuple[str, str], ...] = ()
 
 
 class DescriptorRegistry:

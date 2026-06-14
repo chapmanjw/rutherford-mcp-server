@@ -23,24 +23,40 @@ from ..domain.models import OnBudget
 _log = logging.getLogger(__name__)
 
 
-class AdapterConfig(BaseModel):
-    """Per-adapter overrides applied to a built-in adapter."""
+class AgentConfig(BaseModel):
+    """Per-agent configuration: override a built-in agent, or define a brand-new ACP agent.
+
+    Under ACP an agent is just how to launch it as an ACP server plus a few quirks -- there is no
+    hand-written per-CLI parser -- so an agent can be declared entirely in config. An id that matches a
+    built-in agent overrides its fields (or removes it with ``enabled = false``); an id that does NOT
+    match a built-in defines a new agent and must supply ``command``. The launch fields mirror the
+    Zed/Cline ``acp.json`` shape, so an imported ``agent_servers`` block lands here directly.
+    """
 
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     enabled: bool = True
+    #: The launch argv for this agent's ACP server (e.g. ``["codex-acp"]`` or ``["node", "./agent.js"]``).
+    #: Required to DEFINE a new agent; for a built-in agent it replaces the default launch command.
+    command: list[str] | None = None
+    #: Environment variables SET for the agent subprocess, layered on top of the inherited environment
+    #: (so the agent's own credential discovery still works). Populated from an acp.json ``env`` block.
+    env: dict[str, str] = Field(default_factory=dict)
+    #: The fixed model vendor when known (e.g. ``"openai"``), recorded as provenance; ``None`` keeps the
+    #: built-in value (or stays unknown for a new agent).
+    provider: str | None = None
     default_model: str | None = None
-    #: Per-adapter run timeout in seconds. Overrides the global ``default_timeout_s`` for this
-    #: adapter when a call names no ``timeout_s``; ``None`` falls back to the global default. Useful
-    #: for a slow local model (e.g. Ollama on a CPU, or LM Studio's JIT model load) whose cold load
-    #: can exceed the global budget.
+    #: Seconds for the initialize + new_session handshake before it is judged failed; ``None`` keeps the
+    #: built-in value (or the 30s default for a new agent). Raise it for a heavyweight agent.
+    handshake_timeout_s: float | None = Field(default=None, gt=0)
+    #: Per-agent run timeout in seconds. Overrides the global ``default_timeout_s`` for this agent when a
+    #: call names no ``timeout_s``; ``None`` falls back to the global default.
     timeout_s: float | None = Field(default=None, gt=0)
-    #: Extra command-line arguments appended verbatim to the adapter's invocation. Honored by the
-    #: local-model adapters -- Ollama (e.g. ``["--keepalive", "30s"]``) and LM Studio (e.g.
-    #: ``["--ttl", "3600"]``).
+    #: Extra arguments appended to the launch argv (after ``command``). Lets a built-in agent gain a flag
+    #: without restating its whole command.
     extra_args: list[str] = Field(default_factory=list)
-    #: Per-adapter default reasoning-effort tier (F8a). Used when a call names no ``effort``; ``None``
-    #: falls back to the global ``default_effort``. A no-op for an adapter with no effort knob.
+    #: Per-agent default reasoning-effort tier (F8a). Used when a call names no ``effort``; ``None``
+    #: falls back to the global ``default_effort``. A no-op for an agent with no effort knob.
     effort: Effort | None = None
 
 
@@ -49,10 +65,10 @@ class RutherfordConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    #: Restrict the registry to these adapter ids; ``None`` enables every known adapter.
-    enabled_adapters: list[str] | None = None
-    #: Per-adapter overrides keyed by adapter id.
-    adapters: dict[str, AdapterConfig] = Field(default_factory=dict)
+    #: Restrict the registry to these agent ids; ``None`` enables every known + configured agent.
+    enabled_agents: list[str] | None = None
+    #: Agent definitions and overrides keyed by agent id (built-in overrides and new agents alike).
+    agents: dict[str, AgentConfig] = Field(default_factory=dict)
     #: Default safety posture when a caller does not specify one.
     default_safety_mode: SafetyMode = SafetyMode.READ_ONLY
     #: Default per-run timeout in seconds.
@@ -193,29 +209,29 @@ class RutherfordConfig(BaseModel):
         """
         return persist if persist is not None else (self.default_persistence == "job")
 
-    def default_model_for(self, adapter_id: str) -> str | None:
-        """Return the configured default model for ``adapter_id``, if any."""
-        entry = self.adapters.get(adapter_id)
+    def default_model_for(self, agent_id: str) -> str | None:
+        """Return the configured default model for ``agent_id``, if any."""
+        entry = self.agents.get(agent_id)
         return entry.default_model if entry is not None else None
 
-    def timeout_for(self, adapter_id: str) -> float | None:
-        """Return the configured per-adapter timeout (seconds) for ``adapter_id``, if any."""
-        entry = self.adapters.get(adapter_id)
+    def timeout_for(self, agent_id: str) -> float | None:
+        """Return the configured per-agent timeout (seconds) for ``agent_id``, if any."""
+        entry = self.agents.get(agent_id)
         return entry.timeout_s if entry is not None else None
 
-    def effort_for(self, adapter_id: str) -> Effort | None:
-        """Resolve the default reasoning-effort tier for ``adapter_id`` (F8a): per-adapter, else global.
+    def effort_for(self, agent_id: str) -> Effort | None:
+        """Resolve the default reasoning-effort tier for ``agent_id`` (F8a): per-agent, else global.
 
         Used when a call names no ``effort``; ``None`` means "let the CLI decide" (no effort flag).
         """
-        entry = self.adapters.get(adapter_id)
+        entry = self.agents.get(agent_id)
         if entry is not None and entry.effort is not None:
             return entry.effort
         return self.default_effort
 
-    def extra_args_for(self, adapter_id: str) -> list[str]:
-        """Return the configured extra CLI args for ``adapter_id`` (empty when none)."""
-        entry = self.adapters.get(adapter_id)
+    def extra_args_for(self, agent_id: str) -> list[str]:
+        """Return the configured extra CLI args for ``agent_id`` (empty when none)."""
+        entry = self.agents.get(agent_id)
         return list(entry.extra_args) if entry is not None else []
 
 

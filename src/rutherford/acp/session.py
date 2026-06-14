@@ -320,7 +320,10 @@ def _post_prompt_safety(journal: EventJournal) -> ReexecutionSafety:
 
 
 def _resolve_env(descriptor: AgentDescriptor) -> dict[str, str]:
-    """The environment for the agent subprocess: the full inherited env, or the descriptor's allowlist."""
+    """The environment for the agent subprocess: inherited (or allowlisted), then config overrides on top."""
     if descriptor.env_passthrough is None:
-        return dict(os.environ)
-    return {name: os.environ[name] for name in descriptor.env_passthrough if name in os.environ}
+        env = dict(os.environ)
+    else:
+        env = {name: os.environ[name] for name in descriptor.env_passthrough if name in os.environ}
+    env.update(descriptor.env_overrides)
+    return env

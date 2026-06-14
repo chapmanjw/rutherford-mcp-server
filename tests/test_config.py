@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from rutherford.config.loader import deep_merge, default_global_config_path, load_config
-from rutherford.config.schema import AdapterConfig, RutherfordConfig
+from rutherford.config.schema import AgentConfig, RutherfordConfig
 from rutherford.domain.enums import Effort, SafetyMode
 from rutherford.domain.errors import ConfigError
 
@@ -27,7 +27,7 @@ def test_load_defaults(tmp_path: Path) -> None:
 
 def test_load_project_override(tmp_path: Path) -> None:
     (tmp_path / "rutherford.toml").write_text(
-        'default_timeout_s = 12.0\ndefault_safety_mode = "propose"\n\n[adapters.goose]\ndefault_model = "gpt"\n'
+        'default_timeout_s = 12.0\ndefault_safety_mode = "propose"\n\n[agents.goose]\ndefault_model = "gpt"\n'
         "timeout_s = 9.0\n",
         encoding="utf-8",
     )
@@ -83,7 +83,7 @@ def test_global_config_path_and_deep_merge() -> None:
 
 def test_schema_helpers() -> None:
     config = RutherfordConfig(
-        adapters={"goose": AdapterConfig(default_model="m", effort=Effort.HIGH, extra_args=["--x"])},
+        agents={"goose": AgentConfig(default_model="m", effort=Effort.HIGH, extra_args=["--x"])},
         default_effort=Effort.LOW,
     )
     assert config.effort_for("goose") is Effort.HIGH

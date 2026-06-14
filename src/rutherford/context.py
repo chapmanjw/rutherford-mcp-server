@@ -15,7 +15,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from .acp.descriptors import DescriptorRegistry, default_registry
+from .acp.descriptors import DescriptorRegistry
+from .acp.roster import build_registry
 from .config.loader import load_config
 from .config.schema import RutherfordConfig
 from .domain.error_codes import ErrorCode
@@ -67,10 +68,11 @@ def build_app_context(
     """Assemble the application context: load config, build the descriptor registry and the service.
 
     Arguments are injectable for tests; in production both default to the real implementations (config
-    discovered from disk and environment, the high-fidelity descriptor roster).
+    discovered from disk and environment, the descriptor roster built from the built-in defaults plus any
+    ``[agents.<id>]`` config).
     """
     resolved_config = config if config is not None else load_config()
-    resolved_descriptors = descriptors if descriptors is not None else default_registry()
+    resolved_descriptors = descriptors if descriptors is not None else build_registry(resolved_config)
     delegation = DelegationService(resolved_descriptors, resolved_config)
     consensus = ConsensusService(delegation, resolved_config)
     debate = DebateService(resolved_descriptors, resolved_config)
