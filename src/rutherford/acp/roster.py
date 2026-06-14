@@ -21,8 +21,19 @@ from .descriptors import HIGH_FIDELITY, AgentDescriptor, DescriptorRegistry
 
 
 def build_registry(config: RutherfordConfig) -> DescriptorRegistry:
-    """Assemble the agent registry: built-in defaults, then config overrides / additions / filters."""
+    """Assemble the agent registry: built-in defaults, then config overrides / additions / filters.
+
+    When ``auto_detect_local_models`` is set, a probe of any running Ollama / LM Studio adds a
+    ``goose``-based agent per suitable model -- but at the LOWEST precedence: a built-in or explicit
+    ``[agents.<id>]`` of the same id always wins, and a detected id never overwrites it. Detection is
+    bounded and never raises, so a backend being down cannot break registry build.
+    """
     resolved: dict[str, AgentDescriptor] = {descriptor.id: descriptor for descriptor in HIGH_FIDELITY}
+    if config.auto_detect_local_models:
+        from .local_detect import detect_local_agents  # lazy: local_detect imports this module's env builders
+
+        for detected in detect_local_agents():
+            resolved.setdefault(detected.id, detected)  # built-ins win; never overwrite
     for agent_id, entry in config.agents.items():
         if not entry.enabled:
             resolved.pop(agent_id, None)

@@ -93,6 +93,12 @@ class RutherfordConfig(BaseModel):
     enabled_agents: list[str] | None = None
     #: Agent definitions and overrides keyed by agent id (built-in overrides and new agents alike).
     agents: dict[str, AgentConfig] = Field(default_factory=dict)
+    #: Zero-config local models: when ``True`` (the default), probe a running Ollama (``:11434``) and
+    #: LM Studio (``:1234``) at registry-build time and register each tool-capable model as a
+    #: ``goose``-based ACP agent automatically (id ``ollama-<model>`` / ``lmstudio-<model>``). A
+    #: built-in or explicit ``[agents.<id>]`` of the same id always wins; a backend that is down is
+    #: silently skipped and never breaks startup. Set ``False`` to require explicit local-agent config.
+    auto_detect_local_models: bool = True
     #: Default safety posture when a caller does not specify one.
     default_safety_mode: SafetyMode = SafetyMode.READ_ONLY
     #: Default per-run timeout in seconds.

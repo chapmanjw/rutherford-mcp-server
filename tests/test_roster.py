@@ -14,7 +14,8 @@ from rutherford.domain.errors import ConfigError
 
 
 def test_no_config_is_the_builtin_roster() -> None:
-    registry = build_registry(RutherfordConfig())
+    # auto_detect_local_models off so the count is deterministic regardless of a running local backend.
+    registry = build_registry(RutherfordConfig(auto_detect_local_models=False))
     assert len(registry) == len(HIGH_FIDELITY) == 16
     assert registry.get("goose").command == ("goose", "acp")
 
@@ -45,7 +46,9 @@ def test_env_overrides_flow_to_descriptor() -> None:
 
 
 def test_disable_a_builtin_agent() -> None:
-    registry = build_registry(RutherfordConfig(agents={"openhands": AgentConfig(enabled=False)}))
+    registry = build_registry(
+        RutherfordConfig(auto_detect_local_models=False, agents={"openhands": AgentConfig(enabled=False)})
+    )
     assert not registry.has("openhands")
     assert len(registry) == 15
 

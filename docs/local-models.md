@@ -8,6 +8,26 @@ you don't add Ollama as an agent — you point an existing ACP agent at it as it
 You declare a local agent in config with three lines: which agent to launch (`base`), which runtime
 (`backend`), and which model (`model`). Rutherford fills in the right provider environment for that pair.
 
+## Zero-config auto-detection
+
+You usually don't need to declare anything. On by default (`auto_detect_local_models = true`), Rutherford
+probes a running Ollama (`:11434`) and LM Studio (`:1234`) when it builds the registry and registers each
+suitable model as a `goose`-based agent automatically:
+
+- **Ollama** — only models that report the `tools` capability are registered (an agentic loop needs
+  tool-calling; a model without it, like `gemma3:12b`, is skipped). The id is `ollama-<model>` with the
+  colons slugged out, e.g. `qwen3:8b` becomes `ollama-qwen3-8b`.
+- **LM Studio** — every non-embedding model id is registered (ids containing `embed` are skipped, since
+  LM Studio does not expose tool capability). `openai/gpt-oss-120b` becomes `lmstudio-openai-gpt-oss-120b`.
+
+A built-in agent or an explicit `[agents.<id>]` of the same id always wins — a detected model never
+overwrites it. A backend that is down, slow, or unreachable is skipped (a short ~1.5s probe per endpoint),
+so detection never blocks or breaks startup. Run `capabilities` / `doctor` to see what was found. Set
+`auto_detect_local_models = false` to turn probing off and require explicit local-agent config.
+
+The manual `[agents.<id>]` form below stays available — use it to pin a specific model, a remote host, or
+a different base agent.
+
 ## Quick start
 
 1. Start a backend with a **tool-capable** model loaded (see [Requirements](#requirements)).
