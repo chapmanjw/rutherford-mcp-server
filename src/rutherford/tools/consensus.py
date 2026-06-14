@@ -13,6 +13,8 @@ from .common import (
     as_target,
     ensure_known_agent,
     ensure_known_targets,
+    parse_effort,
+    parse_on_budget,
     parse_stances,
     parse_strategy,
     resolve_run_mode,
@@ -37,6 +39,9 @@ async def consensus_tool(
     safety_mode: str | None = None,
     synthesize: bool | None = None,
     timeout_s: float | None = None,
+    effort: str | None = None,
+    time_budget_s: float | None = None,
+    on_budget: str | None = None,
     mode: str = "sync",
 ) -> str:
     """Validate the panel, fan the prompt out across the targets, and reduce the voices to a TOON envelope.
@@ -49,10 +54,15 @@ async def consensus_tool(
     (optionally with a ``verdict_schema``), the voices are aggregated into a :class:`StrategyResult`
     outcome instead of returned individually. ``synthesize`` (tri-state; defaults to ``synthesize_default``,
     off out of the box) adds a server-side combined answer (``all-voices`` only); ``judge`` names the seat
-    that writes it. ``mode="async"`` submits the panel as a background job and returns a ``job_id``;
-    ``mode="sync"`` (the default) awaits it. Validation always runs on the request path, so a bad panel
-    fails there rather than inside a job. A named ``role`` has its persona prepended to the prompt every
-    voice receives; ``UNKNOWN_ROLE`` if the id is not a known role.
+    that writes it. ``effort`` (low|medium|high|xhigh) asks every voice to spend more reasoning where it has
+    a knob. ``time_budget_s`` is a wall-clock deadline for the WHOLE panel (distinct from each voice's
+    ``timeout_s``): at the deadline answered voices are kept, in-flight ones are cut, and the panel
+    aggregates over the harvest if ``min_quorum`` usable remain (``stop_reason="budget"``) -- fewer than
+    ``min_quorum`` is ``BUDGET_EXHAUSTED``. ``on_budget`` (harvest|continue|resume, default
+    ``default_on_budget``) chooses the deadline behavior. ``mode="async"`` submits the panel as a background
+    job and returns a ``job_id``; ``mode="sync"`` (the default) awaits it. Validation always runs on the
+    request path, so a bad panel fails there rather than inside a job. A named ``role`` has its persona
+    prepended to the prompt every voice receives; ``UNKNOWN_ROLE`` if the id is not a known role.
     """
     auto_panel = expand_all or _wants_all(targets)
     if auto_panel:
@@ -83,6 +93,9 @@ async def consensus_tool(
         strategy=parse_strategy(strategy) if strategy is not None else parse_strategy("all-voices"),
         verdict_schema=verdict_schema,
         judge=judge_target,
+        effort=parse_effort(effort),
+        time_budget_s=time_budget_s,
+        on_budget=parse_on_budget(on_budget),
     )
 
     async def run() -> str:

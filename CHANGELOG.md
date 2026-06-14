@@ -8,6 +8,31 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Reasoning-effort tiers and a whole-panel time budget with harvest over ACP (F8a), ported from v2.
+  - Effort tiers. `delegate` / `consensus` / `debate` gain an `effort` (low | medium | high | xhigh)
+    parameter, resolved per call as explicit `effort` -> per-agent `[agents.<id>] effort` -> global
+    `default_effort` -> none. Since ACP has no effort field, each tier maps to an agent's real knob through a
+    new `acp/effort.py`: **codex** encodes it in the ACP model id as `model[effort]` (the `codex-acp` adapter
+    parses the bracket; `xhigh` supported), **cursor** encodes it as a `model-<tier>` suffix (clamps `xhigh`
+    to `high`), **cline** passes the global `--thinking <tier>` launch flag, and **junie** sets the
+    `JUNIE_EFFORT` env (best-effort: documented as a new-session default, ACP-mode application unconfirmed).
+    Every other agent — including **pi**, whose `--thinking` is an in-session selector with no launch knob —
+    is an honest reported no-op. The codex/cursor model rewrite reaches the agent via a best-effort
+    `session/set_model` (sent only for a model the agent advertised). The result carries `effort` (requested)
+    and `effort_applied` (the tier after clamping, or `None` for a no-op).
+  - Time budget + harvest. `consensus` and `debate` gain `time_budget_s` (a wall-clock deadline for the WHOLE
+    panel, distinct from each turn's `timeout_s`) and `on_budget` (harvest | continue | resume, default
+    `default_on_budget`). Consensus races the voices under an `asyncio.wait` deadline: at the deadline the
+    answered voices are kept and the in-flight ones are cut (their streamed partial harvested and promoted to
+    a usable answer), then the panel aggregates over the harvest as long as `min_quorum` usable voices remain.
+    Debate enforces the budget at round boundaries: a round still in flight at the deadline is cut (its turns
+    recorded as `BUDGET_EXHAUSTED` positions with the partial preserved but never promoted to a stance) and
+    the transcript so far is finalized. A harvest is a SUCCESS — `stop_reason="budget"` plus a `RunRollup`
+    (issued / answered / cut / usable / quorum_met / elapsed_s / time_budget_s / effort_requested /
+    effort_applied / cost); a harvest below `min_quorum` is the one genuine failure, `BUDGET_EXHAUSTED` (not
+    retryable). `on_budget="continue"` makes the budget advisory (every voice / round runs to completion). A
+    run that finishes within its budget sets `stop_reason=None` and a rollup with `stop_reason="ok"`.
+
 - Consensus aggregation over ACP, ported from v2. `consensus` regains the capabilities the v3 fan-out had
   dropped, all behaviorally equivalent to v2 and computed as pure post-processing over the voices the ACP
   turns already return:

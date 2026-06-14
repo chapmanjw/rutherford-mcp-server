@@ -14,7 +14,7 @@ from rutherford import server
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import AppContext, build_app_context
-from rutherford.domain.enums import Stance, Strategy
+from rutherford.domain.enums import Effort, Stance, Strategy
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import ConsensusRequest, ConsensusResult, StrategyResult, Target
@@ -31,6 +31,16 @@ FAKE_A = AgentDescriptor("fake_a", "Fake A", _FAKE_CMD, provider="alpha", defaul
 FAKE_B = AgentDescriptor("fake_b", "Fake B", _FAKE_CMD, provider="beta", default_model="model-b")
 # An agent that exits before the handshake, so its voice always fails.
 DEAD = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.exit(0)"))
+# A slow agent: it streams a partial then sleeps 10s, so a tight panel deadline cuts it mid-turn. Slowness
+# rides the descriptor env, not the prompt, so a panel can mix a fast voice and a slow one on one prompt.
+SLOW = AgentDescriptor(
+    "slow",
+    "Slow",
+    _FAKE_CMD,
+    provider="gamma",
+    default_model="model-s",
+    env_overrides=(("RUTHERFORD_FAKE_SLEEP", "10"),),
+)
 
 
 def _registry(extra: list[AgentDescriptor] | None = None) -> DescriptorRegistry:
@@ -401,3 +411,129 @@ async def test_consensus_tool_async_runs_same_aggregating_path(monkeypatch: Any)
         mode="async",
     )
     assert "job_id" in submit
+
+
+# --- time budget + harvest (F8a) ---------------------------------------------
+
+
+async def test_budget_cuts_the_inflight_voice_and_keeps_the_fast_one() -> None:
+    # A budget shorter than the slow voice cuts it (harvesting its streamed partial) while the fast voice
+    # answers; the panel succeeds with stop_reason="budget" and a rollup recording the cut.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=4.0,
+    )
+    result = await _service(extra=[SLOW]).consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.stop_reason == "budget"
+    by_cli = {voice.target.cli: voice for voice in result.voices}
+    assert by_cli["fake"].ok and "42" in by_cli["fake"].text and by_cli["fake"].stop_reason is None
+    slow = by_cli["slow"]
+    assert slow.stop_reason == "budget" and slow.text == "partial-so-far"  # the streamed partial was harvested
+    assert result.rollup is not None
+    assert result.rollup.stop_reason == "budget" and result.rollup.cut == 1 and result.rollup.answered == 1
+    assert result.rollup.usable == 2 and result.rollup.quorum_met is True
+    assert result.rollup.time_budget_s == 4.0 and result.rollup.elapsed_s > 0
+
+
+async def test_budget_below_quorum_raises_budget_exhausted() -> None:
+    # Two slow voices, each cut with only a streamed partial (usable), but min_quorum=3 cannot be met -> the
+    # genuine starved harvest raises BUDGET_EXHAUSTED rather than certifying off too few.
+    config = RutherfordConfig(min_quorum=3)
+    request = ConsensusRequest(
+        targets=[Target(cli="slow"), Target(cli="slow")],
+        prompt="x",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=2.0,
+    )
+    with pytest.raises(RutherfordError) as exc:
+        await _service(config, extra=[SLOW]).consensus(request)
+    assert exc.value.code is ErrorCode.BUDGET_EXHAUSTED
+
+
+async def test_generous_budget_finishes_clean_with_a_rollup() -> None:
+    # A budget longer than every voice: nothing is cut, the result-level stop_reason stays None (a clean
+    # finish), and the rollup records stop_reason="ok" with the real counts.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=30.0,
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.stop_reason is None
+    assert result.rollup is not None and result.rollup.stop_reason == "ok"
+    assert result.rollup.cut == 0 and result.rollup.answered == 2 and result.rollup.usable == 2
+
+
+async def test_no_budget_leaves_stop_reason_and_rollup_unset() -> None:
+    request = ConsensusRequest(targets=[Target(cli="fake")], prompt="what is 17 + 25?", working_dir=str(REPO_ROOT))
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.stop_reason is None and result.rollup is None
+
+
+async def test_on_budget_continue_runs_every_voice_to_completion() -> None:
+    # With on_budget="continue" the budget is advisory: even a voice slower than the budget runs to its full
+    # answer (no cut), so stop_reason stays None and nothing is harvested.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=2.0,
+        on_budget="continue",
+    )
+    result = await _service(extra=[SLOW]).consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.stop_reason is None
+    assert all(voice.ok and "42" in voice.text for voice in result.voices)  # the slow voice finished too
+    assert result.rollup is not None and result.rollup.stop_reason == "ok" and result.rollup.cut == 0
+
+
+async def test_budget_carries_into_a_strategy_result() -> None:
+    # The budget path composes with the aggregation: a strategy run under a tight budget still cuts the slow
+    # voice and stamps stop_reason + rollup on the StrategyResult.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt=_prompt("VERDICT: yes"),
+        strategy=Strategy.PLURALITY,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=4.0,
+    )
+    result = await _service(extra=[SLOW]).consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.stop_reason == "budget" and result.rollup is not None and result.rollup.cut == 1
+
+
+async def test_budget_rollup_records_effort_requested() -> None:
+    # The rollup surfaces the effort tier asked of the voices, even for fakes whose applied tier is a no-op.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=4.0,
+        effort=Effort.HIGH,
+    )
+    result = await _service(extra=[SLOW]).consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.rollup is not None and result.rollup.effort_requested is Effort.HIGH
+
+
+async def test_budget_path_handles_a_failed_voice() -> None:
+    # The budgeted path still records a handshake-failing voice as a structured failed voice (not a cut),
+    # alongside the fast voice that answered -- one bad voice never aborts a budgeted panel.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="dead")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=10.0,
+    )
+    result = await _service(extra=[DEAD]).consensus(request)
+    assert isinstance(result, ConsensusResult)
+    by_cli = {voice.target.cli: voice for voice in result.voices}
+    assert by_cli["fake"].ok and "42" in by_cli["fake"].text
+    assert by_cli["dead"].ok is False  # handshake failure, surfaced as a failed voice, not a cut
+    assert result.stop_reason is None  # the dead voice finished (failed) before the deadline -- no cut

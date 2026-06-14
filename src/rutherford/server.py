@@ -83,6 +83,7 @@ async def delegate(
     timeout_s: float | None = None,
     trust_workspace: bool = False,
     role: str | None = None,
+    effort: str | None = None,
     mode: str = "sync",
 ) -> str:
     """Delegate a task to one ACP agent and return its normalized result.
@@ -91,8 +92,11 @@ async def delegate(
     `safety_mode` is read_only | propose | write | yolo; when omitted, the configured `default_safety_mode`
     applies (read_only out of the box). write and yolo also need a trusted workspace (`trust_workspace=true`
     or a configured allowlist). `files` lists paths to put in scope. `role` names a persona (see
-    `list_roles`) whose system prompt is prepended to `prompt`. `mode="async"` runs the turn as a
-    background job and returns a `job_id` (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
+    `list_roles`) whose system prompt is prepended to `prompt`. `effort` (low | medium | high | xhigh) asks
+    the agent to spend more reasoning where it has a knob (codex/cursor via the model id, cline via
+    --thinking, junie via env); a reported no-op for an agent with none. Omitted, the configured
+    `default_effort` (per-agent or global) applies. `mode="async"` runs the turn as a background job and
+    returns a `job_id` (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
     """
     return await _guarded(
         delegate_tool(
@@ -106,6 +110,7 @@ async def delegate(
             timeout_s=timeout_s,
             trust_workspace=trust_workspace,
             role=role,
+            effort=effort,
             mode=mode,
         )
     )
@@ -126,6 +131,9 @@ async def consensus(
     synthesize: bool | None = None,
     timeout_s: float | None = None,
     role: str | None = None,
+    effort: str | None = None,
+    time_budget_s: float | None = None,
+    on_budget: str | None = None,
     mode: str = "sync",
 ) -> str:
     """Ask the same prompt of several ACP agents in parallel and reduce the voices.
@@ -142,8 +150,13 @@ async def consensus(
     out of the box) adds a server-side combined answer (`all-voices` only); `judge` names the seat that
     writes it. `safety_mode` and `timeout_s` apply to every voice; one failing voice is a failed result,
     never an aborted panel. `role` names a persona (see `list_roles`) prepended to the prompt every voice
-    receives. `mode="async"` runs the panel as a background job and returns a `job_id` (poll with
-    `job_status` / `job_result`); `mode="sync"` awaits it.
+    receives. `effort` (low | medium | high | xhigh) asks every voice to spend more reasoning where it has a
+    knob. `time_budget_s` is a wall-clock deadline for the WHOLE panel (distinct from each voice's
+    `timeout_s`): at the deadline answered voices are kept, in-flight ones cut, and the panel aggregates over
+    the harvest if `min_quorum` usable remain (`stop_reason="budget"`, with a `rollup`); below `min_quorum`
+    is `BUDGET_EXHAUSTED`. `on_budget` is harvest | continue | resume (default `default_on_budget`).
+    `mode="async"` runs the panel as a background job and returns a `job_id` (poll with `job_status` /
+    `job_result`); `mode="sync"` awaits it.
     """
     return await _guarded(
         consensus_tool(
@@ -161,6 +174,9 @@ async def consensus(
             synthesize=synthesize,
             timeout_s=timeout_s,
             role=role,
+            effort=effort,
+            time_budget_s=time_budget_s,
+            on_budget=on_budget,
             mode=mode,
         )
     )
@@ -177,6 +193,9 @@ async def debate(
     synthesize: bool = True,
     timeout_s: float | None = None,
     role: str | None = None,
+    effort: str | None = None,
+    time_budget_s: float | None = None,
+    on_budget: str | None = None,
     mode: str = "sync",
 ) -> str:
     """Have several ACP agents argue a question across rounds and return the full transcript.
@@ -186,9 +205,13 @@ async def debate(
     independent answer, and each later round shows a voice the others' latest positions and asks it to
     revise -- the agent remembers its own prior reasoning in-session, so only the delta is sent.
     `synthesize=true` (default) adds a closing summary; `judge` names a target to write it. `role` names a
-    persona (see `list_roles`) prepended to the opening prompt every voice argues from. `mode="async"`
-    runs the debate as a background job and returns a `job_id` (poll with `job_status` / `job_result`);
-    `mode="sync"` awaits it.
+    persona (see `list_roles`) prepended to the opening prompt every voice argues from. `effort` (low |
+    medium | high | xhigh) asks every voice to spend more reasoning where it has a knob. `time_budget_s` is a
+    wall-clock deadline for the WHOLE debate enforced at round boundaries: a round still in flight at the
+    deadline is cut and the transcript so far is finalized (`stop_reason="budget"`, with a `rollup`);
+    `on_budget` is harvest | continue | resume (default `default_on_budget`; `continue` runs every round to
+    completion). `mode="async"` runs the debate as a background job and returns a `job_id` (poll with
+    `job_status` / `job_result`); `mode="sync"` awaits it.
     """
     return await _guarded(
         debate_tool(
@@ -202,6 +225,9 @@ async def debate(
             synthesize=synthesize,
             timeout_s=timeout_s,
             role=role,
+            effort=effort,
+            time_budget_s=time_budget_s,
+            on_budget=on_budget,
             mode=mode,
         )
     )

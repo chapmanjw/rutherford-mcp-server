@@ -8,7 +8,15 @@ from typing import Any
 
 from ..context import AppContext, tool_success
 from ..domain.models import DebateRequest
-from .common import apply_role, as_target, ensure_known_targets, resolve_run_mode, resolve_safety_mode
+from .common import (
+    apply_role,
+    as_target,
+    ensure_known_targets,
+    parse_effort,
+    parse_on_budget,
+    resolve_run_mode,
+    resolve_safety_mode,
+)
 from .jobs import make_summary, submit_job
 
 
@@ -24,15 +32,22 @@ async def debate_tool(
     synthesize: bool = True,
     timeout_s: float | None = None,
     role: str | None = None,
+    effort: str | None = None,
+    time_budget_s: float | None = None,
+    on_budget: str | None = None,
     mode: str = "sync",
 ) -> str:
     """Validate the panel, run the multi-round debate over persistent sessions, and return the transcript.
 
     ``mode="async"`` submits the debate as a background job and returns a ``job_id`` immediately;
-    ``mode="sync"`` (the default) awaits and returns the full transcript. Target/judge/safety/mode/role
-    validation always runs synchronously, so a bad panel fails on the request path rather than in a job.
-    A named ``role`` has its persona prepended to the opening prompt every voice argues from;
-    ``UNKNOWN_ROLE`` if the id is not a known role.
+    ``mode="sync"`` (the default) awaits and returns the full transcript. Target/judge/safety/mode/role/
+    effort/on_budget validation always runs synchronously, so a bad panel fails on the request path rather
+    than in a job. A named ``role`` has its persona prepended to the opening prompt every voice argues from;
+    ``UNKNOWN_ROLE`` if the id is not a known role. ``effort`` (low|medium|high|xhigh) asks every voice to
+    spend more reasoning where it has a knob. ``time_budget_s`` is a wall-clock deadline for the WHOLE debate
+    enforced at round boundaries: a round still in flight at the deadline is cut, the transcript so far is
+    finalized (``stop_reason="budget"``), and ``on_budget`` (harvest|continue|resume, default
+    ``default_on_budget``) chooses the behavior -- ``continue`` runs every round to completion.
     """
     parsed = [as_target(target) for target in (targets or [])]
     ensure_known_targets(app.descriptors, parsed)
@@ -50,6 +65,9 @@ async def debate_tool(
         synthesize=synthesize,
         timeout_s=timeout_s,
         judge=judge_target,
+        effort=parse_effort(effort),
+        time_budget_s=time_budget_s,
+        on_budget=parse_on_budget(on_budget),
     )
 
     async def run() -> str:

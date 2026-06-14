@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from ..context import AppContext, tool_success
 from ..domain.models import DelegationRequest, Target
-from .common import apply_role, ensure_known_agent, resolve_run_mode, resolve_safety_mode
+from .common import apply_role, ensure_known_agent, parse_effort, resolve_run_mode, resolve_safety_mode
 from .jobs import make_summary, submit_job
 
 
@@ -22,15 +22,18 @@ async def delegate_tool(
     timeout_s: float | None = None,
     trust_workspace: bool = False,
     role: str | None = None,
+    effort: str | None = None,
     mode: str = "sync",
 ) -> str:
     """Validate the request, drive one ACP turn, and return the TOON-encoded result envelope.
 
     ``mode="async"`` submits the turn as a background job and returns a ``job_id`` immediately (poll it
     with ``job_status`` / ``job_result``); ``mode="sync"`` (the default) awaits and returns the result.
-    Validation (known agent, safety mode, run mode, role) always runs synchronously, so a bad request
-    fails on the request path rather than inside a job. A named ``role`` has its persona prepended to
-    ``prompt`` before the request is built; ``UNKNOWN_ROLE`` if the id is not a known role.
+    Validation (known agent, safety mode, run mode, role, effort) always runs synchronously, so a bad
+    request fails on the request path rather than inside a job. A named ``role`` has its persona prepended
+    to ``prompt`` before the request is built; ``UNKNOWN_ROLE`` if the id is not a known role. ``effort``
+    (low|medium|high|xhigh) asks the agent to spend more reasoning where it has a knob (a reported no-op
+    otherwise); omitted, the per-agent or global ``default_effort`` applies.
     """
     ensure_known_agent(app.descriptors, cli)
     safety = resolve_safety_mode(safety_mode, app.config.default_safety_mode)
@@ -45,6 +48,7 @@ async def delegate_tool(
         safety_mode=safety,
         timeout_s=timeout_s,
         trust_workspace=trust_workspace,
+        effort=parse_effort(effort),
     )
 
     async def run() -> str:

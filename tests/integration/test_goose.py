@@ -16,8 +16,15 @@ from rutherford.acp.descriptors import default_registry
 from rutherford.acp.permission import PermissionPolicy
 from rutherford.acp.session import run_acp_turn
 from rutherford.config.schema import RutherfordConfig
-from rutherford.domain.enums import SafetyMode, Strategy
-from rutherford.domain.models import ConsensusRequest, ConsensusResult, DebateRequest, StrategyResult, Target
+from rutherford.domain.enums import Effort, SafetyMode, Strategy
+from rutherford.domain.models import (
+    ConsensusRequest,
+    ConsensusResult,
+    DebateRequest,
+    DelegationRequest,
+    StrategyResult,
+    Target,
+)
 from rutherford.services.consensus import ConsensusService
 from rutherford.services.debate import DebateService
 from rutherford.services.delegation import DelegationService
@@ -153,3 +160,62 @@ async def test_goose_debate_persistent_sessions() -> None:
     result = await service.debate(request)
     assert len(result.rounds) >= 1
     assert any(contribution.ok for round_ in result.rounds for contribution in round_.contributions)
+
+
+# --- F8a: time budget + effort against real agents ---------------------------
+
+#: A prompt that makes a real agent think for a while, so a tight panel deadline reliably catches a voice
+#: in flight. Open-ended on purpose -- the goal is a long turn, not a crisp answer.
+_SLOW_PROMPT = (
+    "Think step by step and write a thorough, multi-paragraph analysis (at least 8 paragraphs): compare "
+    "the trade-offs of monolith vs microservice architectures across team size, latency, deployment, data "
+    "consistency, and operational cost. Be exhaustive."
+)
+
+
+async def test_goose_consensus_time_budget_harvest() -> None:
+    """A real two-voice goose consensus under a tight time budget forces a harvest (F8a).
+
+    Both voices get a deliberately long prompt and the panel deadline is short, so at least one voice is in
+    flight at the deadline and is cut. Asserts ``stop_reason="budget"`` and a rollup recording the cut -- the
+    live proof the wall-clock harvest works end to end against a real agent, not just the fake.
+    """
+    request = ConsensusRequest(
+        targets=[Target(cli="goose"), Target(cli="goose")],
+        prompt=_SLOW_PROMPT,
+        working_dir=str(Path.cwd()),
+        timeout_s=120.0,  # the per-turn fault budget, far longer than the panel deadline below
+        time_budget_s=6.0,  # the whole-panel wall-clock deadline -- shorter than the long turn takes
+    )
+    result = await _consensus_service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.stop_reason == "budget", f"expected a harvest, got {result.stop_reason!r}"
+    assert result.rollup is not None
+    assert result.rollup.stop_reason == "budget"
+    assert result.rollup.cut >= 1, f"expected at least one cut voice, rollup={result.rollup.model_dump()}"
+    assert result.rollup.time_budget_s == 6.0 and result.rollup.elapsed_s > 0
+
+
+async def test_codex_delegate_effort_high_applies() -> None:
+    """A real ``delegate`` to codex with ``effort="high"`` records ``effort_applied`` (F8a).
+
+    codex encodes effort in the ACP model id, so the high tier rides a concrete base model as ``gpt-5.5[high]``
+    -- an id the ``codex-acp`` adapter advertises at ``new_session`` and that the client's best-effort
+    ``set_model`` then selects. A model is required for the encoding (codex's descriptor carries none by
+    default), so the call names ``gpt-5.5`` explicitly. The successful turn echoes ``effort=high`` and a
+    non-None ``effort_applied=high``.
+    """
+    registry = default_registry()
+    service = DelegationService(registry, RutherfordConfig())
+    request = DelegationRequest(
+        target=Target(cli="codex", model="gpt-5.5"),
+        prompt=_PROMPT,
+        working_dir=str(Path.cwd()),
+        timeout_s=180.0,
+        effort=Effort.HIGH,
+    )
+    result = await service.delegate(request)
+    assert result.ok is True, f"codex failed: {result.error}"
+    assert result.effort is Effort.HIGH
+    assert result.effort_applied is Effort.HIGH, f"effort_applied not set: {result.effort_applied!r}"
+    assert result.target.model == "gpt-5.5[high]"  # the effort-rewritten id the agent was switched to

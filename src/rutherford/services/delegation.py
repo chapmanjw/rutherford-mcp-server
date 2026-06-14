@@ -17,7 +17,7 @@ from ..acp.descriptors import DescriptorRegistry
 from ..acp.permission import PermissionPolicy
 from ..acp.session import run_acp_turn
 from ..config.schema import RutherfordConfig
-from ..domain.enums import is_mutating
+from ..domain.enums import Effort, is_mutating
 from ..domain.error_codes import ErrorCode
 from ..domain.models import DelegationRequest, DelegationResult, ErrorInfo, Target
 
@@ -48,7 +48,25 @@ class DelegationService:
         timeout = req.timeout_s or self._config.timeout_for(req.target.cli) or self._config.default_timeout_s
         policy = PermissionPolicy(mode=req.safety_mode)
         prompt = _compose_prompt(req.prompt, req.files)
-        return await run_acp_turn(descriptor, prompt, policy=policy, cwd=cwd, timeout_s=timeout, model=req.target.model)
+        return await run_acp_turn(
+            descriptor,
+            prompt,
+            policy=policy,
+            cwd=cwd,
+            timeout_s=timeout,
+            model=req.target.model,
+            effort=self.resolve_effort(req.target.cli, req.effort),
+        )
+
+    def resolve_effort(self, cli: str, effort: Effort | None) -> Effort | None:
+        """The reasoning-effort tier a ``cli`` voice runs with (F8a, 2-L): the call value, else the config default.
+
+        The single resolution rule -- call ``effort`` wins, else the per-agent ``[agents.<id>] effort``, else
+        the global ``default_effort``, else ``None`` (let the agent decide). Shared by the delegation primitive
+        and the panels (consensus/debate read it for each voice's rollup, including a voice cut at a deadline),
+        so the precedence can never silently diverge across paths.
+        """
+        return effort if effort is not None else self._config.effort_for(cli)
 
     def _workspace_trusted(self, req: DelegationRequest) -> bool:
         """Whether a mutating delegation is permitted for ``req``'s working directory."""

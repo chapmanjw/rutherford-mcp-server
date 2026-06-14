@@ -28,16 +28,18 @@ from acp.schema import (
     EmbeddedResourceContentBlock,
     ImageContentBlock,
     Implementation,
+    NewSessionResponse,
     PromptResponse,
     ResourceContentBlock,
     TextContentBlock,
 )
 
-from ..domain.enums import ReexecutionSafety
+from ..domain.enums import Effort, ReexecutionSafety
 from ..domain.error_codes import ErrorCode
 from ..domain.models import Cost, DelegationResult, ErrorInfo, Provenance, Target
 from .client import RutherfordACPClient
 from .descriptors import AgentDescriptor
+from .effort import effort_overrides
 from .journal import EventJournal, journal_event_from_message
 from .launch import prepare_argv
 from .permission import PermissionPolicy
@@ -81,7 +83,13 @@ class ACPSession:
     """
 
     def __init__(
-        self, descriptor: AgentDescriptor, *, policy: PermissionPolicy, cwd: str, model: str | None = None
+        self,
+        descriptor: AgentDescriptor,
+        *,
+        policy: PermissionPolicy,
+        cwd: str,
+        model: str | None = None,
+        effort: Effort | None = None,
     ) -> None:
         self._descriptor = descriptor
         self._policy = policy
@@ -89,13 +97,24 @@ class ACPSession:
         # goose). Resolve once here so every path -- delegate, consensus, debate, the conformance probe --
         # hands the agent an absolute working directory.
         self._cwd = str(Path(cwd).resolve())
-        self._target = Target(cli=descriptor.id, model=model or descriptor.default_model)
+        # Resolve effort to this agent's per-call ACP override (extra args / env / a rewritten model id), or a
+        # reported no-op when the agent has no knob (F8a, 2-L). The override is computed against the RESOLVED
+        # model so codex/cursor (which encode effort in the model id) rewrite the model the session will use.
+        resolved_model = model or descriptor.default_model
+        self._effort = effort
+        self._override = effort_overrides(descriptor, effort, model=resolved_model)
+        self._target = Target(cli=descriptor.id, model=self._override.model or resolved_model)
         self._journal = EventJournal()
         self._client = RutherfordACPClient(journal=self._journal, policy=policy, cwd=self._cwd)
         self._stack = AsyncExitStack()
         self._conn: ClientSideConnection | None = None
         self._session_id: str | None = None
         self._pid: int | None = None
+
+    @property
+    def effort_applied(self) -> Effort | None:
+        """The effort tier this session actually applied (clamped), or ``None`` for a no-op (F8a, 2-L)."""
+        return self._override.applied
 
     @property
     def target(self) -> Target:
@@ -107,6 +126,16 @@ class ACPSession:
         """The agent's session id once opened, for provenance and a later resume; ``None`` before open."""
         return self._session_id
 
+    @property
+    def partial_text(self) -> str:
+        """The answer text streamed so far on the CURRENT turn, for a time-budget harvest of a cut voice.
+
+        Read after a voice is cut at a panel's deadline: the turn never resolved, so its journal holds only
+        what the agent streamed before the cut. Empty when nothing was streamed (a single-shot agent that
+        emits its answer only at the end yields no partial, which the harvest records honestly).
+        """
+        return self._journal.message_text()
+
     async def __aenter__(self) -> ACPSession:
         await self.open()
         return self
@@ -116,8 +145,11 @@ class ACPSession:
 
     async def open(self) -> None:
         """Spawn the agent and complete the handshake, or raise :class:`ACPHandshakeError`."""
-        env = _resolve_env(self._descriptor)
-        command, *args = prepare_argv(self._descriptor.command)
+        # Layer this turn's effort override onto the launch: extra env on top of the resolved environment, and
+        # extra args appended to the agent's own argv (e.g. cline's ``--thinking high``). A model-id-encoding
+        # agent (codex/cursor) carries its effort in ``self._target.model`` instead, applied via set_model below.
+        env = {**_resolve_env(self._descriptor), **self._override.env_dict}
+        command, *args = prepare_argv((*self._descriptor.command, *self._override.extra_args))
 
         def _observe(event: StreamEvent) -> None:
             # SYNCHRONOUS observer: inline in receive order, so each turn's journal is complete before its
@@ -169,6 +201,27 @@ class ACPSession:
                 ReexecutionSafety.SAFE,
             ) from exc
         self._session_id = session.session_id
+        await self._select_model(conn, session)
+
+    async def _select_model(self, conn: ClientSideConnection, session: NewSessionResponse) -> None:
+        """Best-effort ``session/set_model`` to the resolved model, so a chosen model (and a model-id-encoded
+        effort tier for codex/cursor) actually takes effect over ACP. Never fatal.
+
+        The model is sent only when one is resolved AND the agent advertised it among ``session.models`` from
+        ``new_session`` -- so an agent that takes no model (or does not offer this one) is left on its default
+        rather than handed an unknown id. Any failure is swallowed: model selection is an enhancement, not a
+        handshake requirement, and the turn proceeds on the agent's default model.
+        """
+        model = self._target.model
+        if not model or self._session_id is None:
+            return
+        if not _advertises_model(session, model):
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                conn.set_session_model(model_id=model, session_id=self._session_id),
+                timeout=self._descriptor.handshake_timeout_s,
+            )
 
     async def prompt(self, text: str, *, timeout_s: float) -> DelegationResult:
         """Run one prompt turn on the live session and return its normalized result.
@@ -189,25 +242,36 @@ class ACPSession:
             )
         except TimeoutError:
             await self.cancel()
-            return _failed(
-                self._target,
-                self._policy,
-                start,
-                ErrorCode.ACP_TURN_TIMEOUT,
-                f"{self._descriptor.id} did not finish within {timeout_s:.0f}s",
-                _post_prompt_safety(self._journal),
-                partial=self._journal.message_text() or None,
+            return self._stamp_effort(
+                _failed(
+                    self._target,
+                    self._policy,
+                    start,
+                    ErrorCode.ACP_TURN_TIMEOUT,
+                    f"{self._descriptor.id} did not finish within {timeout_s:.0f}s",
+                    _post_prompt_safety(self._journal),
+                    partial=self._journal.message_text() or None,
+                )
             )
         except Exception as exc:
-            return _failed(
-                self._target,
-                self._policy,
-                start,
-                ErrorCode.ACP_TURN_ERROR,
-                f"ACP turn for {self._descriptor.id} failed: {exc}",
-                ReexecutionSafety.AMBIGUOUS,
+            return self._stamp_effort(
+                _failed(
+                    self._target,
+                    self._policy,
+                    start,
+                    ErrorCode.ACP_TURN_ERROR,
+                    f"ACP turn for {self._descriptor.id} failed: {exc}",
+                    ReexecutionSafety.AMBIGUOUS,
+                )
             )
-        return _reduce(self._descriptor, self._target, self._policy, self._journal, response, self._session_id, start)
+        result = _reduce(self._descriptor, self._target, self._policy, self._journal, response, self._session_id, start)
+        return self._stamp_effort(result)
+
+    def _stamp_effort(self, result: DelegationResult) -> DelegationResult:
+        """Echo the requested effort tier and the tier actually applied onto the result (F8a, 2-L)."""
+        result.effort = self._effort
+        result.effort_applied = self._override.applied
+        return result
 
     async def cancel(self) -> None:
         """Best-effort ``session/cancel`` for an in-flight turn; never raises."""
@@ -241,19 +305,25 @@ async def run_acp_turn(
     cwd: str,
     timeout_s: float,
     model: str | None = None,
+    effort: Effort | None = None,
 ) -> DelegationResult:
     """Open a one-shot session, run a single prompt turn, and return the normalized result.
 
-    The spawn-per-delegation path for ``delegate`` / ``consensus``. Never raises for an operational failure;
-    a handshake/spawn failure becomes a failed :class:`DelegationResult` (re-execution-safe).
+    The spawn-per-delegation path for ``delegate`` / ``consensus``. ``effort`` is the reasoning-effort tier to
+    apply over ACP (per-agent env / args / a model-id rewrite); it is echoed on the result as ``effort`` and
+    ``effort_applied`` (F8a, 2-L). Never raises for an operational failure; a handshake/spawn failure becomes a
+    failed :class:`DelegationResult` (re-execution-safe), still carrying the requested effort.
     """
     start = time.monotonic()
+    session = ACPSession(descriptor, policy=policy, cwd=cwd, model=model, effort=effort)
     try:
-        async with ACPSession(descriptor, policy=policy, cwd=cwd, model=model) as session:
+        async with session:
             return await session.prompt(prompt, timeout_s=timeout_s)
     except ACPHandshakeError as exc:
-        target = Target(cli=descriptor.id, model=model or descriptor.default_model)
-        return _failed(target, policy, start, exc.code, exc.message, exc.safety)
+        result = _failed(session.target, policy, start, exc.code, exc.message, exc.safety)
+        result.effort = effort
+        result.effort_applied = session.effort_applied
+        return result
 
 
 def _reduce(
@@ -340,3 +410,11 @@ def _resolve_env(descriptor: AgentDescriptor) -> dict[str, str]:
         env = {name: os.environ[name] for name in descriptor.env_passthrough if name in os.environ}
     env.update(descriptor.env_overrides)
     return env
+
+
+def _advertises_model(session: NewSessionResponse, model_id: str) -> bool:
+    """Whether ``new_session`` advertised ``model_id`` among its selectable models (so set_model is safe)."""
+    state = session.models
+    if state is None or state.available_models is None:
+        return False
+    return any(info.model_id == model_id for info in state.available_models)

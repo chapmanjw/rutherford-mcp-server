@@ -14,11 +14,14 @@ from typing import Any
 from pydantic import ValidationError
 
 from ..acp.descriptors import DescriptorRegistry
-from ..domain.enums import DelegationMode, SafetyMode, Stance, Strategy
+from ..domain.enums import DelegationMode, Effort, SafetyMode, Stance, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
-from ..domain.models import Target
+from ..domain.models import OnBudget, Target
 from ..services.roles import RoleStore
+
+#: The valid ``on_budget`` dispositions, for validating the tool-layer string against the Literal type.
+_ON_BUDGET: tuple[str, ...] = ("harvest", "continue", "resume")
 
 #: The per-target metadata keys read from a target dict, beyond ``cli`` and ``model``.
 _TARGET_META_KEYS = ("role", "label", "weight", "parity", "stance")
@@ -75,6 +78,35 @@ def parse_strategy(value: str | Strategy) -> Strategy:
         raise RutherfordError(
             ErrorCode.INVALID_INPUT, f"unknown strategy {value!r}; choose one of: {options}"
         ) from None
+
+
+def parse_effort(value: str | Effort | None) -> Effort | None:
+    """Coerce a reasoning-effort string to :class:`Effort`, or raise ``INVALID_INPUT``; ``None`` passes through.
+
+    ``None`` means the caller omitted ``effort`` -- the one case the configured ``default_effort`` (or a
+    per-agent ``effort``) fills downstream -- so it is preserved here rather than coerced to a tier.
+    """
+    if value is None or isinstance(value, Effort):
+        return value
+    try:
+        return Effort(value)
+    except ValueError:
+        options = ", ".join(effort.value for effort in Effort)
+        raise RutherfordError(ErrorCode.INVALID_INPUT, f"unknown effort {value!r}; choose one of: {options}") from None
+
+
+def parse_on_budget(value: str | None) -> OnBudget | None:
+    """Coerce an ``on_budget`` string to the :data:`OnBudget` literal, or raise ``INVALID_INPUT``.
+
+    ``None`` means the caller omitted it -- the configured ``default_on_budget`` (``harvest`` out of the box)
+    applies downstream -- so it is preserved.
+    """
+    if value is None:
+        return None
+    if value in _ON_BUDGET:
+        return value  # type: ignore[return-value]  # validated against the Literal's members
+    options = ", ".join(_ON_BUDGET)
+    raise RutherfordError(ErrorCode.INVALID_INPUT, f"unknown on_budget {value!r}; choose one of: {options}") from None
 
 
 def parse_stances(values: list[str] | None) -> list[Stance] | None:

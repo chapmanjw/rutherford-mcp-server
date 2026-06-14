@@ -14,6 +14,7 @@ from rutherford import server
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import AppContext, build_app_context
+from rutherford.domain.enums import Effort
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import DebateRequest, Target
@@ -21,13 +22,18 @@ from rutherford.services.debate import DebateService, _disambiguate
 from rutherford.tools.debate import debate_tool
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-FAKE = AgentDescriptor("fake", "Fake", (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py")))
+_FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
+FAKE = AgentDescriptor("fake", "Fake", _FAKE_CMD)
 DEAD = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.exit(0)"))
+# A slow agent: streams a partial then sleeps 10s, so a tight round deadline cuts its turn mid-round.
+SLOW = AgentDescriptor(
+    "slow", "Slow", _FAKE_CMD, default_model="model-s", env_overrides=(("RUTHERFORD_FAKE_SLEEP", "10"),)
+)
 
 
 def _service(config: RutherfordConfig | None = None) -> DebateService:
     resolved = config or RutherfordConfig()
-    return DebateService(DescriptorRegistry([FAKE, DEAD]), resolved)
+    return DebateService(DescriptorRegistry([FAKE, DEAD, SLOW]), resolved)
 
 
 def _app() -> AppContext:
@@ -119,3 +125,105 @@ async def test_debate_tool_and_server_wrapper(monkeypatch: Any) -> None:
         prompt="what is 17 + 25?", targets=["fake", "fake"], rounds=1, working_dir=str(REPO_ROOT)
     )
     assert "42" in wrapped
+
+
+# --- time budget at round boundaries (F8a) -----------------------------------
+
+
+async def test_debate_budget_cuts_a_round_and_finalizes() -> None:
+    # A slow voice keeps round 1 in flight past the deadline: the fast voice's answer is kept, the slow turn
+    # is a BUDGET_EXHAUSTED contribution (its partial preserved, not promoted), and the debate finalizes early.
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        rounds=3,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=4.0,
+    )
+    result = await _service().debate(request)
+    assert result.stop_reason == "budget" and len(result.rounds) == 1  # cut at the round-1 deadline
+    by_cli = {c.target.cli: c for c in result.rounds[0].contributions}
+    assert by_cli["fake"].ok and "42" in by_cli["fake"].text
+    slow = by_cli["slow"]
+    assert slow.ok is False and slow.error is not None and slow.error.code is ErrorCode.BUDGET_EXHAUSTED
+    assert slow.text == "" and slow.partial == "partial-so-far"  # partial kept as a trace, never the text
+    assert result.rollup is not None
+    assert result.rollup.stop_reason == "budget" and result.rollup.cut == 1 and result.rollup.usable == 1
+
+
+async def test_debate_budget_below_quorum_raises_budget_exhausted() -> None:
+    # Both voices slow: every round-1 turn is cut, leaving zero usable positions -> BUDGET_EXHAUSTED.
+    request = DebateRequest(
+        targets=[Target(cli="slow"), Target(cli="slow")],
+        prompt="x",
+        rounds=2,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=2.0,
+    )
+    with pytest.raises(RutherfordError) as exc:
+        await _service().debate(request)
+    assert exc.value.code is ErrorCode.BUDGET_EXHAUSTED
+
+
+async def test_debate_generous_budget_finishes_clean_with_a_rollup() -> None:
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="what is 17 + 25?",
+        rounds=2,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=60.0,
+    )
+    result = await _service().debate(request)
+    assert result.stop_reason is None and len(result.rounds) == 2  # ran to completion within the budget
+    assert result.rollup is not None and result.rollup.stop_reason == "ok" and result.rollup.cut == 0
+
+
+async def test_debate_no_budget_leaves_stop_reason_and_rollup_unset() -> None:
+    result = await _service().debate(_two_fakes(rounds=1))
+    assert result.stop_reason is None and result.rollup is None
+
+
+async def test_debate_on_budget_continue_runs_every_round() -> None:
+    # on_budget="continue" makes the budget advisory: even a slow voice runs to completion, no cut.
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        rounds=1,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=2.0,
+        on_budget="continue",
+    )
+    result = await _service().debate(request)
+    assert result.stop_reason is None
+    assert all(c.ok for c in result.rounds[0].contributions)  # the slow voice finished too
+    assert result.rollup is not None and result.rollup.stop_reason == "ok" and result.rollup.cut == 0
+
+
+async def test_debate_budget_rollup_records_effort_requested() -> None:
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        rounds=2,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=4.0,
+        effort=Effort.MEDIUM,
+    )
+    result = await _service().debate(request)
+    assert result.rollup is not None and result.rollup.effort_requested is Effort.MEDIUM
+
+
+async def test_debate_cut_turn_with_no_stream_has_no_partial() -> None:
+    # A HANG voice streams nothing before the deadline, so its cut contribution has partial=None (an honest
+    # empty harvest) while the fast voice's answer is still kept.
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="what is 17 + 25?\nHANG",  # both voices receive HANG (the shared prompt) -> both cut
+        rounds=1,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=2.0,
+    )
+    config = RutherfordConfig(min_quorum=1)
+    # both cut with no usable position -> below quorum -> BUDGET_EXHAUSTED
+    with pytest.raises(RutherfordError) as exc:
+        await _service(config).debate(request)
+    assert exc.value.code is ErrorCode.BUDGET_EXHAUSTED
