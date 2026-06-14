@@ -111,6 +111,13 @@ class Sandbox:
             return SandboxResult()
         apply = mode in (SafetyMode.WRITE, SafetyMode.YOLO)
         if apply:
+            # A git worktree starts from HEAD, so a changed file carries HEAD + the agent's edit, NOT any
+            # uncommitted edit the user has in the real tree. Applying it back would silently clobber that local
+            # work, so refuse first if any path the apply touches is dirty vs HEAD (the user commits or stashes,
+            # then retries). The non-git temp copy starts from the real tree's current bytes, so it has no such
+            # gap and needs no guard.
+            if self._is_git:
+                self._refuse_if_clobbering([*changed, *deleted])
             # Apply by COPYING the changed files byte-for-byte from the sandbox (and removing the deleted
             # ones), not via ``git apply``: a patch round-trip is at the mercy of the repo's line-ending
             # normalization (``core.autocrlf`` on Windows injects ``\r`` into the applied file), so copying is
@@ -118,6 +125,31 @@ class Sandbox:
             self._copy_apply(changed)
             self._delete_back(deleted)
         return SandboxResult(diff=diff, changed_files=all_changed, applied=apply)
+
+    def _refuse_if_clobbering(self, paths: list[str]) -> None:
+        """Refuse a git apply-back that would overwrite or delete an UNCOMMITTED local edit (worktree is off HEAD).
+
+        If any path the apply would touch is dirty (modified / staged / untracked) vs ``HEAD`` in the real
+        ``working_dir``, the apply would silently replace the user's local work with the worktree's HEAD-based
+        version, so the whole apply is refused with a clear, actionable error. A path the user does not have
+        locally (e.g. a brand-new file the agent created) is not dirty and never blocks.
+        """
+        conflicts = [rel for rel in paths if self._is_dirty_vs_head(rel)]
+        if conflicts:
+            raise RutherfordError(
+                ErrorCode.WORKSPACE_NOT_TRUSTED,
+                "the working tree has uncommitted changes to "
+                f"{', '.join(sorted(conflicts))}. A write delegation runs from HEAD in an isolated worktree, so "
+                "applying it back would overwrite those local edits. Commit or stash them first, then retry.",
+            )
+
+    def _is_dirty_vs_head(self, rel: str) -> bool:
+        """Whether ``rel`` is modified / staged / untracked in the real ``working_dir`` (non-empty porcelain).
+
+        Uses the repo's OWN autocrlf policy (not the forced-off one the sandbox diff uses): otherwise a file
+        git checked out with CRLF under ``autocrlf=true`` would read as modified and wrongly block the apply.
+        """
+        return bool(self._manager.run_git_user_config(self._working_dir, "status", "--porcelain", "--", rel).strip())
 
     def cleanup(self) -> None:
         """Remove the execution root (worktree or temp copy). Idempotent, best-effort, never raises."""
@@ -296,19 +328,31 @@ class SandboxManager:
             self._git(working_dir, "worktree", "prune")
 
     def run_git(self, cwd: Path, *args: str) -> str:
-        """Run a git subcommand in ``cwd`` and return its stdout (raising :class:`RutherfordError` on failure)."""
+        """Run a git subcommand with autocrlf normalization OFF (byte-faithful sandbox diff / apply)."""
         return self._git(cwd, *args)
 
-    def _git(self, cwd: Path, *args: str) -> str:
+    def run_git_user_config(self, cwd: Path, *args: str) -> str:
+        """Run a git subcommand under the repo's OWN config (autocrlf as the user set it).
+
+        Used only for the apply-back clobber check: whether the user's real working tree has an uncommitted
+        edit must reflect what the user's git considers dirty. Forcing ``core.autocrlf=false`` here would
+        falsely flag a file that git merely checked out with CRLF under ``autocrlf=true`` as modified, so the
+        check uses the repo's native line-ending policy.
+        """
+        return self._git(cwd, *args, force_no_autocrlf=False)
+
+    def _git(self, cwd: Path, *args: str, force_no_autocrlf: bool = True) -> str:
         """Run ``git -C <cwd> <args>`` and return stdout; raise :class:`RutherfordError` on a non-zero exit.
 
         The single git entry point -- one ``subprocess.run`` with a hard timeout, text I/O, and no shell. A
         non-zero exit or a launch failure (git missing) becomes a typed error the caller maps to an envelope,
-        never a silent partial sandbox. ``core.autocrlf=false`` is forced so the staged diff stays
+        never a silent partial sandbox. ``core.autocrlf=false`` is forced by default so the staged diff stays
         byte-faithful on Windows (the worktree blob is not line-ending-normalized), matching the byte-for-byte
-        file copy used to apply the changes back.
+        file copy used to apply the changes back; ``force_no_autocrlf=False`` runs under the repo's own policy
+        (the clobber check, which must agree with the user's ``git status``).
         """
-        cmd = ["git", "-c", "core.autocrlf=false", "-C", str(cwd), *args]
+        prefix = ["-c", "core.autocrlf=false"] if force_no_autocrlf else []
+        cmd = ["git", *prefix, "-C", str(cwd), *args]
         try:
             completed = subprocess.run(
                 cmd,

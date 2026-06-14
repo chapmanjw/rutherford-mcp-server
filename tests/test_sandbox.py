@@ -587,3 +587,33 @@ async def test_verify_read_only_flags_a_change_even_on_a_failed_turn(
     result = await service.delegate(req)
     assert result.ok is False
     assert result.error is not None and result.error.code is ErrorCode.READONLY_VIOLATED
+
+
+async def test_write_apply_refuses_to_clobber_an_uncommitted_local_edit(tmp_path: Path) -> None:
+    """A write apply is REFUSED (not silent) when the real tree has an uncommitted edit to a file the agent
+    also changes -- the worktree is off HEAD, so applying back would overwrite the user's local work."""
+    _git_repo(tmp_path)
+    # The user has uncommitted local work in README.md (committed as "seed\n").
+    (tmp_path / "README.md").write_text("the user's uncommitted work\n", encoding="utf-8")
+    service = _service()
+    req = await _delegate(service, prompt="WRITE=README.md:agent version", working_dir=tmp_path, mode=SafetyMode.WRITE)
+    result = await service.delegate(req)
+    assert result.ok is False, "the apply should be refused, not silently clobber the local edit"
+    assert result.error is not None and result.error.code is ErrorCode.WORKSPACE_NOT_TRUSTED
+    assert "uncommitted" in result.error.message.lower()
+    # The user's local edit is preserved.
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == "the user's uncommitted work\n"
+
+
+async def test_write_apply_allows_an_unrelated_uncommitted_edit(tmp_path: Path) -> None:
+    """An uncommitted edit to a file the agent does NOT touch does not block the apply (targeted guard)."""
+    _git_repo(tmp_path)
+    (tmp_path / "README.md").write_text("user editing the readme\n", encoding="utf-8")  # dirty, but unrelated
+    service = _service()
+    req = await _delegate(
+        service, prompt="WRITE=newfile.txt:agent content", working_dir=tmp_path, mode=SafetyMode.WRITE
+    )
+    result = await service.delegate(req)
+    assert result.ok is True, f"an unrelated dirty file must not block the apply: {result.error}"
+    assert (tmp_path / "newfile.txt").read_text(encoding="utf-8") == "agent content"
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == "user editing the readme\n"  # preserved

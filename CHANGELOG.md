@@ -296,6 +296,12 @@ All notable changes to this project are documented in this file. The format is b
   - The sandbox `open()` now runs **under a shield** so a cancellation mid-open cannot strand a half-built
     worktree (and its git admin entry) or temp copy — on a cancel the open is drained and cleaned up before
     the cancellation propagates.
+  - A git `write` / `yolo` apply-back now **refuses to clobber an uncommitted local edit**. The worktree is
+    built off `HEAD`, so a changed file carries `HEAD` + the agent's edit, not any uncommitted change the user
+    has in the real tree; applying it back would silently overwrite that work. If any file the apply touches is
+    dirty vs `HEAD` in the real tree (checked under the repo's own `autocrlf` policy, so a CRLF-checked-out file
+    is not falsely flagged), the apply is refused with a clear "commit or stash first" error. An uncommitted
+    edit to an unrelated file does not block. (A second-pass review finding.)
   - Known, accepted limitation (unchanged, and documented in `acp/sandbox.py` + the security docs): the
     sandbox confines a *cooperative* agent's ACP `fs`/terminal activity by cwd + the path-escape guard; it is
     NOT an OS jail. A write/yolo agent's own process (or a terminal command it runs) can still write an
