@@ -10,6 +10,7 @@ against :class:`~rutherford.config.schema.RutherfordConfig`. Invalid configurati
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from collections.abc import Mapping
@@ -19,12 +20,15 @@ from typing import Any
 from pydantic import ValidationError
 
 from ..domain.errors import ConfigError
+from .acp_json import agents_from_acp_json
 from .schema import RutherfordConfig
 
 #: Project-local config filenames searched in the working directory, in order (first found wins). The
 #: ``.rutherford/config.toml`` form lives under the same project ``.rutherford/`` dir as jobs and panels
 #: and is what ``setup ... scope=project`` writes, so a workspace persistence default takes effect there.
 PROJECT_CONFIG_NAMES = ("rutherford.toml", ".rutherford.toml", ".rutherford/config.toml")
+#: The project-local ``acp.json`` (Zed/Cline ``agent_servers`` import), discovered under ``.rutherford/``.
+PROJECT_ACP_JSON = ".rutherford/acp.json"
 
 
 def default_global_config_path(env: Mapping[str, str] | None = None) -> Path:
@@ -52,6 +56,28 @@ def _read_toml(path: Path) -> dict[str, Any]:
         raise ConfigError(f"could not parse config at {path}: {exc}") from exc
     except OSError as exc:
         raise ConfigError(f"could not read config at {path}: {exc}") from exc
+
+
+def _read_acp_json_agents(path: Path) -> dict[str, Any]:
+    """Read an ``acp.json`` and project its ``agent_servers`` as a ``{"agents": {...}}`` config fragment.
+
+    Returns a fragment so it deep-merges under the TOML ``agents`` (the native config wins at the same
+    scope). Only command/env are emitted (the rest stay at their schema defaults), so the import is minimal.
+    """
+    try:
+        with path.open("rb") as handle:
+            raw = json.load(handle)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"could not parse acp.json at {path}: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"could not read acp.json at {path}: {exc}") from exc
+    if not isinstance(raw, Mapping):
+        return {}
+    agents = agents_from_acp_json(raw)
+    fragment = {
+        agent_id: config.model_dump(exclude_defaults=True, exclude_none=True) for agent_id, config in agents.items()
+    }
+    return {"agents": fragment} if fragment else {}
 
 
 def deep_merge(base: dict[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
@@ -131,9 +157,17 @@ def load_config(
             raise ConfigError(f"RUTHERFORD_CONFIG points to a missing file: {path}")
         data = _read_toml(path)
     else:
+        # Precedence low -> high: global acp.json, global TOML, project acp.json, project TOML. At each
+        # scope the native TOML wins over an imported acp.json; the project wins over the global.
         global_path = default_global_config_path(environ)
+        global_acp = global_path.parent / "acp.json"
+        if global_acp.exists():
+            data = deep_merge(data, _read_acp_json_agents(global_acp))
         if global_path.exists():
-            data = _read_toml(global_path)
+            data = deep_merge(data, _read_toml(global_path))
+        project_acp = working_dir / PROJECT_ACP_JSON
+        if project_acp.exists():
+            data = deep_merge(data, _read_acp_json_agents(project_acp))
         for name in PROJECT_CONFIG_NAMES:
             project_path = working_dir / name
             if project_path.exists():
