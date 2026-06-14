@@ -11,6 +11,7 @@ against :class:`~rutherford.config.schema.RutherfordConfig`. Invalid configurati
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tomllib
 from collections.abc import Mapping
@@ -22,6 +23,8 @@ from pydantic import ValidationError
 from ..domain.errors import ConfigError
 from .acp_json import agents_from_acp_json
 from .schema import RutherfordConfig
+
+_log = logging.getLogger(__name__)
 
 #: Project-local config filenames searched in the working directory, in order (first found wins). The
 #: ``.rutherford/config.toml`` form lives under the same project ``.rutherford/`` dir as jobs and panels
@@ -61,22 +64,30 @@ def _read_toml(path: Path) -> dict[str, Any]:
 def _read_acp_json_agents(path: Path) -> dict[str, Any]:
     """Read an ``acp.json`` and project its ``agent_servers`` as a ``{"agents": {...}}`` config fragment.
 
-    Returns a fragment so it deep-merges under the TOML ``agents`` (the native config wins at the same
-    scope). Only command/env are emitted (the rest stay at their schema defaults), so the import is minimal.
+    Best-effort, because an ``acp.json`` is an OPTIONAL import from another tool (Zed/Cline), not
+    Rutherford's own config: a malformed file is logged and skipped rather than blocking startup (unlike a
+    malformed TOML config, which is a hard error). An imported agent whose id collides with a built-in is
+    skipped, so an auto-import never silently overrides a curated built-in launch -- override one explicitly
+    in ``[agents.<id>]`` instead. Returns a fragment so it deep-merges under the TOML ``agents`` (the native
+    config wins at the same scope). Only command/env are emitted, so the import stays minimal.
     """
     try:
         with path.open("rb") as handle:
             raw = json.load(handle)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise ConfigError(f"could not parse acp.json at {path}: {exc}") from exc
-    except OSError as exc:
-        raise ConfigError(f"could not read acp.json at {path}: {exc}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        _log.warning("ignoring malformed acp.json at %s: %s", path, exc)
+        return {}
     if not isinstance(raw, Mapping):
         return {}
-    agents = agents_from_acp_json(raw)
-    fragment = {
-        agent_id: config.model_dump(exclude_defaults=True, exclude_none=True) for agent_id, config in agents.items()
-    }
+    from ..acp.descriptors import HIGH_FIDELITY  # local import: avoid a config <-> acp import cycle
+
+    builtin_ids = {descriptor.id for descriptor in HIGH_FIDELITY}
+    fragment: dict[str, Any] = {}
+    for agent_id, config in agents_from_acp_json(raw).items():
+        if agent_id in builtin_ids:
+            _log.warning("acp.json agent %r collides with a built-in; keeping the built-in launch", agent_id)
+            continue
+        fragment[agent_id] = config.model_dump(exclude_defaults=True, exclude_none=True)
     return {"agents": fragment} if fragment else {}
 
 
@@ -138,12 +149,19 @@ def load_config(
 ) -> RutherfordConfig:
     """Discover, merge, and validate configuration.
 
-    Precedence (lowest to highest): the global config file, the project-local file, then the
-    ``RUTHERFORD_*`` environment overrides. ``RUTHERFORD_CONFIG`` (or ``explicit_path``) replaces
-    discovery with a single named file. A missing file is not an error -- defaults apply.
+    Precedence (lowest to highest): a discovered ``acp.json`` import and the TOML config file at each
+    scope (global, then project), then the ``RUTHERFORD_*`` environment overrides. At a scope the native
+    TOML wins over an imported ``acp.json``; the project wins over the global. ``RUTHERFORD_CONFIG`` (or
+    ``explicit_path``) replaces discovery with a single named file. A missing file is not an error.
+
+    Security: project-scoped config (``.rutherford/config.toml`` and a discovered ``.rutherford/acp.json``)
+    is trusted as code -- it can set an agent's launch ``command`` and subprocess ``env``. Discovery keys
+    off the process working directory, so only start the server in a workspace you trust. (The
+    trusted-workspace gate covers write/yolo *delegations*, not config discovery.)
 
     Raises:
-        ConfigError: If a config file cannot be parsed or the merged config fails validation.
+        ConfigError: If a TOML config file cannot be parsed or the merged config fails validation. A
+            malformed ``acp.json`` is logged and skipped, not raised (the import is best-effort).
     """
     environ = os.environ if env is None else env
     working_dir = Path.cwd() if cwd is None else Path(cwd)

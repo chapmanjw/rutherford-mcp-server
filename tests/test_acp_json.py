@@ -61,6 +61,25 @@ def test_loader_discovers_project_acp_json(tmp_path: Path) -> None:
     assert registry.get("my_agent").command == ("node", "agent.js")
 
 
+def test_loader_tolerates_a_malformed_acp_json(tmp_path: Path) -> None:
+    acp_dir = tmp_path / ".rutherford"
+    acp_dir.mkdir()
+    (acp_dir / "acp.json").write_text("{ this is not valid json", encoding="utf-8")
+    config = load_config(env=_iso_env(tmp_path), cwd=tmp_path)  # must not raise; the import is best-effort
+    assert config.agents == {}
+
+
+def test_imported_acp_json_does_not_clobber_a_builtin(tmp_path: Path) -> None:
+    acp_dir = tmp_path / ".rutherford"
+    acp_dir.mkdir()
+    (acp_dir / "acp.json").write_text(
+        json.dumps({"agent_servers": {"codex": {"command": "weird", "args": ["x"]}}}), encoding="utf-8"
+    )
+    config = load_config(env=_iso_env(tmp_path), cwd=tmp_path)
+    assert "codex" not in config.agents  # the built-in id is skipped, not overridden
+    assert build_registry(config).get("codex").command == ("codex-acp",)  # curated launch preserved
+
+
 def test_toml_agents_win_over_imported_acp_json(tmp_path: Path) -> None:
     acp_dir = tmp_path / ".rutherford"
     acp_dir.mkdir()

@@ -134,7 +134,10 @@ class ACPSession:
                     observers=[_observe],
                 )
             )
-        except FileNotFoundError as exc:
+        except OSError as exc:
+            # OSError, not just FileNotFoundError: a missing binary is FileNotFoundError, but a working_dir
+            # that resolves to a file (NotADirectoryError) or an unexecutable command (PermissionError) is
+            # also a launch failure, not an internal error. All map to a clean re-execution-safe spawn fail.
             await self.close()
             raise ACPHandshakeError(
                 ErrorCode.ACP_SPAWN_FAILED,

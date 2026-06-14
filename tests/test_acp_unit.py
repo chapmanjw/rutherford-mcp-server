@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,8 +15,9 @@ from rutherford.acp.client import RutherfordACPClient
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry, default_registry
 from rutherford.acp.journal import EventJournal, JournalEvent, journal_event_from_message
 from rutherford.acp.permission import PermissionPolicy
-from rutherford.acp.session import ACPSession
+from rutherford.acp.session import ACPSession, run_acp_turn
 from rutherford.domain.enums import SafetyMode
+from rutherford.domain.error_codes import ErrorCode
 
 
 def _client(mode: SafetyMode, cwd: str = ".") -> tuple[RutherfordACPClient, EventJournal]:
@@ -92,6 +94,18 @@ def test_session_resolves_relative_cwd_to_absolute() -> None:
     # ACP requires an absolute cwd in session/new; a relative one must be resolved before open().
     session = ACPSession(default_registry().get("goose"), policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd=".")
     assert Path(session._cwd).is_absolute()
+
+
+async def test_file_working_dir_is_a_clean_spawn_failure(tmp_path: Path) -> None:
+    # A working_dir that resolves to a file (NotADirectoryError) is a launch failure, not an INTERNAL error.
+    file_cwd = tmp_path / "not-a-dir.txt"
+    file_cwd.write_text("x", encoding="utf-8")
+    descriptor = AgentDescriptor("fake", "Fake", (sys.executable, "-c", "pass"))
+    result = await run_acp_turn(
+        descriptor, "hi", policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd=str(file_cwd), timeout_s=10.0
+    )
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.ACP_SPAWN_FAILED
 
 
 def test_official_adapter_descriptors() -> None:
