@@ -70,8 +70,14 @@ async def test_second_wave_agent_answers(agent_id: str) -> None:
 
     copilot (GitHub Copilot plan), qwen (~/.qwen), droid (Factory -- separate billing), cursor (Cursor
     subscription; the `acp` subcommand is hidden from --help), kiro (kiro-cli, not the IDE-launcher `kiro`),
-    pi (the pi-acp wrapper over `pi --mode rpc`). Each answers a trivial prompt end to end. (hermes was too
-    slow on its free Nous model and kilo needs `kilo auth`; both are left to config, not shipped built-in.)
+    pi (the pi-acp wrapper over `pi --mode rpc`). Each answers a trivial prompt end to end.
+
+    Not parametrized here, on purpose:
+    - hermes: registered and functions over ACP (probe answers in ~7-9s), but the Nous endpoint latency
+      swings from seconds to >190s, so it cannot satisfy a bounded-timeout assertion -- check it with
+      ``doctor`` live instead.
+    - kilo: its Auto Kilo Free Gateway works only in the interactive TUI, not a headless spawn; it needs a
+      real ``kilo auth`` credential before a headless turn completes.
     """
     descriptor = default_registry().get(agent_id)
     result = await run_acp_turn(

@@ -83,7 +83,7 @@ def test_descriptor_registry() -> None:
     registry = default_registry()
     assert registry.has("goose") and "goose" in registry.ids()
     assert registry.get("goose").command == ("goose", "acp")
-    assert len(registry) == 15
+    assert len(registry) == 16
     with pytest.raises(KeyError):
         registry.get("nope")
     with pytest.raises(ValueError, match="duplicate"):
@@ -125,7 +125,7 @@ def test_second_wave_descriptors() -> None:
     assert registry.get("qwen").command == ("qwen", "--acp") and registry.get("qwen").provider == "alibaba"
     assert registry.get("droid").command == ("droid", "exec", "--output-format", "acp")
     assert registry.get("droid").provider is None
-    assert not registry.has("hermes")  # probed OK once but too slow on its free model; left to config
+    assert registry.get("hermes").command == ("hermes", "acp") and registry.get("hermes").provider == "nous"
 
 
 def test_third_wave_descriptors() -> None:

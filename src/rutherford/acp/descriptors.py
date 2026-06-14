@@ -82,10 +82,12 @@ class DescriptorRegistry:
 #: ``11-official-adapters-auth-test.md``). The launch command is the adapter shim, not the underlying CLI.
 #:
 #: ``copilot``/``droid``/``cursor``/``kiro``/``pi`` are bring-your-own-model (provider ``None``); ``qwen``
-#: carries its vendor as an unconfirmed guess. ``cursor``'s ``acp`` subcommand is real but hidden from
-#: ``--help``; ``kiro``'s ACP binary is ``kiro-cli`` (the ``kiro`` binary is the IDE launcher); ``pi`` runs
-#: through the ``pi-acp`` wrapper (``npm i -g pi-acp``), which spawns ``pi --mode rpc``. (``hermes`` was too
-#: slow on its free Nous model and ``kilo`` needs ``kilo auth`` set up -- both left to config. Receipts 12/13.)
+#: and ``hermes`` carry their vendor as an unconfirmed guess. ``cursor``'s ``acp`` subcommand is real but
+#: hidden from ``--help``; ``kiro``'s ACP binary is ``kiro-cli`` (the ``kiro`` binary is the IDE launcher);
+#: ``pi`` runs through the ``pi-acp`` wrapper (``npm i -g pi-acp``), which spawns ``pi --mode rpc``;
+#: ``hermes`` depends on the configured Nous model (a slow one can blow a turn budget). (``kilo`` is not
+#: here: its ``Auto Kilo Free Gateway`` works only in the interactive TUI, not a headless spawn -- it needs
+#: a real ``kilo auth`` credential. Receipts 12/13.)
 HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("goose", "Goose", ("goose", "acp")),
     AgentDescriptor("opencode", "OpenCode", ("opencode", "acp")),
@@ -102,6 +104,7 @@ HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("cursor", "Cursor", ("cursor-agent", "acp")),
     AgentDescriptor("kiro", "Kiro", ("kiro-cli", "acp")),
     AgentDescriptor("pi", "Pi", ("pi-acp",)),
+    AgentDescriptor("hermes", "Hermes", ("hermes", "acp"), provider="nous"),
 )
 
 
