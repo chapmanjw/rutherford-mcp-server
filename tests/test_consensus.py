@@ -23,7 +23,7 @@ from rutherford.tools.common import as_target, ensure_known_targets
 from rutherford.tools.consensus import consensus_tool
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-FAKE = AgentDescriptor("fake", "Fake", (sys.executable, "-m", "tests.fake_acp_agent"))
+FAKE = AgentDescriptor("fake", "Fake", (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py")))
 
 
 def _service(config: RutherfordConfig | None = None) -> ConsensusService:

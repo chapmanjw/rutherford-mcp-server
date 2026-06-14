@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import Any
 
 from ..acp.conformance import probe_agent
@@ -38,8 +37,5 @@ async def doctor_tool(app: AppContext, *, agent: str | None = None, timeout_s: f
         descriptors = [app.descriptors.get(agent)]
     else:
         descriptors = app.descriptors.all()
-    cwd = str(Path.cwd())
-    reports = await asyncio.gather(
-        *(probe_agent(descriptor, cwd=cwd, timeout_s=timeout_s) for descriptor in descriptors)
-    )
+    reports = await asyncio.gather(*(probe_agent(descriptor, timeout_s=timeout_s) for descriptor in descriptors))
     return tool_success({"agents": list(reports)})

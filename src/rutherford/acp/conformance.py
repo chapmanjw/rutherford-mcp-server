@@ -10,6 +10,8 @@ over ACP: it is the only trustworthy signal, since there is no cheap non-interac
 
 from __future__ import annotations
 
+import tempfile
+
 from pydantic import BaseModel
 
 from ..domain.enums import SafetyMode
@@ -82,9 +84,23 @@ def classify(agent_id: str, result: DelegationResult) -> ConformanceReport:
     )
 
 
-async def probe_agent(descriptor: AgentDescriptor, *, cwd: str, timeout_s: float = 60.0) -> ConformanceReport:
-    """Drive ``descriptor``'s agent with a trivial read-only turn and classify the outcome."""
+async def _probe_in(descriptor: AgentDescriptor, cwd: str, timeout_s: float) -> ConformanceReport:
     result = await run_acp_turn(
         descriptor, _PROBE_PROMPT, policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd=cwd, timeout_s=timeout_s
     )
     return classify(descriptor.id, result)
+
+
+async def probe_agent(
+    descriptor: AgentDescriptor, *, cwd: str | None = None, timeout_s: float = 60.0
+) -> ConformanceReport:
+    """Drive ``descriptor``'s agent with a trivial read-only turn and classify the outcome.
+
+    By default the probe runs in an ISOLATED temp directory, not the user's workspace: a conformance check
+    should not trigger an agent's heavyweight workspace setup against the real repo (OpenHands, for example,
+    runs ``git fetch`` on a git cwd, which stalls the handshake). Pass ``cwd`` to probe a specific directory.
+    """
+    if cwd is not None:
+        return await _probe_in(descriptor, cwd, timeout_s)
+    with tempfile.TemporaryDirectory(prefix="rutherford-acp-probe-") as probe_cwd:
+        return await _probe_in(descriptor, probe_cwd, timeout_s)

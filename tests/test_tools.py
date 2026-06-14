@@ -24,7 +24,7 @@ from rutherford.tools.common import ensure_known_agent, parse_safety_mode, resol
 from rutherford.tools.delegate import delegate_tool
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-FAKE = AgentDescriptor("fake", "Fake", (sys.executable, "-m", "tests.fake_acp_agent"))
+FAKE = AgentDescriptor("fake", "Fake", (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py")))
 
 
 def _app() -> AppContext:

@@ -21,7 +21,7 @@ from rutherford.services.debate import DebateService, _disambiguate
 from rutherford.tools.debate import debate_tool
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-FAKE = AgentDescriptor("fake", "Fake", (sys.executable, "-m", "tests.fake_acp_agent"))
+FAKE = AgentDescriptor("fake", "Fake", (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py")))
 DEAD = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.exit(0)"))
 
 

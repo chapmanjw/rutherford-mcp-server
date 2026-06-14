@@ -29,6 +29,9 @@ class AgentDescriptor:
     env_passthrough: tuple[str, ...] | None = None
     #: The model id used when a call names none; ``None`` means the agent's own default.
     default_model: str | None = None
+    #: Seconds allotted for the initialize + new_session handshake before it is judged failed. A heavyweight
+    #: agent that sets up a workspace/runtime on new_session (e.g. OpenHands) needs more than the default.
+    handshake_timeout_s: float = 30.0
 
 
 class DescriptorRegistry:
@@ -73,7 +76,7 @@ HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("cline", "Cline", ("cline", "--acp")),
     AgentDescriptor("junie", "Junie", ("junie", "--acp=true")),
     AgentDescriptor("kimi", "Kimi Code", ("kimi", "acp"), provider="moonshot"),
-    AgentDescriptor("openhands", "OpenHands", ("openhands", "acp")),
+    AgentDescriptor("openhands", "OpenHands", ("openhands", "acp"), handshake_timeout_s=90.0),
 )
 
 

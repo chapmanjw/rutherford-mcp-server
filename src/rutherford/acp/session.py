@@ -43,9 +43,6 @@ from .permission import PermissionPolicy
 
 #: How Rutherford identifies itself to an agent at ``initialize``.
 _CLIENT_INFO = Implementation(name="rutherford-acp", version="3.0.0")
-#: The handshake (initialize + new_session) gets a fixed bound; the model's thinking time is the prompt's.
-_HANDSHAKE_TIMEOUT_S = 30.0
-
 #: The ACP prompt content-block union (annotated so the single-text-block list types cleanly).
 PromptBlock = (
     TextContentBlock | ImageContentBlock | AudioContentBlock | ResourceContentBlock | EmbeddedResourceContentBlock
@@ -142,11 +139,11 @@ class ACPSession:
         try:
             await asyncio.wait_for(
                 conn.initialize(protocol_version=PROTOCOL_VERSION, client_info=_CLIENT_INFO),
-                timeout=_HANDSHAKE_TIMEOUT_S,
+                timeout=self._descriptor.handshake_timeout_s,
             )
             session = await asyncio.wait_for(
                 conn.new_session(cwd=self._cwd, mcp_servers=[]),
-                timeout=_HANDSHAKE_TIMEOUT_S,
+                timeout=self._descriptor.handshake_timeout_s,
             )
         except Exception as exc:
             await self.close()
