@@ -260,7 +260,7 @@ def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) 
         stance=voice.stance,
         ok=result.ok,
         text=result.text,
-        duration_s=result.duration_s,
+        duration_s=round(result.duration_s, 3),
         error=result.error,
         session_id=result.session_id,
         provenance=result.provenance,

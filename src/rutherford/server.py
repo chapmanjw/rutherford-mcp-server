@@ -27,7 +27,7 @@ from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
 from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
-from .tools.jobs import cancel_job_tool, job_result_tool, job_status_tool, list_jobs_tool
+from .tools.jobs import activity_tool, cancel_job_tool, job_result_tool, job_status_tool, list_jobs_tool
 from .tools.roles import list_roles_tool
 from .tools.setup import setup_tool
 
@@ -39,8 +39,8 @@ mcp: FastMCP = FastMCP(
         "Delegations default to the configured default_safety_mode (read_only out of the box); write and "
         "yolo are explicit opt-in behind a trusted workspace. Long tasks can run as background jobs "
         "(mode=async), enumerated with `list_jobs`, polled with `job_status` / `job_result`, and cancelled "
-        "with `cancel_job`. First time here? `setup` shows where config lives and scaffolds a starter "
-        "config.toml."
+        "with `cancel_job`; `activity` is the focused snapshot of just the jobs in flight right now. First "
+        "time here? `setup` shows where config lives and scaffolds a starter config.toml."
     ),
 )
 
@@ -235,6 +235,18 @@ async def list_jobs() -> str:
     in-memory: a finished one is evicted after `job_ttl_s`, and a restart clears them all.
     """
     return await _guarded(list_jobs_tool(get_app()))
+
+
+@mcp.tool
+async def activity() -> str:
+    """Show the background jobs IN FLIGHT right now (running + pending), each with a live elapsed time.
+
+    The focused "what is happening now" snapshot, distinct from `list_jobs`: where `list_jobs` enumerates
+    every tracked job of every status (finished ones included), `activity` returns only the jobs still in
+    flight -- `{active: [...], count}` with each row `{job_id, tool, status, summary, started_at,
+    elapsed_s}`, longest-running first. Empty (`{active: [], count: 0}`) when nothing is running.
+    """
+    return await _guarded(activity_tool(get_app()))
 
 
 @mcp.tool

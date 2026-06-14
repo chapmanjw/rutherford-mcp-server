@@ -108,6 +108,14 @@ class JobStore:
             record.task = asyncio.create_task(self._run(record, coro_factory))
         return job_id
 
+    def now(self) -> float:
+        """The store's current wall-clock time, from its (injectable) clock.
+
+        Exposed so a reader computing a live elapsed -- the ``activity`` snapshot -- measures against the
+        same clock that stamped ``started_at`` / ``created_at``, rather than a second, possibly-skewed one.
+        """
+        return self._clock()
+
     async def get(self, job_id: str) -> JobRecord:
         """Return the job ``job_id``, evicting expired jobs first; raise ``JOB_NOT_FOUND`` if unknown."""
         async with self._lock:

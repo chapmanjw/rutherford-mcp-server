@@ -8,6 +8,11 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- An `activity` tool: a focused snapshot of the background work in flight right now. Where `list_jobs`
+  enumerates every tracked job of every status, `activity` returns only the running and pending jobs —
+  `{active: [...], count}`, each row `{job_id, tool, status, summary, started_at, elapsed_s}` with a live
+  `elapsed_s` measured against the store's clock and the rows sorted longest-running first. It returns
+  `{active: [], count: 0}` when nothing is in flight.
 - A `setup` first-run helper (the "good duck" getting-started surface). It resolves the config path for a
   scope — `project` (`<cwd>/.rutherford/config.toml`) or `global` (the platform config dir's
   `config.toml`) — and returns a sensible commented starter `config.toml` at the effective defaults
@@ -71,6 +76,12 @@ All notable changes to this project are documented in this file. The format is b
   raised "Separator is found, but chunk is longer than limit" and dropped the connection.
 - `cline` now drives over ACP, but only with Cline's own service auth — a ChatGPT-subscription or
   OpenRouter provider configured in the desktop app does not reach the headless `--acp` path.
+- A run's `duration_s` is now rounded to milliseconds (3 decimals) at every source — the `_reduce` and
+  `_failed` paths in the ACP session, and the debate contribution that carries it — instead of serializing
+  a raw `time.monotonic()` float like `0.0017640000442042947`. The long float tails made TOON output
+  needlessly noisy and could make a substring assertion over the envelope (e.g. counting `"42"`) over-count
+  on digits inside the duration, which flaked the consensus test run to run. Semantics are unchanged
+  (`duration_s` stays a `float`); the output is just stable and readable.
 
 ### Changed
 

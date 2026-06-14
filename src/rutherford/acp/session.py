@@ -294,7 +294,7 @@ def _reduce(
         text=text,
         cost=cost,
         session_id=session_id,
-        duration_s=time.monotonic() - start,
+        duration_s=round(time.monotonic() - start, 3),
         provenance=Provenance(provider=descriptor.provider, model=target.model, confirmed=False),
         safety_mode=policy.mode,
     )
@@ -315,7 +315,7 @@ def _failed(
     return DelegationResult(
         target=target,
         ok=False,
-        duration_s=time.monotonic() - start,
+        duration_s=round(time.monotonic() - start, 3),
         error=ErrorInfo(code=code, message=message, reexecution_safety=safety),
         partial=partial,
         cost=cost,

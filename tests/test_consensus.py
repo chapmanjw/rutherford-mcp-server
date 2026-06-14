@@ -75,11 +75,13 @@ def test_as_target_and_known_targets() -> None:
 
 async def test_consensus_tool_and_server_wrapper(monkeypatch: Any) -> None:
     # The nested voices array round-trips poorly through python-toon's decoder, so assert on the encoded
-    # text (the production output): both voices answered, so "42" appears twice.
+    # text (the production output). Match the exact encoded answer field the fake agent produces -- a voice
+    # answering 42 renders as the TOON line `text: "42"` -- so the assertion proves both voices answered 42
+    # and never trips on incidental "42" digits in a duration float (which a bare out.count("42") did).
     out = await consensus_tool(
         _app(), prompt="what is 17 + 25?", targets=["fake", "fake:m"], working_dir=str(REPO_ROOT)
     )
-    assert out.count("42") == 2
+    assert out.count('text: "42"') == 2
     monkeypatch.setattr(server, "_APP", _app())
     wrapped = await server.consensus(prompt="what is 17 + 25?", targets=["fake"], working_dir=str(REPO_ROOT))
     assert "42" in wrapped

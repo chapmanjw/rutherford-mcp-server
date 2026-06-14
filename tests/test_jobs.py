@@ -23,6 +23,7 @@ from rutherford.services.jobs import JobStore
 from rutherford.tools.consensus import consensus_tool
 from rutherford.tools.delegate import delegate_tool
 from rutherford.tools.jobs import (
+    activity_tool,
     cancel_job_tool,
     job_result_tool,
     job_status_tool,
@@ -349,7 +350,9 @@ async def test_consensus_tool_async_returns_job() -> None:
     assert submit["tool"] == "consensus"
     record = await _poll_until_done(app.jobs, submit["job_id"])
     assert record.status is JobStatus.SUCCEEDED
-    assert record.result is not None and record.result.count("42") == 2
+    # Match the encoded answer field (`text: "42"`) so the count cannot be inflated by "42" in a duration
+    # float; the async envelope is byte-identical to the sync one, so both voices answer here too.
+    assert record.result is not None and record.result.count('text: "42"') == 2
 
 
 async def test_delegate_tool_rejects_unknown_mode() -> None:
@@ -373,6 +376,118 @@ async def test_server_delegate_async_and_job_tools(monkeypatch: Any) -> None:
     assert status["status"] == "succeeded"
     listing = decode(await server.list_jobs())
     assert any(job["job_id"] == job_id for job in listing["jobs"])
+
+
+# --- activity (in-flight snapshot) -------------------------------------------
+
+
+async def test_activity_is_empty_when_idle() -> None:
+    app = _app()
+    snapshot = decode(await activity_tool(app))
+    assert snapshot["count"] == 0
+    assert snapshot["active"] == []
+
+
+async def test_activity_shows_in_flight_job_with_positive_elapsed() -> None:
+    app = _app()
+    hold = asyncio.Event()
+    started = asyncio.Event()
+
+    async def in_flight() -> str:
+        started.set()
+        await hold.wait()
+        return "done"
+
+    job_id = await app.jobs.submit("delegate", in_flight, summary="delegate fake -- working")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    await asyncio.sleep(0.01)  # let a little wall-clock pass so elapsed is strictly positive
+
+    snapshot = decode(await activity_tool(app))
+    assert snapshot["count"] == 1
+    row = snapshot["active"][0]
+    assert row["job_id"] == job_id
+    assert row["tool"] == "delegate"
+    assert row["status"] == "running"
+    assert row["summary"] == "delegate fake -- working"
+    assert row["elapsed_s"] > 0.0
+    assert set(row) == {"job_id", "tool", "status", "summary", "started_at", "elapsed_s"}
+
+    hold.set()  # release the job so the loop unwinds cleanly
+    await _poll_until_done(app.jobs, job_id)
+
+
+async def test_activity_excludes_finished_jobs() -> None:
+    app = _app()
+
+    async def quick() -> str:
+        return "done"
+
+    finished_id = await app.jobs.submit("delegate", quick, summary="finished")
+    await _poll_until_done(app.jobs, finished_id)
+
+    hold = asyncio.Event()
+    started = asyncio.Event()
+
+    async def in_flight() -> str:
+        started.set()
+        await hold.wait()
+        return "done"
+
+    running_id = await app.jobs.submit("consensus", in_flight, summary="running")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    snapshot = decode(await activity_tool(app))
+    ids = {row["job_id"] for row in snapshot["active"]}
+    assert running_id in ids
+    assert finished_id not in ids  # a finished job never appears in the in-flight snapshot
+    assert snapshot["count"] == len(snapshot["active"])
+
+    hold.set()
+    await _poll_until_done(app.jobs, running_id)
+
+
+async def test_activity_sorted_longest_running_first() -> None:
+    app = _app()
+    hold = asyncio.Event()
+
+    async def in_flight() -> str:
+        await hold.wait()
+        return "done"
+
+    first = await app.jobs.submit("delegate", in_flight, summary="first")
+    await asyncio.sleep(0.02)  # the first job accrues more elapsed than the second
+    second = await app.jobs.submit("consensus", in_flight, summary="second")
+    await asyncio.sleep(0.01)
+
+    snapshot = decode(await activity_tool(app))
+    order = [row["job_id"] for row in snapshot["active"]]
+    assert order == [first, second]  # longest-running first
+    assert snapshot["active"][0]["elapsed_s"] >= snapshot["active"][1]["elapsed_s"]
+
+    hold.set()
+    for job_id in (first, second):
+        await _poll_until_done(app.jobs, job_id)
+
+
+async def test_server_activity_tool(monkeypatch: Any) -> None:
+    monkeypatch.setattr(server, "_APP", _app())
+    hold = asyncio.Event()
+    started = asyncio.Event()
+
+    async def in_flight() -> str:
+        started.set()
+        await hold.wait()
+        return "done"
+
+    job_id = await server.get_app().jobs.submit("delegate", in_flight, summary="x")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    snapshot = decode(await server.activity())
+    assert snapshot["count"] >= 1
+    assert any(row["job_id"] == job_id for row in snapshot["active"])
+
+    hold.set()
+    await _poll_until_done(server.get_app().jobs, job_id)
 
 
 class _FakeClock:

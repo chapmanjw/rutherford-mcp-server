@@ -12,13 +12,31 @@ re-encoded.
 
 from __future__ import annotations
 
+from typing import TypedDict
+
 from ..context import AppContext, tool_error, tool_success
 from ..domain.enums import JobStatus
 from ..domain.error_codes import ErrorCode
 from ..services.jobs import CoroFactory, JobRecord
 
+
+class ActiveRow(TypedDict):
+    """One in-flight job's row in the ``activity`` snapshot (typed so ``elapsed_s`` sorts cleanly)."""
+
+    job_id: str
+    tool: str
+    status: str
+    summary: str
+    started_at: float | None
+    elapsed_s: float
+
+
 #: How much of a prompt to keep in a job's one-line summary.
 _SNIPPET_LEN = 60
+
+#: The statuses that count as "in flight" for the activity snapshot: work that is running now, plus work
+#: that is queued and about to run (a submitted job is ``pending`` until its task is scheduled).
+_IN_FLIGHT: frozenset[JobStatus] = frozenset({JobStatus.RUNNING, JobStatus.PENDING})
 
 
 def make_summary(tool: str, *, target: str | None = None, prompt: str | None = None) -> str:
@@ -50,6 +68,20 @@ async def list_jobs_tool(app: AppContext) -> str:
     """Return every retained job as a light listing (no heavy result), newest first."""
     jobs = await app.jobs.list()
     return tool_success({"jobs": [_listing(record) for record in jobs]})
+
+
+async def activity_tool(app: AppContext) -> str:
+    """Return a focused snapshot of the work IN FLIGHT right now: the running and pending jobs only.
+
+    Distinct from ``list_jobs`` (which enumerates every tracked job of every status, finished ones
+    included): this is the "what is happening now" view -- only ``running`` / ``pending`` jobs, each with a
+    live ``elapsed_s`` measured against the store's clock, sorted longest-running first. Returns
+    ``{active: [], count: 0}`` when nothing is in flight.
+    """
+    now = app.jobs.now()
+    rows = [_active_row(record, now) for record in await app.jobs.list() if record.status in _IN_FLIGHT]
+    rows.sort(key=lambda row: row["elapsed_s"], reverse=True)
+    return tool_success({"active": rows, "count": len(rows)})
 
 
 async def job_status_tool(app: AppContext, *, job_id: str) -> str:
@@ -107,4 +139,24 @@ def _listing(record: JobRecord) -> dict[str, object]:
         "summary": record.summary,
         "created_at": record.created_at,
         "finished_at": record.finished_at,
+    }
+
+
+def _active_row(record: JobRecord, now: float) -> ActiveRow:
+    """Project an in-flight job into one activity row, with a live elapsed measured to ``now``.
+
+    Elapsed runs from when the work actually started (``started_at``), falling back to ``created_at`` for a
+    job still ``pending`` (its task has not been scheduled yet). Rounded to milliseconds (matching the
+    delegation ``duration_s`` convention) and floored at zero so a clock that has not advanced never reads
+    negative.
+    """
+    started = record.started_at if record.started_at is not None else record.created_at
+    elapsed_s = round(max(now - started, 0.0), 3)
+    return {
+        "job_id": record.job_id,
+        "tool": record.tool,
+        "status": record.status.value,
+        "summary": record.summary,
+        "started_at": record.started_at,
+        "elapsed_s": elapsed_s,
     }
