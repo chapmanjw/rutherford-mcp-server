@@ -23,7 +23,7 @@ from .context import AppContext, build_app_context, error_payload_from, tool_err
 from .domain.error_codes import ErrorCode
 from .domain.errors import ConfigError, RutherfordError
 from .runtime.logging import configure_logging
-from .tools.capabilities import capabilities_tool
+from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
 from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
@@ -164,6 +164,17 @@ async def debate(
 async def capabilities() -> str:
     """List the ACP agents Rutherford can drive (id, display name, launch command, provider)."""
     return await _guarded(capabilities_tool(get_app()))
+
+
+@mcp.tool
+async def doctor(agent: str | None = None, timeout_s: float = 60.0) -> str:
+    """Probe each agent (or one named `agent`) with a real read-only ACP round trip and report conformance.
+
+    The trustworthy health check for ACP agents: whether each spawns, handshakes, and answers. Each report
+    is working / no_answer / handshake_failed / not_installed / error. Slower than `capabilities` (it makes
+    a real call per agent); run it to see which of the roster actually drive on this machine.
+    """
+    return await _guarded(doctor_tool(get_app(), agent=agent, timeout_s=timeout_s))
 
 
 def main() -> None:

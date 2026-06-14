@@ -38,6 +38,7 @@ from ..domain.models import Cost, DelegationResult, ErrorInfo, Provenance, Targe
 from .client import RutherfordACPClient
 from .descriptors import AgentDescriptor
 from .journal import EventJournal, journal_event_from_message
+from .launch import prepare_argv
 from .permission import PermissionPolicy
 
 #: How Rutherford identifies itself to an agent at ``initialize``.
@@ -107,7 +108,7 @@ class ACPSession:
     async def open(self) -> None:
         """Spawn the agent and complete the handshake, or raise :class:`ACPHandshakeError`."""
         env = _resolve_env(self._descriptor)
-        command, *args = self._descriptor.command
+        command, *args = prepare_argv(self._descriptor.command)
 
         def _observe(event: StreamEvent) -> None:
             # SYNCHRONOUS observer: inline in receive order, so each turn's journal is complete before its
