@@ -23,7 +23,7 @@ def test_write_creates_state_and_answer(tmp_path: Path) -> None:
     assert (run_dir / RECORD_FILENAME).is_file()
     assert (run_dir / "artifacts" / "answer.md").read_text(encoding="utf-8") == "hello world"
     record = read_record(run_dir)  # the record round-trips through the reader the way continuation will read it
-    assert record.run_id == "abc123" and record.kind == "delegate" and record.schema_version == 1
+    assert record.run_id == "abc123" and record.kind == "delegate" and record.schema_version == 2
     assert record.argv == ["goose", "acp"]
     # env is NEVER persisted -- it can carry API keys; the record has no env field, so it is absent from disk.
     assert "env" not in (run_dir / RECORD_FILENAME).read_text(encoding="utf-8")

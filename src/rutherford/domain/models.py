@@ -194,6 +194,50 @@ class DiversityReport(BaseModel):
         return f"{text}; LOW DIVERSITY" if self.low_diversity else text
 
 
+class LineageAgreement(BaseModel):
+    """How often two DISTINCT model lineages reached the same verdict when they co-voted across kept panels.
+
+    A lineage contributes one verdict to a panel only when its voices were internally unanimous (an internally
+    split lineage is excluded for that panel, never coin-flipped). ``panels`` is how many kept panels both
+    lineages cast such a verdict on; ``agreements`` is how many of those they reached the SAME verdict on;
+    ``agreement_rate`` is ``agreements / panels``. OBSERVATIONAL ONLY -- agreement is not correctness, so this
+    never feeds a vote discount (see :class:`HistoricalAgreementReport`). ``a`` < ``b`` (sorted, so a pair is
+    listed once and never self-paired -- the same-lineage correlation is the structural prior the family key
+    already encodes, not something this measures).
+    """
+
+    a: str
+    b: str
+    panels: int
+    agreements: int
+    agreement_rate: float
+
+
+class HistoricalAgreementReport(BaseModel):
+    """Cross-run agreement across the kept consensus corpus (F3): which model lineages tended to agree.
+
+    A DELIBERATE non-control surface. It reports correlation; it does NOT down-weight it. An agreement-based
+    discount is unsound -- two lineages that agree because they are both RIGHT would be penalized for being
+    correct, conflating correlation with redundancy. So this informs a HUMAN's roster choice (e.g. drop a
+    lineage that never adds a dissent), it never silently reshapes a live vote. The live, WITHIN-panel
+    model-family discount (opt-in, F3 vote-math) is the sound control -- it keys on a structural prior on
+    independence decided before any answer is seen; this is its read-only, across-panel companion.
+
+    ``panels_scanned`` is the count of kept consensus panels that contributed at least one lineage pair (>= 2
+    distinct lineages each with a parseable, internally-consistent verdict). ``pairs`` is every co-voting
+    lineage pair, most-co-voted first. ``lineages`` is the distinct lineage keys seen. ``dropped_lineage_panels``
+    counts panels where at least one lineage was dropped because its provenance did not resolve to a lineage OR
+    its voices split internally -- surfaced so the report is never silently thin. ``notes`` carries advisory
+    context (e.g. how many kept consensus records carried verdicts at all).
+    """
+
+    panels_scanned: int
+    pairs: list[LineageAgreement] = Field(default_factory=list)
+    lineages: list[str] = Field(default_factory=list)
+    dropped_lineage_panels: int = 0
+    notes: list[str] = Field(default_factory=list)
+
+
 class RunRollup(BaseModel):
     """Per-run budget / effort rollup (F8a), the sibling of :class:`DiversityReport`.
 
@@ -1130,6 +1174,24 @@ class PanelInputs(BaseModel):
     verdict_schema: dict[str, Any] | None = None
 
 
+class StoredVerdict(BaseModel):
+    """One voice's recorded verdict on a kept consensus panel (F3 cross-run): enough to later compute which
+    model lineages tended to agree, without re-running anything.
+
+    The lineage is deliberately NOT frozen here -- ``provider`` + ``model`` are stored raw and the base model
+    FAMILY is recomputed at read time, so an improved family table benefits historical records too. ``verdict``
+    is the extracted token (``None`` for a failed or unparseable voice, which is excluded from agreement). A
+    slim projection of :class:`VoiceVerdict`: only the fields a cross-run agreement report needs.
+    """
+
+    label: str
+    cli: str
+    provider: str | None = None
+    model: str | None = None
+    verdict: str | None = None
+    ok: bool = True
+
+
 class RunRecord(BaseModel):
     """A durable, replay-complete record of one run, persisted as a job (F2).
 
@@ -1151,8 +1213,9 @@ class RunRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    #: Bumped when the persisted shape changes; a reader checks it before trusting a field.
-    schema_version: int = 1
+    #: Bumped when the persisted shape changes; a reader checks it before trusting a field. v2 added
+    #: ``verdicts`` (F3 cross-run); the field is optional, so a v1 record (no ``verdicts``) still validates.
+    schema_version: int = 2
     run_id: str
     #: ``delegate`` | ``consensus`` | ``debate`` -- which tool produced this run.
     kind: str
@@ -1204,6 +1267,11 @@ class RunRecord(BaseModel):
     #: For a panel PARENT record, the resolved panel orchestration config (seat roster, strategy,
     #: synthesize, rounds, judge) so the panel replays from here; ``None`` for a leaf delegate record.
     panel: PanelInputs | None = None
+    #: For a kept consensus panel run under a tally STRATEGY, each voice's recorded verdict (F3 cross-run,
+    #: schema v2): seat identity + provider/model + the extracted verdict token, so a later historical-agreement
+    #: report can see which model lineages tended to agree across kept panels. ``None`` for a leaf, a debate, or
+    #: an all-voices consensus (no per-voice verdicts to record).
+    verdicts: list[StoredVerdict] | None = None
     # --- outputs ---
     ok: bool = True
     error_code: ErrorCode | None = None

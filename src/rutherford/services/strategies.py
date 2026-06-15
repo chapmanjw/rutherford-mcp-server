@@ -552,3 +552,13 @@ def _lineage_key(prov: Provenance | None) -> str | None:
     """
     family = _model_family(prov.model if prov is not None else None)
     return family if family is not None else _provider_key(prov)
+
+
+def lineage_key(prov: Provenance | None) -> str | None:
+    """The F3 effective-lineage key for a provenance (base model family, else vendor): the public name.
+
+    The same key :func:`lineage_discounts` and :func:`effective_diversity` use within a panel, exposed so the
+    cross-run historical-agreement report can key past verdicts on the SAME lineage. Recomputing it at read
+    time (rather than persisting a frozen key) means an improved family table re-keys historical records too.
+    """
+    return _lineage_key(prov)

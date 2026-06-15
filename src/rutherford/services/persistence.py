@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..domain.enums import JobStatus, SafetyMode
-from ..domain.models import Cost, PanelInputs, RunRecord, RunRollup, Topology
+from ..domain.models import Cost, PanelInputs, RunRecord, RunRollup, StoredVerdict, Topology
 from ..io.ledger import RunLedger
 from ..runtime.logging import log_event
 
@@ -67,6 +67,7 @@ def write_panel_record(
     files: list[str] | None = None,
     role: str | None = None,
     panel: PanelInputs | None = None,
+    verdicts: list[StoredVerdict] | None = None,
     stop_reason: str | None = None,
     rollup: RunRollup | None = None,
     topology: Topology | None = None,
@@ -81,7 +82,8 @@ def write_panel_record(
     ``ok`` flags decide the parent ``status`` (succeeded when any voice answered, else failed), and their
     ``cost`` / ``changed_files`` roll up onto the parent. ``safety_mode`` / ``cwd`` / ``files`` / ``role`` /
     ``panel`` are the panel request's (``panel`` is the resolved orchestration config -- roster, strategy,
-    rounds, ...), captured so the parent record is replay-complete (decision 1-D). ``stop_reason`` /
+    rounds, ...), captured so the parent record is replay-complete (decision 1-D). ``verdicts`` is the
+    per-voice verdict projection of a tally-strategy consensus (F3 cross-run), ``None`` otherwise. ``stop_reason`` /
     ``rollup`` record a time-budget harvest (F8a): ``"budget"`` and the per-run rollup when a budget cut the
     panel, both ``None`` on a normal completion. ``topology`` is the panel's observed process/agent fan-out
     (N1, item 3), ``None`` when not measured. ``extra_artifacts`` carries the parent's audit artifacts --
@@ -108,6 +110,9 @@ def write_panel_record(
         role=role,
         files=list(files or []),
         panel=panel,
+        # F3 cross-run (schema v2): the per-voice verdicts of a tally-strategy consensus, so a later
+        # historical-agreement report can read which lineages agreed. ``None`` for all-voices / debate.
+        verdicts=verdicts,
         prompt=prompt,
         changed_files=_union_changed_files(voices),
         cost=_rollup_cost(voices),

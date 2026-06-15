@@ -31,6 +31,7 @@ from .domain.errors import ConfigError, RutherfordError
 from .domain.models import ActivityEvent
 from .runtime.logging import configure_logging
 from .services.delegation import ActivityCallback
+from .tools.analyze import analyze_tool
 from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
 from .tools.continue_job import continue_job_tool
@@ -578,6 +579,19 @@ async def list_jobs() -> str:
     in-memory: a finished one is evicted after `job_ttl_s`, and a restart clears them all.
     """
     return await _guarded(list_jobs_tool(get_app()))
+
+
+@mcp.tool
+async def analyze(report: str = "historical_agreement") -> str:
+    """Analyze the kept run corpus (read-only). `report="historical_agreement"` is the default and only report.
+
+    `historical_agreement` scans the consensus panels you kept (persist=true / default_persistence=job) and
+    reports how often two DISTINCT model lineages reached the same verdict when they co-voted -- an
+    OBSERVATIONAL signal for your roster choice (e.g. a lineage that never adds a dissent), NOT a vote discount:
+    agreement is not correctness, so down-weighting agreeing lineages would punish them for being right
+    together. An empty corpus returns an empty report whose notes explain how to build one.
+    """
+    return await _guarded(analyze_tool(get_app(), report=report))
 
 
 @mcp.tool

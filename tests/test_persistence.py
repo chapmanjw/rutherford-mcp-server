@@ -91,7 +91,7 @@ async def test_persist_true_writes_state_and_answer(tmp_path: Path) -> None:
     assert (run_dir / "artifacts" / "answer.md").read_text(encoding="utf-8").strip() == result.text
     record = read_record(run_dir)  # the record round-trips through the reader continuation will use
     assert record.kind == "delegate" and record.cli == "fake" and record.ok is True
-    assert record.schema_version == 1
+    assert record.schema_version == 2
     # The replay-complete inputs are in the record: the prompt and the resolved launch argv carried verbatim.
     assert record.prompt == "what is 17 + 25?"
     assert any("fake_acp_agent.py" in arg for arg in record.argv)  # the pinned launch argv survives the write

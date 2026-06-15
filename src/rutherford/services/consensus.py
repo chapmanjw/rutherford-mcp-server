@@ -50,6 +50,7 @@ from ..domain.models import (
     RankReport,
     RunRollup,
     SkippedTarget,
+    StoredVerdict,
     StrategyResult,
     Target,
     Topology,
@@ -281,6 +282,7 @@ class ConsensusService:
                 stop_reason,
                 rollup,
                 topology,
+                _stored_verdicts(result),
             )
 
         ok_count = sum(1 for voice in voices if voice.ok)
@@ -314,6 +316,7 @@ class ConsensusService:
         stop_reason: str | None,
         rollup: RunRollup | None,
         topology: Topology,
+        verdicts: list[StoredVerdict] | None,
     ) -> str | None:
         """Write the panel's parent record linking each voice's child record, plus the voice artifacts (F2).
 
@@ -349,6 +352,7 @@ class ConsensusService:
             files=req.files,
             role=req.role,
             panel=panel_inputs,
+            verdicts=verdicts,
             stop_reason=stop_reason,
             rollup=rollup,
             topology=topology,
@@ -1165,6 +1169,33 @@ class ConsensusService:
         if not result.ok or not result.text.strip():
             return None, None, False
         return result.text, judge.display_label, self_authored
+
+
+def _stored_verdicts(result: ConsensusResult | StrategyResult) -> list[StoredVerdict] | None:
+    """Project a strategy panel's per-voice verdicts to the slim persisted form (F3 cross-run), or ``None``.
+
+    Only a tally STRATEGY produces per-voice verdicts (``StrategyResult.voices``); an all-voices
+    :class:`ConsensusResult` has none, so it records ``None``. ``provider`` is read from the voice's resolved
+    provenance (the vendor that actually answered, post-fallback) and ``model`` from the verdict -- both raw, so
+    the lineage family is recomputed at read time rather than frozen here.
+    """
+    if not isinstance(result, StrategyResult):
+        return None
+    verdicts = [
+        StoredVerdict(
+            label=voice.label,
+            cli=voice.cli,
+            provider=voice.provenance.provider if voice.provenance is not None else None,
+            model=voice.model,
+            verdict=voice.verdict,
+            ok=voice.ok,
+        )
+        for voice in result.voices
+    ]
+    # A RANK panel is a StrategyResult too, but it ranks rather than tallying a verdict token -- every voice's
+    # ``verdict`` is None, so there is nothing for a cross-run agreement report to read. Record None rather than
+    # a list of empty verdicts, so a RANK panel reads the same as an all-voices one (no verdicts to record).
+    return verdicts if any(voice.verdict is not None for voice in verdicts) else None
 
 
 def _stamp_dissent(verdicts: list[VoiceVerdict], outcome: str, decision: str | None) -> None:

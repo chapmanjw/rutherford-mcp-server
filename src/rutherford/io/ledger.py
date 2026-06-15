@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 
 from ..domain.models import RunRecord
@@ -47,6 +48,33 @@ def read_record(run_dir: Path) -> RunRecord:
     """
     text = (run_dir / RECORD_FILENAME).read_text(encoding="utf-8")
     return RunRecord.model_validate(json.loads(text))
+
+
+def iter_records(root: Path) -> Iterator[tuple[Path, RunRecord]]:
+    """Yield every readable kept ``(run_dir, RunRecord)`` under ``root``, newest-first by ``created_at``.
+
+    The corpus reader (F3 cross-run / on-demand analysis): the only batch view over the jobs tree. Best-effort,
+    like the writer -- a child dir whose ``state.json`` is missing, unreadable, malformed, or fails validation
+    (a partial write, a foreign directory, an older incompatible record) is SKIPPED, never raised, so one bad
+    record cannot break a sweep over the rest. A missing/empty root yields nothing. Reads every record to sort,
+    so the cost is the corpus size -- bounded by what the caller chose to keep.
+    """
+    if not root.is_dir():
+        return
+    pairs: list[tuple[Path, RunRecord]] = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            record = read_record(child)
+        except (
+            OSError,
+            ValueError,
+        ):  # missing/unreadable (OSError) or malformed/invalid (JSON + pydantic ⊂ ValueError)
+            continue
+        pairs.append((child, record))
+    pairs.sort(key=lambda pair: pair[1].created_at, reverse=True)
+    yield from pairs
 
 
 def read_answer(run_dir: Path) -> str:
