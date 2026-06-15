@@ -28,6 +28,14 @@ async def _turn(prompt: str, *, timeout_s: float = 60.0, descriptor: AgentDescri
     return await run_acp_turn(descriptor, prompt, policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=timeout_s)
 
 
+def test_handshake_timeout_override() -> None:
+    # The descriptor's budget is used by default; a connection probe overrides it so a generous local-model
+    # floor reaches each handshake step (the value used in every wait_for inside open()).
+    desc = AgentDescriptor("x", "X", ("x",), handshake_timeout_s=30.0)
+    assert ACPSession(desc, policy=_READ_ONLY, cwd=".")._handshake_timeout == 30.0
+    assert ACPSession(desc, policy=_READ_ONLY, cwd=".", handshake_timeout_s=99.0)._handshake_timeout == 99.0
+
+
 async def test_run_turn_normal_answer() -> None:
     result = await _turn("what is 17 + 25?")
     assert result.ok is True and "42" in result.text

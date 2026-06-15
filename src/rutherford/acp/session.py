@@ -102,9 +102,17 @@ class ACPSession:
         parent_run_id: str | None = None,
         sandbox_root: str | None = None,
         resume_session_id: str | None = None,
+        handshake_timeout_s: float | None = None,
     ) -> None:
         self._descriptor = descriptor
         self._policy = policy
+        # The per-step budget for each handshake call (initialize / new_session / load_session / set_model):
+        # the descriptor's default, unless a caller overrides it. A handshake-only connection probe passes its
+        # own budget here so a generous local-model floor actually reaches the handshake (descriptor's fixed
+        # default would otherwise dominate, falsely failing a slow cold-model handshake).
+        self._handshake_timeout = (
+            handshake_timeout_s if handshake_timeout_s is not None else descriptor.handshake_timeout_s
+        )
         # Resume a prior agent session over ACP (``session/load``) instead of creating a fresh one
         # (``session/new``): the opaque id from an earlier turn's result, round-tripped back so the agent
         # reloads that conversation. ``None`` is the default fresh-session path. Gated at open() on the agent
@@ -147,6 +155,10 @@ class ACPSession:
         self._conn: ClientSideConnection | None = None
         self._session_id: str | None = None
         self._pid: int | None = None
+        #: The model ids the agent advertised at session open (``session.models``), captured so a caller can
+        #: see what the agent offered -- the "configure" signal of a handshake-only connection check. ``[]``
+        #: when the agent advertises no selectable models (it runs on its own default).
+        self._available_models: list[str] = []
 
     @property
     def effort_applied(self) -> Effort | None:
@@ -172,6 +184,11 @@ class ACPSession:
     def session_id(self) -> str | None:
         """The agent's session id once opened, for provenance and a later resume; ``None`` before open."""
         return self._session_id
+
+    @property
+    def available_models(self) -> list[str]:
+        """The model ids the agent advertised at open (its selectable models); ``[]`` before open or if none."""
+        return list(self._available_models)
 
     @property
     def partial_text(self) -> str:
@@ -240,7 +257,7 @@ class ACPSession:
         try:
             init = await asyncio.wait_for(
                 conn.initialize(protocol_version=PROTOCOL_VERSION, client_info=_CLIENT_INFO),
-                timeout=self._descriptor.handshake_timeout_s,
+                timeout=self._handshake_timeout,
             )
         except Exception as exc:
             await self.close()
@@ -256,6 +273,7 @@ class ACPSession:
             session = await self._resume(conn, init)
         else:
             session = await self._new_session(conn)
+        self._available_models = _models_of(session)
         await self._select_model(conn, session)
 
     async def _new_session(self, conn: ClientSideConnection) -> NewSessionResponse:
@@ -263,7 +281,7 @@ class ACPSession:
         try:
             session = await asyncio.wait_for(
                 conn.new_session(cwd=self._cwd, mcp_servers=[]),
-                timeout=self._descriptor.handshake_timeout_s,
+                timeout=self._handshake_timeout,
             )
         except Exception as exc:
             await self.close()
@@ -297,7 +315,7 @@ class ACPSession:
         try:
             session = await asyncio.wait_for(
                 conn.load_session(cwd=self._cwd, session_id=resume_id, mcp_servers=[]),
-                timeout=self._descriptor.handshake_timeout_s,
+                timeout=self._handshake_timeout,
             )
         except Exception as exc:
             await self.close()
@@ -328,7 +346,7 @@ class ACPSession:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(
                 conn.set_session_model(model_id=model, session_id=self._session_id),
-                timeout=self._descriptor.handshake_timeout_s,
+                timeout=self._handshake_timeout,
             )
 
     async def prompt(self, text: str, *, timeout_s: float) -> DelegationResult:
@@ -590,3 +608,11 @@ def _advertises_model(session: NewSessionResponse | LoadSessionResponse, model_i
     if state is None or state.available_models is None:
         return False
     return any(info.model_id == model_id for info in state.available_models)
+
+
+def _models_of(session: NewSessionResponse | LoadSessionResponse) -> list[str]:
+    """The model ids the session advertised (its selectable models), or ``[]`` when it offers none."""
+    state = session.models
+    if state is None or state.available_models is None:
+        return []
+    return [info.model_id for info in state.available_models]

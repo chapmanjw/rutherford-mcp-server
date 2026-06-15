@@ -44,6 +44,11 @@ def _isolate_config_scopes(tmp_path_factory: pytest.TempPathFactory, monkeypatch
     clears ``RUTHERFORD_CONFIG_DIR`` for every test. A test that drives its own scopes passes ``env`` / ``cwd``
     to ``RoleStore`` / ``load_panels`` directly -- the injected mapping wins over the process env, so this
     fixture never interferes with those explicit-scope tests.
+
+    This applies to integration tests too, so a developer's real ``~/.rutherford`` roles/panels never leak
+    into one that builds an ``AppContext``. An integration test that drives a real agent needing
+    credentials from the home dir (e.g. Grok reads ``~/.grok/auth``) restores ONLY that home for itself via a
+    local fixture (see ``tests/integration/test_grok.py``); it does not blanket-disable this isolation.
     """
     home = tmp_path_factory.mktemp("hermetic-home")
     monkeypatch.setenv("USERPROFILE", str(home))

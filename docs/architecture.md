@@ -73,7 +73,7 @@ hand-written subprocess adapter:
 | `env_overrides` | env vars to set for the subprocess (e.g. a local-runtime provider env) |
 
 `DescriptorRegistry` is an immutable id → descriptor mapping with fail-fast lookup, mirroring the v2
-adapter registry's closed-mapping contract. `HIGH_FIDELITY` is the 16-agent built-in roster. There is
+adapter registry's closed-mapping contract. `HIGH_FIDELITY` is the built-in roster. There is
 no per-agent code: a descriptor plus the shared ACP runtime is the whole integration.
 
 `acp/roster.py:build_registry(config)` assembles the live registry in precedence order:

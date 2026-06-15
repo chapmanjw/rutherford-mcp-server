@@ -103,6 +103,12 @@ class DescriptorRegistry:
 #: ~2.9s). Qoder AI's own installer drops the binary at ``~/.qoder/bin/qodercli/`` (NOT on PATH), so on a
 #: machine where ``qodercli`` is not PATH-resolvable, point the launch command at the full path via
 #: ``[agents.qoder] command = [...]`` -- or let ``discover`` find it.
+#:
+#: ``grok`` is xAI's Grok CLI (``grok agent stdio``); ACP-native with ``--model`` / ``--reasoning-effort``
+#: knobs. Connection-verified 2026-06-14: it spawns, handshakes, and opens a session (``doctor
+#: connect_only`` reports ``reachable``), but a full turn needs a SuperGrok Heavy entitlement -- without it
+#: the model call returns ``403 SuperGrok Heavy subscription required`` and ``doctor`` reports it as a turn
+#: error. So it is wired up and reachable; it answers once the account is entitled.
 HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("goose", "Goose", ("goose", "acp")),
     AgentDescriptor("opencode", "OpenCode", ("opencode", "acp")),
@@ -122,6 +128,7 @@ HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("hermes", "Hermes", ("hermes", "acp"), provider="nous"),
     AgentDescriptor("gemini", "Gemini CLI", ("gemini", "--acp"), provider="google"),
     AgentDescriptor("qoder", "Qoder", ("qodercli", "--acp"), provider="qoder"),
+    AgentDescriptor("grok", "Grok", ("grok", "agent", "stdio"), provider="xai"),
 )
 
 

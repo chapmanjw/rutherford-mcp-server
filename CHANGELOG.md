@@ -8,6 +8,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`grok` built-in agent (19 total) + a handshake-only connection check.** `grok` is xAI's Grok CLI
+  (`grok agent stdio`, provider `xai`), ACP-native with `--model` / `--reasoning-effort` knobs.
+  Connection-verified live: Rutherford spawns it, completes the ACP handshake, opens a session, and reads its
+  advertised models (`grok-build`, `grok-composer-2.5-fast`) — proving it can communicate with and configure
+  Grok. A *completed* turn additionally needs a SuperGrok subscription; without one the model call returns
+  `403 SuperGrok Heavy subscription required`. To make "reachable but not entitled" legible, `doctor` gains a
+  **`connect_only`** option (`doctor connect_only=true`) backed by a new `probe_connection` primitive: it does
+  the spawn + handshake + `new_session` only (no prompt) and reports `reachable` / `handshake_failed` /
+  `not_installed` plus each agent's advertised models — so an agent that connects but can't complete a turn
+  for a reason outside ACP (auth / entitlement / quota) shows as `reachable`, not a turn `error`. (Grok's
+  headless handshake auth can transiently fail "Authentication required" under rapid back-to-back spawns — an
+  xAI auth-refresh race, not a Rutherford fault; the live test retries it.)
 - **`discover`: registry-driven detection of installed ACP agents (a new tool + `python -m rutherford
   discover` CLI).** Fetches the community [ACP agent registry](https://agentclientprotocol.com/get-started/registry)
   (cached at `~/.rutherford/acp-registry.json` for offline reuse; the CDN needs a real User-Agent), detects

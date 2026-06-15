@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from rutherford import server
-from rutherford.acp.conformance import classify, probe_agent
+from rutherford.acp.conformance import classify, probe_agent, probe_connection
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import build_app_context
@@ -97,6 +97,73 @@ def test_probe_timeout_is_a_floor_not_an_override() -> None:
     # An explicit budget larger than the floor still wins -- the floor only RAISES a too-short default.
     assert _probe_timeout(OLLAMA, _LOCAL_PROBE_TIMEOUT_S + 120.0) == _LOCAL_PROBE_TIMEOUT_S + 120.0
     assert _probe_timeout(FAKE, 600.0) == 600.0
+
+
+async def test_probe_connection_reachable_with_models(monkeypatch: Any) -> None:
+    # The handshake-only check: spawn + initialize + new_session succeed, capturing the session + models.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "model-a,model-b")
+    report = await probe_connection(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.status == "reachable" and report.connected is True and report.installed is True
+    assert report.session_id == "fake-session-1"
+    assert report.models == ["model-a", "model-b"]  # the "configure" signal -- what you can set --model to
+
+
+async def test_probe_connection_reachable_without_models() -> None:
+    report = await probe_connection(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.status == "reachable" and report.connected is True and report.models == []
+
+
+async def test_probe_connection_handshake_failed() -> None:
+    report = await probe_connection(DEAD, cwd=str(REPO_ROOT), timeout_s=10.0)
+    assert report.status == "handshake_failed" and report.installed is True and report.connected is False
+
+
+async def test_probe_connection_not_installed() -> None:
+    report = await probe_connection(BAD, cwd=str(REPO_ROOT), timeout_s=10.0)
+    assert report.status == "not_installed" and report.installed is False and report.connected is False
+
+
+async def test_probe_connection_unexpected_error_is_a_clean_report(monkeypatch: Any) -> None:
+    async def _boom(_self: Any) -> None:
+        raise ValueError("kaboom")
+
+    monkeypatch.setattr("rutherford.acp.session.ACPSession.open", _boom)
+    report = await probe_connection(FAKE, cwd=str(REPO_ROOT), timeout_s=10.0)
+    # An unexpected open() fault is a structured `error` report (never raised out of the probe), and the
+    # session is torn down -- no leak.
+    assert report.status == "error" and report.connected is False and "kaboom" in report.detail
+
+
+async def test_probe_connection_cleans_up_then_propagates_cancellation(monkeypatch: Any) -> None:
+    import asyncio
+
+    closed: list[bool] = []
+
+    async def _cancel(_self: Any) -> None:
+        raise asyncio.CancelledError
+
+    async def _record_close(_self: Any) -> None:
+        closed.append(True)
+
+    monkeypatch.setattr("rutherford.acp.session.ACPSession.open", _cancel)
+    monkeypatch.setattr("rutherford.acp.session.ACPSession.close", _record_close)
+    with pytest.raises(asyncio.CancelledError):
+        await probe_connection(FAKE, cwd=str(REPO_ROOT), timeout_s=10.0)
+    assert closed  # cancellation tore the session down before propagating (never leaks the spawned process)
+
+
+async def test_doctor_connect_only_reports_reachable(monkeypatch: Any) -> None:
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "model-x")
+    app = build_app_context(config=RutherfordConfig(), descriptors=DescriptorRegistry([FAKE, BAD]))
+    # The connect_only reports are a uniform array, so the envelope round-trips through the TOON seam.
+    data = decode(await doctor_tool(app, connect_only=True, timeout_s=30.0))
+    by_id = {agent["agent_id"]: agent for agent in data["agents"]}
+    assert by_id["fake"]["status"] == "reachable" and by_id["fake"]["connected"] is True
+    assert by_id["fake"]["session_id"] == "fake-session-1" and by_id["fake"]["models"] == ["model-x"]
+    assert by_id["bad"]["status"] == "not_installed" and by_id["bad"]["connected"] is False
+    monkeypatch.setattr(server, "_APP", app)
+    wrapped = await server.doctor(connect_only=True, timeout_s=30.0)
+    assert "reachable" in wrapped
 
 
 async def test_doctor_budgets_a_cold_local_model(monkeypatch: Any) -> None:

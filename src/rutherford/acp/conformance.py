@@ -10,7 +10,10 @@ over ACP: it is the only trustworthy signal, since there is no cheap non-interac
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import tempfile
+import time
 
 from pydantic import BaseModel
 
@@ -19,7 +22,7 @@ from ..domain.error_codes import ErrorCode
 from ..domain.models import DelegationResult
 from .descriptors import AgentDescriptor
 from .permission import PermissionPolicy
-from .session import run_acp_turn
+from .session import ACPHandshakeError, ACPSession, run_acp_turn
 
 #: A trivial, side-effect-free prompt that any working agent should answer.
 _PROBE_PROMPT = "Respond with exactly the word: OK"
@@ -108,3 +111,105 @@ async def probe_agent(
     # cleanup -- so a residual temp dir is left for the OS to reap rather than crashing a successful probe.
     with tempfile.TemporaryDirectory(prefix="rutherford-acp-probe-", ignore_cleanup_errors=True) as probe_cwd:
         return await _probe_in(descriptor, probe_cwd, timeout_s)
+
+
+class ConnectionReport(BaseModel):
+    """The outcome of a handshake-only connection check: can Rutherford talk to and configure this agent?"""
+
+    agent_id: str
+    #: ``reachable`` (spawned, handshook, and opened a session) | ``handshake_failed`` (installed, but
+    #: initialize/new_session failed) | ``not_installed`` (the launch command was not found) | ``error`` (an
+    #: unexpected fault while opening).
+    status: str
+    installed: bool
+    #: Whether the handshake completed and a session was opened (the "communicate + configure" signal).
+    connected: bool
+    #: The agent's session id once opened (proof a session was created), else ``None``.
+    session_id: str | None
+    #: The model ids the agent advertised at open (what you can configure it with); ``[]`` when it offers none.
+    models: list[str]
+    detail: str
+    duration_s: float
+
+
+async def probe_connection(
+    descriptor: AgentDescriptor, *, cwd: str | None = None, timeout_s: float = 60.0
+) -> ConnectionReport:
+    """Open a session with ``descriptor``'s agent (handshake only, NO prompt) and report whether it connected.
+
+    The lighter cousin of :func:`probe_agent`: it spawns the agent and completes the ACP
+    ``initialize`` / ``new_session`` handshake -- proving Rutherford can *communicate with* and *configure*
+    the agent (it captures the session id and the agent's advertised models) -- but never sends a prompt. So
+    an agent that handshakes cleanly yet cannot complete a turn for a reason outside ACP (a model-side auth /
+    entitlement / quota failure, e.g. Grok without a SuperGrok subscription) reports ``reachable`` here, where
+    the full :func:`probe_agent` would report ``error`` on the turn. Like ``probe_agent`` it runs in an
+    isolated temp directory by default; pass ``cwd`` to use a specific one.
+    """
+    if cwd is not None:
+        return await _connect_in(descriptor, cwd, timeout_s)
+    with tempfile.TemporaryDirectory(prefix="rutherford-acp-connect-", ignore_cleanup_errors=True) as connect_cwd:
+        return await _connect_in(descriptor, connect_cwd, timeout_s)
+
+
+async def _connect_in(descriptor: AgentDescriptor, cwd: str, timeout_s: float) -> ConnectionReport:
+    """Open and immediately close a session, classifying the handshake outcome into a :class:`ConnectionReport`.
+
+    ``timeout_s`` is the per-handshake-step budget (so a generous local-model floor reaches the handshake, not
+    just the descriptor default). The session is ALWAYS torn down -- on the success path, on an unexpected
+    fault, and on cancellation -- so a probe never leaks the spawned agent process: ``open()`` closes itself
+    on an ``ACPHandshakeError``, and any other exit closes here before returning or propagating.
+    """
+    start = time.monotonic()
+    session = ACPSession(
+        descriptor, policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd=cwd, handshake_timeout_s=timeout_s
+    )
+    try:
+        await session.open()
+    except ACPHandshakeError as exc:
+        # open() already tore the session down on failure. SPAWN_FAILED = not installed; anything else
+        # (handshake / new_session) = installed but the handshake did not complete.
+        installed = exc.code is not ErrorCode.ACP_SPAWN_FAILED
+        return _connect_failure(
+            descriptor, "not_installed" if not installed else "handshake_failed", installed, exc.message, start
+        )
+    except asyncio.CancelledError:
+        # An OUTER cancel (e.g. the MCP client cancelling the doctor call) injected mid-open: open() may have
+        # spawned the agent already, so tear it down before propagating -- never leak on cancellation.
+        with contextlib.suppress(Exception):
+            await session.close()
+        raise
+    except Exception as exc:  # open() is designed to raise only ACPHandshakeError; anything else is unexpected
+        with contextlib.suppress(Exception):
+            await session.close()
+        return _connect_failure(descriptor, "error", True, f"unexpected error opening {descriptor.id}: {exc}", start)
+    try:
+        session_id, models = session.session_id, session.available_models
+    finally:
+        with contextlib.suppress(Exception):
+            await session.close()  # always close a successfully-opened session; a teardown fault is non-fatal
+    return ConnectionReport(
+        agent_id=descriptor.id,
+        status="reachable",
+        installed=True,
+        connected=True,
+        session_id=session_id,
+        models=models,
+        detail="spawn + handshake + session open succeeded (no prompt sent)",
+        duration_s=round(time.monotonic() - start, 3),
+    )
+
+
+def _connect_failure(
+    descriptor: AgentDescriptor, status: str, installed: bool, detail: str, start: float
+) -> ConnectionReport:
+    """A non-reachable :class:`ConnectionReport` (the agent did not open a session)."""
+    return ConnectionReport(
+        agent_id=descriptor.id,
+        status=status,
+        installed=installed,
+        connected=False,
+        session_id=None,
+        models=[],
+        detail=detail,
+        duration_s=round(time.monotonic() - start, 3),
+    )

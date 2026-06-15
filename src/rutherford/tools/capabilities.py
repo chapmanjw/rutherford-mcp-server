@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from ..acp.conformance import probe_agent
+from ..acp.conformance import probe_agent, probe_connection
 from ..acp.descriptors import AgentDescriptor
 from ..context import AppContext, tool_success
 from .common import ensure_known_agent
@@ -50,19 +50,35 @@ async def capabilities_tool(app: AppContext) -> str:
     return tool_success({"agents": agents})
 
 
-async def doctor_tool(app: AppContext, *, agent: str | None = None, timeout_s: float = 60.0) -> str:
+async def doctor_tool(
+    app: AppContext, *, agent: str | None = None, timeout_s: float = 60.0, connect_only: bool = False
+) -> str:
     """Probe each agent (or one named ``agent``) with a real read-only ACP round trip and report conformance.
 
     The only trustworthy health signal for an ACP agent: whether it spawns, handshakes, and answers. Probes
-    run in parallel; each report says working / no_answer / handshake_failed / not_installed / error.
+    run in parallel; each report says ok / no_answer / handshake_failed / not_installed / error.
     ``timeout_s`` is the per-agent budget; a LOCAL-model agent (Ollama / LM Studio) gets a generous floor over
     it, because a cold local model loads on its first prompt and the cloud default would false-flag it.
+
+    ``connect_only`` runs the LIGHTER handshake-only check instead: it opens a session (spawn + handshake, no
+    prompt) and reports ``reachable`` / ``handshake_failed`` / ``not_installed`` plus the agent's advertised
+    models -- proving Rutherford can talk to and configure the agent without a model call. Useful for an agent
+    that connects but cannot complete a turn for a reason outside ACP (an auth / entitlement / quota issue,
+    e.g. Grok without a SuperGrok subscription), which the full probe would report as a turn ``error``.
     """
     if agent is not None:
         ensure_known_agent(app.descriptors, agent)
         descriptors = [app.descriptors.get(agent)]
     else:
         descriptors = app.descriptors.all()
+    if connect_only:
+        connect_reports = await asyncio.gather(
+            *(
+                probe_connection(descriptor, timeout_s=_probe_timeout(descriptor, timeout_s))
+                for descriptor in descriptors
+            )
+        )
+        return tool_success({"agents": list(connect_reports)})
     reports = await asyncio.gather(
         *(probe_agent(descriptor, timeout_s=_probe_timeout(descriptor, timeout_s)) for descriptor in descriptors)
     )

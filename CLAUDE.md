@@ -54,7 +54,7 @@ domain + config            domain/, config/, io/   models, enums, errors, error 
 - **`AgentDescriptor` / `DescriptorRegistry` (`acp/descriptors.py`)** — a descriptor is the small
   declaration that replaces a subprocess adapter: an id, a display name, the launch `command` (the
   argv that starts the agent as an ACP server), an optional fixed `provider`, a `default_model`, a
-  handshake budget, and env overrides. `HIGH_FIDELITY` is the 16-agent built-in roster. The registry
+  handshake budget, and env overrides. `HIGH_FIDELITY` is the built-in roster. The registry
   is a closed, fail-fast id → descriptor mapping.
 
 - **`ACPSession` / `run_acp_turn` (`acp/session.py`)** — the reusable connection primitive. An
