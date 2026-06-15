@@ -733,8 +733,10 @@ class DebateRequest(BaseModel):
     #: An optional target to write the closing synthesis. Defaults to the first surviving voice when
     #: unset; pass a distinct CLI for an independent, non-participant judge.
     judge: Target | None = None
-    #: Persist this debate as a durable job (F2): a parent record plus a child record per voice/round,
-    #: under ``<jobs_dir>/``. ``None`` follows ``default_persistence``; ``True`` / ``False`` force it.
+    #: Persist this debate as a durable job (F2): a parent record plus the full ``transcript.md`` artifact,
+    #: under ``<jobs_dir>/``. A debate drives its turns over persistent sessions (not via ``delegate``), so
+    #: there are no per-turn child records -- the transcript carries the run. ``None`` follows
+    #: ``default_persistence``; ``True`` / ``False`` force it.
     persist: bool | None = None
     #: Suppress the suggest-a-job advisory notice when an external orchestrator already tracks this run.
     external_tracking: bool = False

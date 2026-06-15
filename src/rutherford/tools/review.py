@@ -32,8 +32,9 @@ async def review_tool(
 
     Built on the consensus service with the ``principal-reviewer`` role prepended to the review prompt.
     Review is CLAMPED to ``read_only`` -- it takes no ``safety_mode`` so the tool's name stays honest (an
-    inspection-named tool must not run with mutating permissions); a mutating run is ``delegate`` /
-    ``consensus`` by design. Provide either ``diff`` (a unified diff, inlined into the prompt) or ``paths``
+    inspection-named tool must not run with mutating permissions); mutating work runs through ``delegate`` (the
+    single sandboxed write path) by design -- the panels (consensus / debate) are read-only deliberation.
+    Provide either ``diff`` (a unified diff, inlined into the prompt) or ``paths``
     (files put in scope for the agents to read), and either a list of ``targets`` or a saved ``panel`` (with
     optional ``panel_overrides``); panel and targets are mutually exclusive. ``synthesize`` defaults on (a
     combined verdict is the useful default for a review); pass ``false`` for the raw per-voice reviews.
