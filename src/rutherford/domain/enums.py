@@ -136,6 +136,11 @@ class Strategy(StrEnum):
     WEIGHTED = "weighted"
     #: Compare the proposer's verdict against the parity counterweights; disagreement escalates.
     PARITY_PAIR = "parity-pair"
+    #: A two-round preference protocol (F4b): every voice answers, then ranks the OTHER answers
+    #: (anonymized, self-excluded); the panel aggregates the ballots by Borda mean-rank. Unlike the
+    #: one-shot tally strategies it runs a second round, so it is orchestrated by the consensus service,
+    #: not by ``aggregate`` -- the outcome is ``ranked`` (a clear winner) or ``tied`` (a top tie).
+    RANK = "rank"
 
 
 class Effort(StrEnum):

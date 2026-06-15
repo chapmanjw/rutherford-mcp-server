@@ -11,7 +11,10 @@ from rutherford.services.strategies import (
     aggregate,
     apply_stance,
     effective_diversity,
+    extract_ranking,
     extract_verdict,
+    rank_panel,
+    ranking_instruction,
     verdict_instruction,
 )
 
@@ -173,6 +176,108 @@ def test_stamp_dissent_is_honest_when_weight_overrides_head_count() -> None:
     assert verdicts[0].dissent is None  # the weight-winner is not a dissent
     assert verdicts[1].dissent == "minority: 2 of 3 voted 'no'; the panel majority 'yes'"
     assert verdicts[2].dissent == verdicts[1].dissent  # both 'no' voters carry the same honest head count
+
+
+# --- RANK: ballot extraction (F4b) -------------------------------------------
+
+
+def test_ranking_instruction_line_and_json_shapes() -> None:
+    line = ranking_instruction(["A", "B", "C"], None)
+    assert "RANK:" in line and "A, B, C" in line
+    js = ranking_instruction(["A", "B"], {"verdict": "string"})
+    assert '"ranking"' in js and "JSON" in js
+
+
+def test_extract_ranking_line_mode_normalizes_and_drops_unknown() -> None:
+    text = "I reason about it.\nRANK: b, a, c, z"  # z is not a candidate label
+    assert extract_ranking(text, None, ["A", "B", "C"]) == ["B", "A", "C"]  # upper-cased, z dropped
+
+
+def test_extract_ranking_line_mode_last_wins_and_dedupes() -> None:
+    text = "RANK: A, B\nthen on reflection\nRANK: C, A, A, B"  # last line wins; duplicate A collapses
+    assert extract_ranking(text, None, ["A", "B", "C"]) == ["C", "A", "B"]
+
+
+def test_extract_ranking_none_when_no_line() -> None:
+    assert extract_ranking("just prose, no ranking", None, ["A", "B"]) is None
+
+
+def test_extract_ranking_json_mode_last_object_with_a_list() -> None:
+    text = 'draft {"ranking": ["A", "B"]} then final {"ranking": ["B", "A"]}\n{"tokens": 9}'
+    assert extract_ranking(text, {"verdict": "string"}, ["A", "B"]) == ["B", "A"]
+
+
+# --- RANK: Borda aggregation (F4b) -------------------------------------------
+
+
+def _cands(*labels: str) -> list[tuple[str, str]]:
+    return [(label, "fake") for label in labels]
+
+
+def test_rank_panel_clear_winner_by_mean_rank() -> None:
+    # Three self-excluded ballots that agree A > B > C: A is ranked best by both voters who can rank it.
+    candidates = _cands("A", "B", "C")
+    ballots = [("A", ["B", "C"]), ("B", ["A", "C"]), ("C", ["A", "B"])]
+    outcome, decision, report = rank_panel(candidates, ballots)
+    assert outcome == "ranked" and decision == "A" and report.winner == "A"
+    leaderboard = {entry.label: entry for entry in report.leaderboard}
+    assert [entry.label for entry in report.leaderboard] == ["A", "B", "C"]  # sorted best-first
+    assert leaderboard["A"].rank == 1 and leaderboard["A"].mean_rank == 1.0 and leaderboard["A"].ballots == 2
+    assert leaderboard["B"].mean_rank == 1.5 and leaderboard["C"].mean_rank == 2.0
+    # Borda points: top of an L=2 ballot earns 2, bottom 1 -> A=4, B=3, C=2.
+    assert leaderboard["A"].borda_points == 4.0 and leaderboard["C"].borda_points == 2.0
+    assert report.ballots_cast == 3 and report.ballots_unparseable == 0
+
+
+def test_rank_panel_three_candidates_have_no_pairwise() -> None:
+    # With self-exclusion two voters share only the ONE candidate that is neither of them, so a 3-way panel
+    # has no pair with >=2 common answers -> no pairwise rows, concordance undefined. (Pairwise needs N>=4.)
+    _, _, report = rank_panel(_cands("A", "B", "C"), [("A", ["B", "C"]), ("B", ["A", "C"]), ("C", ["A", "B"])])
+    assert report.pairwise == [] and report.concordance is None
+
+
+def test_rank_panel_pairwise_and_concordance_when_voters_agree() -> None:
+    # Four self-excluded ballots all agreeing A>B>C>D: every comparable voter pair correlates +1.
+    candidates = _cands("A", "B", "C", "D")
+    ballots = [("A", ["B", "C", "D"]), ("B", ["A", "C", "D"]), ("C", ["A", "B", "D"]), ("D", ["A", "B", "C"])]
+    outcome, decision, report = rank_panel(candidates, ballots)
+    assert outcome == "ranked" and decision == "A"
+    assert all(pair.correlation == 1.0 for pair in report.pairwise) and report.concordance == 1.0
+    assert report.pairwise  # N=4 -> each pair shares N-2 = 2 candidates, so pairs ARE defined
+
+
+def test_rank_panel_total_disagreement_ties_with_negative_concordance() -> None:
+    # Two voters who reverse each other over the SAME three answers: correlation -1, a three-way mean-rank tie.
+    candidates = _cands("A", "B", "C", "D")
+    outcome, decision, report = rank_panel(candidates, [("V1", ["A", "B", "C"]), ("V2", ["C", "B", "A"])])
+    assert outcome == "tied" and decision is None and report.winner is None
+    assert sorted(report.tied_top) == ["A", "B", "C"]  # all three share mean rank 2.0
+    assert report.concordance == -1.0
+
+
+def test_rank_panel_pairwise_uses_relative_order_not_absolute_position() -> None:
+    # Two voters who AGREE on the order of their common answers (C < D < E) must correlate +1, even though one
+    # interleaves non-common answers (A, B) that push C/D/E to different absolute positions. Absolute-position
+    # Spearman would score this ~0.98; the dense re-rank of the common set restores the true 1.0.
+    candidates = _cands("A", "B", "C", "D", "E")
+    ballots = [("V1", ["A", "C", "B", "D", "E"]), ("V2", ["C", "D", "E"])]  # common {C,D,E}, same relative order
+    _, _, report = rank_panel(candidates, ballots)
+    pair = next(p for p in report.pairwise if {p.a, p.b} == {"V1", "V2"})
+    assert pair.common == 3 and pair.correlation == 1.0
+
+
+def test_rank_panel_below_quorum_is_no_quorum() -> None:
+    outcome, decision, report = rank_panel(_cands("A", "B"), [("A", ["B"])], min_quorum=2)
+    assert outcome == "no_quorum" and decision is None
+    assert report.ballots_cast == 1 and report.leaderboard == []
+
+
+def test_rank_panel_counts_an_unparseable_ballot() -> None:
+    # A voter whose ballot referenced no known candidate (already filtered to []) is counted, not silent.
+    candidates = _cands("A", "B", "C")
+    ballots = [("A", ["B", "C"]), ("B", ["A", "C"]), ("C", [])]  # voter C cast nothing usable
+    _, _, report = rank_panel(candidates, ballots)
+    assert report.ballots_cast == 2 and report.ballots_unparseable == 1
 
 
 # --- stance ------------------------------------------------------------------

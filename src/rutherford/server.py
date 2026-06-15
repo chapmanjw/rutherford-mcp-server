@@ -211,6 +211,7 @@ async def consensus(
     verdict_schema: dict[str, Any] | None = None,
     judge: Any | None = None,
     require_independent_judge: bool = False,
+    require_dissent: bool = False,
     stances: list[str] | None = None,
     expand_all: bool = False,
     working_dir: str | None = None,
@@ -236,9 +237,12 @@ async def consensus(
     optional `panel_overrides`) to reuse a stored roster + strategy instead of `targets`; they are mutually
     exclusive (see `reload_panels`). A `{cli, model}` target may
     also carry per-seat `role` / `label` / `weight` / `parity` / `stance`. With a `strategy` other than
-    `all-voices` (`unanimous` | `majority` | `plurality` | `weighted` | `parity-pair`, optionally with a
-    `verdict_schema`), each voice is asked for a verdict and the panel collapses to one outcome
-    (`StrategyResult`) instead of every voice. Optional `stances` (parallel to `targets`) steer each voice
+    `all-voices` (`unanimous` | `majority` | `plurality` | `weighted` | `parity-pair` | `rank`, optionally
+    with a `verdict_schema`), each voice is asked for a verdict and the panel collapses to one outcome
+    (`StrategyResult`) instead of every voice. `rank` is a two-round protocol (F4b): every voice answers, then
+    ranks the OTHER answers anonymized and self-excluded, aggregated by Borda mean-rank into a `rank`
+    leaderboard with a pairwise agreement matrix and concordance; `require_dissent` surfaces each non-winning
+    position on its `dissent`. Optional `stances` (parallel to `targets`) steer each voice
     and cannot combine with the auto-expanded panel. `synthesize` (defaults to `synthesize_default`, off
     out of the box) adds a server-side combined answer (`all-voices` only); `judge` names the seat that
     writes it. `timeout_s` applies to every voice; one failing voice is a failed result, never an aborted
@@ -267,6 +271,7 @@ async def consensus(
             verdict_schema=verdict_schema,
             judge=judge,
             require_independent_judge=require_independent_judge,
+            require_dissent=require_dissent,
             stances=stances,
             expand_all=expand_all,
             working_dir=working_dir,

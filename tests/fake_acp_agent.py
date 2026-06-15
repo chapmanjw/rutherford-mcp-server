@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from typing import Any
 
 from acp import PROTOCOL_VERSION, RequestError, run_agent
@@ -144,6 +145,22 @@ def _run_command(text: str) -> str | None:
     return line.strip() or None
 
 
+def _ranking_reply(text: str) -> str | None:
+    """A deterministic ``RANK:`` ballot when the prompt is a RANK ranking round, else ``None``.
+
+    Drives the RANK two-round protocol (F4b) without a real model: when the prompt carries the ranking
+    instruction, the agent reads the ``## <LABEL>`` candidate headers and ranks them in PRESENTED order
+    (top-to-bottom as shown). Since Rutherford anonymizes + shuffles each voter's ballot, presented order
+    is a per-voter permutation, so the panel still exercises the de-anonymization and Borda aggregation.
+    """
+    if "Rank ALL of these answers" not in text:
+        return None
+    labels = re.findall(r"(?m)^##\s+(\S+)\s*$", text)
+    if not labels:
+        return None
+    return "RANK: " + ", ".join(labels)
+
+
 def _advertised_models() -> SessionModelState | None:
     """The models this fake advertises at ``new_session``, from ``RUTHERFORD_FAKE_MODELS`` (comma-separated).
 
@@ -223,6 +240,12 @@ class FakeAgent:
             await self._client.session_update(
                 session_id, update_agent_message_text(f"session={session_id} resumed={resumed}")
             )
+            return PromptResponse(stop_reason="end_turn")
+        ranking = _ranking_reply(text)
+        if ranking is not None:
+            # RANK round 2 (F4b): rank the presented candidate labels in order. Checked before SAY so a
+            # ranking ballot is answered deterministically rather than echoed.
+            await self._client.session_update(session_id, update_agent_message_text(ranking))
             return PromptResponse(stop_reason="end_turn")
         env_answer = _env_answer(text)
         if env_answer is not None:

@@ -167,6 +167,9 @@ class RutherfordConfig(BaseModel):
     #: would be authored by a panel participant (name a non-participant judge). Off by default -- the per-call
     #: ``require_independent_judge`` is the usual opt-in; this is the workspace-wide default for binding verdicts.
     require_independent_judge: bool = False
+    #: Workspace-wide default for the RANK no-silent-dismissal surfacing (F4b, 7-G); the per-call
+    #: ``require_dissent`` is the usual opt-in. Off by default.
+    require_dissent: bool = False
     #: Opt-in: after a *successful* ``read_only`` or ``propose`` delegation whose working directory is
     #: a git repo, fingerprint the tree under ``working_dir`` before and after (status with
     #: ``--ignored=matching`` plus the unstaged and staged diffs, scoped to that subtree) and fail the

@@ -607,6 +607,10 @@ class ConsensusRequest(BaseModel):
     #: participant -- for a binding verdict, name a non-participant ``judge``. Opt-in (default off, so no
     #: behavior regression); when off, a self-authored synthesis still runs but is flagged ``self_authored``.
     require_independent_judge: bool = False
+    #: Surface the RANK losing/lowest-ranked positions and why (F4b, 7-G): when set, every non-winning
+    #: candidate is stamped with its standing on the ``dissent`` field so a minority position is first-class,
+    #: not buried in the matrix. Opt-in (default off); composes with ``require_dissent`` in config.
+    require_dissent: bool = False
     #: Persist this panel as a durable job (F2): a parent record plus a child record per voice, under
     #: ``<jobs_dir>/``. ``None`` follows ``default_persistence``; ``True`` / ``False`` force it.
     persist: bool | None = None
@@ -715,6 +719,61 @@ class VoiceVerdict(BaseModel):
     #: The effort tier this seat actually applied (F8a, 2-L), carried from the voice's result. ``None``
     #: when the adapter has no effort knob or no effort was requested.
     effort_applied: Effort | None = None
+    #: This answer's 1-based standing in the RANK leaderboard (F4b), 1 = best. ``None`` for every other
+    #: strategy and for a voice that failed round 1 (no answer to rank). Set from the :class:`RankReport`.
+    rank: int | None = None
+
+
+class RankEntry(BaseModel):
+    """One answer's standing in the RANK Borda leaderboard (F4b, 7-C).
+
+    ``mean_rank`` is the average 1-based ballot position this answer received across the voters who ranked
+    it (lower is better, so the leaderboard sorts ascending); ``borda_points`` is the summed Borda score
+    (a top placement on an ``L``-candidate ballot earns ``L`` points down to ``1``); ``ballots`` is how
+    many voters ranked it (every voter but its own author, minus any whose ballot was unparseable).
+    """
+
+    label: str
+    cli: str
+    rank: int
+    mean_rank: float
+    borda_points: float
+    ballots: int
+
+
+class PairwiseAgreement(BaseModel):
+    """Rank agreement between two voters' ballots over the answers they BOTH ranked (F4b, 7-F).
+
+    ``correlation`` is the Spearman rank correlation in ``[-1, 1]`` over the ``common`` answers both
+    voters ranked (``1`` = identical order, ``-1`` = reversed); only pairs with at least two common
+    answers are reported, since a correlation needs two points. The pairwise matrix is the panel's
+    disagreement map -- where two voters saw the field differently.
+    """
+
+    a: str
+    b: str
+    correlation: float
+    common: int
+
+
+class RankReport(BaseModel):
+    """The RANK strategy's structured outcome (F4b, 7-C): the leaderboard, pairwise matrix, and concordance.
+
+    ``concordance`` is the panel's overall agreement strength -- the mean of the pairwise rank
+    correlations (a Kendall's-W-style measure that tolerates the self-excluded, unequal-length ballots
+    that 7-E produces, where the textbook W is undefined). ``None`` when fewer than two comparable ballots
+    were cast. ``winner`` is the top label, ``None`` on a top tie (then ``tied_top`` lists the labels
+    within an epsilon of the best mean-rank). ``ballots_cast`` / ``ballots_unparseable`` account for how
+    many voters produced a usable ranking, so a thin aggregation is never silent.
+    """
+
+    leaderboard: list[RankEntry] = Field(default_factory=list)
+    winner: str | None = None
+    tied_top: list[str] = Field(default_factory=list)
+    pairwise: list[PairwiseAgreement] = Field(default_factory=list)
+    concordance: float | None = None
+    ballots_cast: int = 0
+    ballots_unparseable: int = 0
 
 
 class StrategyResult(BaseModel):
@@ -734,6 +793,9 @@ class StrategyResult(BaseModel):
     skipped: list[SkippedTarget] = Field(default_factory=list)
     #: Effective model/provider diversity across the answering voices (F3). ``None`` when none answered.
     diversity: DiversityReport | None = None
+    #: The RANK strategy's leaderboard / pairwise matrix / concordance (F4b). ``None`` for every other
+    #: strategy.
+    rank: RankReport | None = None
     #: Advisory, non-fatal notices for the caller (e.g. a suggestion to keep this panel as a job).
     notice: str | None = None
     #: The directory this panel was persisted to when kept as a job (parent + a child record per voice).

@@ -18,7 +18,7 @@ from rutherford.domain.enums import Effort, SafetyMode, Stance, Strategy
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import ConsensusRequest, ConsensusResult, StrategyResult, Target
-from rutherford.services.consensus import ConsensusService
+from rutherford.services.consensus import ConsensusService, _Candidate
 from rutherford.services.delegation import DelegationService
 from rutherford.tools.common import as_target, ensure_known_targets, parse_stances, parse_strategy
 from rutherford.tools.consensus import consensus_tool
@@ -334,6 +334,172 @@ async def test_strategy_weighted_and_parity_metadata_flow_through() -> None:
     proposer = next(v for v in result.voices if v.label == "proposer")
     assert proposer.weight == 3.0
     assert any(v.parity for v in result.voices)
+
+
+# --- RANK: the two-round preference protocol (F4b) ---------------------------
+
+
+def _rank_service(seed: int, config: RutherfordConfig | None = None, *, extra_dead: bool = False) -> ConsensusService:
+    import random
+
+    resolved = config or RutherfordConfig()
+    registry = _registry([DEAD] if extra_dead else None)
+    return ConsensusService(DelegationService(registry, resolved), registry, resolved, rng=random.Random(seed))
+
+
+def _rank_request() -> ConsensusRequest:
+    return ConsensusRequest(
+        targets=[Target(cli="fake")], prompt="what is 17 + 25?", strategy=Strategy.RANK, working_dir=str(REPO_ROOT)
+    )
+
+
+async def test_rank_runs_two_rounds_into_a_leaderboard() -> None:
+    # Three voices answer, then rank the others; the panel returns a RANK StrategyResult with a full
+    # leaderboard. The fake ranks in presented order, so the exact winner rides the (seeded) shuffle -- assert
+    # the structure the protocol guarantees, not a specific winner (the Borda math is unit-tested separately).
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake_a"), Target(cli="fake_b")],
+        prompt="what is 17 + 25?",
+        strategy=Strategy.RANK,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _rank_service(7).consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.strategy is Strategy.RANK and result.outcome in ("ranked", "tied")
+    assert result.rank is not None
+    assert result.rank.ballots_cast == 3 and result.rank.ballots_unparseable == 0
+    assert [entry.rank for entry in result.rank.leaderboard] == [1, 2, 3]  # a dense, ordered leaderboard
+    assert {entry.label for entry in result.rank.leaderboard} == {voice.label for voice in result.voices}
+    assert all(voice.rank is not None for voice in result.voices)  # every answer placed
+    # N=3 -> each voter pair shares only the one candidate that is neither of them, so no pairwise rows.
+    assert result.rank.pairwise == [] and result.rank.concordance is None
+
+
+async def test_rank_four_voices_have_a_pairwise_matrix() -> None:
+    # With four candidates each voter pair shares N-2 = 2 answers, so the pairwise agreement matrix is defined.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake_a"), Target(cli="fake_b"), Target(cli="fake")],
+        prompt="what is 17 + 25?",
+        strategy=Strategy.RANK,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _rank_service(3).consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.rank is not None and result.rank.pairwise  # at least one comparable pair
+    assert result.rank.concordance is not None
+
+
+async def test_rank_self_exclusion_and_anonymization_in_the_ballot() -> None:
+    # A voter's ballot withholds its OWN answer (7-E) and presents the others under anonymous A/B/.. labels
+    # (7-D); the returned map de-anonymizes back to the real candidate labels.
+    service = _rank_service(0)
+    candidates = [
+        _Candidate(pos=0, target_index=0, label="alpha", cli="fake", model=None, text="ANSWER-ALPHA", provenance=None),
+        _Candidate(pos=1, target_index=1, label="beta", cli="fake", model=None, text="ANSWER-BETA", provenance=None),
+        _Candidate(pos=2, target_index=2, label="gamma", cli="fake", model=None, text="ANSWER-GAMMA", provenance=None),
+    ]
+    voter, prompt, anon_to_label = service._ballot_plan(_rank_request(), candidates[0], candidates)
+    assert voter is candidates[0]
+    assert "ANSWER-ALPHA" not in prompt  # self-excluded: the voter never sees its own answer
+    assert "ANSWER-BETA" in prompt and "ANSWER-GAMMA" in prompt
+    assert set(anon_to_label.values()) == {"beta", "gamma"}  # the two OTHERS, anonymized
+    assert set(anon_to_label.keys()) <= {"A", "B"}  # anonymous labels, in presentation order
+
+
+async def test_rank_below_two_answers_is_no_quorum() -> None:
+    # Only one voice answers (the other handshake-fails), so there is nothing to rank against -> no_quorum.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="dead")],
+        prompt="what is 17 + 25?",
+        strategy=Strategy.RANK,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _rank_service(0, extra_dead=True).consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.outcome == "no_quorum" and result.decision is None and result.rank is None
+    by_cli = {voice.cli: voice for voice in result.voices}
+    assert by_cli["dead"].no_verdict_reason == "failed" and by_cli["dead"].rank is None
+
+
+def test_rank_verdicts_stamp_dissent_on_non_winners_when_required() -> None:
+    # F4b (7-G): with require_dissent, every non-winning candidate is stamped with its standing (reusing the
+    # F4a dissent field); the winner and -- when require_dissent is off -- everyone are left clean.
+    from rutherford.domain.models import DelegationResult, RankEntry, RankReport
+
+    service = _rank_service(0)
+    targets = [Target(cli="fake"), Target(cli="fake"), Target(cli="fake")]
+    voices = [DelegationResult(target=Target(cli="fake"), ok=True, text=f"answer {i}") for i in range(3)]
+    candidates = service._rank_candidates(targets, voices)  # labels fake#1 / fake#2 / fake#3
+    leaderboard = {
+        candidates[0].label: RankEntry(
+            label=candidates[0].label, cli="fake", rank=1, mean_rank=1.0, borda_points=4, ballots=2
+        ),
+        candidates[1].label: RankEntry(
+            label=candidates[1].label, cli="fake", rank=2, mean_rank=1.5, borda_points=3, ballots=2
+        ),
+        candidates[2].label: RankEntry(
+            label=candidates[2].label, cli="fake", rank=3, mean_rank=2.0, borda_points=2, ballots=2
+        ),
+    }
+    report = RankReport(leaderboard=list(leaderboard.values()), winner=candidates[0].label)
+
+    stamped = service._rank_verdicts(targets, voices, candidates, leaderboard, report, require_dissent=True)
+    expected = f"ranked #2 of 3 (mean rank 1.5); the panel ranked {candidates[0].label!r} first"
+    assert stamped[0].rank == 1 and stamped[0].dissent is None  # the winner is not dissent
+    assert stamped[1].rank == 2 and stamped[1].dissent == expected
+    assert stamped[2].dissent is not None and "#3 of 3" in stamped[2].dissent
+
+    quiet = service._rank_verdicts(targets, voices, candidates, leaderboard, report, require_dissent=False)
+    assert all(voice.dissent is None for voice in quiet)  # off by default: ranks set, no dissent stamped
+
+
+async def test_rank_on_budget_continue_still_runs_the_ranking_round() -> None:
+    # With on_budget="continue" the budget is advisory: even a budget far too small for two rounds still runs
+    # the ranking round. Without the fix the round-2 budget skip would collapse this to no_quorum (0 ballots).
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake_a"), Target(cli="fake_b")],
+        prompt="what is 17 + 25?",
+        strategy=Strategy.RANK,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=0.01,
+        on_budget="continue",
+    )
+    result = await _rank_service(5).consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.rank is not None and result.rank.ballots_cast == 3  # round 2 ran despite the tiny budget
+    assert result.outcome in ("ranked", "tied")
+
+
+async def test_rank_skips_round_two_when_the_budget_is_already_spent() -> None:
+    # A binding budget spent in round 1 skips the ranking round entirely (every ballot empty), so a RANK panel
+    # never overruns its budget by a whole second round. Driven deterministically via a past mono_start.
+    import time
+
+    service = _rank_service(0)
+    candidates = [
+        _Candidate(pos=0, target_index=0, label="a", cli="fake", model=None, text="A", provenance=None),
+        _Candidate(pos=1, target_index=1, label="b", cli="fake", model=None, text="B", provenance=None),
+    ]
+    ballots = await service._collect_ballots(
+        _rank_request(), candidates, base_depth=0, on_activity=None, budget=0.5, mono_start=time.monotonic() - 100
+    )
+    assert ballots == [("a", []), ("b", [])]  # no ranking turns run; both ballots empty (unparseable)
+
+
+async def test_rank_tool_and_server_wiring(monkeypatch: Any) -> None:
+    out = await consensus_tool(
+        _app(),
+        prompt="what is 17 + 25?",
+        targets=["fake", "fake_a", "fake_b"],
+        strategy="rank",
+        working_dir=str(REPO_ROOT),
+    )
+    assert "rank" in out and ("ranked" in out or "tied" in out)
+    monkeypatch.setattr(server, "_APP", _app())
+    wrapped = await server.consensus(
+        prompt="what is 17 + 25?", targets=["fake", "fake_a", "fake_b"], strategy="rank", working_dir=str(REPO_ROOT)
+    )
+    assert "leaderboard" in wrapped
 
 
 # --- failed-voice edges ------------------------------------------------------

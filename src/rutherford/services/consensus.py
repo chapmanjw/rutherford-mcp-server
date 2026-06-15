@@ -17,10 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import string
 import time
 import uuid
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..acp.cooldown import CooldownTracker
@@ -43,6 +46,8 @@ from ..domain.models import (
     PanelInputs,
     PanelTarget,
     Provenance,
+    RankEntry,
+    RankReport,
     RunRollup,
     SkippedTarget,
     StrategyResult,
@@ -54,9 +59,31 @@ from ..io.ledger import RunLedger
 from ..runtime.depth import ensure_within_aggregate_cap
 from .delegation import ActivityCallback, DelegationService, PanelLifecycle, emit_activity
 from .persistence import PanelVoice, render_panel_voice_files, write_panel_record
-from .strategies import aggregate, apply_stance, effective_diversity, extract_verdict, verdict_instruction
+from .strategies import (
+    aggregate,
+    apply_stance,
+    effective_diversity,
+    extract_ranking,
+    extract_verdict,
+    rank_panel,
+    ranking_instruction,
+    verdict_instruction,
+)
 
 _log = logging.getLogger("rutherford.services.consensus")
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    """One answer that RANK is ranking: its position, the seat it came from, and its display identity."""
+
+    pos: int
+    target_index: int
+    label: str
+    cli: str
+    model: str | None
+    text: str
+    provenance: Provenance | None
 
 
 class ConsensusService:
@@ -71,10 +98,14 @@ class ConsensusService:
         cooldown: CooldownTracker | None = None,
         ledger: RunLedger | None = None,
         clock: Callable[[], float] = time.time,
+        rng: random.Random | None = None,
     ) -> None:
         self._delegation = delegation
         self._descriptors = descriptors
         self._config = config
+        #: The RNG that anonymizes + shuffles each RANK ballot (F4b, 7-D). Injectable so a test can pin the
+        #: shuffle with a seeded ``random.Random``; defaults to an unseeded instance in production.
+        self._rng = rng or random.Random()
         #: The durable run ledger (F2) for the panel's parent record; ``None`` disables persistence. The
         #: per-voice child records are written by the delegation service as each voice runs.
         self._ledger = ledger
@@ -144,6 +175,7 @@ class ConsensusService:
                 "delegate (a single sandboxed agent) for write / propose work.",
             )
         created_at = self._clock()
+        mono_start = time.monotonic()  # for the RANK round-2 deadline (the time budget spans both rounds)
         persist = self._config.wants_persist(req.persist)
         # When persisting, mint the parent id up front so each voice can be written as its child (F2). When not
         # persisting (or no ledger), the voices never self-persist (no orphan per-voice records).
@@ -203,12 +235,23 @@ class ConsensusService:
         topology = self._topology(declared, voices, over_cap)
 
         effective_synthesize = req.synthesize if req.synthesize is not None else self._config.synthesize_default
-        if req.strategy is not Strategy.ALL_VOICES:
+        if req.strategy is Strategy.RANK:
+            # RANK is a two-round protocol (F4b): the answers are in; now run the anonymized ranking round.
+            # ``on_budget="continue"`` makes the budget advisory (round 1 ran every voice to completion), so the
+            # ranking round must NOT be budget-skipped either -- pass no budget so round 2 always runs too.
+            on_budget = req.on_budget if req.on_budget is not None else self._config.default_on_budget
+            rank_budget = None if on_budget == "continue" else budget
+            strategy_result = await self._rank(
+                req, targets, voices, skipped, base_depth, on_activity, rank_budget, mono_start
+            )
+            answer = strategy_result.decision or strategy_result.outcome
+            result: ConsensusResult | StrategyResult = strategy_result
+        elif req.strategy is not Strategy.ALL_VOICES:
             strategy_result = self._aggregate(req, targets, voices, skipped)
             # The parent record's headline answer for a strategy panel is the decision (or, absent one, the
             # outcome category) so a reader opening state.json sees the panel's verdict, not "(no synthesis)".
             answer = strategy_result.decision or strategy_result.outcome
-            result: ConsensusResult | StrategyResult = strategy_result
+            result = strategy_result
         else:
             synthesis, synthesis_by, self_authored = await self._maybe_synthesize(req, voices, base_depth)
             answer = synthesis or "(no synthesis -- see the linked voice records)"
@@ -714,9 +757,13 @@ class ConsensusService:
         return included, skipped
 
     def _voice_prompt(self, req: ConsensusRequest, target: Target, index: int) -> str:
-        """The prompt for one voice: the question, stance-steered, plus a verdict ask under a strategy."""
+        """The prompt for one voice: the question, stance-steered, plus a verdict ask under a tally strategy.
+
+        RANK's first round is a plain answer (no verdict line) -- the ranking ask comes in its second round
+        once every answer is in -- so only the one-shot tally strategies append the verdict instruction.
+        """
         prompt = apply_stance(req.prompt, _stance_for(target, req.stances, index))
-        if req.strategy is not Strategy.ALL_VOICES:
+        if req.strategy not in (Strategy.ALL_VOICES, Strategy.RANK):
             prompt = f"{prompt}\n\n{verdict_instruction(req.verdict_schema)}"
         return prompt
 
@@ -767,6 +814,232 @@ class ConsensusService:
             skipped=skipped,
             diversity=self._diversity(voices),
         )
+
+    async def _rank(
+        self,
+        req: ConsensusRequest,
+        targets: list[Target],
+        voices: list[DelegationResult],
+        skipped: list[SkippedTarget],
+        base_depth: int,
+        on_activity: ActivityCallback | None,
+        budget: float | None,
+        mono_start: float,
+    ) -> StrategyResult:
+        """RANK's second round (F4b): each answering voice ranks the OTHERS, Borda-aggregated into a leaderboard.
+
+        Round 1 already collected the answers (``voices``). Here every answering voice is shown the other
+        answers under shuffled anonymous labels (7-D) with its OWN answer withheld (7-E) and asked to rank
+        them; the ballots are de-anonymized and reduced by :func:`rank_panel`. A panel with fewer than two
+        answers (or below ``min_quorum``) cannot rank and is ``no_quorum``. The time budget, if any, spans
+        both rounds: when it is already spent the ranking round is skipped (every ballot empty), so a RANK
+        panel never overruns its budget by a whole second round.
+        """
+        candidates = self._rank_candidates(targets, voices)
+        require_dissent = req.require_dissent or self._config.require_dissent
+        if len(candidates) < 2 or len(candidates) < self._config.min_quorum:
+            return StrategyResult(
+                strategy=Strategy.RANK,
+                outcome="no_quorum",
+                decision=None,
+                voices=self._rank_verdicts(targets, voices, candidates, {}, None, require_dissent),
+                skipped=skipped,
+                diversity=self._diversity(voices),
+            )
+        ballots = await self._collect_ballots(req, candidates, base_depth, on_activity, budget, mono_start)
+        outcome, decision, report = rank_panel(
+            [(cand.label, cand.cli) for cand in candidates], ballots, min_quorum=self._config.min_quorum
+        )
+        leaderboard = {entry.label: entry for entry in report.leaderboard}
+        return StrategyResult(
+            strategy=Strategy.RANK,
+            outcome=outcome,
+            decision=decision,
+            voices=self._rank_verdicts(targets, voices, candidates, leaderboard, report, require_dissent),
+            skipped=skipped,
+            diversity=self._diversity(voices),
+            rank=report,
+        )
+
+    def _rank_candidates(self, targets: list[Target], voices: list[DelegationResult]) -> list[_Candidate]:
+        """The answering voices, as the candidates RANK ranks (failed round-1 voices are not candidates)."""
+        answering = [(index, voice) for index, voice in enumerate(voices) if voice.ok and voice.text.strip()]
+        labels = _unique_labels([targets[index].display_label for index, _ in answering])
+        return [
+            _Candidate(
+                pos=pos,
+                target_index=index,
+                label=labels[pos],
+                cli=targets[index].cli,
+                model=voice.target.model,
+                text=voice.text,
+                provenance=voice.provenance,
+            )
+            for pos, (index, voice) in enumerate(answering)
+        ]
+
+    async def _collect_ballots(
+        self,
+        req: ConsensusRequest,
+        candidates: list[_Candidate],
+        base_depth: int,
+        on_activity: ActivityCallback | None,
+        budget: float | None,
+        mono_start: float,
+    ) -> list[tuple[str, list[str]]]:
+        """Run the ranking turn for each candidate in parallel and de-anonymize each ballot to real labels.
+
+        When a time budget already elapsed in round 1 the ranking round is skipped entirely (every ballot
+        empty -> ``no_quorum``); otherwise the turns run to completion under each voice's own ``timeout_s``.
+        A turn that fails or yields no parseable ranking becomes an empty ballot, counted (never silent) by
+        :func:`rank_panel` as unparseable.
+        """
+        if budget is not None and budget - (time.monotonic() - mono_start) <= 0:
+            return [(candidate.label, []) for candidate in candidates]
+        plans = [self._ballot_plan(req, candidate, candidates) for candidate in candidates]
+        texts = await asyncio.gather(
+            *(self._ranking_turn(req, candidate, prompt, base_depth, on_activity) for candidate, prompt, _ in plans)
+        )
+        ballots: list[tuple[str, list[str]]] = []
+        for (candidate, _prompt, anon_to_label), text in zip(plans, texts, strict=True):
+            anon = extract_ranking(text, req.verdict_schema, list(anon_to_label.keys())) or []
+            ballots.append((candidate.label, [anon_to_label[label] for label in anon]))
+        return ballots
+
+    def _ballot_plan(
+        self, req: ConsensusRequest, voter: _Candidate, candidates: list[_Candidate]
+    ) -> tuple[_Candidate, str, dict[str, str]]:
+        """Build one voter's ranking prompt: the OTHER answers, anonymized + shuffled, and the anon->label map.
+
+        Self-exclusion (7-E): the voter never sees or ranks its own answer. Anonymization + per-voter shuffle
+        (7-D): the others are relabelled A/B/C in a freshly shuffled order, so neither identity nor position
+        leaks the source. The returned map de-anonymizes the voter's ballot back to the real candidate labels.
+        """
+        others = [cand for cand in candidates if cand.pos != voter.pos]
+        shuffled = list(others)
+        self._rng.shuffle(shuffled)
+        anon_labels = _anon_labels(len(shuffled))
+        anon_to_label = {anon: cand.label for anon, cand in zip(anon_labels, shuffled, strict=True)}
+        block = "\n\n".join(f"## {anon}\n{cand.text.strip()}" for anon, cand in zip(anon_labels, shuffled, strict=True))
+        prompt = (
+            "Several AI coding agents answered the same question. Below are the OTHER answers (not your "
+            "own), anonymized. Read them and rank them by quality, best to worst.\n\n"
+            f"Question:\n{req.prompt}\n\nAnswers:\n\n{block}\n\n{ranking_instruction(anon_labels, req.verdict_schema)}"
+        )
+        return voter, prompt, anon_to_label
+
+    async def _ranking_turn(
+        self,
+        req: ConsensusRequest,
+        voter: _Candidate,
+        prompt: str,
+        base_depth: int,
+        on_activity: ActivityCallback | None,
+    ) -> str:
+        """Run one voter's ranking turn (read-only, one level deeper) and return its answer text, or ``""``.
+
+        Emits this seat's ``voice_started`` / ``voice_finished`` under a ``rank:<pos>`` correlation id so the
+        ranking round is visible in the live activity view (item 3, 7-F). A failed turn returns ``""`` -- an
+        empty ballot, recorded as unparseable rather than aborting the round.
+        """
+        if not self._descriptors.has(voter.cli):
+            return ""
+        descriptor = self._descriptors.get(voter.cli)
+        cwd = req.working_dir or str(Path.cwd())
+        timeout_s = req.timeout_s or self._config.default_timeout_s
+        emit_activity(
+            on_activity,
+            ActivityEvent(
+                kind=ActivityEventKind.VOICE_STARTED,
+                correlation_id=f"rank:{voter.pos}",
+                cli=voter.cli,
+                model=voter.model,
+                role=req.role,
+                depth=base_depth,
+                status="started",
+                message=f"{voter.label} ranking started",
+            ),
+        )
+        async with self._delegation.semaphore:
+            result = await run_acp_turn(
+                descriptor,
+                prompt,
+                policy=PermissionPolicy(SafetyMode.READ_ONLY),
+                cwd=cwd,
+                timeout_s=timeout_s,
+                model=voter.model,
+                base_depth=base_depth + 1,
+            )
+        emit_activity(
+            on_activity,
+            ActivityEvent(
+                kind=ActivityEventKind.VOICE_FINISHED,
+                correlation_id=f"rank:{voter.pos}",
+                cli=voter.cli,
+                model=result.target.model,
+                role=req.role,
+                status="ok" if result.ok else "failed",
+                elapsed_s=result.duration_s,
+                depth=base_depth,
+                message=f"{voter.label} ranking {'ok' if result.ok else 'failed'}",
+            ),
+        )
+        return result.text if result.ok else ""
+
+    def _rank_verdicts(
+        self,
+        targets: list[Target],
+        voices: list[DelegationResult],
+        candidates: list[_Candidate],
+        leaderboard: dict[str, RankEntry],
+        report: RankReport | None,
+        require_dissent: bool,
+    ) -> list[VoiceVerdict]:
+        """Project the panel into RANK :class:`VoiceVerdict`s: each candidate's standing, each failure visible.
+
+        An answering voice carries its leaderboard ``rank``; a voice that failed round 1 stays in the list
+        with ``no_verdict_reason="failed"`` and no rank (it was never a candidate). When ``require_dissent``
+        is set and a clear winner emerged, every non-winning candidate is stamped with its standing (7-G,
+        reusing the F4a ``dissent`` field) so a losing position is surfaced, not buried in the matrix.
+        """
+        by_index = {cand.target_index: cand for cand in candidates}
+        winner = report.winner if report is not None else None
+        total = len(candidates)
+        verdicts: list[VoiceVerdict] = []
+        for index, voice in enumerate(voices):
+            cand = by_index.get(index)
+            if cand is None:
+                verdicts.append(
+                    VoiceVerdict(
+                        label=targets[index].display_label,
+                        cli=targets[index].cli,
+                        model=voice.target.model,
+                        ok=voice.ok,
+                        no_verdict_reason="failed",
+                        text=voice.text,
+                        provenance=voice.provenance,
+                    )
+                )
+                continue
+            entry = leaderboard.get(cand.label)
+            dissent: str | None = None
+            if require_dissent and winner is not None and entry is not None and entry.rank > 1:
+                dissent = (
+                    f"ranked #{entry.rank} of {total} (mean rank {entry.mean_rank}); the panel ranked {winner!r} first"
+                )
+            verdicts.append(
+                VoiceVerdict(
+                    label=cand.label,
+                    cli=cand.cli,
+                    model=cand.model,
+                    ok=True,
+                    text=cand.text,
+                    provenance=cand.provenance,
+                    rank=entry.rank if entry is not None else None,
+                    dissent=dissent,
+                )
+            )
+        return verdicts
 
     def _diversity(self, voices: list[DelegationResult]) -> DiversityReport | None:
         """Effective model/provider diversity across the voices that ANSWERED (ok with non-empty text), or None.
@@ -876,6 +1149,25 @@ def _stamp_dissent(verdicts: list[VoiceVerdict], outcome: str, decision: str | N
                 f"minority: {tally[verdict.verdict]} of {len(eligible)} voted {verdict.verdict!r}; "
                 f"the panel {outcome} {decision!r}"
             )
+
+
+def _unique_labels(labels: list[str]) -> list[str]:
+    """Suffix ``#n`` to repeated display labels so two same-(cli, model) answers stay distinct on the leaderboard."""
+    duplicated = {label for label in labels if labels.count(label) > 1}
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for label in labels:
+        if label in duplicated:
+            seen[label] = seen.get(label, 0) + 1
+            out.append(f"{label}#{seen[label]}")
+        else:
+            out.append(label)
+    return out
+
+
+def _anon_labels(count: int) -> list[str]:
+    """``count`` single-letter anonymous ballot labels (A, B, ...), falling back to ``L<k>`` past 26."""
+    return [string.ascii_uppercase[index] if index < 26 else f"L{index + 1}" for index in range(count)]
 
 
 def _fail_voice(target: Target, req: ConsensusRequest, code: ErrorCode, message: str) -> DelegationResult:
