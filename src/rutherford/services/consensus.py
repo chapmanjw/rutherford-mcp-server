@@ -328,18 +328,11 @@ class ConsensusService:
         panel_voices = [_panel_voice(voice) for voice in voices]
         skipped_pairs = [(entry.cli, entry.reason) for entry in skipped]
         panel_inputs = PanelInputs(
-            targets=[
-                PanelTarget(
-                    cli=voice.target.cli,
-                    model=voice.target.model,
-                    stance=_stance_for(voice.target, req.stances, index),
-                    session_id=voice.session_id,
-                )
-                for index, voice in enumerate(voices)
-            ],
+            targets=[self._panel_target(req, index, voice) for index, voice in enumerate(voices)],
             strategy=req.strategy.value,
             synthesize=synthesize,
             judge=req.judge.display_label if req.judge else None,
+            verdict_schema=req.verdict_schema,
         )
         return write_panel_record(
             self._ledger,
@@ -359,7 +352,27 @@ class ConsensusService:
             stop_reason=stop_reason,
             rollup=rollup,
             topology=topology,
+            continued_from=req.continued_from,
             extra_artifacts=render_panel_voice_files(panel_voices, skipped_pairs),
+        )
+
+    def _panel_target(self, req: ConsensusRequest, index: int, voice: DelegationResult) -> PanelTarget:
+        """One seat's persisted roster entry (item 9 continuation): resolved (cli, model) + the seat's steering.
+
+        The resolved ``(cli, model)`` and resume ``session_id`` come from the voice's result; the steering
+        (stance / weight / parity / role) is read from the ORIGINAL seat ``req.targets[index]`` -- the resolved
+        ``voice.target`` is a bare pair -- so a strategy-panel continuation replays the seat faithfully. An
+        auto-expanded panel has no explicit seat (``req.targets`` empty), so those default.
+        """
+        seat = req.targets[index] if index < len(req.targets) else None
+        return PanelTarget(
+            cli=voice.target.cli,
+            model=voice.target.model,
+            stance=_stance_for(seat or voice.target, req.stances, index),
+            session_id=voice.session_id,
+            weight=seat.effective_weight if seat is not None else 1.0,
+            parity=seat.is_parity if seat is not None else False,
+            role=seat.role if seat is not None else None,
         )
 
     def _topology(self, declared: int, voices: list[DelegationResult], over_cap: bool) -> Topology:
@@ -428,6 +441,10 @@ class ConsensusService:
         the lineage/depth env -- so the panel's fan-out is both bounded and visible. When the panel persists
         (``parent_run_id`` set), the voice is written as a child leaf record of the parent (F2).
         """
+        if _resume_missing(req, index):
+            # item 9: in a continuation this seat had no recorded session to resume -- it is a RESUME_FAILED
+            # voice, never silently cold-started as a fresh (un-continued) answer.
+            return _fail_voice(target, req, ErrorCode.RESUME_FAILED, _no_session_message(target))
         request = DelegationRequest(
             target=target,
             prompt=self._voice_prompt(req, target, index),
@@ -438,6 +455,8 @@ class ConsensusService:
             safety_mode=req.safety_mode,
             timeout_s=req.timeout_s,
             effort=req.effort,  # the panel's producer-effort cap flows to every voice (F8a)
+            # item 9 panel continuation: resume this seat's prior session where one was recorded.
+            session_id=_resume_id(req, index),
             # When the panel persists, each voice is a child record under the parent (F2); when it does not,
             # the voice never self-persists (no orphan per-voice records).
             persist=parent_run_id is not None,
@@ -467,10 +486,11 @@ class ConsensusService:
                 model=target.model,
                 effort=req.effort,
                 base_depth=base_depth,
+                resume_session_id=_resume_id(req, index),  # item 9: resume this seat under a budget too
             )
             if self._descriptors.has(target.cli)
             else None
-            for target in targets
+            for index, target in enumerate(targets)
         ]
         start = time.monotonic()
         tasks = [
@@ -542,6 +562,11 @@ class ConsensusService:
         ``max_concurrency``) and emits its own ``voice_started`` / ``voice_finished`` so it appears in the
         live activity stream like a non-budgeted voice.
         """
+        if _resume_missing(req, index):
+            # item 9 continuation: no recorded session to resume -> a RESUME_FAILED voice, not a cold start.
+            result = _fail_voice(target, req, ErrorCode.RESUME_FAILED, _no_session_message(target))
+            self._emit_voice_finished(on_activity, index, result, target, req, base_depth)
+            return result
         if session is None:
             known = ", ".join(self._descriptors.ids()) or "(none)"
             return _fail_voice(
@@ -1215,6 +1240,22 @@ def _stance_for(target: Target, stances: list[Stance] | None, index: int) -> Sta
     if target.stance is not None:
         return target.stance
     return stances[index] if stances else None
+
+
+def _resume_id(req: ConsensusRequest, index: int) -> str | None:
+    """The resume session handle for voice ``index`` (item 9 panel continuation), or ``None`` for a fresh run."""
+    handles = req.resume_session_ids
+    return handles[index] if handles is not None and index < len(handles) else None
+
+
+def _resume_missing(req: ConsensusRequest, index: int) -> bool:
+    """True when this is a continuation (``resume_session_ids`` set) but this seat has no handle to resume."""
+    return req.resume_session_ids is not None and _resume_id(req, index) is None
+
+
+def _no_session_message(target: Target) -> str:
+    """The RESUME_FAILED message for a continuation seat that the parent recorded no session for."""
+    return f"{target.cli} has no recorded session to continue (the seat established none in the original panel)"
 
 
 def _panel_voice(voice: DelegationResult) -> PanelVoice:

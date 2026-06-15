@@ -622,6 +622,14 @@ class ConsensusRequest(BaseModel):
     #: over-count under ``majority`` / ``plurality`` / ``weighted``. Off by default (it changes outcomes for
     #: correlated panels); composes with ``discount_correlated_votes`` in config.
     discount_correlated: bool = False
+    #: Per-voice resume handles, parallel to ``targets`` (item 9 panel continuation): when set, each voice
+    #: resumes its prior ACP session (``session/load``) so the panel continues a kept consensus job instead of
+    #: starting cold. A seat whose agent cannot reload (or whose handle is ``None``) is a clean ``RESUME_FAILED``
+    #: voice, recorded not silently dropped. ``None`` for a fresh panel.
+    resume_session_ids: list[str | None] | None = None
+    #: The run id this panel CONTINUES (item 9): stamped onto the persisted parent's ``continued_from`` so the
+    #: continuation chain is traceable. ``None`` for a non-continuation panel.
+    continued_from: str | None = None
     #: Persist this panel as a durable job (F2): a parent record plus a child record per voice, under
     #: ``<jobs_dir>/``. ``None`` follows ``default_persistence``; ``True`` / ``False`` force it.
     persist: bool | None = None
@@ -890,6 +898,14 @@ class DebateRequest(BaseModel):
     #: the configured tolerance). Off by default (a debate is free-form argument); on, it adds the termination
     #: grammar and a populated ``outcome``.
     track_convergence: bool = False
+    #: Per-seat resume handles, parallel to ``targets`` (item 9 panel continuation): when set, each seat
+    #: resumes its prior ACP session so the debate CONTINUES a kept debate job -- the agent recalls the prior
+    #: argument and ``rounds`` more rounds are run. A seat whose agent cannot reload is a failed contribution,
+    #: recorded not silently dropped. ``None`` for a fresh debate.
+    resume_session_ids: list[str | None] | None = None
+    #: The run id this debate CONTINUES (item 9): stamped onto the persisted parent's ``continued_from`` so the
+    #: continuation chain is traceable. ``None`` for a non-continuation debate.
+    continued_from: str | None = None
 
 
 class DebateContribution(BaseModel):
@@ -1076,7 +1092,7 @@ class Job(BaseModel):
 
 
 class PanelTarget(BaseModel):
-    """One seat of a persisted panel's resolved roster: the CLI, its model, stance, and resume handle."""
+    """One seat of a persisted panel's resolved roster: the CLI, its model, stance, steering, and resume handle."""
 
     cli: str
     model: str | None = None
@@ -1085,6 +1101,12 @@ class PanelTarget(BaseModel):
     #: resume it (F8a, 2-I) -- in particular a voice cut at the time budget, which has no child record of its
     #: own (its handle is recovered from the harvested partial). ``None`` when the seat established no session.
     session_id: str | None = None
+    #: The seat's voting weight (``weighted`` strategy) and parity-counterweight flag, persisted so a strategy
+    #: panel CONTINUATION (item 9) replays the seat's steering faithfully instead of re-defaulting it.
+    weight: float = 1.0
+    parity: bool = False
+    #: The per-seat role persona this seat argued under, part of the recomposable continuation input.
+    role: str | None = None
 
 
 class PanelInputs(BaseModel):
@@ -1100,6 +1122,9 @@ class PanelInputs(BaseModel):
     synthesize: bool | None = None
     rounds: int | None = None
     judge: str | None = None
+    #: The verdict schema a strategy panel asked each voice to emit (JSON-mode), persisted so a continuation
+    #: replays the same verdict shape. ``None`` for the line-mode / all-voices default.
+    verdict_schema: dict[str, Any] | None = None
 
 
 class RunRecord(BaseModel):

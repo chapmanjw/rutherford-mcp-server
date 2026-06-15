@@ -70,6 +70,7 @@ def write_panel_record(
     stop_reason: str | None = None,
     rollup: RunRollup | None = None,
     topology: Topology | None = None,
+    continued_from: str | None = None,
     extra_artifacts: dict[str, str] | None = None,
 ) -> str | None:
     """Write a panel's parent :class:`RunRecord` linking its child voice records; return its run_dir.
@@ -99,6 +100,8 @@ def write_panel_record(
         finished_at=finished_at,
         duration_s=max(0.0, finished_at - created_at),
         child_run_ids=[voice.run_id for voice in voices if voice.run_id],
+        # item 9: the panel this run continues, so a panel continuation chain is traceable from the parent.
+        continued_from=continued_from,
         cli=",".join(clis) if clis else kind,
         safety_mode=safety_mode,
         cwd=cwd,

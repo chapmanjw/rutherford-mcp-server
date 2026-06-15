@@ -9,9 +9,12 @@ it built on (``continued_from``), so the chain is traceable without ever mutatin
 trust gate is re-applied fresh and defaults to ``read_only`` -- a continuation does not inherit the parent's
 write mode (9-D), since the new direction may change intent.
 
-v1 continues a single ``delegate`` job (9-A). Continuing a consensus / debate panel (resume N voices, add
-rounds) couples to the stateful-debate work and is a deliberate fast-follow, refused here with a clear
-message rather than half-done.
+It continues a ``delegate`` job (resume the one session, or re-inject), a ``consensus`` panel (resume each
+voice's session and re-aggregate under the recorded strategy), or a ``debate`` (resume each seat's session
+and argue ``rounds`` more rounds). A panel continuation reuses the persisted :class:`PanelInputs` -- roster,
+strategy, stances, per-seat steering, the per-seat resume handles -- so it picks up exactly where the kept
+panel left off; a seat whose agent cannot reload its session is recorded as a failed voice, never silently
+dropped.
 """
 
 from __future__ import annotations
@@ -21,13 +24,32 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from ..context import AppContext, tool_success
-from ..domain.enums import Effort, SafetyMode
+from ..domain.enums import Effort, SafetyMode, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
-from ..domain.models import DelegationRequest, DelegationResult, RunRecord, Target
+from ..domain.models import (
+    ConsensusRequest,
+    ConsensusResult,
+    DebateRequest,
+    DebateResult,
+    DelegationRequest,
+    DelegationResult,
+    PanelInputs,
+    RunRecord,
+    StrategyResult,
+    Target,
+)
 from ..io.ledger import read_answer, read_record
 from ..services.delegation import ActivityCallback
-from .common import apply_role, ensure_known_agent, parse_effort, resolve_run_mode, resolve_safety_mode
+from .common import (
+    apply_role,
+    as_target,
+    ensure_known_agent,
+    parse_effort,
+    parse_strategy,
+    resolve_run_mode,
+    resolve_safety_mode,
+)
 from .jobs import make_summary, submit_job
 
 
@@ -44,59 +66,173 @@ async def continue_job_tool(
     trust_workspace: bool = False,
     role: str | None = None,
     effort: str | None = None,
+    rounds: int = 2,
     persist: bool = True,
     mode: str = "sync",
 ) -> str:
-    """Continue the persisted job ``job_id`` with a new ``prompt``, resuming its session or re-injecting context.
+    """Continue the persisted job ``job_id`` with a new ``prompt``, picking up where the kept run left off.
 
     ``job_id`` is the id of a durable run kept under ``<jobs_dir>/`` (the ``run_dir`` name a persisted result
-    carries). The parent's record supplies the agent, model, working dir, role, and files the continuation
-    inherits unless overridden here. When the parent recorded a resumable ACP session it is resumed
-    (``session/load``) so the agent keeps its prior reasoning; an adapter that cannot resume falls back to
-    re-injecting the parent's prompt + answer as fresh context, and the result's ``notice`` says which path
-    ran (9-E). The continuation persists as a CHILD run linked to the parent (``continued_from``); it never
-    mutates the parent (9-B). The trust gate is fresh and defaults to ``read_only`` -- the parent's write mode
-    is NOT inherited (9-D). ``mode="async"`` runs it as a background job and returns a ``job_id``.
-
-    Only a single ``delegate`` job can be continued in v1 (9-A); continuing a consensus / debate panel is a
-    fast-follow and is refused with ``INVALID_INPUT`` here.
+    carries). A ``delegate`` job resumes its one session (else re-injects the prior prompt + answer); a
+    ``consensus`` panel resumes each voice's session and re-aggregates under the recorded strategy; a
+    ``debate`` resumes each seat's session and argues ``rounds`` MORE rounds (``rounds`` is ignored for the
+    other kinds). The parent's record supplies the roster, model, working dir, role, files, and -- for a
+    panel -- the strategy / stances / per-seat steering, all inherited unless overridden here. A seat whose
+    agent cannot reload its ACP session is recorded as a failed voice, never silently dropped. The
+    continuation persists as a fresh run linked to the parent (``continued_from``); it never mutates the
+    parent (9-B). The trust gate is fresh and defaults to ``read_only`` -- the parent's write mode is NOT
+    inherited (9-D); panels are read-only deliberation regardless. ``mode="async"`` runs it as a background
+    job and returns a ``job_id``.
     """
     parent = _read_parent(app, job_id)
-    if parent.kind != "delegate":
-        raise RutherfordError(
-            ErrorCode.INVALID_INPUT,
-            f"continuing a {parent.kind!r} job is not supported yet; v1 continues a single delegate job. Run a "
-            "fresh consensus / debate for a panel.",
-        )
-    ensure_known_agent(app.descriptors, parent.cli)
-    plan = _ContinuationPlan(
-        app=app,
-        job_id=job_id,
-        new_prompt=prompt,
-        target=Target(cli=parent.cli, model=model if model is not None else parent.model),
-        cwd=working_dir if working_dir is not None else parent.cwd,
-        files=list(files) if files is not None else list(parent.files),
-        role=role if role is not None else parent.role,
-        # 9-D: a continuation defaults to read_only -- NOT the parent's mode, and NOT even the workspace
-        # ``default_safety_mode`` (a write-default workspace must still not silently let an unvetted new
-        # direction mutate). An explicit ``safety_mode`` (with a trusted workspace) escalates.
-        safety=resolve_safety_mode(safety_mode, SafetyMode.READ_ONLY),
-        timeout_s=timeout_s,
-        trust_workspace=trust_workspace,
-        effort=parse_effort(effort),
-        persist=persist,
-        parent=parent,
-    )
+    safety = resolve_safety_mode(safety_mode, SafetyMode.READ_ONLY)  # 9-D: read_only default, not parent/config
+    cwd = working_dir if working_dir is not None else parent.cwd
+    inherited_files = list(files) if files is not None else list(parent.files)
+    inherited_role = role if role is not None else parent.role
+    resolved_effort = parse_effort(effort)
 
-    async def run(on_activity: ActivityCallback | None = None) -> str:
-        result, how = await plan.execute(on_activity)
-        result.notice = f"continued job {job_id}: {how}."
-        return tool_success(result)
+    if parent.kind == "delegate":
+        ensure_known_agent(app.descriptors, parent.cli)
+        plan = _ContinuationPlan(
+            app=app,
+            job_id=job_id,
+            new_prompt=prompt,
+            target=Target(cli=parent.cli, model=model if model is not None else parent.model),
+            cwd=cwd,
+            files=inherited_files,
+            role=inherited_role,
+            safety=safety,
+            timeout_s=timeout_s,
+            trust_workspace=trust_workspace,
+            effort=resolved_effort,
+            persist=persist,
+            parent=parent,
+        )
+
+        async def run(on_activity: ActivityCallback | None = None) -> str:
+            result, how = await plan.execute(on_activity)
+            result.notice = f"continued job {job_id}: {how}."
+            return tool_success(result)
+
+        summary_target = plan.target.display_label
+    elif parent.kind in ("consensus", "debate"):
+        panel = _require_panel(parent)
+        request = _panel_continuation_request(
+            parent.kind,
+            panel,
+            job_id,
+            prompt,
+            model,
+            cwd,
+            inherited_files,
+            inherited_role,
+            safety,
+            resolved_effort,
+            timeout_s,
+            rounds,
+            persist,
+        )
+
+        async def run(on_activity: ActivityCallback | None = None) -> str:
+            if isinstance(request, ConsensusRequest):
+                result: ConsensusResult | StrategyResult | DebateResult = await app.consensus.consensus(
+                    request, on_activity=on_activity
+                )
+            else:
+                result = await app.debate.debate(request, on_activity=on_activity)
+            resumed = sum(1 for seat in panel.targets if seat.session_id is not None)
+            result.notice = f"continued {parent.kind} job {job_id}: resumed {resumed} of {len(panel.targets)} seat(s)."
+            return tool_success(result)
+
+        summary_target = ", ".join(seat.cli for seat in panel.targets)
+    else:
+        raise RutherfordError(ErrorCode.INVALID_INPUT, f"cannot continue a {parent.kind!r} job")
 
     if resolve_run_mode(mode):
-        summary = make_summary("continue_job", target=plan.target.display_label, prompt=prompt)
-        return await submit_job(app, "continue_job", run, summary=summary)
+        return await submit_job(
+            app, "continue_job", run, summary=make_summary("continue_job", target=summary_target, prompt=prompt)
+        )
     return await run()
+
+
+def _require_panel(parent: RunRecord) -> PanelInputs:
+    """The persisted panel orchestration config, or a clean error if the record has none (a corrupt panel)."""
+    if parent.panel is None:
+        raise RutherfordError(
+            ErrorCode.INVALID_INPUT, f"the {parent.kind!r} record has no persisted panel inputs to continue from"
+        )
+    return parent.panel
+
+
+def _panel_continuation_request(
+    kind: str,
+    panel: PanelInputs,
+    job_id: str,
+    prompt: str,
+    model: str | None,
+    cwd: str | None,
+    files: list[str],
+    role: str | None,
+    safety: SafetyMode,
+    effort: Effort | None,
+    timeout_s: float | None,
+    rounds: int,
+    persist: bool,
+) -> ConsensusRequest | DebateRequest:
+    """Rebuild a consensus / debate request from a persisted panel, with each seat's resume handle threaded in.
+
+    The roster, per-seat steering (stance / weight / parity / role), the aggregation strategy + verdict schema
+    (consensus), the synthesize flag and judge are replayed from :class:`PanelInputs`; the new ``prompt`` is
+    the continuation direction every resumed seat receives, and ``resume_session_ids`` carries each seat's
+    prior session so the agents pick up their own reasoning. ``model`` overrides every seat's model when given.
+    """
+    targets = [
+        Target(
+            cli=seat.cli,
+            model=model if model is not None else seat.model,
+            stance=seat.stance,
+            weight=seat.weight,
+            parity=seat.parity,
+            role=seat.role,
+        )
+        for seat in panel.targets
+    ]
+    resume_session_ids: list[str | None] = [seat.session_id for seat in panel.targets]
+    judge = as_target(panel.judge) if panel.judge else None
+    if kind == "consensus":
+        return ConsensusRequest(
+            targets=targets,
+            prompt=prompt,
+            strategy=parse_strategy(panel.strategy) if panel.strategy else Strategy.ALL_VOICES,
+            verdict_schema=panel.verdict_schema,
+            synthesize=panel.synthesize,
+            judge=judge,
+            working_dir=cwd,
+            files=files,
+            role=role,
+            safety_mode=safety,
+            effort=effort,
+            timeout_s=timeout_s,
+            resume_session_ids=resume_session_ids,
+            continued_from=job_id,
+            persist=persist,
+        )
+    return DebateRequest(
+        targets=targets,
+        prompt=prompt,
+        rounds=rounds,
+        synthesize=panel.synthesize if panel.synthesize is not None else True,
+        judge=judge,
+        working_dir=cwd,
+        files=files,
+        role=role,
+        safety_mode=safety,
+        effort=effort,
+        timeout_s=timeout_s,
+        resume_session_ids=resume_session_ids,
+        continued_from=job_id,
+        persist=persist,
+    )
 
 
 class _ContinuationPlan:

@@ -12,16 +12,26 @@ import pytest
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import AppContext, build_app_context
-from rutherford.domain.enums import SafetyMode
+from rutherford.domain.enums import SafetyMode, Stance, Strategy
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import DelegationRequest, RunRecord, Target
+from rutherford.domain.models import (
+    ConsensusRequest,
+    ConsensusResult,
+    DebateRequest,
+    DelegationRequest,
+    PanelInputs,
+    PanelTarget,
+    RunRecord,
+    Target,
+)
 from rutherford.io.ledger import read_record
-from rutherford.tools.continue_job import _reinjection_prompt, continue_job_tool
+from rutherford.tools.continue_job import _panel_continuation_request, _reinjection_prompt, continue_job_tool
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
 FAKE = AgentDescriptor("fake", "Fake", _FAKE_CMD)
+FAKE_A = AgentDescriptor("fake_a", "Fake A", _FAKE_CMD, provider="alpha", default_model="model-a")
 # A fake that does NOT advertise the ACP loadSession capability, so a resume against it is RESUME_FAILED.
 NO_RESUME = AgentDescriptor(
     "fake_noresume", "No Resume", _FAKE_CMD, env_overrides=(("RUTHERFORD_FAKE_NO_LOADSESSION", "1"),)
@@ -31,6 +41,11 @@ NO_RESUME = AgentDescriptor(
 def _app(tmp_path: Path) -> AppContext:
     config = RutherfordConfig(jobs_dir=str(tmp_path / "jobs"))
     return build_app_context(config=config, descriptors=DescriptorRegistry([FAKE, NO_RESUME]))
+
+
+def _panel_app(tmp_path: Path) -> AppContext:
+    config = RutherfordConfig(jobs_dir=str(tmp_path / "jobs"))
+    return build_app_context(config=config, descriptors=DescriptorRegistry([FAKE, FAKE_A, NO_RESUME]))
 
 
 def _children(app: AppContext, parent_run_id: str) -> list[RunRecord]:
@@ -145,13 +160,184 @@ async def test_continue_defaults_read_only_even_in_a_write_default_workspace(tmp
 # --- guards ------------------------------------------------------------------
 
 
-async def test_continue_rejects_a_panel_kind(tmp_path: Path) -> None:
-    # v1 continues a single delegate (9-A); a consensus / debate parent is refused with a clear message.
-    app = _app(tmp_path)
-    app.ledger.write(RunRecord(run_id="panel01", kind="consensus", cli="fake", prompt="x"), answer="yes")
+async def test_continue_rejects_an_unknown_kind(tmp_path: Path) -> None:
+    # delegate / consensus / debate are continuable; any other kind is a clean refusal, not a crash.
+    app = _panel_app(tmp_path)
+    app.ledger.write(RunRecord(run_id="weird01", kind="mystery", cli="fake", prompt="x"), answer="y")
     with pytest.raises(RutherfordError) as exc:
-        await continue_job_tool(app, job_id="panel01", prompt="more")
-    assert exc.value.code is ErrorCode.INVALID_INPUT and "not supported yet" in exc.value.message
+        await continue_job_tool(app, job_id="weird01", prompt="more")
+    assert exc.value.code is ErrorCode.INVALID_INPUT and "cannot continue" in exc.value.message
+
+
+async def test_continue_a_consensus_panel_resumes_each_voice(tmp_path: Path) -> None:
+    # A kept consensus panel is continued: each voice resumes its prior session (WHOAMI proves the reload),
+    # and the continuation is a fresh consensus run linked to the parent.
+    app = _panel_app(tmp_path)
+    parent = await app.consensus.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="fake"), Target(cli="fake_a")],
+            prompt="what is 17 + 25?",
+            persist=True,
+            working_dir=str(REPO_ROOT),
+        )
+    )
+    assert isinstance(parent, ConsensusResult) and parent.run_dir is not None
+    parent_id = Path(parent.run_dir).name
+
+    out = await continue_job_tool(app, job_id=parent_id, prompt="WHOAMI", working_dir=str(REPO_ROOT))
+    assert f"continued consensus job {parent_id}: resumed 2 of 2 seat(s)" in out
+    assert out.count("resumed=yes") == 2  # both voices reloaded their prior session
+    children = _children(app, parent_id)
+    assert len(children) == 1 and children[0].kind == "consensus"  # one continuation parent, linked
+
+
+async def test_continue_a_debate_resumes_seats_and_argues_more_rounds(tmp_path: Path) -> None:
+    app = _panel_app(tmp_path)
+    parent = await app.debate.debate(
+        DebateRequest(
+            targets=[Target(cli="fake"), Target(cli="fake_a")],
+            prompt="what is 17 + 25?",
+            rounds=1,
+            persist=True,
+            working_dir=str(REPO_ROOT),
+        )
+    )
+    assert parent.run_dir is not None
+    parent_id = Path(parent.run_dir).name
+
+    out = await continue_job_tool(app, job_id=parent_id, prompt="WHOAMI", rounds=2, working_dir=str(REPO_ROOT))
+    assert f"continued debate job {parent_id}: resumed 2 of 2 seat(s)" in out
+    assert "resumed=yes" in out  # the seats reloaded their prior debate session
+    children = _children(app, parent_id)
+    assert len(children) == 1 and children[0].kind == "debate"
+
+
+async def test_consensus_resume_records_a_non_resumable_voice_as_failed(tmp_path: Path) -> None:
+    # A seat whose agent cannot reload its session is a clean RESUME_FAILED voice -- recorded, not a silent
+    # drop and not a panel crash; the resumable seat still answers.
+    app = _panel_app(tmp_path)
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake_noresume")],
+        prompt="WHOAMI",
+        working_dir=str(REPO_ROOT),
+        resume_session_ids=["fake-session-1", "fake-session-1"],
+    )
+    result = await app.consensus.consensus(request)
+    assert isinstance(result, ConsensusResult)
+    by_cli = {voice.target.cli: voice for voice in result.voices}
+    assert by_cli["fake"].ok and "resumed=yes" in by_cli["fake"].text  # resumed cleanly
+    failed = by_cli["fake_noresume"]
+    assert failed.ok is False and failed.error is not None and failed.error.code is ErrorCode.RESUME_FAILED
+
+
+async def test_consensus_continuation_seat_with_no_handle_is_resume_failed_not_cold_started(tmp_path: Path) -> None:
+    # A continuation seat the parent recorded NO session for (handle None) must be a RESUME_FAILED voice, NOT
+    # silently cold-started as a fresh (un-continued) answer -- 'continue' means resume, crisply.
+    app = _panel_app(tmp_path)
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake_a")],
+        prompt="what is 17 + 25?",  # would answer "42" if cold-started
+        working_dir=str(REPO_ROOT),
+        resume_session_ids=["fake-session-1", None],  # the second seat has no recorded session
+    )
+    result = await app.consensus.consensus(request)
+    assert isinstance(result, ConsensusResult)
+    by_cli = {voice.target.cli: voice for voice in result.voices}
+    assert by_cli["fake"].ok  # the seat with a handle resumed
+    no_handle = by_cli["fake_a"]
+    assert no_handle.ok is False and no_handle.error is not None and no_handle.error.code is ErrorCode.RESUME_FAILED
+    assert "42" not in no_handle.text  # it did NOT cold-start and answer the new question
+
+
+async def test_consensus_resume_aligns_each_handle_to_its_own_seat(tmp_path: Path) -> None:
+    # Distinct handles per seat: each agent must load ITS OWN handle (the index alignment), not a swapped one.
+    # A swap (reversed resume_session_ids) would make 'fake' report the other seat's session id.
+    app = _panel_app(tmp_path)
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake_a")],
+        prompt="WHOAMI",
+        working_dir=str(REPO_ROOT),
+        resume_session_ids=["handle-for-fake", "handle-for-fake-a"],
+    )
+    result = await app.consensus.consensus(request)
+    by_cli = {voice.target.cli: voice for voice in result.voices}
+    assert "session=handle-for-fake" in by_cli["fake"].text  # fake loaded its own (position-0) handle
+    assert "session=handle-for-fake-a" in by_cli["fake_a"].text  # fake_a loaded its own (position-1) handle
+
+
+async def test_debate_continuation_resume_failure_keeps_its_error_code(tmp_path: Path) -> None:
+    # A debate seat that cannot reload its session is a RESUME_FAILED contribution -- NOT a generic
+    # ACP_HANDSHAKE_FAILED. The non-resumable fake fails to load; the resumable seat still argues.
+    app = _panel_app(tmp_path)
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="fake_noresume")],
+        prompt="WHOAMI",
+        rounds=1,
+        working_dir=str(REPO_ROOT),
+        resume_session_ids=["fake-session-1", "fake-session-1"],
+    )
+    result = await app.debate.debate(request)
+    by_cli = {c.target.cli: c for c in result.rounds[0].contributions}
+    assert by_cli["fake"].ok is True
+    failed = by_cli["fake_noresume"]
+    assert failed.ok is False and failed.error is not None and failed.error.code is ErrorCode.RESUME_FAILED
+
+
+def test_panel_continuation_request_replays_the_persisted_panel() -> None:
+    # The request is rebuilt faithfully from PanelInputs: roster + per-seat steering, strategy, resume handles,
+    # and the forward link -- so a continued strategy panel votes the same way, not a re-defaulted one.
+    panel = PanelInputs(
+        targets=[
+            PanelTarget(
+                cli="fake", model="m", stance=Stance.FOR, session_id="s1", weight=3.0, parity=False, role="proposer"
+            ),
+            PanelTarget(cli="fake_a", stance=Stance.AGAINST, session_id="s2", weight=1.0, parity=True),
+        ],
+        strategy="weighted",
+        synthesize=True,
+        verdict_schema={"verdict": "string"},
+    )
+    request = _panel_continuation_request(
+        "consensus",
+        panel,
+        "parent99",
+        "new question",
+        None,
+        str(REPO_ROOT),
+        [],
+        None,
+        SafetyMode.READ_ONLY,
+        None,
+        None,
+        2,
+        True,
+    )
+    assert isinstance(request, ConsensusRequest)
+    assert request.strategy is Strategy.WEIGHTED and request.verdict_schema == {"verdict": "string"}
+    assert request.continued_from == "parent99" and request.resume_session_ids == ["s1", "s2"]
+    assert (
+        request.targets[0].weight == 3.0
+        and request.targets[0].role == "proposer"
+        and request.targets[0].stance is Stance.FOR
+    )
+    assert request.targets[1].parity is True and request.targets[1].stance is Stance.AGAINST
+
+
+async def test_continue_a_consensus_panel_async_returns_a_job_id(tmp_path: Path) -> None:
+    app = _panel_app(tmp_path)
+    parent = await app.consensus.consensus(
+        ConsensusRequest(
+            targets=[Target(cli="fake"), Target(cli="fake_a")],
+            prompt="what is 17 + 25?",
+            persist=True,
+            working_dir=str(REPO_ROOT),
+        )
+    )
+    assert isinstance(parent, ConsensusResult) and parent.run_dir is not None
+    out = await continue_job_tool(
+        app, job_id=Path(parent.run_dir).name, prompt="WHOAMI", working_dir=str(REPO_ROOT), mode="async"
+    )
+    assert "job_id" in out
 
 
 async def test_continue_unknown_job_is_not_found(tmp_path: Path) -> None:

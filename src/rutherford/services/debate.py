@@ -181,7 +181,7 @@ class DebateService:
         )
 
         sessions: dict[int, ACPSession] = {}
-        open_errors: dict[int, str] = {}
+        open_errors: dict[int, ErrorInfo] = {}
         await self._open_sessions(req, voices, policy, cwd, sessions, open_errors, base_depth)
         start = time.monotonic()
         stop_reason: str | None = None
@@ -343,6 +343,10 @@ class DebateService:
                     model=voice.target.model,
                     stance=voice.stance,
                     session_id=seat_sessions.get(_seat_id(voice)),
+                    # item 9 continuation: persist the seat's steering so a debate continuation replays it.
+                    weight=voice.target.effective_weight,
+                    parity=voice.target.is_parity,
+                    role=voice.target.role,
                 )
                 for voice in voices
             ],
@@ -368,6 +372,7 @@ class DebateService:
             stop_reason=stop_reason,
             rollup=rollup,
             topology=topology,
+            continued_from=req.continued_from,
             extra_artifacts={"transcript.md": _render_transcript(req.prompt, rounds)},
         )
 
@@ -447,19 +452,30 @@ class DebateService:
         policy: PermissionPolicy,
         cwd: str,
         sessions: dict[int, ACPSession],
-        open_errors: dict[int, str],
+        open_errors: dict[int, ErrorInfo],
         base_depth: int,
     ) -> None:
         """Open one ACP session per voice in parallel; record an unknown-agent or handshake failure.
 
         Each session carries the debate's producer-effort cap (F8a) and the N1 lineage/depth signal
         (``base_depth``), so every turn on it runs at the resolved tier and a Rutherford-host voice stays
-        bounded.
+        bounded. Each failure keeps its OWN error code (a resume miss is ``RESUME_FAILED``, not a generic
+        handshake failure), so a continuation reports honestly why a seat could not rejoin.
         """
 
         async def _open(voice: _Voice) -> None:
             if not self._descriptors.has(voice.target.cli):
-                open_errors[voice.index] = f"unknown agent id {voice.target.cli!r}"
+                open_errors[voice.index] = ErrorInfo(
+                    code=ErrorCode.ACP_HANDSHAKE_FAILED, message=f"unknown agent id {voice.target.cli!r}"
+                )
+                return
+            if _debate_resume_missing(req, voice.index):
+                # item 9 continuation: this seat had no recorded session to resume -> a RESUME_FAILED
+                # contribution, never silently cold-started into the continued debate.
+                open_errors[voice.index] = ErrorInfo(
+                    code=ErrorCode.RESUME_FAILED,
+                    message=f"{voice.target.cli} has no recorded session to continue",
+                )
                 return
             session = ACPSession(
                 self._descriptors.get(voice.target.cli),
@@ -468,11 +484,15 @@ class DebateService:
                 model=voice.target.model,
                 effort=req.effort,
                 base_depth=base_depth,
+                # item 9 continuation: resume this seat's prior debate session where one was recorded, so the
+                # agent recalls the earlier argument; a seat that cannot reload fails open (RESUME_FAILED) and
+                # is recorded as a failed contribution, never silently dropped.
+                resume_session_id=_debate_resume_id(req, voice.index),
             )
             try:
                 await session.open()
             except ACPHandshakeError as exc:
-                open_errors[voice.index] = exc.message
+                open_errors[voice.index] = ErrorInfo(code=exc.code, message=exc.message)
                 return
             sessions[voice.index] = session
 
@@ -484,7 +504,7 @@ class DebateService:
         voices: list[_Voice],
         active: list[_Voice],
         sessions: dict[int, ACPSession],
-        open_errors: dict[int, str],
+        open_errors: dict[int, ErrorInfo],
         round_index: int,
         history: list[DebateRound],
         timeout_s: float,
@@ -851,6 +871,17 @@ def _seat_id(voice: _Voice) -> str:
     return f"{voice.index}:{voice.target.display_label}"
 
 
+def _debate_resume_id(req: DebateRequest, index: int) -> str | None:
+    """The resume session handle for seat ``index`` (item 9 continuation), or ``None`` for a fresh debate."""
+    handles = req.resume_session_ids
+    return handles[index] if handles is not None and index < len(handles) else None
+
+
+def _debate_resume_missing(req: DebateRequest, index: int) -> bool:
+    """True when this is a continuation (``resume_session_ids`` set) but this seat has no handle to resume."""
+    return req.resume_session_ids is not None and _debate_resume_id(req, index) is None
+
+
 def _disambiguate(labels: list[str]) -> list[str]:
     """Suffix ``#n`` to labels that repeat, so two same-(cli, model) seats are distinguishable."""
     duplicated = {label for label in labels if labels.count(label) > 1}
@@ -906,7 +937,7 @@ def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) 
     )
 
 
-def _failed_contribution(voice: _Voice, round_index: int, message: str) -> DebateContribution:
+def _failed_contribution(voice: _Voice, round_index: int, error: ErrorInfo) -> DebateContribution:
     return DebateContribution(
         label=voice.label,
         seat_id=_seat_id(voice),
@@ -914,7 +945,7 @@ def _failed_contribution(voice: _Voice, round_index: int, message: str) -> Debat
         round_index=round_index,
         stance=voice.stance,
         ok=False,
-        error=ErrorInfo(code=ErrorCode.ACP_HANDSHAKE_FAILED, message=message),
+        error=error,  # keeps the open failure's own code (RESUME_FAILED / handshake), not a generic one
     )
 
 
