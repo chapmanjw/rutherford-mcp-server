@@ -1,54 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""Shared input parsing for the tool layer.
+"""Shared input parsing for the tool layer (ACP-native).
 
-Tools accept simple client-friendly inputs (a CLI id and model string, a safety-mode string, a
-list of target dicts). These helpers validate and coerce them into domain types, raising
-:class:`~rutherford.domain.errors.RutherfordError` with ``INVALID_INPUT`` on bad input so the
-FastMCP layer reports a clean error.
+Tools accept simple client-friendly inputs (an agent id, a safety-mode string). These helpers validate and
+coerce them into domain types, raising :class:`~rutherford.domain.errors.RutherfordError` with
+``INVALID_INPUT`` / ``UNKNOWN_TARGET`` on bad input so the FastMCP layer reports a clean error.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from pydantic import ValidationError
 
-from ..adapters.registry import AdapterRegistry
+from ..acp.descriptors import DescriptorRegistry
 from ..domain.enums import DelegationMode, Effort, SafetyMode, Stance, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import OnBudget, Target
+from ..services.roles import RoleStore
 
-#: The valid ``on_budget`` dispositions (kept in sync with the :data:`OnBudget` literal).
-_ON_BUDGET_CHOICES = ("harvest", "continue", "resume")
-
-if TYPE_CHECKING:
-    from ..context import AppContext
-    from ..domain.models import Job
+#: The valid ``on_budget`` dispositions, for validating the tool-layer string against the Literal type.
+_ON_BUDGET: tuple[str, ...] = ("harvest", "continue", "resume")
 
 #: The per-target metadata keys read from a target dict, beyond ``cli`` and ``model``.
 _TARGET_META_KEYS = ("role", "label", "weight", "parity", "stance")
-
-
-def async_job_envelope(
-    app: AppContext, job: Job, *, persist: bool | None, complex_run: bool, external_tracking: bool
-) -> dict[str, Any]:
-    """Build the ``mode=async`` submit envelope, carrying the same F2 persistence notice the sync path adds.
-
-    A non-trivial run started as a background job is exactly the case decision 1-J targets, but the async
-    path returns at submit time before any result exists -- so the notice is computed here from whether the
-    run *will* persist (``persist``, else the configured ``default_persistence``). ``None`` notice is
-    omitted so the envelope stays minimal when there is nothing to say.
-    """
-    would_persist = app.config.wants_persist(persist)
-    notice = app.persistence_notice(
-        persisted=would_persist, complex_run=complex_run, external_tracking=external_tracking
-    )
-    payload: dict[str, Any] = {"job_id": job.id, "status": job.status, "kind": job.kind}
-    if notice is not None:
-        payload["notice"] = notice
-    return payload
 
 
 def parse_safety_mode(value: str | SafetyMode) -> SafetyMode:
@@ -64,48 +40,31 @@ def parse_safety_mode(value: str | SafetyMode) -> SafetyMode:
         ) from None
 
 
-def parse_persistence(value: str) -> str:
-    """Validate a ``default_persistence`` choice (``ephemeral`` | ``job``) for setup, or raise ``INVALID_INPUT``.
-
-    Kept as a string (the config field is a ``Literal``, not an enum) but validated at the tool boundary so
-    an invalid value is a clean error here, never written into config where it would fail the next load.
-    """
-    if value in ("ephemeral", "job"):
-        return value
-    raise RutherfordError(
-        ErrorCode.INVALID_INPUT, f"unknown default_persistence {value!r}; choose one of: ephemeral, job"
-    )
-
-
-def parse_scope(value: str) -> str:
-    """Validate a setup ``scope`` (``global`` | ``project``), or raise ``INVALID_INPUT``."""
-    if value in ("global", "project"):
-        return value
-    raise RutherfordError(ErrorCode.INVALID_INPUT, f"unknown scope {value!r}; choose one of: global, project")
-
-
 def resolve_safety_mode(value: str | SafetyMode | None, default: SafetyMode) -> SafetyMode:
     """The effective safety mode for a call: the explicit value, else the configured default.
 
-    ``None`` means the caller omitted the field -- the one case the configured
-    ``default_safety_mode`` is documented to fill. The ``None`` sentinel (not a ``"read_only"``
-    string default on the tool signature) is what lets the tool layer tell "omitted" apart from
-    "explicitly read_only", so an explicit choice always wins over config. An explicit value still
-    validates through :func:`parse_safety_mode`.
+    ``None`` means the caller omitted the field -- the one case the configured ``default_safety_mode``
+    fills -- so an explicit choice always wins over config.
     """
     if value is None:
         return default
     return parse_safety_mode(value)
 
 
-def parse_mode(value: str | DelegationMode) -> DelegationMode:
-    """Coerce a sync/async mode string to :class:`DelegationMode`, or raise ``INVALID_INPUT``."""
+def resolve_run_mode(value: str | DelegationMode) -> bool:
+    """Coerce a run-mode string to a boolean ``run_async``, or raise ``INVALID_INPUT``.
+
+    ``"sync"`` (the default) runs the work on the request path; ``"async"`` submits it as a background
+    job. Returns ``True`` for async so the caller can branch on one bool. A typoed mode fails here, on
+    the request path, rather than being silently treated as sync.
+    """
     if isinstance(value, DelegationMode):
-        return value
+        return value is DelegationMode.ASYNC
     try:
-        return DelegationMode(value)
+        return DelegationMode(value) is DelegationMode.ASYNC
     except ValueError:
-        raise RutherfordError(ErrorCode.INVALID_INPUT, f"unknown mode {value!r}; choose 'sync' or 'async'") from None
+        options = ", ".join(item.value for item in DelegationMode)
+        raise RutherfordError(ErrorCode.INVALID_INPUT, f"unknown mode {value!r}; choose one of: {options}") from None
 
 
 def parse_strategy(value: str | Strategy) -> Strategy:
@@ -122,10 +81,10 @@ def parse_strategy(value: str | Strategy) -> Strategy:
 
 
 def parse_effort(value: str | Effort | None) -> Effort | None:
-    """Coerce a reasoning-effort string to :class:`Effort` (F8a, 2-L), or raise ``INVALID_INPUT``.
+    """Coerce a reasoning-effort string to :class:`Effort`, or raise ``INVALID_INPUT``; ``None`` passes through.
 
-    ``None`` means the caller omitted it -- the one case the configured ``default_effort`` is documented to
-    fill -- so it passes through unchanged for the service to resolve. An explicit value always wins.
+    ``None`` means the caller omitted ``effort`` -- the one case the configured ``default_effort`` (or a
+    per-agent ``effort``) fills downstream -- so it is preserved here rather than coerced to a tier.
     """
     if value is None or isinstance(value, Effort):
         return value
@@ -137,17 +96,16 @@ def parse_effort(value: str | Effort | None) -> Effort | None:
 
 
 def parse_on_budget(value: str | None) -> OnBudget | None:
-    """Validate an ``on_budget`` disposition (F8a, 2-M), or ``None`` when the caller omitted it.
+    """Coerce an ``on_budget`` string to the :data:`OnBudget` literal, or raise ``INVALID_INPUT``.
 
-    Kept as a string (the field is a ``Literal``, not an enum) but validated at the tool boundary so an
-    invalid value is a clean error here. ``None`` passes through unchanged so the service fills it from the
-    configured ``default_on_budget`` -- the one case the workspace default applies; an explicit value wins.
+    ``None`` means the caller omitted it -- the configured ``default_on_budget`` (``harvest`` out of the box)
+    applies downstream -- so it is preserved.
     """
     if value is None:
         return None
-    if value in _ON_BUDGET_CHOICES:
-        return value  # type: ignore[return-value]  # narrowed to the OnBudget literal by the membership check
-    options = ", ".join(_ON_BUDGET_CHOICES)
+    if value in _ON_BUDGET:
+        return value  # type: ignore[return-value]  # validated against the Literal's members
+    options = ", ".join(_ON_BUDGET)
     raise RutherfordError(ErrorCode.INVALID_INPUT, f"unknown on_budget {value!r}; choose one of: {options}") from None
 
 
@@ -170,12 +128,20 @@ def parse_stances(values: list[str] | None) -> list[Stance] | None:
     return stances
 
 
+def ensure_known_agent(descriptors: DescriptorRegistry, agent_id: str) -> None:
+    """Raise ``UNKNOWN_TARGET`` if ``agent_id`` is not a registered ACP agent."""
+    if not descriptors.has(agent_id):
+        known = ", ".join(descriptors.ids()) or "(none)"
+        raise RutherfordError(ErrorCode.UNKNOWN_TARGET, f"unknown agent id {agent_id!r}; known agents: {known}")
+
+
 def as_target(value: Target | dict[str, Any] | str) -> Target:
     """Coerce a target into a :class:`Target`.
 
     Accepts a :class:`Target`; a ``cli`` / ``cli:model`` string; or a dict with ``cli`` (required),
     ``model``, and the optional per-seat metadata ``role`` / ``label`` / ``weight`` / ``parity`` /
-    ``stance``. An invalid metadata value (e.g. an unknown stance) raises ``INVALID_INPUT``.
+    ``stance``. An invalid metadata value (e.g. an unknown stance, a negative weight) raises
+    ``INVALID_INPUT``.
     """
     if isinstance(value, Target):
         return value
@@ -192,23 +158,25 @@ def as_target(value: Target | dict[str, Any] | str) -> Target:
     if isinstance(value, str):
         cli, _, model = value.partition(":")
         if not cli:
-            raise RutherfordError(ErrorCode.INVALID_INPUT, "target string must be 'cli' or 'cli:model'")
+            raise RutherfordError(ErrorCode.INVALID_INPUT, "a target string must be 'cli' or 'cli:model'")
         return Target(cli=cli, model=model or None)
     raise RutherfordError(ErrorCode.INVALID_INPUT, f"cannot interpret target {value!r}")
 
 
-def ensure_known_cli(registry: AdapterRegistry, cli_id: str) -> None:
-    """Raise ``UNKNOWN_TARGET`` if ``cli_id`` is not a registered adapter.
-
-    Called at the tool boundary so a typo'd CLI id is one clean error naming the known adapters,
-    rather than (for consensus/debate) a buried failed *voice* the caller has to dig out.
-    """
-    if not registry.has(cli_id):
-        known = ", ".join(registry.ids()) or "(none)"
-        raise RutherfordError(ErrorCode.UNKNOWN_TARGET, f"unknown CLI id {cli_id!r}; known adapters: {known}")
-
-
-def ensure_known_targets(registry: AdapterRegistry, targets: list[Target]) -> None:
-    """Validate every target's ``cli`` against the registry (see :func:`ensure_known_cli`)."""
+def ensure_known_targets(descriptors: DescriptorRegistry, targets: list[Target]) -> None:
+    """Validate every target's ``cli`` against the registry (see :func:`ensure_known_agent`)."""
     for target in targets:
-        ensure_known_cli(registry, target.cli)
+        ensure_known_agent(descriptors, target.cli)
+
+
+def apply_role(roles: RoleStore, role: str | None, prompt: str) -> str:
+    """Prepend role ``role``'s persona to ``prompt`` when one is named, else return ``prompt`` unchanged.
+
+    The single role seam for ``delegate`` / ``consensus`` / ``debate``: a named role is validated against
+    the store (a bad id raises ``UNKNOWN_ROLE`` on the request path, listing the known roles) and its
+    prompt is prepended; an omitted role is a no-op. The role is folded into the prompt here, at the tool
+    layer, so the services keep handing one composed prompt to the agent.
+    """
+    if role is None:
+        return prompt
+    return roles.apply(role, prompt)

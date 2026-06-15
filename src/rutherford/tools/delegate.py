@@ -1,14 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""The ``delegate`` tool: hand one task to one CLI."""
+"""The ``delegate`` tool: hand a task to one ACP agent and return its normalized result."""
 
 from __future__ import annotations
 
+from typing import Any
+
 from ..context import AppContext, tool_success
-from ..domain.enums import DelegationMode, is_mutating
+from ..domain.enums import is_mutating
 from ..domain.models import DelegationRequest, Target
 from ..services.delegation import ActivityCallback
-from .common import as_target, async_job_envelope, parse_effort, parse_mode, resolve_safety_mode
+from .common import (
+    apply_role,
+    as_target,
+    ensure_known_agent,
+    ensure_known_targets,
+    parse_effort,
+    resolve_run_mode,
+    resolve_safety_mode,
+)
+from .jobs import make_summary, submit_job
 
 
 async def delegate_tool(
@@ -19,89 +30,83 @@ async def delegate_tool(
     model: str | None = None,
     working_dir: str | None = None,
     files: list[str] | None = None,
-    role: str | None = None,
     safety_mode: str | None = None,
-    mode: str = "sync",
     timeout_s: float | None = None,
-    effort: str | None = None,
-    session_id: str | None = None,
-    include_raw: bool = False,
     trust_workspace: bool = False,
+    role: str | None = None,
+    effort: str | None = None,
+    fallback: list[Any] | None = None,
+    allow_model_fallback: bool = True,
     persist: bool | None = None,
+    session_id: str | None = None,
     external_tracking: bool = False,
-    fallback: list[str] | None = None,
-    on_activity: ActivityCallback | None = None,
+    mode: str = "sync",
 ) -> str:
-    """Delegate ``prompt`` to ``(cli, model)`` and return the normalized result.
+    """Validate the request, drive one ACP turn (with fallback), and return the TOON-encoded result envelope.
 
-    With ``mode="async"`` the call returns a job id immediately; poll ``job_status`` /
-    ``job_result``. A delegation that fails operationally (missing binary, timeout, non-zero exit)
-    returns a result with ``ok=false`` and an error code, not an exception. ``fallback`` is an ordered
-    list of alternate ``cli`` / ``cli:model`` targets to try if the primary fails on a retryable
-    category (F7). ``persist`` keeps the run as a durable job under ``.rutherford/jobs/<id>/`` (its
-    ``run_dir`` is returned on the result); ``None`` follows the configured ``default_persistence``.
-    ``effort`` (``low`` | ``medium`` | ``high`` | ``xhigh``) is the producer "how hard may it think" hint,
-    mapped to the CLI's native knob and reported as ``effort_applied`` (F8a); omit it to follow the
-    configured ``default_effort``. The wall-clock ``time_budget_s`` harvest is a panel feature (see
-    ``consensus`` / ``debate``): a single delegation has no fan-out to harvest, so it is the degenerate
-    case that "collapses toward timeout" (F8a, 2-behavior) -- ``timeout_s`` is the per-call bound, and a
-    run that hits it keeps the stdout it streamed before the cut on the result's ``partial`` rather than
-    discarding it.
+    ``mode="async"`` submits the turn as a background job and returns a ``job_id`` immediately (poll it
+    with ``job_status`` / ``job_result``); ``mode="sync"`` (the default) awaits and returns the result.
+    Validation (known agent, safety mode, run mode, role, effort, fallback targets) always runs
+    synchronously, so a bad request fails on the request path rather than inside a job. A named ``role`` has
+    its persona prepended to ``prompt`` before the request is built; ``UNKNOWN_ROLE`` if the id is not a known
+    role. ``effort`` (low|medium|high|xhigh) asks the agent to spend more reasoning where it has a knob (a
+    reported no-op otherwise); omitted, the per-agent or global ``default_effort`` applies.
+
+    ``fallback`` is an ordered list of alternate targets (``cli`` / ``cli:model`` strings, or ``{cli, model}``
+    objects) to try when the primary delegation fails on a re-execution-SAFE failure (a spawn/handshake
+    failure that never ran the prompt); a benched (cooled-down) alternate is skipped and the first one that
+    answers becomes the result, with ``fallback_chain`` recording the failures along the way. A write/yolo
+    delegation never falls back (a partial mutation may have happened). ``allow_model_fallback`` (on by
+    default) lets a model-unavailable failure retry the SAME agent on its configured ``fallback_model`` first,
+    where it has one (most ACP agents do not -- a clean no-op).
+
+    ``persist`` keeps this run as a durable job under ``<jobs_dir>/<run_id>/`` (F2: ``state.json`` plus the
+    answer / diff artifacts), so it survives the process. ``None`` follows the configured
+    ``default_persistence`` (``ephemeral`` out of the box -- nothing on disk unless asked); ``True`` / ``False``
+    force it for this one call. The persisted result carries its ``run_dir``.
+
+    ``session_id`` resumes a prior agent session: pass the ``session_id`` from an earlier delegate result and
+    the agent reloads that conversation (ACP ``session/load``) instead of starting fresh, so a follow-up turn
+    continues where the last left off. Only agents that persist their own sessions support it; against one that
+    does not the call fails ``RESUME_FAILED``. The resume restores the conversation, not the filesystem -- a
+    write/yolo resume still runs in a fresh isolated sandbox.
     """
+    ensure_known_agent(app.descriptors, cli)
+    safety = resolve_safety_mode(safety_mode, app.config.default_safety_mode)
+    run_async = resolve_run_mode(mode)
+    composed_prompt = apply_role(app.roles, role, prompt)
+    fallback_targets = [as_target(target) for target in fallback] if fallback else []
+    ensure_known_targets(app.descriptors, fallback_targets)
     request = DelegationRequest(
         target=Target(cli=cli, model=model),
-        prompt=prompt,
+        prompt=composed_prompt,
         working_dir=working_dir,
-        files=files or [],
+        files=list(files) if files else [],
         role=role,
-        safety_mode=resolve_safety_mode(safety_mode, app.config.default_safety_mode),
-        mode=parse_mode(mode),
+        safety_mode=safety,
         timeout_s=timeout_s,
-        effort=parse_effort(effort),
-        session_id=session_id,
-        include_raw=include_raw,
         trust_workspace=trust_workspace,
+        effort=parse_effort(effort),
+        fallback=fallback_targets,
+        allow_model_fallback=allow_model_fallback,
         persist=persist,
-        fallback=[as_target(entry) for entry in (fallback or [])],
+        session_id=session_id,
     )
-    correlation_id = app.new_correlation_id()
-    # A non-trivial delegation worth a suggest-a-job nudge (1-J): a mutating run, or a multi-target run --
-    # a fallback chain names alternate targets, so it is no longer a "plain single-target" delegation.
-    complex_run = is_mutating(request.safety_mode) or bool(request.fallback)
 
-    if request.mode is DelegationMode.ASYNC:
-        job = app.jobs.submit(
-            "delegate",
-            # A single delegation has no fan-out to harvest, so it publishes no interim result (the third
-            # body arg is unused); time-budget continue/harvest is a panel feature. The activity stream goes
-            # to the job's structured poll buffer (an async job has no live request to push to).
-            lambda progress, activity, _set_interim: app.delegation.delegate(
-                request,
-                correlation_id=correlation_id,
-                base_depth=app.base_depth,
-                on_progress=progress,
-                on_activity=activity,
-            ),
+    async def run(on_activity: ActivityCallback | None = None) -> str:
+        # A standalone delegation emits one voice_started/voice_finished pair (N1, item 3): on the async path
+        # the job buffers them for the ``activity`` poll table; on the sync path there is no sink (None).
+        result = await app.delegation.delegate(request, correlation_id="voice:0", on_activity=on_activity)
+        # Advisory F2 nudge (suppressed by external_tracking): a mutating or fallback delegation is worth
+        # keeping as a durable job, plus the one-time first-run setup hint.
+        result.notice = app.persistence_notice(
+            persisted=result.run_dir is not None,
+            complex_run=is_mutating(request.safety_mode) or bool(request.fallback),
+            external_tracking=external_tracking,
         )
-        return tool_success(
-            async_job_envelope(
-                app,
-                job,
-                persist=request.persist,
-                complex_run=complex_run,
-                external_tracking=external_tracking,
-            )
-        )
+        return tool_success(result)
 
-    # Sync path only: push live progress to the caller via MCP (N1, item 3). An async job returns a job id
-    # immediately, so its progress is polled (``activity`` / ``job_status``), never pushed -- hence on_activity
-    # is wired here, not into the job body above.
-    result = await app.delegation.delegate(
-        request, correlation_id=correlation_id, base_depth=app.base_depth, on_activity=on_activity
-    )
-    result.notice = app.persistence_notice(
-        persisted=result.run_dir is not None,
-        complex_run=complex_run,
-        external_tracking=external_tracking,
-    )
-    return tool_success(result)
+    if run_async:
+        summary = make_summary("delegate", target=request.target.display_label, prompt=prompt)
+        return await submit_job(app, "delegate", run, summary=summary)
+    return await run()

@@ -6,11 +6,518 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-06-15
+
+A ground-up, ACP-native rewrite. Rutherford is now the [Agent Client Protocol](https://agentclientprotocol.com)
+*client* and every coding agent is an ACP *server* it spawns and drives through a real
+`initialize` / `session/new` / `session/prompt` exchange, so the protocol negotiates output, system prompts,
+file context, permissions, and resume, and there is no per-agent output parser to maintain. The persistent
+session is the foundation a debate runs on (one session per voice across rounds, sending only the delta).
+
+**Breaking.** The entire v2 subprocess-adapter architecture is gone: no `ProcessRunner`, no
+`build_invocation` / `parse_output`, no `adapters/` package, no hand-written code adapter per CLI. Adding an
+agent is now a config-driven `AgentDescriptor` (`[agents.<id>]`) or a built-in descriptor, never an adapter
+(see `docs/adding-an-agent.md`). The built-in roster is 19 ACP-native agents; a few v2 CLIs without a working
+headless ACP mode are not carried over and can be added back via `discover` or config once their ACP support
+lands. A `write` / `yolo` / `propose` delegation now runs inside an isolated git-worktree (or copy) sandbox
+with only a reviewed diff applied back; `consensus` and `debate` are read-only deliberation and refuse a
+mutating mode at the service boundary.
+
+### Added
+
+- **`grok` built-in agent (19 total) + a handshake-only connection check.** `grok` is xAI's Grok CLI
+  (`grok agent stdio`, provider `xai`), ACP-native with `--model` / `--reasoning-effort` knobs.
+  Connection-verified live: Rutherford spawns it, completes the ACP handshake, opens a session, and reads its
+  advertised models (`grok-build`, `grok-composer-2.5-fast`) — proving it can communicate with and configure
+  Grok. A *completed* turn additionally needs a SuperGrok subscription; without one the model call returns
+  `403 SuperGrok Heavy subscription required`. To make "reachable but not entitled" legible, `doctor` gains a
+  **`connect_only`** option (`doctor connect_only=true`) backed by a new `probe_connection` primitive: it does
+  the spawn + handshake + `new_session` only (no prompt) and reports `reachable` / `handshake_failed` /
+  `not_installed` plus each agent's advertised models — so an agent that connects but can't complete a turn
+  for a reason outside ACP (auth / entitlement / quota) shows as `reachable`, not a turn `error`. (Grok's
+  headless handshake auth can transiently fail "Authentication required" under rapid back-to-back spawns — an
+  xAI auth-refresh race, not a Rutherford fault; the live test retries it.)
+- **`discover`: registry-driven detection of installed ACP agents (a new tool + `python -m rutherford
+  discover` CLI).** Fetches the community [ACP agent registry](https://agentclientprotocol.com/get-started/registry)
+  (cached at `~/.rutherford/acp-registry.json` for offline reuse; the CDN needs a real User-Agent), detects
+  which registry agents are ALREADY installed on this machine, probes the ones it finds with a real
+  read-only ACP round trip, and proposes a reviewable `[agents.<id>]` config block for every new agent that
+  drives. Detection is **detect-only**: it scans PATH plus curated install dirs (`~/.local/bin`,
+  `~/.cargo/bin`, and every `~/.<vendor>/bin`, one subdir deep — which is how it finds a custom-path install
+  like Qoder at `~/.qoder/bin/qodercli/`) and **never downloads or runs `npx`**. A registry id that aliases a
+  built-in (e.g. `codex-acp` → `codex`, `mistral-vibe` → `vibe`) is recognized as already-in-roster, so it is
+  never proposed as a duplicate. `write=true` (CLI `--write`) appends the proposal to the project config the
+  loader actually reads (`--global` for the global one), creating the file if needed and never overwriting an
+  existing section; `probe=false` (`--no-probe`) returns the raw detection without spawning anything. Safety
+  posture (hardened over an adversarial review): probing only ever spawns a resolved agent binary, never a
+  shell/interpreter — a structural family classifier refuses `powershell`/`python`/`node`/`R` and their
+  versioned, `-dbg`/`-preview`, `.cmd`-shim, and `pythonw`-variant forms, so a tampered registry cannot get
+  code-bearing args executed; the written config is TOML-injection-safe (a registry id is only kept if it is a
+  safe bare key, comment text and command args are fully escaped, and a write into a malformed config is
+  refused rather than risked). Use it to adopt any ACP agent or bridge Rutherford does not ship as a built-in.
+- **Two more built-in agents (18 total): `gemini` and `qoder`.** `gemini` is Google's official Gemini CLI
+  (`gemini --acp`, provider `google`) — live-verified driving over ACP (status=ok, ~2.2s), which supersedes
+  the earlier "headless ACP known-issue" note (fixed by Gemini CLI 0.46.0); it adds a Google/Gemini voice to
+  the crew. `qoder` is Qoder AI's `qodercli` (`qodercli --acp`; the `--acp` flag is real but hidden from
+  `--help`, like Cursor's `acp`) — live-verified (status=ok, ~2.9s). Qoder AI's installer drops the binary at
+  `~/.qoder/bin/qodercli/` rather than on PATH, so on such a machine point `[agents.qoder] command` at the
+  full path (or add the dir to PATH).
+- **`delegate` can resume a prior agent session** via a `session_id` parameter (v2 parity). Pass the
+  `session_id` from an earlier delegate result and the agent reloads that conversation over ACP
+  (`session/load`) instead of opening a fresh one (`session/new`), so a follow-up turn continues where the
+  last left off. It is gated on the agent advertising the ACP `loadSession` capability at `initialize`; a
+  resume against an agent that does not persist its own sessions fails cleanly with `RESUME_FAILED` rather
+  than silently starting fresh (wiring the previously-unreachable error code). The resume restores the
+  *conversation*, not the filesystem — a `write`/`yolo` resume still runs in a fresh isolated sandbox. The
+  `DelegationRequest.session_id` field existed but was inert; it is now threaded tool → service →
+  `run_acp_turn` → `ACPSession`.
+- Local-model support for **opencode** on both Ollama and LM Studio (`[agents.<id>] base="opencode"
+  backend="ollama"|"lmstudio" model=...`). opencode is configured entirely through one inline-JSON
+  environment variable (`OPENCODE_CONFIG_CONTENT`) that declares an `@ai-sdk/openai-compatible` provider
+  pointed at the runtime's `/v1` endpoint, so there is no config file on disk — one source of truth in
+  `roster._opencode_openai`. Vetted live (2026-06-14): a real ACP turn answered on Ollama (`qwen3:8b`) and
+  LM Studio (`openai/gpt-oss-20b`). This supersedes the earlier "opencode's acp turn returns empty" finding,
+  which was an unconfigured-provider artifact, not an opencode limitation.
+- Documented the full, honestly-vetted local-backend support matrix in `docs/local-models.md`: which
+  agent × {ollama, lmstudio} pairs work, and — for the ones that do **not** — the concrete reason. `codex`
+  has no local pair (its custom providers now require the OpenAI Responses API wire that local runtimes don't
+  speak, and `codex-acp` is auth-gated); `hermes` can talk to Ollama but only via its own `config.yaml`
+  provider (its `acp` mode ignores the inference-provider env), so it is a config-file change, not an
+  env-keyed `backend`. `claude_code` on Ollama works but is slow and needs a generous timeout + a capable
+  model. A new `-m integration` suite (`tests/integration/test_local_backends.py`) drives every supported
+  pair live and skips a runtime that is down.
+- Durable runs (F2): a `delegate` / `consensus` / `debate` call can now be kept as a job on disk. Each of
+  the three tools takes a `persist` flag (`true` / `false`, or `None` to follow the configured
+  `default_persistence` — `ephemeral` out of the box, so nothing is written unless asked), and the
+  previously-inert `default_persistence` / `jobs_dir` config is now wired. A persisted run is written under
+  `<jobs_dir>/<run_id>/` (`jobs_dir` defaults to `<cwd>/.rutherford/jobs`):
+  - `state.json` — a versioned, replay-complete `RunRecord` as JSON (an internal record only Rutherford's
+    own reader consumes, so it round-trips losslessly rather than using the token-optimized TOON of the
+    tool wire): the resolved launch `argv`, requested-vs-resolved model, provenance, safety mode, requested/applied
+    effort, topology, `cwd`, prompt, role, files, ok / error code, changed files, cost, stop reason, and a
+    rollup. The child process `env` is **never** persisted (it can carry secrets); replay recomposes it.
+  - `artifacts/answer.md` (the answer / synthesis) and, for a write run, `artifacts/diff.md` (the sandbox
+    diff, including created / untracked files).
+  - A persisted `consensus` writes a parent record linking a child record per voice (`child_run_ids`), with
+    one `artifacts/voices/voice-N.md` per voice and a `voices/skipped.md` for an auto-panel's left-out agents;
+    the parent rolls up status / cost / changed-file union and carries the resolved `PanelInputs` (roster +
+    per-seat stance + session handle, strategy, synthesize, judge). A persisted `debate` writes a parent
+    record plus the full `artifacts/transcript.md` (a debate drives its turns over persistent sessions, so the
+    transcript carries the run rather than per-turn child records).
+  - `io/ledger.py` (`RunLedger`) is the one writer of the jobs directory; persistence is best-effort — a write
+    failure logs and degrades to an unpersisted result, never failing a run that already produced an answer.
+    `io.ledger.read_record` / `iter_records` are the reader side (job continuation and the `analyze` report).
+- The write/propose sandbox substrate, so Rutherford can safely delegate file-writing work to an agent over
+  ACP. A mutating delegation (`write` / `propose` / `yolo`) with a `working_dir` no longer runs the agent in
+  the user's tree — it runs in an isolated execution root and only a reviewed diff is ever applied back.
+  - SandboxManager (`acp/sandbox.py`). For a git `working_dir`, a mutating turn runs in an ephemeral detached
+    git worktree off the repo's current `HEAD` (the agent's spawn cwd, the ACP `session/new` cwd, and the
+    file/terminal confinement root are all the worktree). After the turn the changed set is computed
+    (`git diff --cached --binary` for the patch plus `--name-status` for the created / edited / deleted
+    paths): `propose` discards the worktree and returns the diff with nothing applied; `write` / `yolo` apply
+    the changes back to the real `working_dir` by copying the changed files byte-for-byte (and removing the
+    deleted ones) — copying rather than `git apply` so the result is byte-faithful on Windows (no `core.autocrlf`
+    `\r` injection). A non-git `working_dir` runs in a bounded temp copy and copies the changed files back; a
+    tree over the copy-size guard is refused with a clear "write mode needs a git working_dir" error rather than
+    run unsandboxed. The worktree / copy is always cleaned up and the agent's process tree reaped.
+  - FileGateway (`acp/client.py`). In a sandbox, `write_text_file` (always) and `read_text_file` (in a
+    mutating sandbox) are confined to the sandbox root: a path that escapes it (`..`, an absolute path outside,
+    a symlink out) is rejected with a clean `RequestError` and journaled (`fs_write_denied` / `fs_read_denied`),
+    so a sandboxed agent cannot reach the rest of the disk through the ACP file callbacks.
+  - TerminalBroker (`acp/client.py`). `write` / `yolo` implement the ACP terminal callbacks for real — the
+    command runs with its cwd pinned to the sandbox root (a sanitized argv, no shell), with a bounded timeout
+    and an output-size cap, and its process tree is reaped on kill / release / session close. `read_only` and
+    `propose` keep denying terminal execution (propose may edit the throwaway worktree to produce a diff but
+    must not run commands).
+  - `verify_read_only` is now wired (gap 13). When the config flag is on and a successful `read_only`
+    delegation ran in a git `working_dir`, the tree under it is fingerprinted (status + the staged and unstaged
+    diffs, scoped to that subtree) before and after the turn; a change fails the result with
+    `READONLY_VIOLATED` (`SIDE_EFFECTED`), catching an agent that touched the disk out of band.
+  - The `DelegationResult` now carries `diff` (the sandboxed run's patch — for `propose`, the deliverable)
+    and `changes_applied` (`True` for an applied `write` / `yolo`, `False` for a `propose`), and
+    `changed_files` is now sourced from the sandbox (the per-delegation delta off `HEAD`, sound rather than
+    the current dirty state).
+- Named panels, the `review` / `plan` tools, and config-scope role layering, ported from v2 onto the
+  ACP-native core.
+  - Saved panels. A `panels.toon` file defines named, reusable rosters
+    (`Panel{name, description, strategy, targets:[{cli, model, role, label, weight, parity, stance}]}`),
+    discovered across the same scopes as the rest of the config — `~/.rutherford/panels.toon`, the project
+    `.rutherford/panels.toon`, then `$RUTHERFORD_CONFIG_DIR` — and merged by name, the closest scope winning.
+    The store loads lazily and is cached on the `AppContext`; every discovered file is validated in one pass
+    against the live agent registry, so a panel naming an unknown agent, a bad strategy, an empty target list,
+    or a negative weight raises `PANEL_INVALID` reporting every problem at once. `consensus` and `debate` gain
+    a `panel` parameter (plus `panel_overrides`, a shallow merge re-validated through the same model): the
+    saved seats and the panel's aggregation `strategy` replace explicit `targets`, and naming both is rejected
+    (`targets` / `stances` are mutually exclusive with `panel`). An unknown panel is `PANEL_NOT_FOUND`. A new
+    `reload_panels` tool re-reads the files and returns `{reloaded, count, panels:[{name, description,
+    target_count}]}`.
+  - The `review` tool. A read-only `consensus` over a code diff or a set of files under the
+    `principal-reviewer` persona, synthesize on by default. `review(targets|panel, paths=None, diff=None,
+    role="principal-reviewer", synthesize=True, ...)` builds the review prompt from the inlined `diff` or the
+    in-scope `paths`, runs every voice read-only (the tool takes no `safety_mode`, so an inspection-named tool
+    can never mutate), and returns the consensus envelope.
+  - The `plan` tool. A read-only `delegate` under the `architect` persona: `plan(cli, goal, model=None,
+    working_dir=None, files=None, timeout_s=None)` asks one agent to design an approach (not implement it),
+    clamped to read-only, returning the delegation envelope.
+  - Role-scope layering. The role store now layers custom roles across the v2 scope order — built-in (package)
+    → each `config.role_dirs` → `~/.rutherford/roles/` → the project `./.rutherford/roles/` →
+    `$RUTHERFORD_CONFIG_DIR` — the closest scope winning by id, so a workspace can override a built-in. Role
+    files may be markdown (the body is the prompt) or TOON (a `prompt` / `system_prompt` field). Each `Role`
+    records its `source` (`built-in` | a `role_dirs` path | `user` | `project` | `env`), surfaced in
+    `list_roles`. Loading stays tolerant: a malformed or unreadable role file is logged and skipped, never a
+    startup crash.
+- The reliability layer over ACP — ReexecutionSafety-gated fallback and per-agent cooldown / quarantine
+  (F7), ported from v2.
+  - Cross-target + model fallback. `delegate` gains a `fallback` parameter (an ordered list of `cli` /
+    `cli:model` alternates) and `allow_model_fallback` (on by default). On a FAILED turn whose
+    `error.reexecution_safety is SAFE` — only a pre-prompt spawn / handshake failure that never ran the
+    prompt, so it could not have spent cost or caused a side effect — Rutherford retries: first the SAME agent
+    on its configured `fallback_model` when the failure looks model-unavailable (most ACP agents declare none,
+    so this is a clean no-op), then each `fallback` alternate in turn until one answers. A DUPLICATE_COST /
+    AMBIGUOUS / SIDE_EFFECTED failure (a refusal, an empty answer, a timeout, a mid-turn transport drop) is
+    NEVER retried, and a write / yolo delegation never falls back (a partial mutation may have happened). The
+    result records `fallback_from` (the originally requested model), `fallback_chain` (the labels that failed
+    before the one that answered, a benched alternate shown as `<label> (benched)`), and bumps
+    `delegation_call_count` per attempt — which already feeds `Topology.realized_delegations`. The consensus /
+    debate voices benefit through the same primitive (fallback is opt-in per call).
+  - Cooldown / quarantine. A new `acp/cooldown.py` `CooldownTracker` (keyed per agent id, in-memory,
+    process-global on the `AppContext`) benches an agent after `cooldown_threshold` UNHEALTHY ACP failures
+    within `cooldown_window_s`, for `cooldown_duration_s` (`0` disables). A new `acp/failures.py` classifies
+    UNHEALTHY (the seat is broken: `ACP_SPAWN_FAILED` / `ACP_HANDSHAKE_FAILED` / `ACP_TURN_TIMEOUT` /
+    `ACP_TURN_ERROR` and the rate-limit / auth classes) vs CLEAN (the request's fault: a refusal, an empty
+    answer, a bad-prompt guard — these never bench a healthy agent). A benched agent is left OUT of an
+    `expand_all` auto-panel (recorded in `skipped` as `benched, Ns remaining`) and skipped as a fallback
+    candidate, but an EXPLICIT `delegate` to it STILL RUNS — cooldown shapes auto-selection, it never blocks a
+    direct request. The `cooldown_threshold` / `cooldown_window_s` / `cooldown_duration_s` config fields move
+    out of the "not yet wired" list in `docs/configuration.md`. An optional per-agent `fallback_model` config
+    field (and `AgentDescriptor` field) lets an agent that can decline a model recover on a known-good one; no
+    built-in agent declares one.
+
+- N1 topology, a per-voice live-activity stream, sync progress push, and the cross-cutting limits over ACP
+  (item 3 + reliability), ported from v2.
+  - Topology. `consensus` / `StrategyResult` / `debate` and a single `delegate` result now carry a populated
+    `Topology`: `declared` (the intended width), `realized_delegations` (Rutherford's own ACP delegations
+    summed across voices/turns, incl. any fallback re-runs), `observed_peak_agents` (a FLOOR sampled from the
+    live process tree — a coarse psutil timer walks each agent's descendants during a turn, reusing
+    `teardown`, and the panel takes the peak; a CLI's remote agents are invisible, hence "floor"), and
+    `over_cap`.
+  - Per-voice activity stream + the `activity` tool. The services emit one `ActivityEvent` stream from a
+    single source — a panel emits `panel_started`, a `voice_started` / `voice_finished` (or `cut`) per voice
+    under a stable correlation id, and `panel_finished`, guaranteed exactly one terminal event by a
+    `PanelLifecycle` wrapper. A background job buffers the stream on a bounded `JobRecord.activity[]`, and the
+    `activity` MCP tool now returns one row PER VOICE in flight (`{job_id, tool, cli, model, role, status,
+    elapsed_s, observed_agents, budget_left_s}`) instead of one row per job, still `{active, count}`.
+  - Sync progress push. A synchronous `consensus` / `debate` call pushes MCP progress notifications as voices
+    finish (a consensus-fraction `done`/`declared`), via a `make_progress_pusher` -> `Context.report_progress`
+    seam in `server.py`, gated on a client-supplied `progressToken` (silent otherwise). An async job is polled
+    via `activity` instead.
+  - Limits. A `max_concurrency` semaphore (held around every ACP turn by the delegation primitive and shared
+    with the consensus budget-harvest and a debate's round turns) bounds how many live ACP sessions a wide
+    panel launches at once. The aggregate-agent cap is wired: a panel whose declared width exceeds
+    `max_agents_advisory` flags `Topology.over_cap` and logs a warning, or — with `enforce_agent_cap=true` —
+    is refused up front with `AGENT_CAP_EXCEEDED`. A new `runtime/depth.py` propagates `RUTHERFORD_DEPTH`
+    (+ count-first `RUTHERFORD_LINEAGE` and `RUTHERFORD_PARENT_RUN`) into every spawned ACP agent's
+    environment and enforces `max_depth`, refusing a too-deep Rutherford-driving-Rutherford call with
+    `MAX_DEPTH_EXCEEDED`. The `max_concurrency`, `max_agents_advisory`, `enforce_agent_cap`, and `max_depth`
+    config fields move out of the "not yet wired" list in `docs/configuration.md`.
+
+- Reasoning-effort tiers and a whole-panel time budget with harvest over ACP (F8a), ported from v2.
+  - Effort tiers. `delegate` / `consensus` / `debate` gain an `effort` (low | medium | high | xhigh)
+    parameter, resolved per call as explicit `effort` -> per-agent `[agents.<id>] effort` -> global
+    `default_effort` -> none. Since ACP has no effort field, each tier maps to an agent's real knob through a
+    new `acp/effort.py`: **codex** encodes it in the ACP model id as `model[effort]` (the `codex-acp` adapter
+    parses the bracket; `xhigh` supported), **cursor** encodes it as a `model-<tier>` suffix (clamps `xhigh`
+    to `high`), **cline** passes the global `--thinking <tier>` launch flag, and **junie** sets the
+    `JUNIE_EFFORT` env (best-effort: documented as a new-session default, ACP-mode application unconfirmed).
+    Every other agent — including **pi**, whose `--thinking` is an in-session selector with no launch knob —
+    is an honest reported no-op. The codex/cursor model rewrite reaches the agent via a best-effort
+    `session/set_model` (sent only for a model the agent advertised). The result carries `effort` (requested)
+    and `effort_applied` (the tier after clamping, or `None` for a no-op).
+  - Time budget + harvest. `consensus` and `debate` gain `time_budget_s` (a wall-clock deadline for the WHOLE
+    panel, distinct from each turn's `timeout_s`) and `on_budget` (harvest | continue | resume, default
+    `default_on_budget`). Consensus races the voices under an `asyncio.wait` deadline: at the deadline the
+    answered voices are kept and the in-flight ones are cut (their streamed partial harvested and promoted to
+    a usable answer), then the panel aggregates over the harvest as long as `min_quorum` usable voices remain.
+    Debate enforces the budget at round boundaries: a round still in flight at the deadline is cut (its turns
+    recorded as `BUDGET_EXHAUSTED` positions with the partial preserved but never promoted to a stance) and
+    the transcript so far is finalized. A harvest is a SUCCESS — `stop_reason="budget"` plus a `RunRollup`
+    (issued / answered / cut / usable / quorum_met / elapsed_s / time_budget_s / effort_requested /
+    effort_applied / cost); a harvest below `min_quorum` is the one genuine failure, `BUDGET_EXHAUSTED` (not
+    retryable). `on_budget="continue"` makes the budget advisory (every voice / round runs to completion). A
+    run that finishes within its budget sets `stop_reason=None` and a rollup with `stop_reason="ok"`.
+
+- Consensus aggregation over ACP, ported from v2. `consensus` regains the capabilities the v3 fan-out had
+  dropped, all behaviorally equivalent to v2 and computed as pure post-processing over the voices the ACP
+  turns already return:
+  - Strategies. A `strategy` other than `all-voices` (`unanimous` | `majority` | `plurality` | `weighted`
+    | `parity-pair`) asks each voice for a verdict and reduces the panel to one outcome
+    (`StrategyResult`), instead of returning every voice. `majority` / `weighted` require a *true* >50%
+    share of all eligible voices (a failed or unparseable voice stays in the denominator, so an outcome
+    cannot be certified off the one voice that answered); `plurality` is the lenient top-scorer rule (a
+    top tie is `tied`); `unanimous` needs every voice to weigh in and agree (a failure vetoes it, `split`);
+    `parity-pair` compares the proposer against every parity counterweight and escalates on disagreement.
+    Outcomes: `unanimous` / `majority` / `no_majority` / `plurality` / `tied` / `split` / `agree` /
+    `escalate` / `no_quorum`. `all-voices` still returns the every-voice shape.
+  - Verdict extraction. Each voice's verdict is read the v2 way — the last `VERDICT: <token>` line
+    (case-insensitive) by default, or the last JSON object carrying a non-empty `verdict` field when a
+    `verdict_schema` is given (a balanced-brace scan, so a trailing footer object or a truncated array
+    cannot steal the vote). A voice with no extractable verdict is `unparseable` — recorded with a reason,
+    never silently dropped, and kept in the denominator.
+  - Server-side synthesis. `synthesize` (tri-state, defaulting to `synthesize_default`, off out of the
+    box) runs a combining pass for an `all-voices` panel on a fresh read-only ACP turn — the nominated
+    `judge` if named, else the first successful voice — and records `synthesis` / `synthesis_by`.
+  - Diversity scoring. A `DiversityReport` is computed from the answering voices' provenance —
+    answered-voice count, distinct models, distinct providers, unknowns — and flags `low_diversity` when
+    at least two voices resolve but collapse below `min_distinct` distinct models *or* providers.
+  - `min_quorum` / `no_quorum`. An aggregating strategy with fewer than `min_quorum` usable (ok +
+    parseable) voices returns `no_quorum` instead of a decision.
+  - `expand_all` / auto-panel. Omit `targets`, pass an empty list, pass the sentinel `"all"`, or set
+    `expand_all=true` to fan out to every registered agent (capped at `max_targets`), with each excluded
+    agent recorded in `skipped` with its reason.
+  - Per-seat `Target` metadata. A `{cli, model}` target may carry `role` (a per-seat role override),
+    `weight` (for `weighted`), `parity` / `stance` (for `parity-pair` and steering); the strategies read
+    the seat's metadata even though the ACP turn rebuilds the result's bare `(cli, model)` target.
+  - The dropped `consensus` parameters are back: `strategy`, `verdict_schema`, `judge`, `stances`,
+    `synthesize`, and `expand_all`, alongside the existing ones. `mode="async"` runs the same aggregating
+    path off the request path.
+- An `activity` tool: a focused snapshot of the background work in flight right now. Where `list_jobs`
+  enumerates every tracked job of every status, `activity` returns only the running and pending jobs —
+  `{active: [...], count}`, each row `{job_id, tool, status, summary, started_at, elapsed_s}` with a live
+  `elapsed_s` measured against the store's clock and the rows sorted longest-running first. It returns
+  `{active: [], count: 0}` when nothing is in flight.
+- A `setup` first-run helper (the "good duck" getting-started surface). It resolves the config path for a
+  scope — `project` (`<cwd>/.rutherford/config.toml`) or `global` (the platform config dir's
+  `config.toml`) — and returns a sensible commented starter `config.toml` at the effective defaults
+  (`default_safety_mode`, `default_timeout_s`, `auto_detect_local_models`, `max_targets`, a commented-out
+  `[agents.local-goose]` local-model example, and a `trusted_workspaces` line), plus a snapshot of the
+  agents already registered. With `write=true` it creates the file but never clobbers an existing one
+  (`already_exists=true`, `written=false`); with `write=false` (default) it returns the proposed `content`
+  and `path` without touching disk. `trust_workspace=true` adds the current directory to
+  `trusted_workspaces`. The generated TOML round-trips through `tomllib` and validates against
+  `RutherfordConfig`. An invalid scope fails on the request path with `INVALID_INPUT`.
+- Role personas (the "good duck" role surface, over the ACP core). A `role="<id>"` argument on
+  `delegate` / `consensus` / `debate` prepends a reusable system prompt to the caller's task (the role
+  text, a `---` delimiter, then the prompt). Five substantive built-ins ship as package data:
+  `principal-reviewer`, `architect`, `debugger`, `security-reviewer`, and `explainer`. A `role_dirs`
+  directory adds new roles or overrides a built-in of the same id; each role is a markdown file with a
+  small `name` / `description` frontmatter block whose body is the prompt. Loading is tolerant — a
+  missing directory or a malformed role file is logged and skipped, never a startup crash. A new
+  `list_roles` tool enumerates the catalog (`{roles: [{id, name, description}]}`), and a bad `role` id
+  fails on the request path with the new `UNKNOWN_ROLE` code listing the known roles.
+- Async background jobs. `delegate` / `consensus` / `debate` take `mode="async"` to run the work off the
+  request path: the call returns a small `{job_id, status, tool}` envelope immediately and the work runs as
+  an in-memory `asyncio` task. Four tools manage them — `list_jobs` (light listing, newest first),
+  `job_status` (status + timings), `job_result` (the finished run's envelope, byte-for-byte the same as the
+  sync path, or a structured error when failed/cancelled/not-done), and `cancel_job` (kill a running job).
+  The store is bounded by `max_jobs` (evict the oldest finished, else `TOO_MANY_JOBS`) and `job_ttl_s`
+  (finished jobs expire on access); a background task captures any exception so it can never crash the
+  server. In-memory only — jobs clear on restart (durable, replayable runs are the separate F2 corpus).
+- Nine more agents in the ACP-native roster (v3): `codex` and `claude_code` via the official Zed adapters
+  `codex-acp` / `claude-agent-acp` (both reuse the existing CLI login over ACP — no API key — keeping the
+  ChatGPT and Claude Code logins, correcting the earlier research note that flagged them as possibly
+  API-key-only), plus `copilot` (`copilot --acp`), `qwen` (`qwen --acp`), `droid`
+  (`droid exec --output-format acp`), `cursor` (`cursor-agent acp`), `kiro` (`kiro-cli acp`), `pi`
+  (the `pi-acp` wrapper) and `hermes` (`hermes acp`), each probed and driven live.
+  (`hermes` is registered but kept out of the bounded integration test — the Nous endpoint latency is too
+  variable to assert against; check it live with `doctor`.)
+- Config-driven agents. Under ACP an agent is just how to launch it plus a few quirks (no per-CLI parser),
+  so the roster is now built from the curated built-in defaults plus a `[agents.<id>]` config section.
+  A config entry overrides a built-in agent's command/env/provider/model/handshake, disables one with
+  `enabled = false`, or defines a brand-new agent (any unknown id, which must supply a launch `command`);
+  `enabled_agents` restricts the result. The launch fields mirror the Zed/Cline `acp.json` shape.
+- Zed/Cline `acp.json` import. The loader auto-discovers an `acp.json` beside the global config and in the
+  project's `.rutherford/`, folding its `agent_servers` into the agents config the way Zed/Cline read it.
+  The native TOML wins over an imported `acp.json` at the same scope; an import never overrides a built-in
+  or blocks startup when malformed.
+- Local-model backends (Ollama / LM Studio) as first-class ACP voices. An `[agents.<id>]` entry with
+  `base` (a built-in to clone), `backend` (`ollama` / `lmstudio`), `model` (and optional `host`) points an
+  agent at a local runtime — Rutherford fills in the provider env. Supported pairs (all proven live):
+  `goose` × ollama/lmstudio, `qwen` × ollama/lmstudio, `claude_code` × ollama (Ollama's
+  Anthropic-compatible endpoint; LM Studio is OpenAI-only). The model must support tool-calling. See
+  `docs/local-models.md`.
+- **`python -m rutherford init` first-run CLI** (v2 parity). Scaffolds a starter `config.toml` from the
+  effective defaults — `<cwd>/.rutherford/config.toml` by default, or the platform global path with
+  `--global` — prints the registered agents, and never clobbers an existing config (edit it, or remove it
+  and re-run). `--yes` skips the y/N confirmation. It reuses the same scaffold the `setup` MCP tool writes;
+  as the bootstrap command it scaffolds from defaults (and warns) rather than refusing when an existing,
+  possibly unrelated config — a broken project `config.toml` must not block `init --global` — fails to load.
+- **Advisory persistence notices** on `delegate` / `consensus` / `debate` results (v2 parity). A non-fatal
+  `notice` rides the result envelope (absent from the wire when empty) to nudge a caller toward durable jobs:
+  a one-time-per-session first-run hint when the workspace has no `config.toml`, and a suggestion to pass
+  `persist=true` for a complex (multi-voice / write) run that was not persisted under the default-ephemeral
+  policy. A new `external_tracking=true` parameter on the three tools silences the suggestion when an
+  orchestrator already tracks the run.
+- **`RANK`: a two-round preference-voting consensus strategy (F4b).** `strategy=rank` runs an answer round,
+  then a second round where each voice ranks the others' answers — anonymized, self-excluded, and per-voter
+  shuffled so a voice cannot favor its own or anchor on an order. The result is a `RankReport`: a Borda
+  leaderboard, a pairwise Spearman-correlation matrix, and a concordance score, plus a required dissent from
+  the top pick. For questions with no single right answer (which of these designs is best?) where a yes/no
+  tally does not fit.
+- **Anti-anchoring integrity guards on consensus and debate (F4a).** A synthesis/closing authored by a panel
+  participant is flagged `self_authored`, and `require_independent_judge` refuses one (so a voice cannot grade
+  its own panel); a losing-but-valid verdict or a set-aside debate position carries a structured `dissent`
+  reason rather than vanishing; and a debate's round-1 answer is captured as a blind `pre_commit` before any
+  voice sees another's, so pre-vs-post movement is visible and convergence is measured against a real prior.
+- **F3 lineage trust signals.** A consensus result carries an `effective_lineages` headline — how many
+  genuinely independent model lineages produced the answers, keyed on the base model family (so `claude-opus`
+  and `claude-sonnet` read as two lineages, not one "anthropic"), with a `LOW DIVERSITY` flag — so a panel
+  that is one model in several CLI costumes is visible rather than passing as N independent opinions. An
+  opt-in, off-by-default correlation-aware vote-math (`discount_correlated`) down-weights votes that share a
+  lineage so the panel does not over-count; an across-panel `analyze` report surfaces which lineages tend to
+  agree (observational only — it never reshapes a live vote).
+- **`continue_job`: resume or build on a completed durable job.** Point `continue_job` at a kept job id with a
+  new prompt and it resumes the agent's ACP session (`session/load`) where supported, else re-injects the
+  prior prompt + answer; works for a `delegate`, `consensus`, or `debate` job (a panel rebuilds its roster and
+  strategy from the persisted `PanelInputs` and resumes each seat). The continuation is a fresh child run
+  linked via `continued_from`, and it re-derives its own safety gate defaulting to `read_only` — never
+  inheriting the parent's mode or the workspace write-default.
+- **Stateful debate (F5).** A debate can carry the full transcript forward each round (`carry_forward`) rather
+  than only the previous round, and track convergence: a per-round progress ledger plus a termination grammar
+  yields a `DebateOutcome` with a `TerminationReason` (`converged` / `stalled` / `unresolved` / `budget` /
+  `quorum_lost`), so a `DebateResult` can say whether the panel actually agreed or just ran out of rounds.
+- **`analyze`: an offline report over the kept run corpus.** A read-only tool (`analyze report=historical_agreement`)
+  that scans the consensus panels you chose to persist and reports how often two model lineages reached the
+  same verdict when they co-voted — a signal for your roster choice, never a vote discount.
+
+### Fixed
+
+- **`doctor` no longer false-flags a cold local model.** A local-model agent (provider `ollama` / `lmstudio`,
+  or a configured backend whose env points at a `localhost` / `127.0.0.1` endpoint — matched
+  case-insensitively) now gets a generous probe-timeout floor (180s) over the per-call `timeout_s`, because a
+  cold local model loads from disk on its first prompt and the 60s cloud default reliably reported a healthy
+  model as broken. The floor only raises a too-short budget; a larger explicit `timeout_s` and a cloud
+  agent's default are untouched.
+
+- **Produce into a fresh, non-git location.** A `write` / `propose` / `yolo` delegation whose `working_dir`
+  does not exist yet (a brand-new path to scaffold a project or write a report into, with no git repo) no
+  longer crashes with an unhandled `FileNotFoundError` from the sandbox copy. It is now a first-class
+  "write / produce things that are not in a git repo" path: the sandbox is an empty temp directory, and the
+  apply-back creates the real directory (and parents) as it writes the produced files — for `propose` nothing
+  is applied, so the path stays absent. A `working_dir` that points at a file (not a directory) is refused
+  cleanly. The existing non-git temp-copy path (an existing non-git directory) is unchanged.
+- **Sandbox filesystem faults are structured, never an uncaught raise** (found by a multi-lens review of the
+  produce change). An `OSError` while building the sandbox (mkdtemp / copytree) or applying it back (`mkdir`
+  on an unwritable produce target, disk full) is now returned as a failed `DelegationResult`, honoring the
+  delegation primitive's "every fault is a structured result, never raises" contract — previously it could
+  propagate out and abort a whole consensus/debate panel. A build failure after `mkdtemp` no longer leaks the
+  temp directory, and the non-git temp sandbox is now removed in full (the `mkdtemp` parent, not just the
+  copy) on cleanup.
+- **Write-sandbox hardening** (found by a second, deeper Codex-via-Rutherford safety review of the
+  delegation / sandbox paths):
+  - A sandboxed mode (`propose` / `write` / `yolo`) **with no `working_dir`** is now refused up front
+    (`INVALID_INPUT`). Previously such a call fell through to the direct, un-sandboxed path and ran in the
+    server's own cwd with writes allowed — and `trust_workspace=true` passed the trust gate regardless of
+    `working_dir`, so this was a real unsandboxed-write bypass. A sandbox needs a tree to isolate; the call
+    must name one.
+  - The sandbox **apply-back is now containment-checked**: each changed/deleted path is resolved and refused
+    unless it stays within the resolved `working_dir`. Without this, a symlink inside the workspace
+    (`link -> /outside`) could redirect an applied edit to a file *outside* the trusted tree — a write escape.
+  - `verify_read_only` now fingerprints the tree **whether or not the turn succeeded**. A read-only turn that
+    mutated the tree and then failed (or returned empty) is now surfaced as `READONLY_VIOLATED` instead of an
+    ordinary failure that hid the side effect.
+  - The **non-git temp-copy sandbox now detects deletions**: a `write` / `yolo` agent that removes a file in
+    the sandbox has the deletion applied back to the real tree, matching the git-worktree path (previously the
+    non-git path lost deletions entirely).
+  - The sandbox `open()` now runs **under a shield** so a cancellation mid-open cannot strand a half-built
+    worktree (and its git admin entry) or temp copy — on a cancel the open is drained and cleaned up before
+    the cancellation propagates.
+  - A git `write` / `yolo` apply-back now **refuses to clobber an uncommitted local edit**. The worktree is
+    built off `HEAD`, so a changed file carries `HEAD` + the agent's edit, not any uncommitted change the user
+    has in the real tree; applying it back would silently overwrite that work. If any file the apply touches is
+    dirty vs `HEAD` in the real tree (checked under the repo's own `autocrlf` policy, so a CRLF-checked-out file
+    is not falsely flagged), the apply is refused with a clear "commit or stash first" error. An uncommitted
+    edit to an unrelated file does not block. (A second-pass review finding.)
+  - Further sandbox-robustness fixes (a third review pass of the apply-back):
+    - The non-git temp-copy path now diffs the agent's edits against an **open-time content baseline** (per-file
+      hashes), not the live tree — so a concurrent user edit to an *untouched* file is no longer mis-attributed
+      as an agent change, and a concurrent edit to a file the agent *did* change is detected and the apply is
+      refused (rather than silently overwriting it).
+    - A git **rename is applied as delete-old + add-new** (`--no-renames` on the diff), so a repo with
+      `diff.renames` enabled no longer leaves the renamed-from path behind.
+    - The non-git copy now **skips symlinks** entirely instead of dereferencing them, so a symlink pointing
+      outside the workspace can't pull external bytes into the sandbox; the real symlink is left untouched.
+    - Delete-back resolves only a path's **parent** (not the final component), so deleting a workspace symlink
+      removes the link itself rather than following it (or being wrongly skipped).
+    - Apply-back **never writes through a destination symlink** (a fourth review pass): if the destination is a
+      symlink it is replaced at its own in-tree location rather than followed, so a symlink can't redirect a
+      write to another file the conflict checks never examined; a real directory at the destination is skipped.
+  - Two limitations are deliberate and documented (in `acp/sandbox.py`), given the cooperative-agent threat
+    model: the sandbox is cwd + path-guard isolation, **not an OS jail** (a write/yolo agent's own process or a
+    terminal command can still write an absolute path outside it; OS containment is deferred); and the
+    check-then-apply path has a **narrow inherent TOCTOU** (a user save in the sub-millisecond window between
+    the clobber check and the copy is not caught — the same gap `git apply` / `git stash` have).
+  - Known, accepted limitation (unchanged, and documented in `acp/sandbox.py` + the security docs): the
+    sandbox confines a *cooperative* agent's ACP `fs`/terminal activity by cwd + the path-escape guard; it is
+    NOT an OS jail. A write/yolo agent's own process (or a terminal command it runs) can still write an
+    absolute path outside the sandbox. Full OS containment (Job Objects / ACLs) remains deferred. This is
+    strictly safer than v2, which ran agents directly in the user's tree with no Rutherford-side sandbox.
+- **Safety: `consensus` and `debate` now refuse a mutating / sandboxed `safety_mode`** (`propose` / `write` /
+  `yolo`) and run read-only. A debate drives its voices over persistent ACP sessions, and a budgeted consensus
+  drives its harvest sessions, **directly in the real `working_dir` with no per-turn worktree** — so a mutating
+  mode on those paths would let an agent write straight into the user's tree, unsandboxed. Beyond the leak,
+  there is no coherent way to merge edits from several agents into one working tree (the same reason delegation
+  already refuses a mutating cross-target fallback). The guard lives in the *services* (the security boundary,
+  not just the tool wrapper), so it holds no matter which caller set the mode; the error points the caller at
+  `delegate`, which isolates a single agent in a worktree sandbox and applies the reviewed diff back. Write /
+  propose work belongs to `delegate`; panels (`consensus` / `debate` / `review` / `plan`) are read-only
+  deliberation. (Found by the Codex-via-Rutherford parity review.)
+- A steered debate voice (stance `for` / `against`) now has its stance **re-embedded every round**, not just
+  round 1 (v2 parity). The later-round delta prompt re-appends "Keep arguing in favor of / against the
+  proposition."; without it a multi-round debate drifts toward the center as each voice accommodates the
+  others, so the assigned side has to be restated each round to hold the adversarial framing. (The v3 delta
+  still omits the voice's own prior position — the persistent session remembers it — which is the leaner
+  ACP-native shape; only the stance reminder was missing.)
+- Orphaned agent process trees. A wrapper adapter spawns the underlying CLI as a child; the ACP transport
+  terminated only the direct child, leaving that CLI running, holding the working directory, and piling up
+  across `doctor` probes. The session now reaps the agent's descendant tree on close.
+- A relative `working_dir` is resolved to an absolute path before `session/new` (ACP requires absolute);
+  a `working_dir` that points at a file now fails cleanly as a spawn failure instead of an internal error.
+- The ACP stdin buffer is raised from asyncio's 64 KiB default to 16 MiB. A single `session/update` larger
+  than the limit (e.g. kilo enumerating hundreds of OpenRouter models, or a large file read) previously
+  raised "Separator is found, but chunk is longer than limit" and dropped the connection.
+- `cline` now drives over ACP, but only with Cline's own service auth — a ChatGPT-subscription or
+  OpenRouter provider configured in the desktop app does not reach the headless `--acp` path.
+- A run's `duration_s` is now rounded to milliseconds (3 decimals) at every source — the `_reduce` and
+  `_failed` paths in the ACP session, and the debate contribution that carries it — instead of serializing
+  a raw `time.monotonic()` float like `0.0017640000442042947`. The long float tails made TOON output
+  needlessly noisy and could make a substring assertion over the envelope (e.g. counting `"42"`) over-count
+  on digits inside the duration, which flaked the consensus test run to run. Semantics are unchanged
+  (`duration_s` stays a `float`); the output is just stable and readable.
+
+### Changed
+
+- **TOON is reserved for the MCP wire; internal records and panel files are not TOON.** TOON cuts the tokens
+  an MCP client spends reading a tool *result*, but the F2 record is purely internal — only Rutherford's own
+  reader (job continuation / the `analyze` report) loads it back, no LLM consumes it — so it is persisted as
+  JSON (`state.json`), which round-trips losslessly including a real `argv` with colon-bearing elements
+  (`gemma3:12b`, a Windows path). Tool results on the wire stay TOON; the Markdown artifacts (`answer.md`,
+  `diff.md`, `transcript.md`, `voices/voice-N.md`) are plain Markdown.
+- The `setup` starter `config.toml` now scaffolds the F2 durability knobs (`default_persistence`, a commented
+  `jobs_dir`) and `synthesize_default` at their effective defaults, and points at the sibling `panels.toon`
+  for named multi-agent panels (with a note to call `reload_panels` after editing it) — closing the v2-setup
+  parity gap where the scaffold only emitted the safety/timeout/roster basics.
+- Config: `AdapterConfig` → `AgentConfig` (gains `command`/`env`/`provider`/`handshake_timeout_s`),
+  `adapters` → `agents`, `enabled_adapters` → `enabled_agents`.
+
+### Removed
+
+- **The entire v2 subprocess-adapter machinery.** `ProcessRunner` / `AsyncProcessRunner`, the `adapters/`
+  package and every hand-written per-CLI code adapter, `build_invocation` / `parse_output` and the golden
+  parse tests, and the shared output-parsing toolkit are all gone — ACP negotiates output, prompts, file
+  context, permissions, and resume, so there is no per-agent parser to maintain. An agent is now a config
+  `[agents.<id>]` block or a built-in `AgentDescriptor`.
+- **The v2 config surface** noted under Changed above is a breaking rename (`AdapterConfig`/`adapters`/
+  `enabled_adapters` → `AgentConfig`/`agents`/`enabled_agents`); a v2 `rutherford.toml` must be updated.
+- **A few v2 CLIs are not in the 19-agent built-in roster** — those without a working headless ACP server
+  mode (e.g. Kilo Code's headless turn hangs). Any dropped CLI can be added back through `[agents.<id>]`
+  config or proposed by `discover` once it ships a drivable ACP mode.
+
 ## [2.0.0] - 2026-06-13
 
 Purely additive: the supported roster grows from 13 to 22 CLIs and there are no breaking changes
 (strict SemVer would make this 1.8.0; 2.0.0 marks the roster milestone). Each new adapter was verified
-live end to end before release.
+live end to end before release. (This release is on the v2 line; the 3.0.0 ACP rewrite supersedes its
+adapter architecture, but the entry is kept for history.)
 
 ### Added
 

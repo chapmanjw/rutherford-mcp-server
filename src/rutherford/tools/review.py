@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""The ``review`` tool: a read-only code review, built on consensus."""
+"""The ``review`` tool: a read-only code review across ACP agents, built on consensus."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from ..context import AppContext, tool_success
-from ..domain.enums import SafetyMode, Stance
+from ..domain.enums import SafetyMode
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import ConsensusRequest, Target
-from .common import as_target, ensure_known_targets
+from .common import apply_role, as_target, ensure_known_targets
 from .panels import panel_for_call
 
 
@@ -23,45 +23,46 @@ async def review_tool(
     panel_overrides: dict[str, Any] | None = None,
     paths: list[str] | None = None,
     diff: str | None = None,
-    role: str = "codereviewer",
+    role: str = "principal-reviewer",
     working_dir: str | None = None,
     synthesize: bool | None = None,
     timeout_s: float | None = None,
 ) -> str:
-    """Review a diff or a set of files across one or more targets and return every voice.
+    """Review a diff or a set of files across one or more agents and return every voice.
 
-    Built on the consensus service with the ``codereviewer`` role. Review is CLAMPED to
-    ``read_only`` -- it takes no ``safety_mode`` so the tool's name stays honest (an
-    inspection-named tool must not run mutation-capable adapter flags); a mutating run is
-    ``delegate``/``consensus`` by design. Provide either ``diff`` (a unified diff) or ``paths``
-    (files for the agents to read), and either a list of ``targets`` or a saved ``panel`` (with
-    optional ``panel_overrides``); panel and targets are mutually exclusive.
+    Built on the consensus service with the ``principal-reviewer`` role prepended to the review prompt.
+    Review is CLAMPED to ``read_only`` -- it takes no ``safety_mode`` so the tool's name stays honest (an
+    inspection-named tool must not run with mutating permissions); mutating work runs through ``delegate`` (the
+    single sandboxed write path) by design -- the panels (consensus / debate) are read-only deliberation.
+    Provide either ``diff`` (a unified diff, inlined into the prompt) or ``paths``
+    (files put in scope for the agents to read), and either a list of ``targets`` or a saved ``panel`` (with
+    optional ``panel_overrides``); panel and targets are mutually exclusive. ``synthesize`` defaults on (a
+    combined verdict is the useful default for a review); pass ``false`` for the raw per-voice reviews.
+    Returns the ``ConsensusResult`` / ``StrategyResult`` envelope consensus produces.
     """
     if not diff and not paths:
         raise RutherfordError(ErrorCode.INVALID_INPUT, "review needs either 'diff' or 'paths'")
 
     review_targets: list[Target]
-    review_stances: list[Stance] | None
     if panel is not None:
         review_targets = panel_for_call(app, panel, panel_overrides, targets, None).to_targets()
-        review_stances = None  # each panel seat carries its own stance
     else:
         review_targets = [as_target(target) for target in targets or []]
-        review_stances = None
-    ensure_known_targets(app.registry, review_targets)  # a clean tool-boundary error, not a buried voice
+    ensure_known_targets(app.descriptors, review_targets)  # a clean tool-boundary error, not a buried voice
 
     request = ConsensusRequest(
         targets=review_targets,
-        prompt=_review_prompt(diff),
+        prompt=apply_role(app.roles, role, _review_prompt(diff)),
         role=role,
-        stances=review_stances,
         files=paths or [],
         working_dir=working_dir,
         safety_mode=SafetyMode.READ_ONLY,
-        synthesize=synthesize,
+        # Review synthesizes on by default (a combined verdict is the useful default), unlike consensus whose
+        # ``synthesize_default`` is off; an explicit ``False`` from the caller still wins.
+        synthesize=True if synthesize is None else synthesize,
         timeout_s=timeout_s,
     )
-    result = await app.consensus.consensus(request, correlation_id=app.new_correlation_id(), base_depth=app.base_depth)
+    result = await app.consensus.consensus(request)
     return tool_success(result)
 
 

@@ -1,6 +1,0 @@
-{"id":"1c73de16-f7d3-4580-91c8-6b409cfb43c4","timestamp":"2026-06-13T14:32:39.506050","source":"user","llm_message":{"role":"user","content":[{"type":"text","text":"What is the capital of France?"}]},"kind":"MessageEvent"}
-Agent is working
-{"id":"d1672f24-2a4a-49a5-a56b-750ce2c87010","timestamp":"2026-06-13T14:32:41.899523","source":"agent","llm_message":{"role":"assistant","content":[{"type":"text","text":"\nThe capital of France is Paris.\n"}],"reasoning_content":"The user asked a simple question."},"kind":"MessageEvent"}
-Agent finished
-Conversation ID: 8a52ba7fe5fa466a8776a659d8161491
-Hint: run openhands --resume 8a52ba7f-e5fa-466a-8776-a659d8161491 to resume this conversation.

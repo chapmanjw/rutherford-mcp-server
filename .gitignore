@@ -26,6 +26,7 @@ htmlcov/
 
 # Working dirs a delegated CLI drops in the repo when run here (e.g. Antigravity/agy)
 .antigravitycli/
+.junie/
 
 # Per-user Claude Code settings
 .claude/settings.local.json
@@ -34,3 +35,6 @@ htmlcov/
 *.log
 .DS_Store
 Thumbs.db
+
+# Stray PowerShell module cache (created by pwsh runs in the repo cwd)
+Microsoft/

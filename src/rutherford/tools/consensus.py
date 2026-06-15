@@ -1,41 +1,45 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""The ``consensus`` tool: ask the same prompt of several CLIs in parallel."""
+"""The ``consensus`` tool: ask the same prompt of several ACP agents in parallel and reduce the voices."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from ..context import AppContext, tool_success
-from ..domain.enums import DelegationMode
 from ..domain.models import ConsensusRequest, Target
 from ..services.delegation import ActivityCallback
 from .common import (
+    apply_role,
     as_target,
-    async_job_envelope,
-    ensure_known_cli,
+    ensure_known_agent,
     ensure_known_targets,
     parse_effort,
-    parse_mode,
     parse_on_budget,
     parse_stances,
     parse_strategy,
+    resolve_run_mode,
     resolve_safety_mode,
 )
+from .jobs import make_summary, submit_job
 from .panels import panel_for_call
 
 
 async def consensus_tool(
     app: AppContext,
     *,
-    targets: list[Any] | str | None = None,
     prompt: str,
+    targets: list[Any] | str | None = None,
     panel: str | None = None,
     panel_overrides: dict[str, Any] | None = None,
     strategy: str | None = None,
     verdict_schema: dict[str, Any] | None = None,
     judge: Any = None,
+    require_independent_judge: bool = False,
+    require_dissent: bool = False,
+    discount_correlated: bool = False,
     stances: list[str] | None = None,
+    expand_all: bool = False,
     working_dir: str | None = None,
     files: list[str] | None = None,
     role: str | None = None,
@@ -45,108 +49,104 @@ async def consensus_tool(
     effort: str | None = None,
     time_budget_s: float | None = None,
     on_budget: str | None = None,
-    harvest_partial: bool = False,
-    mode: str = "sync",
-    include_raw: bool = False,
     persist: bool | None = None,
     external_tracking: bool = False,
+    mode: str = "sync",
     on_activity: ActivityCallback | None = None,
 ) -> str:
-    """Run ``prompt`` across several CLIs in parallel and return every voice.
+    """Validate the panel, fan the prompt out across the targets, and reduce the voices to a TOON envelope.
 
-    ``targets`` is a list of ``{cli, model}`` objects (or ``cli`` / ``cli:model`` strings). Omit it,
-    pass an empty list, or pass the sentinel ``"all"`` to fan out to every installed + authenticated
-    adapter (each at its default model, capped at ``max_targets``); the result's ``skipped`` field
-    explains any adapter left out. Alternatively name a saved ``panel`` (with optional one-off
-    ``panel_overrides``) instead of ``targets``; the two are mutually exclusive. Optional ``stances``
-    (parallel to ``targets``) steer each voice for/against/neutral and cannot be combined with the
-    auto-expanded panel. Optional ``synthesize`` adds a server-side combined answer; when omitted it
-    defaults to the configured ``synthesize_default`` (false out of the box), and an explicit value
-    always wins. With a ``strategy`` other than ``all-voices`` (optionally with a ``verdict_schema``), the
-    voices are aggregated into an outcome instead of returned individually.
-
-    ``effort`` (``low`` | ``medium`` | ``high`` | ``xhigh``) is the producer "how hard may each voice think"
-    hint, mapped per adapter and reported as applied (F8a); omit it to follow ``default_effort``.
-    ``time_budget_s`` is a wall-clock harvest deadline for the WHOLE panel, distinct from each voice's
-    ``timeout_s``: at the deadline the answered voices are kept and in-flight ones are cut, and the panel
-    aggregates over the harvest if ``min_quorum`` holds (else ``BUDGET_EXHAUSTED``). ``on_budget`` picks the
-    disposition: ``harvest`` (default), ``continue`` (run all voices; budget advisory), or ``resume``.
-    ``harvest_partial=true`` additionally re-prompts each cut voice whose session was recovered for a clean
-    best answer at the cut (it spends extra budget, hence opt-in).
+    ``targets`` is a list of ``{cli, model}`` objects (or ``cli`` / ``cli:model`` strings). Omit it, pass
+    an empty list, pass the sentinel ``"all"``, or set ``expand_all=true`` to fan out to every registered
+    agent (each at its default model, capped at ``max_targets``); the result's ``skipped`` field explains
+    any agent left out. Alternatively name a saved ``panel`` (with optional one-off ``panel_overrides``)
+    instead of ``targets``; a panel supplies the seats and the aggregation ``strategy`` and is mutually
+    exclusive with ``targets`` / ``stances``. Optional ``stances`` (parallel to ``targets``) steer each voice
+    for/against/neutral and cannot be combined with the auto-expanded panel. With a ``strategy`` other than
+    ``all-voices``
+    (optionally with a ``verdict_schema``), the voices are aggregated into a :class:`StrategyResult`
+    outcome instead of returned individually. ``synthesize`` (tri-state; defaults to ``synthesize_default``,
+    off out of the box) adds a server-side combined answer (``all-voices`` only); ``judge`` names the seat
+    that writes it. ``effort`` (low|medium|high|xhigh) asks every voice to spend more reasoning where it has
+    a knob. ``time_budget_s`` is a wall-clock deadline for the WHOLE panel (distinct from each voice's
+    ``timeout_s``): at the deadline answered voices are kept, in-flight ones are cut, and the panel
+    aggregates over the harvest if ``min_quorum`` usable remain (``stop_reason="budget"``) -- fewer than
+    ``min_quorum`` is ``BUDGET_EXHAUSTED``. ``on_budget`` (harvest|continue|resume, default
+    ``default_on_budget``) chooses the deadline behavior. ``mode="async"`` submits the panel as a background
+    job and returns a ``job_id``; ``mode="sync"`` (the default) awaits it. Validation always runs on the
+    request path, so a bad panel fails there rather than inside a job. A named ``role`` has its persona
+    prepended to the prompt every voice receives; ``UNKNOWN_ROLE`` if the id is not a known role. ``persist``
+    keeps the panel as a durable job (F2): a parent ``state.json`` linking a child record per voice, plus
+    ``voices/voice-N.md`` artifacts; ``None`` follows ``default_persistence``, ``True`` / ``False`` force it.
     """
-    target_objs: list[Target]
+    parsed: list[Target]
+    parsed_stances = parse_stances(stances)
     panel_strategy: str | None = None
     if panel is not None:
-        resolved = panel_for_call(app, panel, panel_overrides, targets, stances)
-        target_objs = resolved.to_targets()
-        panel_strategy = resolved.strategy
-        panel_stances = None  # each panel seat carries its own stance
-        expand_all = False
+        # A saved panel supplies the seats (each carrying its own stance) and the aggregation strategy; it is
+        # mutually exclusive with ``targets`` / ``stances`` (panel_for_call rejects either alongside it).
+        resolved_panel = panel_for_call(app, panel, panel_overrides, targets, stances)
+        parsed = resolved_panel.to_targets()
+        panel_strategy = resolved_panel.strategy
+        parsed_stances = None
+        auto_panel = False
     else:
-        panel_stances = parse_stances(stances)
-        expand_all = _wants_all(targets)
-        if expand_all:
-            target_objs = []
+        auto_panel = expand_all or _wants_all(targets)
+        if auto_panel:
+            parsed = []
         elif isinstance(targets, str):
-            target_objs = [as_target(targets)]  # a bare "cli" / "cli:model" string
+            parsed = [as_target(targets)]  # a bare "cli" / "cli:model" string
         else:
-            target_objs = [as_target(target) for target in targets or []]
-    if not expand_all:
-        ensure_known_targets(app.registry, target_objs)  # a clean tool-boundary error, not a buried voice
+            parsed = [as_target(target) for target in (targets or [])]
+    if not auto_panel:
+        ensure_known_targets(app.descriptors, parsed)
     judge_target = as_target(judge) if judge is not None else None
     if judge_target is not None:
-        ensure_known_cli(app.registry, judge_target.cli)  # a typo'd judge is a clean error, not silent no-synthesis
-    effective_strategy = parse_strategy(strategy if strategy is not None else (panel_strategy or "all-voices"))
+        ensure_known_agent(app.descriptors, judge_target.cli)  # a typo'd judge is a clean error, not silent
+    safety = resolve_safety_mode(safety_mode, app.config.default_safety_mode)
+    run_async = resolve_run_mode(mode)
+    composed_prompt = apply_role(app.roles, role, prompt)
+    # An explicit ``strategy`` wins; else the panel's own ``strategy``; else the legacy all-voices path.
+    effective_strategy = strategy if strategy is not None else panel_strategy
     request = ConsensusRequest(
-        targets=target_objs,
-        prompt=prompt,
-        stances=panel_stances,
+        targets=parsed,
+        prompt=composed_prompt,
+        stances=parsed_stances,
         working_dir=working_dir,
-        files=files or [],
+        files=list(files) if files else [],
         role=role,
-        safety_mode=resolve_safety_mode(safety_mode, app.config.default_safety_mode),
+        safety_mode=safety,
         synthesize=synthesize,
         timeout_s=timeout_s,
+        expand_all=auto_panel,
+        strategy=parse_strategy(effective_strategy) if effective_strategy is not None else parse_strategy("all-voices"),
+        verdict_schema=verdict_schema,
+        judge=judge_target,
+        require_independent_judge=require_independent_judge,
+        require_dissent=require_dissent,
+        discount_correlated=discount_correlated,
         effort=parse_effort(effort),
         time_budget_s=time_budget_s,
         on_budget=parse_on_budget(on_budget),
-        harvest_partial=harvest_partial,
-        include_raw=include_raw,
-        expand_all=expand_all,
-        strategy=effective_strategy,
-        verdict_schema=verdict_schema,
-        judge=judge_target,
         persist=persist,
-        external_tracking=external_tracking,
     )
-    correlation_id = app.new_correlation_id()
 
-    if parse_mode(mode) is DelegationMode.ASYNC:
-        # ``set_interim`` carries the F8a ``on_budget=continue`` best-effort result to the job while the
-        # stragglers keep running, so a poller sees the harvested-so-far set before the panel finishes.
-        job = app.jobs.submit(
-            "consensus",
-            lambda progress, activity, set_interim: app.consensus.consensus(
-                request,
-                correlation_id=correlation_id,
-                base_depth=app.base_depth,
-                on_progress=progress,
-                on_activity=activity,  # N1: the structured stream feeds the job's poll buffer (decision 3-K)
-                on_interim_result=set_interim,
-            ),
+    async def run(job_activity: ActivityCallback | None = None) -> str:
+        # N1 (item 3): the async path hands the panel the JOB's activity sink (the ``activity`` poll table);
+        # the sync path uses ``on_activity`` (the MCP progress push), supplied by server.py. Exactly one is
+        # ever set -- a sync call has no job buffer, an async call has no live caller to push to.
+        result = await app.consensus.consensus(request, on_activity=job_activity or on_activity)
+        # Advisory F2 nudge (suppressed by external_tracking): a consensus panel is a multi-voice run worth
+        # keeping as a durable job, plus the one-time first-run setup hint.
+        result.notice = app.persistence_notice(
+            persisted=result.run_dir is not None, complex_run=True, external_tracking=external_tracking
         )
-        return tool_success(
-            async_job_envelope(app, job, persist=persist, complex_run=True, external_tracking=external_tracking)
-        )
+        return tool_success(result)
 
-    # Sync path only: push live progress via MCP (N1, item 3); an async job is polled, not pushed.
-    result = await app.consensus.consensus(
-        request, correlation_id=correlation_id, base_depth=app.base_depth, on_activity=on_activity
-    )
-    result.notice = app.persistence_notice(
-        persisted=result.run_dir is not None, complex_run=True, external_tracking=external_tracking
-    )
-    return tool_success(result)
+    if run_async:
+        roster = ", ".join(target.display_label for target in parsed) or "all"
+        return await submit_job(app, "consensus", run, summary=make_summary("consensus", target=roster, prompt=prompt))
+    return await run()
 
 
 def _wants_all(targets: list[Any] | str | None) -> bool:

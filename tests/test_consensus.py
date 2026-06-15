@@ -1,1124 +1,860 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""Tests for the consensus service, driven by fakes."""
+"""Tests for consensus over ACP: fan-out, caps, strategies, verdicts, synthesis, diversity, expand_all."""
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable
+import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from rutherford.adapters.registry import AdapterRegistry
+from rutherford import server
+from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
-from rutherford.domain.enums import ActivityEventKind, AuthState, Stance, Strategy
+from rutherford.context import AppContext, build_app_context
+from rutherford.domain.enums import Effort, SafetyMode, Stance, Strategy
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import (
-    ActivityEvent,
-    ConsensusRequest,
-    ConsensusResult,
-    DelegationRequest,
-    InvocationSpec,
-    ProcessResult,
-    StrategyResult,
-    Target,
-)
-from rutherford.services.consensus import ConsensusService
+from rutherford.domain.models import ConsensusRequest, ConsensusResult, StrategyResult, Target
+from rutherford.services.consensus import ConsensusService, _Candidate
 from rutherford.services.delegation import DelegationService
-from rutherford.services.roles import load_roles
-from tests.fakes import FakeAdapter, FakeProcessRunner
+from rutherford.tools.common import as_target, ensure_known_targets, parse_stances, parse_strategy
+from rutherford.tools.consensus import consensus_tool
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+_FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
+FAKE = AgentDescriptor("fake", "Fake", _FAKE_CMD)
+# Two more fakes with distinct provider + default model, so a panel of them spans real diversity.
+FAKE_A = AgentDescriptor("fake_a", "Fake A", _FAKE_CMD, provider="alpha", default_model="model-a")
+FAKE_B = AgentDescriptor("fake_b", "Fake B", _FAKE_CMD, provider="beta", default_model="model-b")
+# An agent that exits before the handshake, so its voice always fails.
+DEAD = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.exit(0)"))
+# A slow agent: it streams a partial then sleeps 1.5s, so a tight panel deadline cuts it mid-turn. Slowness
+# rides the descriptor env, not the prompt, so a panel can mix a fast voice and a slow one on one prompt. The
+# sleep is kept small on purpose: the budget/cut/harvest logic works at asyncio resolution, so the slow voice
+# only needs to outlast the ~1.2s cut budget by a clear margin (it finishes near subprocess-spawn + 1.5s),
+# not take whole seconds. A floor of ~0.7s of subprocess-spawn overhead per voice is why the budgets below
+# sit near a second rather than truly sub-second: a budget under the spawn floor would cut the FAST voice too.
+SLOW = AgentDescriptor(
+    "slow",
+    "Slow",
+    _FAKE_CMD,
+    provider="gamma",
+    default_model="model-s",
+    env_overrides=(("RUTHERFORD_FAKE_SLEEP", "1.5"),),
+)
 
 
-def _consensus(adapters: list[FakeAdapter], runner: FakeProcessRunner, config: RutherfordConfig | None = None):
-    cfg = config or RutherfordConfig()
-    registry = AdapterRegistry(adapters)
-    delegation = DelegationService(registry, runner, cfg, load_roles())
-    return ConsensusService(delegation, cfg, registry)
+# Voices with a FIXED vendor lineage AND a fixed verdict (via env), so a panel can hold two correlated
+# 'alpha' yes-votes against one independent 'beta' no-vote -- the case the F3 vote-math discount targets.
+ALPHA_YES = AgentDescriptor(
+    "alpha_yes", "Alpha Yes", _FAKE_CMD, provider="alpha", env_overrides=(("RUTHERFORD_FAKE_VERDICT", "yes"),)
+)
+ALPHA_YES2 = AgentDescriptor(
+    "alpha_yes2", "Alpha Yes 2", _FAKE_CMD, provider="alpha", env_overrides=(("RUTHERFORD_FAKE_VERDICT", "yes"),)
+)
+BETA_NO = AgentDescriptor(
+    "beta_no", "Beta No", _FAKE_CMD, provider="beta", env_overrides=(("RUTHERFORD_FAKE_VERDICT", "no"),)
+)
 
 
-async def test_one_voice_per_target() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="best language?")
+def _registry(extra: list[AgentDescriptor] | None = None) -> DescriptorRegistry:
+    return DescriptorRegistry([FAKE, FAKE_A, FAKE_B, *(extra or [])])
+
+
+def _discount_service() -> ConsensusService:
+    config = RutherfordConfig()
+    registry = DescriptorRegistry([ALPHA_YES, ALPHA_YES2, BETA_NO])
+    return ConsensusService(DelegationService(registry, config), registry, config)
+
+
+def _correlated_panel(**kwargs: Any) -> ConsensusRequest:
+    return ConsensusRequest(
+        targets=[Target(cli="alpha_yes"), Target(cli="alpha_yes2"), Target(cli="beta_no")],
+        prompt="Decide.",
+        strategy=Strategy.MAJORITY,
+        working_dir=str(REPO_ROOT),
+        **kwargs,
     )
-    assert len(result.voices) == 2
-    assert {voice.target.cli for voice in result.voices} == {"a", "b"}
-    assert all(voice.ok for voice in result.voices)
-    assert result.synthesis is None  # off by default
 
 
-async def test_one_bad_voice_does_not_abort_the_panel() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    # "b" is not installed -> its voice fails, "a" still answers.
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b", installed=False)], runner)
-    result = await service.consensus(ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
-    by_cli = {voice.target.cli: voice for voice in result.voices}
-    assert by_cli["a"].ok
-    assert not by_cli["b"].ok
-    assert by_cli["b"].error is not None
-    assert by_cli["b"].error.code == "BINARY_NOT_FOUND"
+def _service(config: RutherfordConfig | None = None, extra: list[AgentDescriptor] | None = None) -> ConsensusService:
+    resolved = config or RutherfordConfig()
+    registry = _registry(extra)
+    return ConsensusService(DelegationService(registry, resolved), registry, resolved)
 
 
-async def test_a_raising_adapter_probe_does_not_abort_the_panel() -> None:
-    # The headline promise under its harshest test: an adapter whose detect() RAISES (not
-    # "returns a failure") must become one structured failed voice while the siblings answer.
-    class _DetectRaises(FakeAdapter):
-        def detect(self):
-            raise RuntimeError("probe exploded")
+def _app() -> AppContext:
+    return build_app_context(config=RutherfordConfig(), descriptors=_registry())
 
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), _DetectRaises("boom"), FakeAdapter("c")], runner)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="boom"), Target(cli="c")], prompt="q")
+
+def _prompt(say: str) -> str:
+    return f"Decide.\nSAY={say}"
+
+
+# --- the legacy all-voices path ----------------------------------------------
+
+
+async def test_consensus_collects_every_voice() -> None:
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake", model="m")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
     )
+    result = await _service().consensus(request)
     assert isinstance(result, ConsensusResult)
-    by_cli = {voice.target.cli: voice for voice in result.voices}
-    assert by_cli["a"].ok and by_cli["c"].ok  # the healthy siblings still answered
-    assert not by_cli["boom"].ok
-    assert by_cli["boom"].error is not None
-    assert by_cli["boom"].error.code == "INTERNAL"
-
-
-async def test_a_cancellation_escaping_a_voice_propagates_not_folds(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The flip side of the exception fold: gather(return_exceptions=True) captures CancelledError
-    # too, so without the explicit re-raise a cancelled panel would be SWALLOWED into one INTERNAL
-    # failed voice and the consensus would "complete". Cancellation must stay cancellation.
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    real_delegate = DelegationService.delegate
-
-    async def cancelled(self: DelegationService, req: DelegationRequest, **kwargs: object):
-        if req.target.cli == "b":
-            raise asyncio.CancelledError()
-        return await real_delegate(self, req, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(DelegationService, "delegate", cancelled)
-    with pytest.raises(asyncio.CancelledError):
-        await service.consensus(ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
-
-
-async def test_an_exception_escaping_delegate_is_folded_into_a_failed_voice(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Defense in depth behind the delegate()-level containment: even if an exception still gets
-    # OUT of delegate(), the fan-out folds it into that voice instead of failing the gather.
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    real_delegate = DelegationService.delegate
-
-    async def explode(self: DelegationService, req: DelegationRequest, **kwargs: object):
-        if req.target.cli == "b":
-            raise RuntimeError("escaped containment")
-        return await real_delegate(self, req, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(DelegationService, "delegate", explode)
-    result = await service.consensus(ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
-    by_cli = {voice.target.cli: voice for voice in result.voices}
-    assert by_cli["a"].ok
-    assert not by_cli["b"].ok
-    assert by_cli["b"].error is not None
-    assert by_cli["b"].error.code == "INTERNAL"
-    assert "escaped containment" in by_cli["b"].error.message
-
-
-async def test_stances_steer_each_prompt() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="a"), Target(cli="b")],
-            prompt="rewrite in Rust?",
-            stances=[Stance.FOR, Stance.AGAINST],
-        )
-    )
-    prompts = [spec.argv[2] for spec, _ in runner.calls]
-    assert any("Argue in favor" in prompt for prompt in prompts)
-    assert any("Argue against" in prompt for prompt in prompts)
-
-
-async def test_per_target_stance_steers_that_voice() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="a", stance=Stance.FOR), Target(cli="b", stance=Stance.AGAINST)],
-            prompt="adopt gRPC?",
-        )
-    )
-    prompts = [spec.argv[2] for spec, _ in runner.calls]
-    assert any("Argue in favor" in prompt for prompt in prompts)
-    assert any("Argue against" in prompt for prompt in prompts)
-
-
-async def test_per_target_role_overrides_call_role(tmp_path: Path) -> None:
-    (tmp_path / "sleuth.md").write_text("---\nname: sleuth\n---\nBE A SLEUTH.\n", encoding="utf-8")
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    registry = AdapterRegistry([FakeAdapter("a"), FakeAdapter("b")])
-    delegation = DelegationService(registry, runner, RutherfordConfig(), load_roles(extra_dirs=[tmp_path]))
-    service = ConsensusService(delegation, RutherfordConfig(), registry)
-    await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a", role="sleuth"), Target(cli="b")], prompt="who did it?", role=None)
-    )
-    by_cli = {spec.argv[0]: spec.argv[2] for spec, _ in runner.calls}
-    assert "BE A SLEUTH." in by_cli["a"]  # the per-target role was applied to its voice
-    assert "BE A SLEUTH." not in by_cli["b"]  # and only to its voice
-
-
-async def test_target_cap_enforced() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner, RutherfordConfig(max_targets=1))
-    with pytest.raises(RutherfordError) as info:
-        await service.consensus(ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
-    assert info.value.code == "TOO_MANY_TARGETS"
-
-
-async def test_stance_count_must_match_targets() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    with pytest.raises(RutherfordError, match="stances"):
-        await service.consensus(
-            ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", stances=[Stance.FOR])
-        )
-
-
-async def test_empty_targets_rejected() -> None:
-    runner = FakeProcessRunner()
-    with pytest.raises(RutherfordError, match="at least one target"):
-        await _consensus([FakeAdapter("a")], runner).consensus(ConsensusRequest(targets=[], prompt="q"))
-
-
-async def test_synthesize_produces_a_combined_answer() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="combined answer"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", synthesize=True)
-    )
-    assert result.synthesis == "combined answer"
-    # Two voices plus one synthesis delegation.
-    assert len(runner.calls) == 3
-
-
-async def test_explicit_synthesize_false_overrides_synthesize_default() -> None:
-    # F13: synthesize is tri-state. An explicit False must win over synthesize_default=true --
-    # before the fix the gate OR'd the two, so a caller could never turn the configured default off.
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner, RutherfordConfig(synthesize_default=True))
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", synthesize=False)
-    )
-    assert result.synthesis is None
-    assert len(runner.calls) == 2  # two voices only; no synthesis delegation ran
-
-
-async def test_omitted_synthesize_defers_to_synthesize_default() -> None:
-    # The None sentinel: an omitted synthesize is the one case the configured default fills.
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="combined answer"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner, RutherfordConfig(synthesize_default=True))
-    result = await service.consensus(ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
-    assert result.synthesis == "combined answer"
-    assert len(runner.calls) == 3  # two voices plus the synthesis delegation
-
-
-async def test_synthesis_uses_a_named_judge_target() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("j")], runner)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", synthesize=True, judge=Target(cli="j"))
-    )
-    assert result.synthesis is not None
-    assert result.synthesis_by == "j"  # the named non-participant judge wrote it
-    assert any(spec.argv[0] == "j" for spec, _ in runner.calls)  # synthesis was delegated to the judge
-
-
-async def test_synthesis_defaults_to_first_voice_and_records_it() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", synthesize=True)
-    )
-    # With no judge, a participant synthesizes -- but who is now surfaced, not hidden.
-    assert result.synthesis_by == "a"
-
-
-async def test_synthesis_with_a_failing_judge_records_no_author() -> None:
-    # The bulletproofing fix: a named judge that cannot run produces no synthesis, so synthesis_by
-    # must be None rather than claiming the absent judge wrote one.
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("j", installed=False)], runner)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", synthesize=True, judge=Target(cli="j"))
-    )
-    assert result.synthesis is None
-    assert result.synthesis_by is None
-
-
-# --- consensus strategies -----------------------------------------------------------------------
-
-
-def _verdict_runner(verdicts: dict[str, str]) -> FakeProcessRunner:
-    """A runner where each cli answers with its mapped ``VERDICT:`` token."""
-
-    def run_fn(spec: object) -> ProcessResult:
-        cli = spec.argv[0]  # type: ignore[attr-defined]
-        return ProcessResult(exit_code=0, stdout=f"my reasoning\nVERDICT: {verdicts[cli]}")
-
-    return FakeProcessRunner(run_fn=run_fn)
-
-
-async def test_no_strategy_returns_the_legacy_consensus_shape() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.consensus(ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
-    assert isinstance(result, ConsensusResult)  # not a StrategyResult
-
-
-async def test_strategy_appends_a_verdict_instruction_to_each_voice() -> None:
-    runner = _verdict_runner({"a": "yes", "b": "yes"})
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", strategy=Strategy.UNANIMOUS)
-    )
-    prompts = [spec.argv[2] for spec, _ in runner.calls]
-    assert all("VERDICT:" in prompt for prompt in prompts)
-
-
-async def test_majority_strategy_returns_the_winning_verdict() -> None:
-    runner = _verdict_runner({"a": "approve", "b": "approve", "c": "block"})
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner)
-    result = await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")],
-            prompt="ship it?",
-            strategy=Strategy.MAJORITY,
-        )
-    )
-    assert isinstance(result, StrategyResult)
-    assert result.outcome == "majority"
-    assert result.decision == "approve"
-    assert {voice.cli: voice.verdict for voice in result.voices} == {"a": "approve", "b": "approve", "c": "block"}
-
-
-async def test_weighted_strategy_lets_a_heavy_voice_win() -> None:
-    runner = _verdict_runner({"a": "approve", "b": "approve", "c": "block"})
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner)
-    result = await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="a"), Target(cli="b"), Target(cli="c", weight=5.0)],
-            prompt="ship it?",
-            strategy=Strategy.WEIGHTED,
-        )
-    )
-    assert isinstance(result, StrategyResult)
-    assert result.decision == "block"  # the heavy "block" outweighs two "approve" votes
-
-
-async def test_unparseable_voice_is_returned_and_vetoes_unanimity() -> None:
-    def run_fn(spec: object) -> ProcessResult:
-        cli = spec.argv[0]  # type: ignore[attr-defined]
-        if cli == "c":
-            return ProcessResult(exit_code=0, stdout="I won't commit to a verdict.")
-        return ProcessResult(exit_code=0, stdout="reasoning\nVERDICT: approve")
-
-    runner = FakeProcessRunner(run_fn=run_fn)
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner)
-    result = await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")],
-            prompt="q",
-            strategy=Strategy.UNANIMOUS,
-        )
-    )
-    assert isinstance(result, StrategyResult)
-    # The fixed bug: a voice that did not produce a verdict vetoes unanimity rather than being
-    # silently excluded so the survivors certify "unanimous".
-    assert result.outcome == "split"
-    by_cli = {voice.cli: voice for voice in result.voices}
-    assert by_cli["c"].verdict is None  # still returned
-    assert by_cli["c"].no_verdict_reason == "unparseable"  # and the reason is recorded, not silent
-    assert by_cli["c"].text == "I won't commit to a verdict."
-
-
-async def test_strategy_records_failed_voice_reason() -> None:
-    # A failed voice is kept in the tally denominator with reason "failed", so an outcome is never
-    # certified off a minority of survivors without a trace of who dropped out.
-    runner = _verdict_runner({"a": "approve", "b": "approve"})
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c", installed=False)], runner)
-    result = await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")],
-            prompt="q",
-            strategy=Strategy.MAJORITY,
-        )
-    )
-    assert isinstance(result, StrategyResult)
-    assert result.outcome == "majority" and result.decision == "approve"  # 2 of 3 eligible
-    by_cli = {voice.cli: voice for voice in result.voices}
-    assert by_cli["c"].ok is False
-    assert by_cli["c"].no_verdict_reason == "failed"
-
-
-# --- (a) expand_all: fan out to every installed + authenticated adapter -------------------------
-
-
-async def test_expand_all_fans_out_to_authenticated_adapters() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    adapters = [
-        FakeAdapter("a", auth_state=AuthState.AUTHENTICATED),
-        FakeAdapter("b", auth_state=AuthState.NEEDS_LOGIN),
-        FakeAdapter("c", auth_state=AuthState.UNKNOWN),  # no cheap check -> included optimistically
-        FakeAdapter("d", installed=False),
-    ]
-    service = _consensus(adapters, runner)
-    result = await service.consensus(ConsensusRequest(prompt="which language?", expand_all=True))
-
-    assert {voice.target.cli for voice in result.voices} == {"a", "c"}
-    assert all(voice.target.model is None for voice in result.voices)  # each at its default model
-    skipped = {entry.cli: entry.reason for entry in result.skipped}
-    assert set(skipped) == {"b", "d"}
-    assert "not installed" in skipped["d"]
-
-
-async def test_expand_all_excludes_optional_adapters() -> None:
-    # An optional adapter (a local model) is installed + authenticated, but must NOT auto-join the
-    # "all" panel -- it only participates when named explicitly, so it never silently slows it.
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    adapters = [FakeAdapter("a"), FakeAdapter("ollama", optional=True)]
-    service = _consensus(adapters, runner)
-    result = await service.consensus(ConsensusRequest(prompt="q", expand_all=True))
-
-    assert {voice.target.cli for voice in result.voices} == {"a"}
-    skipped = {entry.cli: entry.reason for entry in result.skipped}
-    assert "ollama" in skipped
-    assert "optional" in skipped["ollama"]
-
-
-async def test_expand_all_announces_panel_via_progress() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    adapters = [FakeAdapter("a"), FakeAdapter("b", auth_state=AuthState.NEEDS_LOGIN)]
-    service = _consensus(adapters, runner)
-    lines: list[str] = []
-    await service.consensus(ConsensusRequest(prompt="q", expand_all=True), on_progress=lines.append)
-    assert any("including a" in line for line in lines)
-    assert any("skipping b" in line for line in lines)
-
-
-async def test_expand_all_caps_at_max_targets() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    adapters = [FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")]
-    service = _consensus(adapters, runner, RutherfordConfig(max_targets=2))
-    result = await service.consensus(ConsensusRequest(prompt="q", expand_all=True))
     assert len(result.voices) == 2
-    assert any("max_targets" in entry.reason for entry in result.skipped)
+    assert all(voice.ok and "42" in voice.text for voice in result.voices)
+
+
+async def test_consensus_requires_a_target() -> None:
+    with pytest.raises(RutherfordError) as exc:
+        await _service().consensus(ConsensusRequest(targets=[], prompt="x"))
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+
+
+async def test_consensus_enforces_target_cap() -> None:
+    config = RutherfordConfig(max_targets=1)
+    with pytest.raises(RutherfordError) as exc:
+        await _service(config).consensus(ConsensusRequest(targets=[Target(cli="fake"), Target(cli="fake")], prompt="x"))
+    assert exc.value.code is ErrorCode.TOO_MANY_TARGETS
+
+
+@pytest.mark.parametrize("mode", [SafetyMode.PROPOSE, SafetyMode.WRITE, SafetyMode.YOLO])
+async def test_consensus_rejects_a_sandboxed_safety_mode(mode: SafetyMode) -> None:
+    # A consensus asks many agents one question; there is no coherent merge of edits from several of them into
+    # one tree, and the budgeted-harvest path drives sessions directly in the real working_dir with no per-turn
+    # sandbox. So a sandboxed (propose/write/yolo) mode is refused in the service; writes go through delegate.
+    with pytest.raises(RutherfordError) as exc:
+        await _service().consensus(
+            ConsensusRequest(targets=[Target(cli="fake")], prompt="x", safety_mode=mode, working_dir=str(REPO_ROOT))
+        )
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+    assert "read-only" in exc.value.message and "delegate" in exc.value.message
+
+
+async def test_consensus_diversity_is_low_for_same_model() -> None:
+    request = ConsensusRequest(
+        targets=[Target(cli="fake", model="m"), Target(cli="fake", model="m")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.diversity is not None and result.diversity.low_diversity is True
+
+
+async def test_consensus_diversity_high_across_distinct_models() -> None:
+    request = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_b")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.diversity is not None and result.diversity.low_diversity is False
+    assert result.diversity.distinct_models == 2 and result.diversity.distinct_providers == 2
+    # item 5: the named effective-lineages headline (vendor proxy now) is carried on the result.
+    assert result.diversity.effective_lineages == 2
+    assert result.diversity.headline == "2 effective lineage(s) among 2 answering voice(s)"
+
+
+# --- synthesis ---------------------------------------------------------------
+
+
+async def test_consensus_synthesize_picks_a_synthesizer() -> None:
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.synthesis is not None and result.synthesis_by is not None
+
+
+async def test_consensus_synthesize_off_by_default() -> None:
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")], prompt="what is 17 + 25?", working_dir=str(REPO_ROOT)
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.synthesis is None and result.synthesis_by is None
+
+
+async def test_consensus_synthesize_uses_named_judge() -> None:
+    request = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_a")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        judge=Target(cli="fake_b"),
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.synthesis_by == "fake_b"
+
+
+# --- F4a no-self-approval (judge independence) -------------------------------
+
+
+async def test_consensus_synthesis_flags_self_authorship() -> None:
+    # F4a (4-A): the default judge is the first voice -- a panel participant -- so the synthesis is flagged
+    # self_authored. Naming a non-participant judge clears the flag.
+    self_judged = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_a")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(self_judged)
+    assert isinstance(result, ConsensusResult)
+    assert result.synthesis is not None and result.self_authored is True  # judged by a participant
+
+    external = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_a")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        judge=Target(cli="fake_b"),  # not one of the answering voices
+        working_dir=str(REPO_ROOT),
+    )
+    independent = await _service().consensus(external)
+    assert isinstance(independent, ConsensusResult)
+    assert independent.synthesis is not None and independent.self_authored is False
+
+
+async def test_consensus_require_independent_judge_refuses_a_participant() -> None:
+    # F4a (4-A): with require_independent_judge the default (participant) judge is REFUSED rather than
+    # silently authoring its own panel's verdict -- a clean INVALID_INPUT pointing at a non-participant judge.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_a")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        require_independent_judge=True,
+        working_dir=str(REPO_ROOT),
+    )
+    with pytest.raises(RutherfordError) as exc:
+        await _service().consensus(request)
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+    assert "require_independent_judge" in exc.value.message and "non-participant" in exc.value.message
+
+
+async def test_consensus_require_independent_judge_allows_an_external_judge() -> None:
+    # The same flag passes cleanly once a genuinely non-participant judge is named.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_a")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        require_independent_judge=True,
+        judge=Target(cli="fake_b"),
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.synthesis is not None and result.self_authored is False
+    assert result.synthesis_by == "fake_b"
+
+
+async def test_consensus_require_independent_judge_via_config() -> None:
+    # The guard also fires from config (require_independent_judge=True) with no per-call flag -- the default
+    # participant judge is refused server-wide.
+    config = RutherfordConfig(require_independent_judge=True)
+    request = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_a")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        working_dir=str(REPO_ROOT),
+    )
+    with pytest.raises(RutherfordError) as exc:
+        await _service(config).consensus(request)
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+
+
+# --- strategies & verdict extraction -----------------------------------------
+
+
+async def test_strategy_unanimous_from_verdict_lines() -> None:
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt=_prompt("VERDICT: yes"),
+        strategy=Strategy.UNANIMOUS,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.outcome == "unanimous" and result.decision == "yes"
+    assert all(voice.verdict == "yes" for voice in result.voices)
+
+
+async def test_strategy_majority_true_majority() -> None:
+    # the fake echoes one shared prompt, so every voice plants the same verdict; three yeses are a
+    # true majority of three eligible voices (the dissent path is covered in test_strategies.py).
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake"), Target(cli="fake")],
+        prompt=_prompt("VERDICT: yes"),
+        strategy=Strategy.MAJORITY,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.outcome == "majority" and result.decision == "yes"
+
+
+async def test_strategy_verdict_via_json_schema() -> None:
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt=_prompt('{"verdict": "approve"}'),
+        strategy=Strategy.UNANIMOUS,
+        verdict_schema={"verdict": "string"},
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.decision == "approve"
+
+
+async def test_strategy_unparseable_voice_is_recorded_not_dropped() -> None:
+    # a prose answer with no VERDICT line (and a verdict_schema expecting JSON it never emits) -> every
+    # voice is unparseable, recorded with a reason rather than silently dropped; 0 parseable < the
+    # default min_quorum of 1 -> no_quorum.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="Decide yes or no, but answer in prose only.",
+        strategy=Strategy.UNANIMOUS,
+        verdict_schema={"verdict": "string"},
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert all(voice.verdict is None and voice.no_verdict_reason == "unparseable" for voice in result.voices)
+    assert result.outcome == "no_quorum"
+
+
+async def test_strategy_no_quorum_when_below_min_quorum() -> None:
+    config = RutherfordConfig(min_quorum=2)
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="Decide yes or no.",  # both unparseable -> 0 parseable < min_quorum
+        strategy=Strategy.MAJORITY,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service(config).consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.outcome == "no_quorum" and result.decision is None
+
+
+async def test_strategy_weighted_and_parity_metadata_flow_through() -> None:
+    # the proposer (heavy) and a parity counterweight both say ship -> agree
+    request = ConsensusRequest(
+        targets=[
+            Target(cli="fake", weight=3.0, label="proposer"),
+            Target(cli="fake", parity=True),
+        ],
+        prompt=_prompt("VERDICT: ship"),
+        strategy=Strategy.PARITY_PAIR,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.outcome == "agree" and result.decision == "ship"
+    proposer = next(v for v in result.voices if v.label == "proposer")
+    assert proposer.weight == 3.0
+    assert any(v.parity for v in result.voices)
+
+
+# --- RANK: the two-round preference protocol (F4b) ---------------------------
+
+
+def _rank_service(seed: int, config: RutherfordConfig | None = None, *, extra_dead: bool = False) -> ConsensusService:
+    import random
+
+    resolved = config or RutherfordConfig()
+    registry = _registry([DEAD] if extra_dead else None)
+    return ConsensusService(DelegationService(registry, resolved), registry, resolved, rng=random.Random(seed))
+
+
+def _rank_request() -> ConsensusRequest:
+    return ConsensusRequest(
+        targets=[Target(cli="fake")], prompt="what is 17 + 25?", strategy=Strategy.RANK, working_dir=str(REPO_ROOT)
+    )
+
+
+async def test_rank_runs_two_rounds_into_a_leaderboard() -> None:
+    # Three voices answer, then rank the others; the panel returns a RANK StrategyResult with a full
+    # leaderboard. The fake ranks in presented order, so the exact winner rides the (seeded) shuffle -- assert
+    # the structure the protocol guarantees, not a specific winner (the Borda math is unit-tested separately).
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake_a"), Target(cli="fake_b")],
+        prompt="what is 17 + 25?",
+        strategy=Strategy.RANK,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _rank_service(7).consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.strategy is Strategy.RANK and result.outcome in ("ranked", "tied")
+    assert result.rank is not None
+    assert result.rank.ballots_cast == 3 and result.rank.ballots_unparseable == 0
+    assert [entry.rank for entry in result.rank.leaderboard] == [1, 2, 3]  # a dense, ordered leaderboard
+    assert {entry.label for entry in result.rank.leaderboard} == {voice.label for voice in result.voices}
+    assert all(voice.rank is not None for voice in result.voices)  # every answer placed
+    # N=3 -> each voter pair shares only the one candidate that is neither of them, so no pairwise rows.
+    assert result.rank.pairwise == [] and result.rank.concordance is None
+
+
+async def test_rank_four_voices_have_a_pairwise_matrix() -> None:
+    # With four candidates each voter pair shares N-2 = 2 answers, so the pairwise agreement matrix is defined.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake_a"), Target(cli="fake_b"), Target(cli="fake")],
+        prompt="what is 17 + 25?",
+        strategy=Strategy.RANK,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _rank_service(3).consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.rank is not None and result.rank.pairwise  # at least one comparable pair
+    assert result.rank.concordance is not None
+
+
+async def test_rank_self_exclusion_and_anonymization_in_the_ballot() -> None:
+    # A voter's ballot withholds its OWN answer (7-E) and presents the others under anonymous A/B/.. labels
+    # (7-D); the returned map de-anonymizes back to the real candidate labels.
+    service = _rank_service(0)
+    candidates = [
+        _Candidate(pos=0, target_index=0, label="alpha", cli="fake", model=None, text="ANSWER-ALPHA", provenance=None),
+        _Candidate(pos=1, target_index=1, label="beta", cli="fake", model=None, text="ANSWER-BETA", provenance=None),
+        _Candidate(pos=2, target_index=2, label="gamma", cli="fake", model=None, text="ANSWER-GAMMA", provenance=None),
+    ]
+    voter, prompt, anon_to_label = service._ballot_plan(_rank_request(), candidates[0], candidates)
+    assert voter is candidates[0]
+    assert "ANSWER-ALPHA" not in prompt  # self-excluded: the voter never sees its own answer
+    assert "ANSWER-BETA" in prompt and "ANSWER-GAMMA" in prompt
+    assert set(anon_to_label.values()) == {"beta", "gamma"}  # the two OTHERS, anonymized
+    assert set(anon_to_label.keys()) <= {"A", "B"}  # anonymous labels, in presentation order
+
+
+async def test_rank_below_two_answers_is_no_quorum() -> None:
+    # Only one voice answers (the other handshake-fails), so there is nothing to rank against -> no_quorum.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="dead")],
+        prompt="what is 17 + 25?",
+        strategy=Strategy.RANK,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _rank_service(0, extra_dead=True).consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.outcome == "no_quorum" and result.decision is None and result.rank is None
+    by_cli = {voice.cli: voice for voice in result.voices}
+    assert by_cli["dead"].no_verdict_reason == "failed" and by_cli["dead"].rank is None
+
+
+def test_rank_verdicts_stamp_dissent_on_non_winners_when_required() -> None:
+    # F4b (7-G): with require_dissent, every non-winning candidate is stamped with its standing (reusing the
+    # F4a dissent field); the winner and -- when require_dissent is off -- everyone are left clean.
+    from rutherford.domain.models import DelegationResult, RankEntry, RankReport
+
+    service = _rank_service(0)
+    targets = [Target(cli="fake"), Target(cli="fake"), Target(cli="fake")]
+    voices = [DelegationResult(target=Target(cli="fake"), ok=True, text=f"answer {i}") for i in range(3)]
+    candidates = service._rank_candidates(targets, voices)  # labels fake#1 / fake#2 / fake#3
+    leaderboard = {
+        candidates[0].label: RankEntry(
+            label=candidates[0].label, cli="fake", rank=1, mean_rank=1.0, borda_points=4, ballots=2
+        ),
+        candidates[1].label: RankEntry(
+            label=candidates[1].label, cli="fake", rank=2, mean_rank=1.5, borda_points=3, ballots=2
+        ),
+        candidates[2].label: RankEntry(
+            label=candidates[2].label, cli="fake", rank=3, mean_rank=2.0, borda_points=2, ballots=2
+        ),
+    }
+    report = RankReport(leaderboard=list(leaderboard.values()), winner=candidates[0].label)
+
+    stamped = service._rank_verdicts(targets, voices, candidates, leaderboard, report, require_dissent=True)
+    expected = f"ranked #2 of 3 (mean rank 1.5); the panel ranked {candidates[0].label!r} first"
+    assert stamped[0].rank == 1 and stamped[0].dissent is None  # the winner is not dissent
+    assert stamped[1].rank == 2 and stamped[1].dissent == expected
+    assert stamped[2].dissent is not None and "#3 of 3" in stamped[2].dissent
+
+    quiet = service._rank_verdicts(targets, voices, candidates, leaderboard, report, require_dissent=False)
+    assert all(voice.dissent is None for voice in quiet)  # off by default: ranks set, no dissent stamped
+
+
+async def test_rank_on_budget_continue_still_runs_the_ranking_round() -> None:
+    # With on_budget="continue" the budget is advisory: even a budget far too small for two rounds still runs
+    # the ranking round. Without the fix the round-2 budget skip would collapse this to no_quorum (0 ballots).
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake_a"), Target(cli="fake_b")],
+        prompt="what is 17 + 25?",
+        strategy=Strategy.RANK,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=0.01,
+        on_budget="continue",
+    )
+    result = await _rank_service(5).consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.rank is not None and result.rank.ballots_cast == 3  # round 2 ran despite the tiny budget
+    assert result.outcome in ("ranked", "tied")
+
+
+async def test_rank_skips_round_two_when_the_budget_is_already_spent() -> None:
+    # A binding budget spent in round 1 skips the ranking round entirely (every ballot empty), so a RANK panel
+    # never overruns its budget by a whole second round. Driven deterministically via a past mono_start.
+    import time
+
+    service = _rank_service(0)
+    candidates = [
+        _Candidate(pos=0, target_index=0, label="a", cli="fake", model=None, text="A", provenance=None),
+        _Candidate(pos=1, target_index=1, label="b", cli="fake", model=None, text="B", provenance=None),
+    ]
+    ballots = await service._collect_ballots(
+        _rank_request(), candidates, base_depth=0, on_activity=None, budget=0.5, mono_start=time.monotonic() - 100
+    )
+    assert ballots == [("a", []), ("b", [])]  # no ranking turns run; both ballots empty (unparseable)
+
+
+async def test_rank_tool_and_server_wiring(monkeypatch: Any) -> None:
+    out = await consensus_tool(
+        _app(),
+        prompt="what is 17 + 25?",
+        targets=["fake", "fake_a", "fake_b"],
+        strategy="rank",
+        working_dir=str(REPO_ROOT),
+    )
+    assert "rank" in out and ("ranked" in out or "tied" in out)
+    monkeypatch.setattr(server, "_APP", _app())
+    wrapped = await server.consensus(
+        prompt="what is 17 + 25?", targets=["fake", "fake_a", "fake_b"], strategy="rank", working_dir=str(REPO_ROOT)
+    )
+    assert "leaderboard" in wrapped
+
+
+# --- F3 correlation-aware vote-math (opt-in lineage discount) ----------------
+
+
+async def test_consensus_discount_correlated_collapses_a_vendor_lineage() -> None:
+    # Two 'alpha' voices vote yes, one 'beta' votes no. With the discount, the alpha pair is ONE effective
+    # vote -> it ties the independent beta no -> no_majority, and each correlated voice is stamped 0.5.
+    result = await _discount_service().consensus(_correlated_panel(discount_correlated=True))
+    assert isinstance(result, StrategyResult)
+    assert result.correlation_discounted is True and result.outcome == "no_majority" and result.decision is None
+    by_cli = {voice.cli: voice for voice in result.voices}
+    assert by_cli["alpha_yes"].lineage_weight == 0.5 and by_cli["alpha_yes2"].lineage_weight == 0.5
+    assert by_cli["beta_no"].lineage_weight == 1.0  # the lone vendor keeps full weight
+
+
+async def test_consensus_without_discount_lets_the_lineage_over_count() -> None:
+    # The same panel WITHOUT the discount: the two correlated alpha votes over-count and carry the majority.
+    result = await _discount_service().consensus(_correlated_panel())
+    assert isinstance(result, StrategyResult)
+    assert result.correlation_discounted is False and result.outcome == "majority" and result.decision == "yes"
+    assert all(voice.lineage_weight is None for voice in result.voices)  # not stamped when off
+
+
+async def test_consensus_discount_correlated_via_config() -> None:
+    config = RutherfordConfig(discount_correlated_votes=True)
+    registry = DescriptorRegistry([ALPHA_YES, ALPHA_YES2, BETA_NO])
+    service = ConsensusService(DelegationService(registry, config), registry, config)
+    result = await service.consensus(_correlated_panel())  # no per-call flag; config default fires
+    assert isinstance(result, StrategyResult)
+    assert result.correlation_discounted is True and result.outcome == "no_majority"
+
+
+# --- failed-voice edges ------------------------------------------------------
+
+
+async def test_failed_voice_recorded_in_strategy() -> None:
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="dead")],
+        prompt=_prompt("VERDICT: yes"),
+        strategy=Strategy.UNANIMOUS,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service(extra=[DEAD]).consensus(request)
+    assert isinstance(result, StrategyResult)
+    dead = next(v for v in result.voices if v.cli == "dead")
+    assert dead.ok is False and dead.no_verdict_reason == "failed" and dead.verdict is None
+    # one failed voice vetoes unanimity (it stays in the denominator)
+    assert result.outcome == "split"
+
+
+async def test_diversity_none_when_no_voice_answers() -> None:
+    request = ConsensusRequest(targets=[Target(cli="dead"), Target(cli="dead")], prompt="x", working_dir=str(REPO_ROOT))
+    result = await _service(extra=[DEAD]).consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert all(not voice.ok for voice in result.voices)
+    assert result.diversity is None  # nothing answered, nothing to measure
+
+
+async def test_synthesize_returns_nothing_when_all_voices_fail() -> None:
+    request = ConsensusRequest(
+        targets=[Target(cli="dead"), Target(cli="dead")],
+        prompt="x",
+        synthesize=True,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service(extra=[DEAD]).consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.synthesis is None and result.synthesis_by is None
+
+
+async def test_synthesize_returns_nothing_when_judge_fails() -> None:
+    # a named judge that cannot run -> no synthesis is produced, so synthesis_by names no one
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        judge=Target(cli="dead"),
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service(extra=[DEAD]).consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.synthesis is None and result.synthesis_by is None
+
+
+# --- stances -----------------------------------------------------------------
+
+
+async def test_consensus_stances_length_must_match() -> None:
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="x",
+        stances=[Stance.FOR],
+        working_dir=str(REPO_ROOT),
+    )
+    with pytest.raises(RutherfordError) as exc:
+        await _service().consensus(request)
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+
+
+async def test_per_seat_stance_steers_the_prompt() -> None:
+    # a per-seat stance is echoed into the prompt the voice receives; the fake echoes it back, so the
+    # stance wrapper ("Argue in favor") shows up in that voice's answer text.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake", stance=Stance.FOR)],
+        prompt="ship it?",
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert "Argue in favor" in result.voices[0].text
+
+
+# --- expand_all --------------------------------------------------------------
+
+
+async def test_expand_all_fans_to_every_registered_agent() -> None:
+    request = ConsensusRequest(prompt="what is 17 + 25?", expand_all=True, working_dir=str(REPO_ROOT))
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert {voice.target.cli for voice in result.voices} == {"fake", "fake_a", "fake_b"}
+    assert result.skipped == []
+
+
+async def test_expand_all_records_skipped_over_cap() -> None:
+    config = RutherfordConfig(max_targets=2)
+    request = ConsensusRequest(prompt="what is 17 + 25?", expand_all=True, working_dir=str(REPO_ROOT))
+    result = await _service(config).consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert len(result.voices) == 2
+    assert len(result.skipped) == 1 and "max_targets" in result.skipped[0].reason
 
 
 async def test_expand_all_rejects_stances() -> None:
-    runner = FakeProcessRunner()
-    service = _consensus([FakeAdapter("a")], runner)
-    with pytest.raises(RutherfordError, match="stances cannot be combined"):
-        await service.consensus(ConsensusRequest(prompt="q", expand_all=True, stances=[Stance.FOR]))
+    request = ConsensusRequest(prompt="x", expand_all=True, stances=[Stance.FOR], working_dir=str(REPO_ROOT))
+    with pytest.raises(RutherfordError) as exc:
+        await _service().consensus(request)
+    assert exc.value.code is ErrorCode.INVALID_INPUT
 
 
-# --- (b) a voice whose named model is unavailable falls back instead of being dropped -----------
+# --- tool / server wiring ----------------------------------------------------
 
 
-async def test_consensus_voice_falls_back_on_unavailable_model() -> None:
-    def run_fn(spec: object) -> ProcessResult:
-        argv = spec.argv  # type: ignore[attr-defined]
-        if "named-only" in argv:
-            return ProcessResult(exit_code=1, stderr="Named models unavailable on your plan. Switch to Auto.")
-        return ProcessResult(exit_code=0, stdout="answered on auto")
+def test_as_target_and_known_targets() -> None:
+    assert as_target("fake").cli == "fake"
+    assert as_target("fake:m").model == "m"
+    assert as_target({"cli": "fake", "model": "m"}).model == "m"
+    assert as_target({"cli": "fake", "weight": 2.0, "parity": True, "stance": "for"}).weight == 2.0
+    assert as_target(Target(cli="fake")).cli == "fake"
+    for bad in ({"model": "m"}, ":nope", 123, {"cli": "fake", "weight": -1.0}, {"cli": "fake", "stance": "sideways"}):
+        with pytest.raises(RutherfordError):
+            as_target(bad)  # type: ignore[arg-type]
+    registry = _registry()
+    ensure_known_targets(registry, [Target(cli="fake")])
+    with pytest.raises(RutherfordError):
+        ensure_known_targets(registry, [Target(cli="nope")])
 
-    runner = FakeProcessRunner(run_fn=run_fn)
-    service = _consensus([FakeAdapter("a"), FakeAdapter("c", fallback_model="auto")], runner)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="c", model="named-only")], prompt="q")
+
+def test_parse_strategy_and_stances() -> None:
+    assert parse_strategy("majority") is Strategy.MAJORITY
+    assert parse_stances(["for", "against"]) == [Stance.FOR, Stance.AGAINST]
+    assert parse_stances(None) is None
+    with pytest.raises(RutherfordError):
+        parse_strategy("nope")
+    with pytest.raises(RutherfordError):
+        parse_stances(["sideways"])
+
+
+async def test_consensus_tool_all_voices_and_server_wrapper(monkeypatch: Any) -> None:
+    out = await consensus_tool(
+        _app(), prompt="what is 17 + 25?", targets=["fake", "fake:m"], working_dir=str(REPO_ROOT)
     )
-    by_cli = {voice.target.cli: voice for voice in result.voices}
-    assert by_cli["a"].ok
-    assert by_cli["c"].ok  # the voice survived rather than being dropped
-    assert by_cli["c"].text == "answered on auto"
-    assert by_cli["c"].fallback_from == "named-only"  # surfaced: a fallback occurred
-    assert by_cli["c"].target.model == "auto"  # surfaced: the model that actually answered
+    assert out.count('text: "42"') == 2
+    monkeypatch.setattr(server, "_APP", _app())
+    wrapped = await server.consensus(prompt="what is 17 + 25?", targets=["fake"], working_dir=str(REPO_ROOT))
+    assert "42" in wrapped
 
 
-# --- (c) a hard-failing adapter is reported but does not sink the panel -------------------------
-
-
-async def test_expand_all_one_hard_failure_does_not_sink_panel() -> None:
-    def run_fn(spec: object) -> ProcessResult:
-        if spec.argv[0] == "b":  # type: ignore[attr-defined]
-            return ProcessResult(exit_code=2, stderr="boom: internal error")
-        return ProcessResult(exit_code=0, stdout="ok")
-
-    runner = FakeProcessRunner(run_fn=run_fn)
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner)
-    result = await service.consensus(ConsensusRequest(prompt="q", expand_all=True))
-
-    by_cli = {voice.target.cli: voice for voice in result.voices}
-    assert by_cli["a"].ok and by_cli["c"].ok  # other voices still return
-    assert not by_cli["b"].ok
-    assert by_cli["b"].error is not None
-    assert by_cli["b"].error.code == "NONZERO_EXIT"  # explicit failure, not an empty voice
-    assert by_cli["b"].text == ""
-
-
-async def test_expand_all_with_nothing_authenticated_returns_empty_panel() -> None:
-    runner = FakeProcessRunner()
-    adapters = [FakeAdapter("a", auth_state=AuthState.NEEDS_LOGIN), FakeAdapter("b", installed=False)]
-    service = _consensus(adapters, runner)
-    result = await service.consensus(ConsensusRequest(prompt="q", expand_all=True))
-    assert result.voices == []
-    assert {entry.cli for entry in result.skipped} == {"a", "b"}
-    assert result.synthesis is None
-
-
-# --- (d) the global concurrency cap bounds parallel fan-out -------------------------------------
-
-
-class _ConcurrencyRunner:
-    """A ProcessRunner with a real await point, so a test can observe how many runs overlap."""
-
-    def __init__(self) -> None:
-        self.active = 0
-        self.max_active = 0
-
-    async def run(
-        self,
-        spec: InvocationSpec,
-        timeout_s: float,
-        on_progress: Callable[[str], None] | None = None,
-        on_stdout: Callable[[str], None] | None = None,
-    ) -> ProcessResult:
-        self.active += 1
-        self.max_active = max(self.max_active, self.active)
-        await asyncio.sleep(0.02)
-        self.active -= 1
-        return ProcessResult(exit_code=0, stdout="ok")
-
-
-async def test_max_concurrency_bounds_parallel_fan_out() -> None:
-    runner = _ConcurrencyRunner()
-    cfg = RutherfordConfig(max_concurrency=2)
-    registry = AdapterRegistry([FakeAdapter(f"a{i}") for i in range(4)])
-    service = ConsensusService(DelegationService(registry, runner, cfg, load_roles()), cfg, registry)
-    result = await service.consensus(ConsensusRequest(targets=[Target(cli=f"a{i}") for i in range(4)], prompt="q"))
-    assert len(result.voices) == 4 and all(voice.ok for voice in result.voices)
-    assert runner.max_active <= 2  # the global semaphore capped concurrent subprocesses (4 -> 2)
-
-
-async def test_one_shared_cap_bounds_concurrent_consensus_and_debate() -> None:
-    # The headline F9 property: ONE semaphore on the shared DelegationService bounds concurrency
-    # across a consensus AND a debate running at once -- not a per-call cap. A future refactor that
-    # moved the semaphore into a per-call object would let this exceed the cap and fail here.
-    from rutherford.domain.models import DebateRequest
-    from rutherford.services.debate import DebateService
-
-    runner = _ConcurrencyRunner()
-    cfg = RutherfordConfig(max_concurrency=2)
-    registry = AdapterRegistry([FakeAdapter(f"a{i}") for i in range(4)])
-    delegation = DelegationService(registry, runner, cfg, load_roles())
-    consensus = ConsensusService(delegation, cfg, registry)
-    debate = DebateService(delegation, cfg)
-    await asyncio.gather(
-        consensus.consensus(ConsensusRequest(targets=[Target(cli=f"a{i}") for i in range(4)], prompt="q")),
-        debate.debate(
-            DebateRequest(targets=[Target(cli="a0"), Target(cli="a1")], prompt="q", rounds=2, synthesize=False)
-        ),
+async def test_consensus_tool_strategy_outcome() -> None:
+    out = await consensus_tool(
+        _app(),
+        prompt=_prompt("VERDICT: yes"),
+        targets=["fake", "fake"],
+        strategy="unanimous",
+        working_dir=str(REPO_ROOT),
     )
-    assert runner.max_active <= 2  # both panels share one cap
+    assert "unanimous" in out and "yes" in out
 
 
-# --- (e) F8a: time-budget harvest + effort ------------------------------------------------------
+async def test_consensus_tool_expand_all_via_all_sentinel() -> None:
+    out = await consensus_tool(_app(), prompt="what is 17 + 25?", targets="all", working_dir=str(REPO_ROOT))
+    assert out.count('text: "42"') == 3  # fanned out to all three registered fakes
 
 
-class _BudgetRunner:
-    """A runner with per-cli delays that streams optional partial lines before its delay.
-
-    Drives the time-budget harvest deterministically: a zero-delay voice finishes within any budget;
-    a long-delay voice is still in-flight at the deadline and gets cut. Partial lines are teed to
-    ``on_stdout`` *before* the delay, so a cut voice has accumulated a partial answer at the cut.
-    """
-
-    def __init__(self, delays: dict[str, float], partials: dict[str, list[str]] | None = None) -> None:
-        self.delays = delays
-        self.partials = partials or {}
-
-    async def run(
-        self,
-        spec: InvocationSpec,
-        timeout_s: float,
-        on_progress: Callable[[str], None] | None = None,
-        on_stdout: Callable[[str], None] | None = None,
-    ) -> ProcessResult:
-        cli = spec.argv[0]
-        for line in self.partials.get(cli, []):
-            if on_stdout is not None:
-                on_stdout(line)
-        await asyncio.sleep(self.delays.get(cli, 0.0))
-        return ProcessResult(exit_code=0, stdout=f"{cli} answered")
-
-
-def _budget_consensus(runner: object, config: RutherfordConfig | None = None) -> ConsensusService:
-    cfg = config or RutherfordConfig()
-    registry = AdapterRegistry([FakeAdapter("fast"), FakeAdapter("slow"), FakeAdapter("slow2")])
-    delegation = DelegationService(registry, runner, cfg, load_roles())  # type: ignore[arg-type]
-    return ConsensusService(delegation, cfg, registry)
-
-
-async def test_time_budget_harvests_fast_voices_and_cuts_slow_ones() -> None:
-    # The headline F8a behavior (2-behavior): at the deadline the answered voices are kept and the
-    # in-flight ones are cut, with the panel still returning a result.
-    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0})
-    service = _budget_consensus(runner)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
+async def test_consensus_tool_async_runs_same_aggregating_path(monkeypatch: Any) -> None:
+    monkeypatch.setattr(server, "_APP", _app())
+    submit = await server.consensus(
+        prompt=_prompt("VERDICT: yes"),
+        targets=["fake", "fake"],
+        strategy="majority",
+        mode="async",
     )
+    assert "job_id" in submit
+
+
+# --- time budget + harvest (F8a) ---------------------------------------------
+
+
+async def test_budget_cuts_the_inflight_voice_and_keeps_the_fast_one() -> None:
+    # A budget shorter than the slow voice cuts it (harvesting its streamed partial) while the fast voice
+    # answers; the panel succeeds with stop_reason="budget" and a rollup recording the cut.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=1.2,
+    )
+    result = await _service(extra=[SLOW]).consensus(request)
     assert isinstance(result, ConsensusResult)
-    by_cli = {voice.target.cli: voice for voice in result.voices}
-    assert by_cli["fast"].ok and by_cli["fast"].text == "fast answered"
-    assert not by_cli["slow"].ok  # cut at the deadline
-    assert by_cli["slow"].error is not None
-    assert by_cli["slow"].error.code == "BUDGET_EXHAUSTED"
-    assert by_cli["slow"].stop_reason == "budget"
     assert result.stop_reason == "budget"
-
-
-async def test_budget_harvest_promotes_a_partial_to_a_usable_candidate_answer() -> None:
-    # 2-F/2-H: a cut voice on a supports_partial_output adapter (FakeAdapter is TEXT) has the stdout it
-    # streamed before the cut harvested through the adapter's parser into a usable candidate answer -- so
-    # the in-flight work is not wasted: it is ``ok``, counts toward quorum, and feeds aggregation/synthesis.
-    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0}, partials={"slow": ["draft line 1", "draft line 2"]})
-    service = _budget_consensus(runner)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
-    )
-    assert isinstance(result, ConsensusResult)
-    slow = next(voice for voice in result.voices if voice.target.cli == "slow")
-    assert slow.ok  # the streamed partial became a usable candidate answer
-    assert slow.stop_reason == "budget"  # ...but flagged as a budget harvest, not a clean finish
-    assert "draft line 1" in slow.text and "draft line 2" in slow.text  # the partial is the answer
-    assert slow.partial is not None and "draft line 1" in slow.partial  # raw bytes preserved too
-    assert result.rollup is not None and result.rollup.usable == 2  # both voices count toward quorum
-
-
-async def test_harvested_partial_reports_the_resolved_default_effort() -> None:
-    # The harvested partial must report the effort the subprocess actually ran with -- which, when the call
-    # named none, is the configured default_effort (resolved like the delegation service does), not None.
-    from rutherford.domain.enums import Effort
-
-    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0}, partials={"slow": ["partial draft"]})
-    registry = AdapterRegistry([FakeAdapter("fast"), FakeAdapter("slow")])
-    cfg = RutherfordConfig(default_effort=Effort.HIGH)  # the call names no effort; the default fills it
-    service = ConsensusService(DelegationService(registry, runner, cfg, load_roles()), cfg, registry)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
-    )
-    assert isinstance(result, ConsensusResult)
-    slow = next(voice for voice in result.voices if voice.target.cli == "slow")
-    assert slow.ok  # the partial was harvested into a usable answer
-    assert slow.effort == Effort.HIGH and slow.effort_applied == Effort.HIGH  # the resolved default, not None
-
-
-async def test_budget_cut_on_a_single_envelope_adapter_is_a_trace_not_an_answer() -> None:
-    # 2-H: a single-envelope adapter (JSON/TRANSCRIPT) emits its answer once, at the end, so a cut yields
-    # only a partial TRACE, never a usable answer. Such a cut voice stays a BUDGET_EXHAUSTED failure with
-    # the raw bytes preserved on ``partial`` -- it must NOT be promoted to a usable answer.
-    from rutherford.domain.enums import OutputMode
-    from rutherford.domain.models import AdapterCapabilities
-
-    class _SingleEnvelopeAdapter(FakeAdapter):
-        def capabilities(self) -> AdapterCapabilities:
-            return AdapterCapabilities(output_mode=OutputMode.JSON)  # supports_partial_output -> False
-
-    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0}, partials={"slow": ["incomplete trace"]})
-    registry = AdapterRegistry([FakeAdapter("fast"), _SingleEnvelopeAdapter("slow")])
-    cfg = RutherfordConfig()
-    service = ConsensusService(DelegationService(registry, runner, cfg, load_roles()), cfg, registry)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
-    )
-    assert isinstance(result, ConsensusResult)
-    slow = next(voice for voice in result.voices if voice.target.cli == "slow")
-    assert not slow.ok  # a single-envelope cut is a trace, never a usable answer
-    assert slow.error is not None and slow.error.code == "BUDGET_EXHAUSTED"
-    assert slow.partial is not None and "incomplete trace" in slow.partial  # kept as a trace
-    assert result.rollup is not None and result.rollup.usable == 1  # only the fast voice counts
+    by_cli = {voice.target.cli: voice for voice in result.voices}
+    assert by_cli["fake"].ok and "42" in by_cli["fake"].text and by_cli["fake"].stop_reason is None
+    slow = by_cli["slow"]
+    assert slow.stop_reason == "budget" and slow.text == "partial-so-far"  # the streamed partial was harvested
+    assert result.rollup is not None
+    assert result.rollup.stop_reason == "budget" and result.rollup.cut == 1 and result.rollup.answered == 1
+    assert result.rollup.usable == 2 and result.rollup.quorum_met is True
+    assert result.rollup.time_budget_s == 1.2 and result.rollup.elapsed_s > 0
 
 
 async def test_budget_below_quorum_raises_budget_exhausted() -> None:
-    # 2-E': a harvest that left fewer than min_quorum usable voices is a genuine failure raised before
-    # any result is returned -- the zero/under-yield edge BUDGET_EXHAUSTED is reserved for.
-    runner = _BudgetRunner({"slow": 5.0, "slow2": 5.0})
-    service = _budget_consensus(runner, RutherfordConfig(min_quorum=2))
-    with pytest.raises(RutherfordError) as info:
-        await service.consensus(
-            ConsensusRequest(targets=[Target(cli="slow"), Target(cli="slow2")], prompt="q", time_budget_s=0.3)
-        )
-    assert info.value.code == "BUDGET_EXHAUSTED"
-    assert "min_quorum" in info.value.message
+    # Two slow voices, each cut with only a streamed partial (usable), but min_quorum=3 cannot be met -> the
+    # genuine starved harvest raises BUDGET_EXHAUSTED rather than certifying off too few.
+    config = RutherfordConfig(min_quorum=3)
+    request = ConsensusRequest(
+        targets=[Target(cli="slow"), Target(cli="slow")],
+        prompt="x",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=1.2,
+    )
+    with pytest.raises(RutherfordError) as exc:
+        await _service(config, extra=[SLOW]).consensus(request)
+    assert exc.value.code is ErrorCode.BUDGET_EXHAUSTED
+
+
+async def test_generous_budget_finishes_clean_with_a_rollup() -> None:
+    # A budget longer than every voice: nothing is cut, the result-level stop_reason stays None (a clean
+    # finish), and the rollup records stop_reason="ok" with the real counts.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=30.0,
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.stop_reason is None
+    assert result.rollup is not None and result.rollup.stop_reason == "ok"
+    assert result.rollup.cut == 0 and result.rollup.answered == 2 and result.rollup.usable == 2
+
+
+async def test_no_budget_leaves_stop_reason_and_rollup_unset() -> None:
+    request = ConsensusRequest(targets=[Target(cli="fake")], prompt="what is 17 + 25?", working_dir=str(REPO_ROOT))
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.stop_reason is None and result.rollup is None
 
 
 async def test_on_budget_continue_runs_every_voice_to_completion() -> None:
-    # 2-M: with on_budget="continue" the budget is advisory -- every voice runs to completion and none
-    # is cut, even one slower than the budget. The rollup still records the run, with no harvest.
-    runner = _BudgetRunner({"fast": 0.0, "slow": 0.2})
-    service = _budget_consensus(runner)
-    result = await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.05, on_budget="continue"
-        )
+    # With on_budget="continue" the budget is advisory: even a voice slower than the budget runs to its full
+    # answer (no cut), so stop_reason stays None and nothing is harvested.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=1.2,
+        on_budget="continue",
     )
-    assert all(voice.ok for voice in result.voices)  # nothing cut despite the slow voice exceeding 0.05s
+    result = await _service(extra=[SLOW]).consensus(request)
+    assert isinstance(result, ConsensusResult)
     assert result.stop_reason is None
-    assert result.rollup is not None
-    assert result.rollup.stop_reason == "ok"
-    assert result.rollup.cut == 0
+    assert all(voice.ok and "42" in voice.text for voice in result.voices)  # the slow voice finished too
+    assert result.rollup is not None and result.rollup.stop_reason == "ok" and result.rollup.cut == 0
 
 
-async def test_on_budget_resume_cuts_the_straggler_like_harvest_today() -> None:
-    # 2-M: ``resume`` cuts the stragglers at the deadline like ``harvest`` and intends a later deliberate
-    # come-back to them. Today that come-back rides the item-9 continuation primitive and a mid-run-cut
-    # voice has no established session to record, so ``resume`` is harvest-equivalent -- pinned here so a
-    # future item-9 change that diverges them is a deliberate, visible edit.
-    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0})
-    service = _budget_consensus(runner)
-    result = await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3, on_budget="resume"
-        )
+async def test_budget_carries_into_a_strategy_result() -> None:
+    # The budget path composes with the aggregation: a strategy run under a tight budget still cuts the slow
+    # voice and stamps stop_reason + rollup on the StrategyResult.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt=_prompt("VERDICT: yes"),
+        strategy=Strategy.PLURALITY,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=1.2,
     )
+    result = await _service(extra=[SLOW]).consensus(request)
+    assert isinstance(result, StrategyResult)
+    assert result.stop_reason == "budget" and result.rollup is not None and result.rollup.cut == 1
+
+
+async def test_budget_rollup_records_effort_requested() -> None:
+    # The rollup surfaces the effort tier asked of the voices, even for fakes whose applied tier is a no-op.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=1.2,
+        effort=Effort.HIGH,
+    )
+    result = await _service(extra=[SLOW]).consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.rollup is not None and result.rollup.effort_requested is Effort.HIGH
+
+
+async def test_budget_path_handles_a_failed_voice() -> None:
+    # The budgeted path still records a handshake-failing voice as a structured failed voice (not a cut),
+    # alongside the fast voice that answered -- one bad voice never aborts a budgeted panel.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake"), Target(cli="dead")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=10.0,
+    )
+    result = await _service(extra=[DEAD]).consensus(request)
     assert isinstance(result, ConsensusResult)
     by_cli = {voice.target.cli: voice for voice in result.voices}
-    assert by_cli["fast"].ok
-    assert not by_cli["slow"].ok and by_cli["slow"].error is not None
-    assert by_cli["slow"].error.code == "BUDGET_EXHAUSTED"  # cut at the deadline, exactly like harvest
-    assert result.stop_reason == "budget"
-
-
-async def test_on_budget_continue_detaches_publishing_an_interim_then_the_full_set() -> None:
-    # 2-M: on_budget=continue with an interim sink (an async job) detaches at the deadline -- it publishes
-    # the best-effort answered-so-far set and keeps the stragglers running, returning the full set when they
-    # land. Nothing is cut: the final has every voice and is not flagged as a budget harvest.
-    interims: list[ConsensusResult | StrategyResult] = []
-    # Generous gap (fast finishes ~instantly, well under the 0.3s budget; slow's 1.0s far exceeds it) so the
-    # deadline reliably fires with the slow voice still pending even on a loaded CI runner.
-    runner = _BudgetRunner({"fast": 0.0, "slow": 1.0})
-    service = _budget_consensus(runner)
-    result = await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3, on_budget="continue"
-        ),
-        on_interim_result=interims.append,
-    )
-    assert interims, "an interim best-effort result must be published at the deadline"
-    first = interims[0]
-    assert isinstance(first, ConsensusResult)
-    assert {voice.target.cli for voice in first.voices} == {"fast"}  # only the answered-so-far voice
-    assert first.notice is not None and "still running" in first.notice
-    assert isinstance(result, ConsensusResult)
-    assert {voice.target.cli for voice in result.voices} == {"fast", "slow"}  # the full set at the end
-    assert all(voice.ok for voice in result.voices)
-    assert result.stop_reason is None  # continue never cuts -- not a harvest
-
-
-async def test_on_budget_continue_without_an_interim_sink_runs_all_to_completion() -> None:
-    # The sync path: with no interim sink, continue cannot detach -- it just runs every voice to completion
-    # and returns the full set (no interim emitted, nothing cut).
-    runner = _BudgetRunner({"fast": 0.0, "slow": 0.2})
-    service = _budget_consensus(runner)
-    result = await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.05, on_budget="continue"
-        )
-    )
-    assert isinstance(result, ConsensusResult)
-    assert all(voice.ok for voice in result.voices) and len(result.voices) == 2
-    assert result.stop_reason is None
-
-
-async def test_strategy_carries_per_voice_effort_applied() -> None:
-    # 2-L: the applied-effort reporting surface must survive the strategy aggregation -- each VoiceVerdict
-    # carries the tier its voice actually applied, not just the all-voices result.
-    from rutherford.domain.enums import Effort
-
-    runner = _verdict_runner({"a": "approve", "b": "approve"})
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="a"), Target(cli="b")], prompt="q", strategy=Strategy.MAJORITY, effort=Effort.HIGH
-        )
-    )
-    assert isinstance(result, StrategyResult)
-    assert result.voices and all(verdict.effort_applied == Effort.HIGH for verdict in result.voices)
-
-
-async def test_rollup_effort_requested_reflects_the_resolved_default() -> None:
-    # 2-L-map: a budget that defaulted the effort must not report None for requested -- the rollup records
-    # the resolved tier (the configured default the voices actually ran with).
-    from rutherford.domain.enums import Effort
-
-    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0})
-    service = _budget_consensus(runner, RutherfordConfig(default_effort=Effort.HIGH))
-    result = await service.consensus(  # effort omitted -> resolves to default_effort=high
-        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
-    )
-    assert result.rollup is not None
-    assert result.rollup.effort_requested == Effort.HIGH
-
-
-async def test_default_on_budget_continue_is_honored_when_the_call_omits_it() -> None:
-    # 2-M (per-call param + workspace default): an omitted on_budget follows the configured
-    # default_on_budget. With default_on_budget="continue", a slow voice that exceeds the budget is NOT
-    # cut (the budget is advisory) -- proving the config default reached the service, not a hard "harvest".
-    runner = _BudgetRunner({"fast": 0.0, "slow": 0.2})
-    service = _budget_consensus(runner, RutherfordConfig(default_on_budget="continue"))
-    result = await service.consensus(  # on_budget omitted -> resolves to the config default (continue)
-        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.05)
-    )
-    assert isinstance(result, ConsensusResult)
-    assert all(voice.ok for voice in result.voices)  # nothing cut despite the slow voice exceeding 0.05s
-    assert result.stop_reason is None
-
-
-async def test_no_budget_means_no_rollup_and_no_stop_reason() -> None:
-    # The default path: no time budget -> the run completes normally, with no rollup and no stop_reason,
-    # so the F8a fields stay absent from the wire for the common case.
-    runner = _BudgetRunner({"fast": 0.0, "slow": 0.0})
-    service = _budget_consensus(runner)
-    result = await service.consensus(ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q"))
-    assert result.stop_reason is None
-    assert result.rollup is None
-
-
-async def test_budget_rollup_reports_counts_and_effort() -> None:
-    # The rollup is the F8a audit surface: who was issued, who answered, who was cut, quorum, and the
-    # effort actually applied (the FakeAdapter echoes the requested tier as applied).
-    from rutherford.domain.enums import Effort
-
-    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0})
-    service = _budget_consensus(runner)
-    result = await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3, effort=Effort.HIGH
-        )
-    )
-    rollup = result.rollup
-    assert rollup is not None
-    assert rollup.stop_reason == "budget"
-    assert rollup.requested == 2
-    assert rollup.answered == 1 and rollup.cut == 1
-    assert rollup.usable == 1 and rollup.quorum_met is True
-    assert rollup.time_budget_s == 0.3
-    assert rollup.effort_requested == Effort.HIGH
-    assert rollup.effort_applied == Effort.HIGH  # the fake "supports" the tier, so applied == requested
-    assert rollup.elapsed_s >= 0.0
-
-
-class _HarvestRunner:
-    """A runner where the slow voice streams a partial then overruns, and the harvest_partial follow-up
-    (its prompt contains "out of time") returns a clean best answer fast -- so a test can drive 2-I."""
-
-    async def run(
-        self,
-        spec: InvocationSpec,
-        timeout_s: float,
-        on_progress: Callable[[str], None] | None = None,
-        on_stdout: Callable[[str], None] | None = None,
-    ) -> ProcessResult:
-        prompt = spec.argv[2] if len(spec.argv) > 2 else ""
-        if "out of time" in prompt:  # the 2-I active harvest follow-up against the recovered session
-            return ProcessResult(exit_code=0, stdout="clean best answer")
-        cli = spec.argv[0]
-        if cli == "slow":
-            if on_stdout is not None:
-                on_stdout("raw partial draft")  # streamed before the cut -> recovers a session
-            await asyncio.sleep(5.0)
-            return ProcessResult(exit_code=0, stdout="slow answered")
-        return ProcessResult(exit_code=0, stdout=f"{cli} answered")
-
-
-async def test_harvest_partial_reprompts_a_cut_voice_for_a_clean_best_answer() -> None:
-    # 2-I active: harvest_partial=true re-prompts a cut voice whose session was recovered (from its streamed
-    # partial) for a clean best answer, which replaces the raw partial.
-    runner = _HarvestRunner()
-    service = _budget_consensus(runner)
-    events: list[ActivityEvent] = []
-    result = await service.consensus(
-        ConsensusRequest(
-            targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3, harvest_partial=True
-        ),
-        on_activity=events.append,
-    )
-    assert isinstance(result, ConsensusResult)
-    slow = next(voice for voice in result.voices if voice.target.cli == "slow")
-    assert slow.ok
-    assert slow.text == "clean best answer"  # the re-prompt replaced the raw partial
-    assert slow.stop_reason == "budget"  # still flagged as a (post-deadline) harvest
-    # N1 (3-A): the harvest follow-up is another delegation on top of the cut voice, counted in realized.
-    assert slow.delegation_call_count == 2  # the cut voice (1) + the follow-up (1)
-    assert result.topology is not None
-    assert result.topology.realized_delegations == 3  # fast (1) + slow cut+follow-up (2)
-    # N1 (3-K): the follow-up is visible in the activity stream -- a cut then a finished slow voice.
-    slow_events = [e for e in events if e.cli == "slow"]
-    assert any(e.kind is ActivityEventKind.CUT for e in slow_events)
-    assert any(e.kind is ActivityEventKind.VOICE_FINISHED and e.status == "ok" for e in slow_events)
-
-
-async def test_cut_voice_records_a_recovered_session_even_without_an_answer() -> None:
-    # 2-I passive: a voice cut mid-run whose partial established a session but no usable answer yet must
-    # still record that session handle, so a later resume/harvest can use it.
-    from rutherford.domain.enums import OutputMode
-    from rutherford.domain.error_codes import ErrorCode
-    from rutherford.domain.models import AdapterCapabilities, DelegationResult, ErrorInfo, InvocationContext
-
-    class _SessionNoAnswerAdapter(FakeAdapter):
-        def capabilities(self) -> AdapterCapabilities:
-            return AdapterCapabilities(supports_resume=True, output_mode=OutputMode.JSONL)  # partial-output
-
-        def parse_output(self, raw: ProcessResult, ctx: InvocationContext) -> DelegationResult:
-            # The partial established a session but carries no answer yet -> a failed parse with the session.
-            return DelegationResult(
-                target=ctx.target,
-                ok=False,
-                error=ErrorInfo(code=ErrorCode.PARSE_ERROR, message="no answer yet"),
-                session_id="recovered-sess",
-                safety_mode=ctx.safety_mode,
-            )
-
-    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0}, partials={"slow": ["session established, still thinking"]})
-    registry = AdapterRegistry([FakeAdapter("fast"), _SessionNoAnswerAdapter("slow")])
-    cfg = RutherfordConfig()
-    service = ConsensusService(DelegationService(registry, runner, cfg, load_roles()), cfg, registry)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
-    )
-    assert isinstance(result, ConsensusResult)
-    slow = next(voice for voice in result.voices if voice.target.cli == "slow")
-    assert not slow.ok  # no usable answer -> a trace cut
-    assert slow.session_id == "recovered-sess"  # ...but the session is recorded for a later resume (2-I)
-
-
-async def test_harvest_partial_off_leaves_the_raw_partial() -> None:
-    # Without harvest_partial, the cut voice keeps its raw harvested partial (no follow-up re-prompt).
-    runner = _HarvestRunner()
-    service = _budget_consensus(runner)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3)
-    )
-    assert isinstance(result, ConsensusResult)
-    slow = next(voice for voice in result.voices if voice.target.cli == "slow")
-    assert slow.text == "raw partial draft"  # the raw streamed partial, not a re-prompted answer
-
-
-async def test_outer_cancellation_during_harvest_propagates_and_drains() -> None:
-    # An external cancel of the whole panel (e.g. cancel_job) while voices are in flight must propagate
-    # as CancelledError, not be folded into a budget-cut voice. The slow voices are cancel-drained.
-    runner = _BudgetRunner({"slow": 5.0, "slow2": 5.0})
-    service = _budget_consensus(runner)
-    task = asyncio.ensure_future(
-        service.consensus(ConsensusRequest(targets=[Target(cli="slow"), Target(cli="slow2")], prompt="q"))
-    )
-    await asyncio.sleep(0.05)  # let the voices start
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-
-async def test_effort_flows_to_every_voice_and_is_reported_applied() -> None:
-    # 2-L: the panel's effort cap reaches each voice, and the applied tier is reported back per voice
-    # (the FakeAdapter maps every tier as supported, echoing it as applied).
-    from rutherford.domain.enums import Effort
-
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", effort=Effort.MEDIUM)
-    )
-    assert all(voice.effort == Effort.MEDIUM for voice in result.voices)
-    assert all(voice.effort_applied == Effort.MEDIUM for voice in result.voices)
-    # The fake adapter encodes the effort flag into the argv, so it reached the invocation.
-    assert all("--effort=medium" in spec.argv for spec, _ in runner.calls)
-
-
-async def test_expand_all_skips_a_benched_adapter() -> None:
-    # F7: an adapter on cooldown is left out of the auto-expanded panel, with a reason.
-    config = RutherfordConfig(cooldown_threshold=1)  # one unhealthy failure benches
-
-    def run_fn(spec: InvocationSpec) -> ProcessResult:
-        cli = spec.argv[0]
-        if cli == "b":
-            return ProcessResult(exit_code=1, stderr="rate limit exceeded")  # unhealthy -> benches b
-        return ProcessResult(exit_code=0, stdout="ok")
-
-    runner = FakeProcessRunner(run_fn=run_fn)
-    registry = AdapterRegistry([FakeAdapter("a"), FakeAdapter("b")])
-    delegation = DelegationService(registry, runner, config, load_roles())
-    consensus = ConsensusService(delegation, config, registry)
-
-    await delegation.delegate(DelegationRequest(target=Target(cli="b"), prompt="q"))  # bench b
-    assert delegation.is_benched("b")
-
-    result = await consensus.consensus(ConsensusRequest(expand_all=True, prompt="q"))
-    assert isinstance(result, ConsensusResult)
-    included = {voice.target.cli for voice in result.voices}
-    assert "a" in included
-    assert "b" not in included
-    assert any(entry.cli == "b" and "cooldown" in entry.reason for entry in result.skipped)
-
-
-# --- (f) N1 (item 3): topology + activity events + advisory cap ----------------------------------
-
-
-async def test_consensus_populates_topology() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok", observed_peak_agents=3))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.consensus(ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
-    assert result.topology is not None
-    assert result.topology.declared == 2
-    assert result.topology.realized_delegations == 2
-    assert result.topology.observed_peak_agents == 3  # the max local peak across the voices
-    assert result.topology.over_cap is False
-
-
-async def test_consensus_emits_panel_and_voice_activity_events() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], runner)
-    events: list[ActivityEvent] = []
-    await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"), on_activity=events.append
-    )
-    kinds = [event.kind for event in events]
-    assert kinds[0] is ActivityEventKind.PANEL_STARTED
-    assert events[0].tool == "consensus" and events[0].declared == 2
-    assert kinds[-1] is ActivityEventKind.PANEL_FINISHED
-    assert ActivityEventKind.VOICE_STARTED in kinds
-    assert ActivityEventKind.VOICE_FINISHED in kinds
-
-
-async def test_consensus_over_cap_flag_is_advisory_not_a_refusal() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    cfg = RutherfordConfig(max_agents_advisory=2)  # 3 declared voices exceeds the advisory cap
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner, cfg)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")], prompt="q")
-    )
-    assert isinstance(result, ConsensusResult)
-    assert len(result.voices) == 3  # advisory: ran anyway
-    assert result.topology is not None and result.topology.over_cap is True
-
-
-async def test_consensus_enforced_cap_refuses_up_front() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    cfg = RutherfordConfig(max_agents_advisory=2, enforce_agent_cap=True)
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner, cfg)
-    with pytest.raises(RutherfordError) as info:
-        await service.consensus(
-            ConsensusRequest(targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")], prompt="q")
-        )
-    assert info.value.code == ErrorCode.AGENT_CAP_EXCEEDED
-    assert not runner.calls  # refused before launching any voice
-
-
-async def test_consensus_emits_cut_and_budget_tick_on_a_harvest() -> None:
-    runner = _BudgetRunner({"fast": 0.0, "slow": 5.0})
-    service = _budget_consensus(runner)
-    events: list[ActivityEvent] = []
-    await service.consensus(
-        ConsensusRequest(targets=[Target(cli="fast"), Target(cli="slow")], prompt="q", time_budget_s=0.3),
-        on_activity=events.append,
-    )
-    kinds = [event.kind for event in events]
-    assert ActivityEventKind.BUDGET_TICK in kinds
-    cut_events = [event for event in events if event.kind is ActivityEventKind.CUT]
-    assert any(event.cli == "slow" for event in cut_events)  # the in-flight voice was cut at the deadline
-
-
-async def test_consensus_emits_job_cancelled_on_outer_cancel() -> None:
-    runner = _BudgetRunner({"slow": 5.0, "slow2": 5.0})
-    service = _budget_consensus(runner)
-    events: list[ActivityEvent] = []
-    task = asyncio.ensure_future(
-        service.consensus(
-            ConsensusRequest(targets=[Target(cli="slow"), Target(cli="slow2")], prompt="q"),
-            on_activity=events.append,
-        )
-    )
-    await asyncio.sleep(0.05)  # let the voices start
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert any(event.kind is ActivityEventKind.JOB_CANCELLED for event in events)
-
-
-async def test_consensus_emits_job_cancelled_on_cancel_during_synthesis() -> None:
-    # N1 (3-K): a cancel during the closing synthesis (after every voice finished, so the voice-task guard
-    # has already exited) must still close the activity stream with a terminal event, not orphan it.
-    class _SlowSynthRunner:
-        async def run(
-            self,
-            spec: InvocationSpec,
-            timeout_s: float,
-            on_progress: Callable[[str], None] | None = None,
-            on_stdout: Callable[[str], None] | None = None,
-        ) -> ProcessResult:
-            prompt = spec.argv[2] if len(spec.argv) > 2 else ""
-            if "synthesizing" in prompt:  # the synthesis pass overruns so a cancel can land inside it
-                await asyncio.sleep(5.0)
-                return ProcessResult(exit_code=0, stdout="synth")
-            return ProcessResult(exit_code=0, stdout="voice answer")
-
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b")], _SlowSynthRunner())  # type: ignore[arg-type]
-    events: list[ActivityEvent] = []
-    task = asyncio.ensure_future(
-        service.consensus(
-            ConsensusRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", synthesize=True),
-            on_activity=events.append,
-        )
-    )
-    for _ in range(300):  # wait until both voices finished and the (slow) synthesis is in flight
-        await asyncio.sleep(0.01)
-        if sum(1 for e in events if e.kind is ActivityEventKind.VOICE_FINISHED) >= 2:
-            break
-    await asyncio.sleep(0.05)  # let the synthesis await start
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert any(e.kind is ActivityEventKind.JOB_CANCELLED for e in events)  # the stream is closed, not orphaned
-
-
-async def test_consensus_topology_counts_a_voice_model_fallback() -> None:
-    # N1 (decision 3-A): realized counts fallback re-runs. Voice b's requested model is rejected and it
-    # falls back, running two subprocesses, so realized (3) exceeds the declared width (2).
-    def run_fn(spec: InvocationSpec) -> ProcessResult:
-        if "named-only" in spec.argv:
-            return ProcessResult(exit_code=1, stderr="Named models unavailable on your plan. Switch to Auto.")
-        return ProcessResult(exit_code=0, stdout="ok")
-
-    runner = FakeProcessRunner(run_fn=run_fn)
-    service = _consensus([FakeAdapter("a"), FakeAdapter("b", fallback_model="auto")], runner)
-    result = await service.consensus(
-        ConsensusRequest(targets=[Target(cli="a"), Target(cli="b", model="named-only")], prompt="q")
-    )
-    assert result.topology is not None
-    assert result.topology.declared == 2
-    assert result.topology.realized_delegations == 3  # a: 1, b: primary + fallback = 2
-
-
-async def test_consensus_emits_panel_finished_before_budget_exhausted_raise() -> None:
-    # N1 (3-K): BUDGET_EXHAUSTED is a terminal outcome after panel_started, so the stream must still get a
-    # (failed) panel_finished before the raise -- otherwise push/poll has no terminal event.
-    runner = _BudgetRunner({"slow": 5.0, "slow2": 5.0})  # both cut, none usable -> BUDGET_EXHAUSTED
-    service = _budget_consensus(runner)
-    events: list[ActivityEvent] = []
-    with pytest.raises(RutherfordError) as info:
-        await service.consensus(
-            ConsensusRequest(targets=[Target(cli="slow"), Target(cli="slow2")], prompt="q", time_budget_s=0.3),
-            on_activity=events.append,
-        )
-    assert info.value.code == ErrorCode.BUDGET_EXHAUSTED
-    assert any(e.kind is ActivityEventKind.PANEL_FINISHED and e.status == "failed" for e in events)
+    assert by_cli["fake"].ok and "42" in by_cli["fake"].text
+    assert by_cli["dead"].ok is False  # handshake failure, surfaced as a failed voice, not a cut
+    assert result.stop_reason is None  # the dead voice finished (failed) before the deadline -- no cut

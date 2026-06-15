@@ -1,643 +1,625 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""Tests for the debate service, driven by fakes."""
+"""Tests for debate over ACP: persistent per-voice sessions, delta prompts, drop-outs, and synthesis."""
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable
+import sys
+from pathlib import Path
+from typing import Any
 
 import pytest
 
-from rutherford.adapters.registry import AdapterRegistry
+from rutherford import server
+from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
-from rutherford.domain.enums import ActivityEventKind, Stance
+from rutherford.context import AppContext, build_app_context
+from rutherford.domain.enums import Effort, SafetyMode, Stance, TerminationReason
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import ActivityEvent, DebateRequest, InvocationSpec, ProcessResult, Target
-from rutherford.services.debate import DebateService
+from rutherford.domain.models import DebateContribution, DebateRequest, DebateRound, Target
+from rutherford.services.debate import (
+    DebateService,
+    _disambiguate,
+    _participant_clis,
+    _set_aside_dissents,
+    _Voice,
+    _with_later_stance,
+)
 from rutherford.services.delegation import DelegationService
-from rutherford.services.roles import load_roles
-from tests.fakes import FakeAdapter, FakeProcessRunner
+from rutherford.tools.debate import debate_tool
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+_FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
+FAKE = AgentDescriptor("fake", "Fake", _FAKE_CMD)
+DEAD = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.exit(0)"))
+# A slow agent: streams a partial then sleeps 1.5s, so a tight round deadline cuts its turn mid-round. The
+# sleep is kept small on purpose: round-boundary budget cuts work at asyncio resolution, so the slow voice
+# only needs to outlast the ~1.2s cut budget by a clear margin (it finishes near subprocess-spawn + 1.5s).
+# The budgets below sit near a second rather than truly sub-second because of a ~0.7s subprocess-spawn floor
+# per voice: a budget under that floor would cut the FAST voice too, starving the round.
+SLOW = AgentDescriptor(
+    "slow", "Slow", _FAKE_CMD, default_model="model-s", env_overrides=(("RUTHERFORD_FAKE_SLEEP", "1.5"),)
+)
+# A fast fake with a distinct id, so a debate of two ``fake`` voices can name it as a NON-participant judge.
+JUDGE = AgentDescriptor("judge", "Judge", _FAKE_CMD, provider="beta", default_model="model-j")
+# Voices that always vote a fixed way (via env), so a convergence-tracked debate (F5) can hold a stable
+# disagreement -- a steady 'yes' bloc against a steady 'no' -- without per-voice prompts.
+YES_VOTER = AgentDescriptor("yesvoter", "Yes", _FAKE_CMD, env_overrides=(("RUTHERFORD_FAKE_VERDICT", "yes"),))
+NO_VOTER = AgentDescriptor("novoter", "No", _FAKE_CMD, env_overrides=(("RUTHERFORD_FAKE_VERDICT", "no"),))
 
 
-def _debate(
-    adapters: list[FakeAdapter],
-    runner: FakeProcessRunner,
-    config: RutherfordConfig | None = None,
-) -> DebateService:
-    cfg = config or RutherfordConfig()
-    registry = AdapterRegistry(adapters)
-    delegation = DelegationService(registry, runner, cfg, load_roles())
-    return DebateService(delegation, cfg)
+def _service(config: RutherfordConfig | None = None) -> DebateService:
+    resolved = config or RutherfordConfig()
+    registry = DescriptorRegistry([FAKE, DEAD, SLOW, JUDGE])
+    return DebateService(registry, resolved, DelegationService(registry, resolved))
 
 
-def _prompts(runner: FakeProcessRunner) -> list[str]:
-    """The prompt each delegation was given (FakeAdapter argv is ``[id, "-p", prompt]``)."""
-    return [spec.argv[2] for spec, _ in runner.calls]
+def _converge_service(config: RutherfordConfig | None = None) -> DebateService:
+    resolved = config or RutherfordConfig()
+    registry = DescriptorRegistry([FAKE, YES_VOTER, NO_VOTER])
+    return DebateService(registry, resolved, DelegationService(registry, resolved))
 
 
-async def test_single_round_returns_one_round_per_voice() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="my answer"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="best db?", rounds=1)
+def _app() -> AppContext:
+    return build_app_context(config=RutherfordConfig(), descriptors=DescriptorRegistry([FAKE]))
+
+
+def _two_fakes(**kwargs: Any) -> DebateRequest:
+    return DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="what is 17 + 25?",
+        working_dir=str(REPO_ROOT),
+        **kwargs,
     )
-    assert len(result.rounds) == 1
-    contributions = result.rounds[0].contributions
-    assert {c.label for c in contributions} == {"a", "b"}
-    assert all(c.ok for c in contributions)
-    assert all(c.round_index == 1 for c in contributions)
-    assert result.final == "my answer"  # synthesize is on by default
 
 
-async def test_later_rounds_show_each_voice_the_others() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    await service.debate(DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="rewrite in Rust?", rounds=2))
-    prompts = _prompts(runner)
-    # Round one is the bare question; round two asks each voice to rebut the others.
-    assert any("rewrite in Rust?" in prompt and "Critique" not in prompt for prompt in prompts)
-    assert any("Critique the other positions" in prompt for prompt in prompts)
-    assert any("other participants' latest positions" in prompt for prompt in prompts)
+async def test_debate_two_rounds_on_persistent_sessions() -> None:
+    result = await _service().debate(_two_fakes(rounds=2))
+    assert len(result.rounds) == 2
+    assert all(len(round_.contributions) == 2 for round_ in result.rounds)
+    assert all(contribution.ok for round_ in result.rounds for contribution in round_.contributions)
+    # round 2 ran on the SAME live sessions via delta prompts, and both voices still answered
+    assert all(contribution.ok for contribution in result.rounds[1].contributions)
+    assert result.final is not None and result.synthesis_by is not None
 
 
-async def test_a_raising_seat_becomes_a_failed_contribution_not_a_round_abort() -> None:
-    # The debate shares consensus's partial-failure contract: a seat whose adapter probe RAISES
-    # must be recorded as a failed contribution while the other seat's turn survives and the
-    # debate runs to completion (later rounds proceed with the survivors).
-    class _DetectRaises(FakeAdapter):
-        def detect(self):
-            raise RuntimeError("probe exploded")
+async def test_debate_needs_two_targets() -> None:
+    with pytest.raises(RutherfordError) as exc:
+        await _service().debate(DebateRequest(targets=[Target(cli="fake")], prompt="x"))
+    assert exc.value.code is ErrorCode.INVALID_INPUT
 
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b"), _DetectRaises("boom")], runner)
-    result = await service.debate(
-        DebateRequest(
-            targets=[Target(cli="a"), Target(cli="b"), Target(cli="boom")],
-            prompt="q",
-            rounds=2,
-            synthesize=False,
-        )
+
+async def test_debate_enforces_target_cap() -> None:
+    with pytest.raises(RutherfordError) as exc:
+        await _service(RutherfordConfig(max_targets=1)).debate(_two_fakes())
+    assert exc.value.code is ErrorCode.TOO_MANY_TARGETS
+
+
+async def test_debate_validates_rounds() -> None:
+    with pytest.raises(RutherfordError):
+        await _service().debate(_two_fakes(rounds=0))
+    with pytest.raises(RutherfordError):
+        await _service(RutherfordConfig(max_debate_rounds=2)).debate(_two_fakes(rounds=5))
+
+
+async def test_debate_unknown_agent_becomes_a_failed_contribution() -> None:
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="nope")],
+        prompt="what is 17 + 25?",
+        rounds=1,
+        working_dir=str(REPO_ROOT),
     )
-    round_one = {c.label: c for c in result.rounds[0].contributions}
-    assert round_one["a"].ok and round_one["b"].ok
-    assert not round_one["boom"].ok
-    assert round_one["boom"].error is not None
-    assert round_one["boom"].error.code == "INTERNAL"
-    assert len(result.rounds) == 2  # the debate completed with the two surviving seats
-    assert {c.label for c in result.rounds[1].contributions} == {"a", "b"}  # the raiser dropped out
-    assert all(c.ok for c in result.rounds[1].contributions)
+    result = await _service().debate(request)
+    by_cli = {contribution.target.cli: contribution for contribution in result.rounds[0].contributions}
+    assert by_cli["fake"].ok is True and "42" in by_cli["fake"].text
+    assert by_cli["nope"].ok is False
 
 
-async def test_a_cancellation_escaping_a_seat_propagates_not_folds(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Mirrors the consensus pin: a CancelledError captured by the round's return_exceptions gather
-    # must re-raise, not fold into a failed contribution -- a cancelled debate must not "complete"
-    # with a swallowed cancellation.
-    import asyncio
-
-    from rutherford.domain.models import DelegationRequest
-
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    real_delegate = DelegationService.delegate
-
-    async def cancelled(self: DelegationService, req: DelegationRequest, **kwargs: object):
-        if req.target.cli == "b":
-            raise asyncio.CancelledError()
-        return await real_delegate(self, req, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(DelegationService, "delegate", cancelled)
-    with pytest.raises(asyncio.CancelledError):
-        await service.debate(
-            DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, synthesize=False)
-        )
-
-
-async def test_an_exception_escaping_a_seat_delegation_is_folded_into_the_round(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Defense in depth behind delegate()'s containment: an exception that still escapes one
-    # seat's delegation becomes that seat's failed contribution, not a lost round.
-    from rutherford.domain.models import DelegationRequest
-
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    real_delegate = DelegationService.delegate
-
-    async def explode(self: DelegationService, req: DelegationRequest, **kwargs: object):
-        if req.target.cli == "b":
-            raise RuntimeError("escaped containment")
-        return await real_delegate(self, req, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(DelegationService, "delegate", explode)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, synthesize=False)
+async def test_debate_handshake_failure_becomes_a_failed_contribution() -> None:
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="dead")],
+        prompt="what is 17 + 25?",
+        rounds=1,
+        working_dir=str(REPO_ROOT),
     )
-    contributions = {c.label: c for c in result.rounds[0].contributions}
-    assert contributions["a"].ok
-    assert not contributions["b"].ok
-    assert contributions["b"].error is not None
-    assert contributions["b"].error.code == "INTERNAL"
+    result = await _service().debate(request)
+    by_cli = {contribution.target.cli: contribution for contribution in result.rounds[0].contributions}
+    assert by_cli["fake"].ok is True
+    dead = by_cli["dead"]
+    assert dead.ok is False and dead.error is not None and dead.error.code is ErrorCode.ACP_HANDSHAKE_FAILED
 
 
-async def test_failed_voice_drops_out_of_later_rounds() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    # "b" is not installed: it fails round one and should not appear in round two.
-    service = _debate([FakeAdapter("a"), FakeAdapter("b", installed=False), FakeAdapter("c")], runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")], prompt="q", rounds=2)
-    )
-    round_one = {c.label: c for c in result.rounds[0].contributions}
-    assert set(round_one) == {"a", "b", "c"}
-    assert not round_one["b"].ok
-    assert round_one["b"].error is not None and round_one["b"].error.code == "BINARY_NOT_FOUND"
-    round_two = {c.label for c in result.rounds[1].contributions}
-    assert round_two == {"a", "c"}  # the failed voice fell out
-
-
-async def test_debate_stops_when_fewer_than_two_voices_remain() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    # With only "a" surviving round one, there is no one left to debate, so round two is skipped.
-    service = _debate([FakeAdapter("a"), FakeAdapter("b", installed=False)], runner)
-    result = await service.debate(DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=3))
-    assert len(result.rounds) == 1
-
-
-async def test_stances_steer_round_one_and_persist() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    await service.debate(
-        DebateRequest(
-            targets=[Target(cli="a"), Target(cli="b")],
-            prompt="adopt gRPC?",
-            rounds=2,
-            stances=[Stance.FOR, Stance.AGAINST],
-        )
-    )
-    prompts = _prompts(runner)
-    assert any("Argue in favor" in prompt for prompt in prompts)  # round one steering
-    assert any("Argue against" in prompt for prompt in prompts)
-    assert any("Keep arguing in favor" in prompt for prompt in prompts)  # stance persists into round two
-    assert any("Keep arguing against" in prompt for prompt in prompts)
-
-
-async def test_no_synthesize_skips_the_closing_pass() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, synthesize=False)
-    )
-    assert result.final is None
-    assert len(runner.calls) == 2  # two voices, one round, no closing delegation
-
-
-async def test_needs_at_least_two_targets() -> None:
-    runner = FakeProcessRunner()
-    service = _debate([FakeAdapter("a")], runner)
-    with pytest.raises(RutherfordError, match="at least two targets"):
-        await service.debate(DebateRequest(targets=[Target(cli="a")], prompt="q"))
-
-
-async def test_rounds_capped_by_config() -> None:
-    runner = FakeProcessRunner()
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner, RutherfordConfig(max_debate_rounds=2))
-    with pytest.raises(RutherfordError, match="max_debate_rounds"):
-        await service.debate(DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=3))
-
-
-async def test_target_cap_enforced() -> None:
-    runner = FakeProcessRunner()
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner, RutherfordConfig(max_targets=1))
-    with pytest.raises(RutherfordError) as info:
-        await service.debate(DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q"))
-    assert info.value.code == "TOO_MANY_TARGETS"
-
-
-async def test_stance_count_must_match_targets() -> None:
-    runner = FakeProcessRunner()
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    with pytest.raises(RutherfordError, match="stances"):
-        await service.debate(
-            DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", stances=[Stance.FOR])
-        )
-
-
-async def test_progress_announces_each_round() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    lines: list[str] = []
-    await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2),
-        on_progress=lines.append,
-    )
-    assert any("round 1 of 2" in line for line in lines)
-    assert any("round 2 of 2" in line for line in lines)
-    assert any("synthesizing" in line for line in lines)
-
-
-async def test_explicit_target_labels_key_the_transcript() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.debate(
-        DebateRequest(
-            targets=[Target(cli="a", label="proposer"), Target(cli="b", label="critic")],
-            prompt="q",
-            rounds=1,
-        )
-    )
-    assert {c.label for c in result.rounds[0].contributions} == {"proposer", "critic"}
-
-
-async def test_all_voices_failing_round_one_yields_no_final() -> None:
-    runner = FakeProcessRunner()
-    service = _debate([FakeAdapter("a", installed=False), FakeAdapter("b", installed=False)], runner)
-    result = await service.debate(DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2))
-    assert len(result.rounds) == 1  # nobody survived to argue a second round
-    assert all(not c.ok for c in result.rounds[0].contributions)
+async def test_debate_without_synthesis() -> None:
+    result = await _service().debate(_two_fakes(rounds=1, synthesize=False))
     assert result.final is None
 
 
-async def test_duplicate_seat_labels_do_not_collide() -> None:
-    # The fixed bug: two unlabeled same-(cli, model) seats share a display label, so keying identity
-    # on the label merged them into one survivor and fed each the wrong "own previous position".
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="my position"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="a"), Target(cli="b")], prompt="q", rounds=2)
+# --- F4a no-self-approval + pre-commit + set-aside dissent --------------------
+
+
+async def test_debate_closing_flags_self_authorship() -> None:
+    # F4a (4-A): the default closing author is the first surviving voice -- a participant -- so the closing is
+    # flagged self_authored. Naming a non-participant judge clears it.
+    result = await _service().debate(_two_fakes(rounds=1))
+    assert result.final is not None and result.self_authored is True
+
+    judged = await _service().debate(_two_fakes(rounds=1, judge=Target(cli="judge")))
+    assert judged.final is not None and judged.self_authored is False
+    assert judged.synthesis_by == "judge"
+
+
+async def test_debate_require_independent_judge_refuses_a_participant() -> None:
+    # With require_independent_judge the default (participant) closing author is refused; a non-participant
+    # judge passes cleanly.
+    with pytest.raises(RutherfordError) as exc:
+        await _service().debate(_two_fakes(rounds=1, require_independent_judge=True))
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+    assert "require_independent_judge" in exc.value.message and "non-participant" in exc.value.message
+
+    ok = await _service().debate(_two_fakes(rounds=1, require_independent_judge=True, judge=Target(cli="judge")))
+    assert ok.final is not None and ok.self_authored is False
+
+
+async def test_debate_require_independent_judge_via_config() -> None:
+    # The guard fires from config as well, refusing a participant closing server-wide with no per-call flag.
+    config = RutherfordConfig(require_independent_judge=True)
+    with pytest.raises(RutherfordError) as exc:
+        await _service(config).debate(_two_fakes(rounds=1))
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+
+
+async def test_debate_carries_round_one_pre_commit_onto_later_rounds() -> None:
+    # F4a (4-C): each seat's blind round-1 answer is carried onto its later-round contributions so a reader
+    # sees pre-vs-post movement. Round 1 itself has no pre_commit (it IS the pre-commitment).
+    result = await _service().debate(_two_fakes(rounds=2))
+    assert len(result.rounds) == 2
+    assert all(c.pre_commit is None for c in result.rounds[0].contributions)  # round 1 is the blind commit
+    round_one_by_seat = {c.seat_id: c.text for c in result.rounds[0].contributions}
+    for contribution in result.rounds[1].contributions:
+        assert contribution.pre_commit == round_one_by_seat[contribution.seat_id]
+        assert contribution.pre_commit  # a non-empty captured round-1 position
+
+
+def _contribution(
+    label: str, *, seat: str, round_index: int, ok: bool, text: str, dissent: str | None = None
+) -> DebateContribution:
+    return DebateContribution(
+        label=label,
+        seat_id=seat,
+        target=Target(cli=label.lower()),
+        round_index=round_index,
+        ok=ok,
+        text=text,
+        dissent=dissent,
     )
-    round_one = result.rounds[0].contributions
-    assert {c.label for c in round_one} == {"a", "a#2", "b"}  # disambiguated, not two "a"
-    assert len({c.seat_id for c in round_one}) == 3  # three distinct identities
-    assert len(result.rounds[1].contributions) == 3  # all three survive independently
-    # A later-round rebuttal shows the duplicate twin as a separate participant's position.
-    later_prompts = [spec.argv[2] for spec, _ in runner.calls][3:]
-    assert any("## a#2" in prompt for prompt in later_prompts)
 
 
-async def test_closing_uses_a_named_judge() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="closing"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("j")], runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, judge=Target(cli="j"))
+def test_participant_clis_spans_every_round_not_just_the_close() -> None:
+    # F4a (4-A): a seat that argued round 1 then dropped is still a participant, so the no-self-approval set
+    # must include it -- otherwise a named judge that debated-then-dropped is wrongly treated as independent.
+    round1 = DebateRound(
+        index=1,
+        contributions=[
+            _contribution("Fake", seat="0:Fake", round_index=1, ok=True, text="A"),
+            _contribution("Dropper", seat="1:Dropper", round_index=1, ok=True, text="B"),
+        ],
     )
-    assert result.final == "closing"
-    assert result.synthesis_by == "j"  # an independent, non-participant judge wrote the closing
-    assert any(spec.argv[0] == "j" for spec, _ in runner.calls)
-
-
-async def test_closing_defaults_to_a_participant_and_records_it() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.debate(DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1))
-    # No judge: a participant writes the closing, but synthesis_by surfaces which one.
-    assert result.synthesis_by in {"a", "b"}
-
-
-async def test_explicit_label_colliding_with_a_generated_suffix_stays_distinct() -> None:
-    # The bulletproofing fix: a caller who hand-labels a seat "a#2" must not collide with the
-    # auto-generated "#2" for two unlabeled "a" seats. All display labels stay distinct, and no
-    # rebuttal prompt shows two different seats under one "## a#2" heading.
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="my position"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.debate(
-        DebateRequest(
-            targets=[Target(cli="a"), Target(cli="a"), Target(cli="a", label="a#2")],
-            prompt="q",
-            rounds=2,
-        )
+    round2 = DebateRound(
+        index=2,
+        contributions=[
+            _contribution("Fake", seat="0:Fake", round_index=2, ok=True, text="A2"),
+            _contribution(
+                "Dropper",
+                seat="1:Dropper",
+                round_index=2,
+                ok=False,
+                text="",
+                dissent="set aside: no usable answer in round 2",
+            ),
+        ],
     )
-    round_one = result.rounds[0].contributions
-    assert len({c.label for c in round_one}) == 3  # three distinct display labels, no collision
-    assert len({c.seat_id for c in round_one}) == 3
-    later_prompts = [spec.argv[2] for spec, _ in runner.calls][3:]
-    assert all(prompt.count("## a#2") <= 1 for prompt in later_prompts)
+    assert _participant_clis([round1, round2]) == {"fake", "dropper"}  # dropper counts despite leaving round 2
 
 
-async def test_closing_with_a_failing_judge_records_no_author() -> None:
-    # The bulletproofing fix: a named judge that cannot run produces no synthesis, so synthesis_by
-    # must not claim the judge authored one that does not exist.
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("j", installed=False)], runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, judge=Target(cli="j"))
+def test_set_aside_dissents_surfaces_a_dropped_seats_last_position() -> None:
+    # F4a (4-B): the closing summarizes only the final usable round, so a seat that argued earlier then dropped
+    # must be surfaced (its last usable text + why) or the "name each set-aside dissent" instruction is moot.
+    round1 = DebateRound(
+        index=1,
+        contributions=[
+            _contribution("Fake", seat="0:Fake", round_index=1, ok=True, text="keep it"),
+            _contribution("Dropper", seat="1:Dropper", round_index=1, ok=True, text="ship anyway"),
+        ],
     )
-    assert result.final is None
-    assert result.synthesis_by is None
-
-
-# --- F8a: time-budget harvest (round-boundary) + effort -----------------------------------------
-
-
-class _RoundAwareRunner:
-    """A runner where round 1 (the bare question) is instant but a rebuttal round (``Critique`` in the
-    prompt) sleeps ``slow_s``. Drives the F8a deadline deterministically: round 1 completes within any
-    budget, and a later round's turns overrun a small budget and are cut by ``asyncio.wait``.
-    """
-
-    def __init__(self, slow_s: float) -> None:
-        self.slow_s = slow_s
-
-    async def run(
-        self,
-        spec: InvocationSpec,
-        timeout_s: float,
-        on_progress: Callable[[str], None] | None = None,
-        on_stdout: Callable[[str], None] | None = None,
-    ) -> ProcessResult:
-        prompt = spec.argv[2] if len(spec.argv) > 2 else ""
-        await asyncio.sleep(self.slow_s if "Critique" in prompt else 0.0)  # rebuttal rounds are the slow ones
-        return ProcessResult(exit_code=0, stdout=f"{spec.argv[0]} position")
-
-
-class _PerCliDelayRunner:
-    """A runner with per-cli delays (and optional per-cli partial lines streamed before the delay), so
-    within one round a fast turn finishes while a slow one is cut -- and the cut one can have streamed a
-    partial first."""
-
-    def __init__(self, delays: dict[str, float], partials: dict[str, list[str]] | None = None) -> None:
-        self.delays = delays
-        self.partials = partials or {}
-
-    async def run(
-        self,
-        spec: InvocationSpec,
-        timeout_s: float,
-        on_progress: Callable[[str], None] | None = None,
-        on_stdout: Callable[[str], None] | None = None,
-    ) -> ProcessResult:
-        cli = spec.argv[0]
-        for line in self.partials.get(cli, []):
-            if on_stdout is not None:
-                on_stdout(line)
-        await asyncio.sleep(self.delays.get(cli, 0.0))
-        return ProcessResult(exit_code=0, stdout=f"{cli} position")
-
-
-def _delay_debate(runner: object, config: RutherfordConfig | None = None, clis: tuple[str, ...] = ("a", "b")):
-    cfg = config or RutherfordConfig()
-    registry = AdapterRegistry([FakeAdapter(cli) for cli in clis])
-    delegation = DelegationService(registry, runner, cfg, load_roles())  # type: ignore[arg-type]
-    return DebateService(delegation, cfg)
-
-
-async def test_time_budget_finalizes_after_a_completed_round_when_the_next_is_cut() -> None:
-    # 2-where/2-behavior: round 1 (instant) completes within the budget; round 2 (a rebuttal, slow) overruns
-    # the remaining budget and its turns are cut by asyncio.wait. The fully-cut round 2 is KEPT (its turns
-    # carry recovered sessions/traces, 2-I/2-F), but the closing + quorum run over the last USABLE round
-    # (round 1). The requested 3 rounds do not all run.
-    runner = _RoundAwareRunner(5.0)
-    service = _delay_debate(runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=3, time_budget_s=0.3)
+    round2 = DebateRound(
+        index=2,
+        contributions=[
+            _contribution("Fake", seat="0:Fake", round_index=2, ok=True, text="still keep it"),
+            _contribution(
+                "Dropper",
+                seat="1:Dropper",
+                round_index=2,
+                ok=False,
+                text="",
+                dissent="set aside: no usable answer in round 2",
+            ),
+        ],
     )
-    assert len(result.rounds) == 2  # round 1 (complete) + the kept fully-cut round 2; round 3 never ran
-    assert all(c.ok for c in result.rounds[0].contributions)  # round 1 completed in full
-    assert all(
-        not c.ok and c.error is not None and c.error.code == "BUDGET_EXHAUSTED" for c in result.rounds[1].contributions
+    final = round2  # the last usable round (Fake answered)
+    set_aside = _set_aside_dissents([round1, round2], final)
+    assert set_aside == [("Dropper", "set aside: no usable answer in round 2", "ship anyway")]  # its round-1 text
+    # a seat still answering the final round is already in the transcript, never re-surfaced as "set aside"
+    assert all(label != "Fake" for label, _, _ in set_aside)
+
+
+def test_set_aside_dissents_omits_a_pure_failure_with_no_position() -> None:
+    # A seat that never produced a usable position has nothing to NAME -- it is omitted (its failure is its own
+    # record), so the closing block only ever carries real dissenting positions.
+    round1 = DebateRound(
+        index=1,
+        contributions=[
+            _contribution("Fake", seat="0:Fake", round_index=1, ok=True, text="answer"),
+            _contribution(
+                "Dead",
+                seat="1:Dead",
+                round_index=1,
+                ok=False,
+                text="",
+                dissent="set aside: no usable answer in round 1",
+            ),
+        ],
     )
-    assert result.stop_reason == "budget"
+    assert _set_aside_dissents([round1], round1) == []  # the dead seat has no position to surface
+
+
+async def test_debate_set_aside_voice_is_stamped_with_dissent() -> None:
+    # F4a (4-B): a seat that produced no usable answer in a round is dropped -- its contribution carries a
+    # structural set-aside reason, never a silent disappearance. The dead voice fails round 1 and is stamped.
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="fake"), Target(cli="dead")],
+        prompt="what is 17 + 25?",
+        rounds=2,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().debate(request)
+    dead = next(c for c in result.rounds[0].contributions if c.target.cli == "dead")
+    assert dead.ok is False and dead.dissent == "set aside: no usable answer in round 1"
+    # the surviving voices argued on and were never set aside
+    survivors = [c for c in result.rounds[0].contributions if c.target.cli == "fake"]
+    assert survivors and all(c.dissent is None for c in survivors)
+    # round 2 ran only the two survivors (the dead seat is gone)
+    assert {c.target.cli for c in result.rounds[1].contributions} == {"fake"}
+
+
+@pytest.mark.parametrize("mode", [SafetyMode.PROPOSE, SafetyMode.WRITE, SafetyMode.YOLO])
+async def test_debate_rejects_a_sandboxed_safety_mode(mode: SafetyMode) -> None:
+    # A debate runs its voices over PERSISTENT sessions directly in the real working_dir -- there is no
+    # per-turn worktree to isolate writes into, so a sandboxed (propose/write/yolo) mode would let an agent
+    # write straight into the user's tree. The service refuses it; write/propose work goes through delegate.
+    with pytest.raises(RutherfordError) as exc:
+        await _service().debate(_two_fakes(rounds=1, safety_mode=mode))
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+    assert "read-only" in exc.value.message and "delegate" in exc.value.message
+
+
+def test_disambiguate_labels() -> None:
+    assert _disambiguate(["a", "b"]) == ["a", "b"]
+    assert _disambiguate(["a", "a", "b"]) == ["a#1", "a#2", "b"]
+
+
+def test_with_later_stance_helper() -> None:
+    assert _with_later_stance("x", Stance.FOR).endswith("Keep arguing in favor of the proposition.")
+    assert _with_later_stance("x", Stance.AGAINST).endswith("Keep arguing against the proposition.")
+    assert _with_later_stance("x", None) == "x"  # an unsteered voice gets no reminder
+
+
+def test_stance_is_re_embedded_every_round_not_just_round_one() -> None:
+    # Item 17 (v2 parity): a FOR/AGAINST voice keeps its stance reminder on the later-round delta prompt;
+    # without it a multi-round debate drifts to the center as each voice accommodates the others.
+    service = _service()
+    voice = _Voice(index=0, target=Target(cli="fake"), label="Pro", stance=Stance.FOR)
+    req = _two_fakes(rounds=3)
+
+    opening = service._round_prompt(req, voice, [])
+    assert "Argue in favor of the proposition." in opening  # round 1 opens with the stance
+
+    other = DebateContribution(
+        label="Con",
+        seat_id="1:Con",
+        target=Target(cli="fake"),
+        round_index=1,
+        stance=Stance.AGAINST,
+        ok=True,
+        text="No, the opposite is true.",
+    )
+    later = service._round_prompt(req, voice, [DebateRound(index=1, contributions=[other])])
+    assert "Keep arguing in favor of the proposition." in later  # the stance is restated each round
+    assert "No, the opposite is true." in later  # the other voice's latest position rides the delta
+
+
+def test_unsteered_later_round_prompt_has_no_stance_reminder() -> None:
+    service = _service()
+    voice = _Voice(index=0, target=Target(cli="fake"), label="Neutral", stance=None)
+    other = DebateContribution(label="Other", target=Target(cli="fake"), round_index=1, ok=True, text="point")
+    later = service._round_prompt(_two_fakes(rounds=2), voice, [DebateRound(index=1, contributions=[other])])
+    assert "Keep arguing" not in later
+
+
+async def test_debate_tool_and_server_wrapper(monkeypatch: Any) -> None:
+    out = await debate_tool(
+        _app(), prompt="what is 17 + 25?", targets=["fake", "fake"], rounds=1, working_dir=str(REPO_ROOT)
+    )
+    assert "42" in out
+    monkeypatch.setattr(server, "_APP", _app())
+    wrapped = await server.debate(
+        prompt="what is 17 + 25?", targets=["fake", "fake"], rounds=1, working_dir=str(REPO_ROOT)
+    )
+    assert "42" in wrapped
+
+
+# --- time budget at round boundaries (F8a) -----------------------------------
+
+
+async def test_debate_budget_cuts_a_round_and_finalizes() -> None:
+    # A slow voice keeps round 1 in flight past the deadline: the fast voice's answer is kept, the slow turn
+    # is a BUDGET_EXHAUSTED contribution (its partial preserved, not promoted), and the debate finalizes early.
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        rounds=3,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=1.2,
+    )
+    result = await _service().debate(request)
+    assert result.stop_reason == "budget" and len(result.rounds) == 1  # cut at the round-1 deadline
+    by_cli = {c.target.cli: c for c in result.rounds[0].contributions}
+    assert by_cli["fake"].ok and "42" in by_cli["fake"].text
+    slow = by_cli["slow"]
+    assert slow.ok is False and slow.error is not None and slow.error.code is ErrorCode.BUDGET_EXHAUSTED
+    assert slow.text == "" and slow.partial == "partial-so-far"  # partial kept as a trace, never the text
+    # F4a (4-B): a seat cut at the deadline produced no usable answer, so it is set aside, not silent.
+    assert slow.dissent == "set aside: no usable answer in round 1"
     assert result.rollup is not None
-    assert result.rollup.stop_reason == "budget"
-    # answered/usable are over the last usable round (round 1); cut counts round 2's cancelled turns.
-    assert result.rollup.requested == 2 and result.rollup.answered == 2 and result.rollup.usable == 2
-    assert result.rollup.cut == 2 and result.rollup.quorum_met is True
-
-
-async def test_a_partially_cut_round_keeps_the_turns_that_finished() -> None:
-    # 2-where: within a round the budget cuts only the in-flight turns. A fast voice finishes and is kept;
-    # a slow one is cut (BUDGET_EXHAUSTED) -- the round is finalized with the turn that completed.
-    runner = _PerCliDelayRunner({"a": 0.0, "b": 5.0})
-    service = _delay_debate(runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.3)
-    )
-    assert len(result.rounds) == 1
-    by_label = {c.label: c for c in result.rounds[0].contributions}
-    assert by_label["a"].ok  # the fast turn finished and is kept
-    assert not by_label["b"].ok and by_label["b"].error is not None
-    assert by_label["b"].error.code == "BUDGET_EXHAUSTED"  # the in-flight turn was cut at the deadline
-    assert result.stop_reason == "budget"
-    assert result.rollup is not None
-    assert result.rollup.answered == 1 and result.rollup.cut == 1 and result.rollup.usable == 1
-
-
-async def test_a_cut_debate_turn_preserves_its_streamed_partial_as_a_trace() -> None:
-    # 2-F (capture always): a turn cut at the deadline is a failed contribution, but the stdout it streamed
-    # before the cut is preserved on the contribution's ``partial`` (a trace, never promoted to ``text``).
-    runner = _PerCliDelayRunner({"a": 0.0, "b": 5.0}, partials={"b": ["b half-formed rebuttal"]})
-    service = _delay_debate(runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.3)
-    )
-    cut = next(c for c in result.rounds[0].contributions if c.label == "b")
-    assert not cut.ok
-    assert cut.partial is not None and "b half-formed rebuttal" in cut.partial
-    assert "b half-formed rebuttal" not in cut.text  # a cut turn's partial is a trace, not its position
-
-
-class _RoundAwarePartialRunner:
-    """Round 1 (the bare question) is instant; a rebuttal round (``Critique`` in the prompt) streams a
-    partial then overruns ``slow_s`` -- so a whole later round can be cut while each turn streamed a
-    session-bearing partial first."""
-
-    def __init__(self, slow_s: float, partial: str) -> None:
-        self.slow_s = slow_s
-        self.partial = partial
-
-    async def run(
-        self,
-        spec: InvocationSpec,
-        timeout_s: float,
-        on_progress: Callable[[str], None] | None = None,
-        on_stdout: Callable[[str], None] | None = None,
-    ) -> ProcessResult:
-        prompt = spec.argv[2] if len(spec.argv) > 2 else ""
-        if "Critique" in prompt:  # a rebuttal round -- stream a partial, then overrun the budget
-            if on_stdout is not None:
-                on_stdout(self.partial)
-            await asyncio.sleep(self.slow_s)
-        return ProcessResult(exit_code=0, stdout=f"{spec.argv[0]} position")
-
-
-async def test_a_fully_cut_round_is_kept_with_its_recovered_sessions() -> None:
-    # 2-I/2-F edge: when an ENTIRE later round is cut (no turn finished) but each turn streamed a
-    # session-bearing partial, the round is kept (not dropped) so its recovered resume handles and traces
-    # survive into the result; the debate still finalizes over the last usable round (round 1).
-    runner = _RoundAwarePartialRunner(5.0, "rebuttal streamed a session then was cut")
-    service = _delay_debate(runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=3, time_budget_s=0.3)
-    )
-    assert len(result.rounds) == 2  # round 1 (usable) + the kept fully-cut round 2
-    round_two = result.rounds[1].contributions
-    assert all(not c.ok for c in round_two)  # the whole round was cut
-    assert all(c.session_id == "fake-session" for c in round_two)  # ...but every handle is recovered (2-I)
-    assert all(c.partial and "streamed a session" in c.partial for c in round_two)  # ...and the trace kept (2-F)
-
-
-async def test_a_cut_debate_turn_recovers_its_resume_session_from_the_partial() -> None:
-    # 2-I passive (debate): a turn cut mid-stream whose partial established a session records that handle on
-    # its contribution (the FakeAdapter is TEXT/partial-output and parses a session), so the parent roster
-    # can preserve it for a later continuation -- even though the cut turn is a trace, not a stance.
-    runner = _PerCliDelayRunner({"a": 0.0, "b": 5.0}, partials={"b": ["b streamed a session then was cut"]})
-    service = _delay_debate(runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.3)
-    )
-    cut = next(c for c in result.rounds[0].contributions if c.label == "b")
-    assert not cut.ok  # a trace cut, no usable stance
-    assert cut.session_id == "fake-session"  # ...but the resume handle is recovered from the partial (2-I)
-
-
-async def test_on_budget_continue_runs_every_round() -> None:
-    # 2-M: with on_budget="continue" the budget is advisory -- every requested round runs to completion
-    # even though a rebuttal round outlasts the budget, and the run is not flagged as a harvest.
-    runner = _RoundAwareRunner(0.1)
-    service = _delay_debate(runner)
-    result = await service.debate(
-        DebateRequest(
-            targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.01, on_budget="continue"
-        )
-    )
-    assert len(result.rounds) == 2  # both rounds ran; the budget did not cut the debate short
-    assert all(c.ok for round_ in result.rounds for c in round_.contributions)
-    assert result.stop_reason is None
-    assert result.rollup is not None and result.rollup.stop_reason == "ok"
+    assert result.rollup.stop_reason == "budget" and result.rollup.cut == 1 and result.rollup.usable == 1
 
 
 async def test_debate_budget_below_quorum_raises_budget_exhausted() -> None:
-    # 2-E': when even round 1 is cut so the debate yields no usable position (here both turns are slow and
-    # cut at the deadline), it is a genuine BUDGET_EXHAUSTED failure raised before any result.
-    runner = _PerCliDelayRunner({"a": 5.0, "b": 5.0})
-    service = _delay_debate(runner)
-    with pytest.raises(RutherfordError) as info:
-        await service.debate(
-            DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.3)
-        )
-    assert info.value.code == "BUDGET_EXHAUSTED"
-
-
-async def test_no_budget_means_no_rollup_for_a_debate() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, synthesize=False)
+    # Both voices slow: every round-1 turn is cut, leaving zero usable positions -> BUDGET_EXHAUSTED.
+    request = DebateRequest(
+        targets=[Target(cli="slow"), Target(cli="slow")],
+        prompt="x",
+        rounds=2,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=1.2,
     )
+    with pytest.raises(RutherfordError) as exc:
+        await _service().debate(request)
+    assert exc.value.code is ErrorCode.BUDGET_EXHAUSTED
+
+
+async def test_debate_generous_budget_finishes_clean_with_a_rollup() -> None:
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="what is 17 + 25?",
+        rounds=2,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=60.0,
+    )
+    result = await _service().debate(request)
+    assert result.stop_reason is None and len(result.rounds) == 2  # ran to completion within the budget
+    assert result.rollup is not None and result.rollup.stop_reason == "ok" and result.rollup.cut == 0
+
+
+async def test_debate_no_budget_leaves_stop_reason_and_rollup_unset() -> None:
+    result = await _service().debate(_two_fakes(rounds=1))
+    assert result.stop_reason is None and result.rollup is None
+
+
+async def test_debate_on_budget_continue_runs_every_round() -> None:
+    # on_budget="continue" makes the budget advisory: even a slow voice runs to completion, no cut.
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        rounds=1,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=1.2,
+        on_budget="continue",
+    )
+    result = await _service().debate(request)
     assert result.stop_reason is None
-    assert result.rollup is None
+    assert all(c.ok for c in result.rounds[0].contributions)  # the slow voice finished too
+    assert result.rollup is not None and result.rollup.stop_reason == "ok" and result.rollup.cut == 0
 
 
-async def test_effort_flows_to_every_debate_turn() -> None:
-    # 2-L: the debate's effort cap reaches every turn and is reported per contribution.
-    from rutherford.domain.enums import Effort
+async def test_debate_budget_rollup_records_effort_requested() -> None:
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        rounds=2,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=1.2,
+        effort=Effort.MEDIUM,
+    )
+    result = await _service().debate(request)
+    assert result.rollup is not None and result.rollup.effort_requested is Effort.MEDIUM
 
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="position"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.debate(
-        DebateRequest(
-            targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, synthesize=False, effort=Effort.HIGH
+
+async def test_debate_cut_turn_with_no_stream_has_no_partial() -> None:
+    # A HANG voice streams nothing before the deadline, so its cut contribution has partial=None (an honest
+    # empty harvest) while the fast voice's answer is still kept.
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="what is 17 + 25?\nHANG",  # both voices receive HANG (the shared prompt) -> both cut
+        rounds=1,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=1.2,
+    )
+    config = RutherfordConfig(min_quorum=1)
+    # both cut with no usable position -> below quorum -> BUDGET_EXHAUSTED
+    with pytest.raises(RutherfordError) as exc:
+        await _service(config).debate(request)
+    assert exc.value.code is ErrorCode.BUDGET_EXHAUSTED
+
+
+# --- F5: carry-forward + convergence/stall + DebateOutcome -------------------
+
+
+def _ledger_round(index: int, *texts: str) -> DebateRound:
+    contributions = [
+        DebateContribution(
+            label=f"v{i}", seat_id=f"{i}:v{i}", target=Target(cli="fake"), round_index=index, ok=True, text=text
         )
+        for i, text in enumerate(texts)
+    ]
+    return DebateRound(index=index, contributions=contributions)
+
+
+def _round_with(index: int, label: str, text: str) -> DebateRound:
+    other = DebateContribution(
+        label=label, seat_id=f"1:{label}", target=Target(cli="fake"), round_index=index, ok=True, text=text
     )
-    contributions = [c for round_ in result.rounds for c in round_.contributions]
-    assert contributions and all(c.effort_applied == Effort.HIGH for c in contributions)
-    assert all("--effort=high" in spec.argv for spec, _ in runner.calls)
+    return DebateRound(index=index, contributions=[other])
 
 
-# --- N1 (item 3): topology + activity events + advisory cap --------------------------------------
-
-
-async def test_debate_populates_topology_with_observed_peak() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="pos", observed_peak_agents=2))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, synthesize=False)
+def test_carry_forward_sends_the_full_transcript_not_just_the_delta() -> None:
+    # F5 (11-B): a carry-forward round re-sends EVERY prior round verbatim, not only the previous one.
+    service = _service()
+    voice = _Voice(index=0, target=Target(cli="fake"), label="A", stance=None)
+    req = _two_fakes(rounds=3, carry_forward=True)
+    prompt = service._round_prompt(
+        req, voice, [_round_with(1, "B", "round-one-pos"), _round_with(2, "B", "round-two-pos")]
     )
-    assert result.topology is not None
-    assert result.topology.declared == 2
-    assert result.topology.realized_delegations == 2  # 2 voices x 1 round
-    assert result.topology.observed_peak_agents == 2
+    assert "FULL transcript" in prompt
+    assert "round-one-pos" in prompt and "round-two-pos" in prompt  # BOTH prior rounds
+    assert "Round 1" in prompt and "Round 2" in prompt
 
 
-async def test_debate_realized_delegations_counts_every_turn() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="pos"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    result = await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, synthesize=False)
+def test_default_delta_sends_only_the_previous_round() -> None:
+    # Default (no carry-forward): only the latest round's positions ride the delta -- the session memory holds
+    # the rest. This is the contrast that makes carry-forward a real, separate mode.
+    service = _service()
+    voice = _Voice(index=0, target=Target(cli="fake"), label="A", stance=None)
+    req = _two_fakes(rounds=3)
+    prompt = service._round_prompt(
+        req, voice, [_round_with(1, "B", "round-one-pos"), _round_with(2, "B", "round-two-pos")]
     )
-    assert result.topology is not None
-    assert result.topology.realized_delegations == 4  # 2 voices x 2 rounds is the cumulative fan-out
+    assert "round-two-pos" in prompt and "round-one-pos" not in prompt  # only the previous round
 
 
-async def test_debate_emits_panel_and_voice_activity_events() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="pos"))
-    service = _debate([FakeAdapter("a"), FakeAdapter("b")], runner)
-    events: list[ActivityEvent] = []
-    await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, synthesize=False),
-        on_activity=events.append,
+def test_convergence_ledger_unanimous_is_converged() -> None:
+    ledger = _service()._convergence_ledger(_ledger_round(1, "VERDICT: yes", "VERDICT: yes"), None)
+    assert ledger.converged is True and ledger.decision == "yes" and ledger.tally == {"yes": 2}
+
+
+def test_convergence_ledger_stable_majority_stalls_not_converges() -> None:
+    # A stable MAJORITY that is not unanimous is NOT convergence -- the stall counter rises while it holds.
+    service = _service()
+    first = service._convergence_ledger(_ledger_round(2, "VERDICT: yes", "VERDICT: yes", "VERDICT: no"), None)
+    assert first.converged is False and first.decision == "yes" and first.stall_count == 0  # just established
+    second = service._convergence_ledger(_ledger_round(3, "VERDICT: yes", "VERDICT: yes", "VERDICT: no"), first)
+    assert second.stall_count == 1 and second.changed is False  # the decision held one round
+    third = service._convergence_ledger(_ledger_round(4, "VERDICT: yes", "VERDICT: yes", "VERDICT: no"), second)
+    assert third.stall_count == 2
+
+
+def test_convergence_ledger_decision_change_resets_the_stall() -> None:
+    service = _service()
+    first = service._convergence_ledger(_ledger_round(1, "VERDICT: yes", "VERDICT: yes", "VERDICT: no"), None)
+    moved = service._convergence_ledger(_ledger_round(2, "VERDICT: no", "VERDICT: no", "VERDICT: yes"), first)
+    assert moved.decision == "no" and moved.changed is True and moved.stall_count == 0
+
+
+def test_convergence_ledger_no_verdicts_has_no_decision() -> None:
+    ledger = _service()._convergence_ledger(_ledger_round(1, "just prose", "more prose"), None)
+    assert ledger.decision is None and ledger.converged is False and ledger.stall_count == 0
+
+
+def test_convergence_ledger_a_no_verdict_round_resets_the_stall() -> None:
+    # A held decision that then becomes unreadable (no verdicts) resets the stall -- a vanished decision is
+    # not a "held" one, so the panel is no longer frozen on it.
+    service = _service()
+    first = service._convergence_ledger(_ledger_round(1, "VERDICT: yes", "VERDICT: yes", "VERDICT: no"), None)
+    held = service._convergence_ledger(_ledger_round(2, "VERDICT: yes", "VERDICT: yes", "VERDICT: no"), first)
+    assert held.stall_count == 1
+    blank = service._convergence_ledger(_ledger_round(3, "prose", "prose", "prose"), held)
+    assert blank.decision is None and blank.stall_count == 0
+
+
+def test_debate_outcome_and_ledger_serialize_onto_the_wire() -> None:
+    # F5 metadata rides the TOON wire: to_plain (model_dump json, exclude_none) keeps the enum + the tally dict.
+    from rutherford.domain.models import DebateOutcome, ProgressLedger
+    from rutherford.io.serialize import to_plain
+
+    outcome = to_plain(
+        DebateOutcome(termination=TerminationReason.STALLED, rounds_run=3, decision="yes", stall_count=2)
     )
-    kinds = [event.kind for event in events]
-    assert kinds[0] is ActivityEventKind.PANEL_STARTED and events[0].tool == "debate"
-    assert kinds[-1] is ActivityEventKind.PANEL_FINISHED
-    assert ActivityEventKind.VOICE_STARTED in kinds
-    assert ActivityEventKind.VOICE_FINISHED in kinds
+    assert outcome["termination"] == "stalled" and outcome["rounds_run"] == 3 and outcome["decision"] == "yes"
+    ledger = ProgressLedger(round_index=2, outcome="majority", decision="yes", tally={"yes": 2, "no": 1}, stall_count=1)
+    assert to_plain(ledger)["tally"] == {"yes": 2, "no": 1}  # the per-verdict tally dict round-trips
 
 
-async def test_debate_enforced_cap_refuses_up_front() -> None:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="pos"))
-    cfg = RutherfordConfig(max_agents_advisory=2, enforce_agent_cap=True)
-    service = _debate([FakeAdapter("a"), FakeAdapter("b"), FakeAdapter("c")], runner, cfg)
-    with pytest.raises(RutherfordError) as info:
-        await service.debate(
-            DebateRequest(targets=[Target(cli="a"), Target(cli="b"), Target(cli="c")], prompt="q", rounds=1)
-        )
-    assert info.value.code == ErrorCode.AGENT_CAP_EXCEEDED
-    assert not runner.calls  # refused before launching any turn
-
-
-async def test_debate_emits_cut_and_budget_tick_on_a_harvest() -> None:
-    runner = _PerCliDelayRunner({"a": 0.0, "b": 5.0})
-    service = _delay_debate(runner)
-    events: list[ActivityEvent] = []
-    await service.debate(
-        DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.3),
-        on_activity=events.append,
+async def test_debate_converges_on_a_unanimous_verdict() -> None:
+    # Both voices vote 'yes' in round 1 -> unanimity -> the debate stops CONVERGED without running all rounds.
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="Decide.\nSAY=VERDICT: yes",
+        rounds=4,
+        working_dir=str(REPO_ROOT),
+        track_convergence=True,
     )
-    kinds = [event.kind for event in events]
-    assert ActivityEventKind.BUDGET_TICK in kinds
-    assert any(event.kind is ActivityEventKind.CUT and event.cli == "b" for event in events)
+    result = await _service().debate(request)
+    assert result.outcome is not None
+    assert result.outcome.termination is TerminationReason.CONVERGED and result.outcome.converged is True
+    assert result.outcome.decision == "yes" and result.outcome.rounds_run == 1  # converged at round 1
+    assert result.rounds[0].ledger is not None and result.rounds[0].ledger.converged is True
 
 
-async def test_debate_emits_job_cancelled_on_outer_cancel() -> None:
-    runner = _PerCliDelayRunner({"a": 5.0, "b": 5.0})
-    service = _delay_debate(runner)
-    events: list[ActivityEvent] = []
-    task = asyncio.ensure_future(
-        service.debate(
-            DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=1, synthesize=False),
-            on_activity=events.append,
-        )
+async def test_debate_without_convergence_tracking_is_unresolved() -> None:
+    # No tracking: the debate runs its full round budget and terminates UNRESOLVED, with no per-round ledger.
+    result = await _service().debate(_two_fakes(rounds=2))
+    assert result.outcome is not None and result.outcome.termination is TerminationReason.UNRESOLVED
+    assert result.outcome.rounds_run == 2 and result.outcome.converged is False
+    assert all(round_.ledger is None for round_ in result.rounds)
+
+
+async def test_debate_stalls_on_a_frozen_disagreement() -> None:
+    # A steady 2-yes / 1-no split never reaches unanimity but the majority holds: the debate stops STALLED
+    # once the decision is unchanged for the stall tolerance, instead of burning every round.
+    config = RutherfordConfig(debate_stall_tolerance=1)
+    request = DebateRequest(
+        targets=[Target(cli="yesvoter"), Target(cli="novoter"), Target(cli="yesvoter")],
+        prompt="Decide.",
+        rounds=4,
+        working_dir=str(REPO_ROOT),
+        track_convergence=True,
     )
-    await asyncio.sleep(0.05)  # let the first round start
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert any(event.kind is ActivityEventKind.JOB_CANCELLED for event in events)
+    result = await _converge_service(config).debate(request)
+    assert result.outcome is not None and result.outcome.termination is TerminationReason.STALLED
+    assert result.outcome.decision == "yes" and result.outcome.converged is False
+    # tolerance=1: round 1 establishes the decision (stall 0), round 2 holds it (stall 1 >= 1) -> stop at 2.
+    assert result.outcome.rounds_run == 2
 
 
-async def test_debate_emits_panel_finished_before_budget_exhausted_raise() -> None:
-    # N1 (3-K): BUDGET_EXHAUSTED after panel_started must still close the stream with a (failed)
-    # panel_finished before raising. Round 1 is all-cut here, so no usable round -> exhaustion.
-    runner = _PerCliDelayRunner({"a": 5.0, "b": 5.0})
-    service = _delay_debate(runner)
-    events: list[ActivityEvent] = []
-    with pytest.raises(RutherfordError) as info:
-        await service.debate(
-            DebateRequest(targets=[Target(cli="a"), Target(cli="b")], prompt="q", rounds=2, time_budget_s=0.3),
-            on_activity=events.append,
-        )
-    assert info.value.code == ErrorCode.BUDGET_EXHAUSTED
-    assert any(event.kind is ActivityEventKind.PANEL_FINISHED and event.status == "failed" for event in events)
+async def test_debate_quorum_lost_is_recorded_in_the_outcome() -> None:
+    # A debate that drops below two voices terminates QUORUM_LOST (recorded on the outcome, not just a silent stop).
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="dead")],
+        prompt="what is 17 + 25?",
+        rounds=3,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().debate(request)
+    assert result.outcome is not None and result.outcome.termination is TerminationReason.QUORUM_LOST
+
+
+async def test_debate_budget_termination_is_recorded_in_the_outcome() -> None:
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        rounds=3,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=1.2,
+    )
+    result = await _service().debate(request)
+    assert result.outcome is not None and result.outcome.termination is TerminationReason.BUDGET

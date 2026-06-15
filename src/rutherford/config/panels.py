@@ -2,17 +2,20 @@
 # Copyright (c) 2026 John Chapman
 """Saved consensus/debate panels, loaded from ``panels.toon`` on disk.
 
-A panel is a named, reusable set of targets -- the crew you keep reaching for -- so a caller can
-say ``panel="design-roundtable"`` instead of spelling out the targets every time. Panels are
-discovered across three locations and merged by name, closest scope winning: a project's
-``<cwd>/.rutherford/panels.toon`` overrides your global ``~/.rutherford/panels.toon`` for a panel
-of the same name, and an explicit ``$RUTHERFORD_CONFIG_DIR`` overrides both. This mirrors how the
-TOML config treats a project ``rutherford.toml`` over the global ``config.toml``.
+A panel is a named, reusable set of targets -- the crew you keep reaching for -- so a caller can say
+``panel="design-roundtable"`` instead of spelling out the targets every time. Panels are discovered across
+the same scopes as the rest of the config (``~/.rutherford``, then the project ``<cwd>/.rutherford``, then an
+explicit ``$RUTHERFORD_CONFIG_DIR``) and merged by name, the closest scope winning: a project's
+``<cwd>/.rutherford/panels.toon`` overrides the global ``~/.rutherford/panels.toon`` for a panel of the same
+name, and ``$RUTHERFORD_CONFIG_DIR`` overrides both. This mirrors how the TOML config treats a project config
+over the global one.
 
-Files are TOON (the format the rest of Rutherford already speaks), read through the
-:mod:`rutherford.io.serialize` decode seam. Loading is lazy and cached for the process via
-:class:`PanelCache`; the ``reload_panels`` tool clears the cache. Validation runs over every
-discovered file at load and reports every problem in one pass rather than failing on the first.
+Files are TOON (the format the rest of Rutherford speaks), read through the :mod:`rutherford.io.serialize`
+decode seam. Loading is lazy and cached for the process via :class:`PanelCache`; the ``reload_panels`` tool
+clears the cache. Validation runs over every discovered file at load and reports every problem in one pass
+rather than failing on the first. A panel's seat fields map onto the consensus :class:`~rutherford.domain.
+models.Target`, so the metadata the consensus service already honors (role/model/label/weight/parity/stance)
+is exactly what a panel seat can carry.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from ..domain.models import Target
 from ..io.serialize import DecodeError, decode
 from .locations import config_scopes
 
-#: The file searched in each config location.
+#: The file searched in each config scope.
 PANELS_FILENAME = "panels.toon"
 
 #: The keys a panel record and a panel target may carry. Anything else is a validation error.
@@ -54,9 +57,9 @@ class PanelTarget(BaseModel):
     model: str | None = None
     role: str | None = None
     label: str | None = None
-    #: ``ge=0`` mirrors :class:`~rutherford.domain.models.Target` exactly: a negative weight must
-    #: fail HERE, at panel load, as a PANEL_INVALID -- not later as a raw ValidationError when
-    #: ``to_targets()`` builds the Target mid-call.
+    #: ``ge=0`` mirrors :class:`~rutherford.domain.models.Target` exactly: a negative weight must fail HERE,
+    #: at panel load, as a PANEL_INVALID -- not later as a raw ValidationError when ``to_targets()`` builds the
+    #: Target mid-call.
     weight: float | None = Field(default=None, ge=0)
     parity: bool | None = None
     stance: Stance | None = None
@@ -69,10 +72,10 @@ class Panel(BaseModel):
 
     name: str
     description: str = ""
-    #: How a consensus over this panel is aggregated; a consensus call using this panel adopts it
-    #: unless overridden. Typed as :class:`Strategy` (not a plain ``str``) so ``panel_overrides``,
-    #: which revalidate through this model, reject an unknown strategy like every other field;
-    #: the StrEnum keeps the wire string and ``model_dump`` round-trip intact.
+    #: How a consensus over this panel is aggregated; a consensus call using this panel adopts it unless the
+    #: call overrides it. Typed as :class:`Strategy` (not a plain ``str``) so ``panel_overrides``, which
+    #: revalidate through this model, reject an unknown strategy like every other field; the StrEnum keeps the
+    #: wire string and ``model_dump`` round-trip intact.
     strategy: Strategy = Strategy.ALL_VOICES
     targets: list[PanelTarget]
 
@@ -173,10 +176,10 @@ def load_panels(
 ) -> PanelStore:
     """Discover, merge, and validate every ``panels.toon``; raise once with all problems if any fail.
 
-    Locations are read lowest to highest precedence (user, then project, then ``$RUTHERFORD_CONFIG_DIR``)
-    and panels merge by name, so a closer scope overrides a farther one. ``known_clis`` is the set of
-    registered adapter ids; a panel target naming an unknown CLI is a validation error pointing at the
-    offending file and target index.
+    Scopes are read lowest to highest precedence (user, then project, then ``$RUTHERFORD_CONFIG_DIR``) and
+    panels merge by name, so a closer scope overrides a farther one. ``known_clis`` is the set of registered
+    agent ids; a panel target naming an unknown agent is a validation error pointing at the offending file and
+    target index.
 
     Raises:
         RutherfordError: ``PANEL_INVALID`` if any discovered file fails to parse or validate.
@@ -194,8 +197,8 @@ def load_panels(
             continue
         try:
             raw = decode(path.read_text(encoding="utf-8"))
-        # UnicodeDecodeError: a non-UTF-8 file (e.g. UTF-16 from Windows PowerShell 5.1
-        # redirection) is one more malformed-file problem, not a crash past the aggregator.
+        # UnicodeDecodeError: a non-UTF-8 file (e.g. UTF-16 from Windows PowerShell 5.1 redirection) is one
+        # more malformed-file problem, not a crash past the aggregator.
         except (DecodeError, UnicodeDecodeError, OSError) as exc:
             problems.append({"path": str(path), "error": f"could not read panels file: {exc}"})
             continue
@@ -207,7 +210,7 @@ def load_panels(
             panel, panel_problems = _parse_panel(str(name), record, valid_clis, str(path))
             problems.extend(panel_problems)
             if panel is not None:
-                merged[name] = panel  # a closer location overrides a farther one for the same name
+                merged[name] = panel  # a closer scope overrides a farther one for the same name
 
     if problems:
         raise RutherfordError(ErrorCode.PANEL_INVALID, _summarize(problems), details={"problems": problems})
@@ -254,8 +257,8 @@ def _parse_panel(
     panel = Panel(
         name=name,
         description=str(record.get("description", "")),
-        # The membership check above already vetted the value, so pydantic's str -> Strategy
-        # coercion here cannot fail; an absent (or null) strategy takes the default.
+        # The membership check above already vetted the value, so pydantic's str -> Strategy coercion here
+        # cannot fail; an absent (or null) strategy takes the default.
         strategy=record.get("strategy") or Strategy.ALL_VOICES,
         targets=[PanelTarget(**target) for target in clean_targets],
     )
@@ -284,7 +287,7 @@ def _parse_target(
         problems.append({**here, "error": "target needs a non-empty 'cli'"})
     elif cli not in valid_clis:
         known = ", ".join(sorted(valid_clis)) or "(none)"
-        problems.append({**here, "error": f"unknown cli {cli!r}; known adapters: {known}"})
+        problems.append({**here, "error": f"unknown cli {cli!r}; known agents: {known}"})
 
     stance = raw.get("stance")
     if stance is not None and stance not in {member.value for member in Stance}:
@@ -295,8 +298,8 @@ def _parse_target(
     if weight is not None and not isinstance(weight, (int, float)):
         problems.append({**here, "error": "weight must be a number"})
     elif isinstance(weight, (int, float)) and weight < 0:
-        # Caught here (and again by PanelTarget's ge=0) so a bad panel file is one aggregated
-        # load-time report naming the file and seat, never an in-flight tool failure.
+        # Caught here (and again by PanelTarget's ge=0) so a bad panel file is one aggregated load-time report
+        # naming the file and seat, never an in-flight tool failure.
         problems.append({**here, "error": "weight must be non-negative"})
 
     parity = raw.get("parity")

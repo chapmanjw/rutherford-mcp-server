@@ -1,3 +1,0 @@
-{"type":"step_start","sessionID":"ses_7c1a9b3e2d4f5a6b","messageID":"msg_01","part":{"id":"prt_step_01"}}
-{"type":"text","sessionID":"ses_7c1a9b3e2d4f5a6b","part":{"id":"prt_txt_01","text":"The capital of France is Paris."}}
-{"type":"step_finish","sessionID":"ses_7c1a9b3e2d4f5a6b","messageID":"msg_01","part":{"id":"prt_step_01","tokens":{"input":1180,"output":12},"cost":0.0098}}

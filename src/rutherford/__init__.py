@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""Rutherford: an MCP server that orchestrates agentic coding CLIs.
+"""Rutherford: an MCP server that orchestrates agentic coding agents over ACP.
 
-Rutherford lets any MCP client delegate work to, and build consensus across, a crew of
-terminal coding agents (Claude Code, Codex, Antigravity, Kiro, OpenCode, Goose). The
-orchestration core depends only on the abstract :class:`~rutherford.adapters.base.CLIAdapter`
-and :class:`~rutherford.runtime.process.ProcessRunner` interfaces; every CLI-specific detail
-lives behind an adapter.
+Rutherford lets any MCP client delegate work to, and build consensus across, a crew of coding agents
+driven through Zed's Agent Client Protocol (ACP). The orchestration core depends only on the agent
+:class:`~rutherford.acp.descriptors.DescriptorRegistry` and the ACP session runtime; an agent is a small
+descriptor (how to launch it as an ACP server), not a hand-written per-CLI adapter. (v3: ACP-native rebuild.)
 """
 
 from __future__ import annotations

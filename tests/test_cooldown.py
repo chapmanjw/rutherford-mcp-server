@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""Tests for the F7 cooldown tracker, with an injected clock so windows need no real sleeping."""
+"""Tests for the per-agent cooldown tracker (F7): bench after N failures, un-bench after the duration."""
 
 from __future__ import annotations
 
-from rutherford.runtime.cooldown import CooldownTracker
+from rutherford.acp.cooldown import CooldownTracker
 
 
 class _Clock:
-    """A hand-cranked monotonic clock."""
+    """A hand-advanced monotonic clock, so the windows are tested without sleeping."""
 
     def __init__(self) -> None:
         self.now = 0.0
@@ -16,92 +16,73 @@ class _Clock:
     def __call__(self) -> float:
         return self.now
 
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
-
 
 def _tracker(
-    clock: _Clock, *, threshold: int = 3, window_s: float = 120.0, duration_s: float = 60.0
-) -> CooldownTracker:
-    return CooldownTracker(threshold=threshold, window_s=window_s, duration_s=duration_s, clock=clock)
-
-
-def test_benches_after_threshold_failures_in_window() -> None:
+    *, threshold: int = 3, window_s: float = 120.0, duration_s: float = 60.0
+) -> tuple[CooldownTracker, _Clock]:
     clock = _Clock()
-    tracker = _tracker(clock, threshold=3)
-    tracker.record_failure("a")
-    tracker.record_failure("a")
-    assert not tracker.is_benched("a")  # 2 < 3
-    tracker.record_failure("a")
-    assert tracker.is_benched("a")  # 3rd trips it
+    return CooldownTracker(threshold=threshold, window_s=window_s, duration_s=duration_s, clock=clock), clock
 
 
-def test_old_failures_outside_window_do_not_count() -> None:
-    clock = _Clock()
-    tracker = _tracker(clock, threshold=2, window_s=100.0)
-    tracker.record_failure("a")
-    clock.advance(101.0)  # the first failure ages out of the window
-    tracker.record_failure("a")
-    assert not tracker.is_benched("a")  # only one failure is within the window
+def test_benches_after_threshold_failures_within_window() -> None:
+    tracker, _clock = _tracker(threshold=3)
+    tracker.record_failure("goose")
+    tracker.record_failure("goose")
+    assert tracker.is_benched("goose") is False  # two failures, below the threshold of three
+    tracker.record_failure("goose")
+    assert tracker.is_benched("goose") is True  # the third trips the bench
 
 
-def test_bench_lifts_after_duration() -> None:
-    clock = _Clock()
-    tracker = _tracker(clock, threshold=1, duration_s=60.0)
-    tracker.record_failure("a")
-    assert tracker.is_benched("a")
-    assert 0 < tracker.remaining_s("a") <= 60.0
-    clock.advance(60.0)
-    assert not tracker.is_benched("a")  # the bench has lifted
-    assert tracker.remaining_s("a") == 0.0
+def test_unbenches_after_the_duration() -> None:
+    tracker, clock = _tracker(threshold=2, duration_s=60.0)
+    tracker.record_failure("goose")
+    tracker.record_failure("goose")
+    assert tracker.is_benched("goose") is True
+    assert tracker.remaining_s("goose") == 60.0
+    clock.now = 59.9
+    assert tracker.is_benched("goose") is True
+    clock.now = 60.0
+    assert tracker.is_benched("goose") is False  # the bench lifts exactly at the duration
+    assert tracker.remaining_s("goose") == 0.0
 
 
-def test_success_clears_the_failure_streak() -> None:
-    clock = _Clock()
-    tracker = _tracker(clock, threshold=2)
-    tracker.record_failure("a")
-    tracker.record_success("a")  # streak reset
-    tracker.record_failure("a")
-    assert not tracker.is_benched("a")  # only one failure since the success
+def test_old_failures_outside_the_window_do_not_count() -> None:
+    tracker, clock = _tracker(threshold=2, window_s=100.0)
+    tracker.record_failure("goose")
+    clock.now = 150.0  # the first failure is now outside the 100s window
+    tracker.record_failure("goose")
+    assert tracker.is_benched("goose") is False  # the stale failure was pruned, so this is only the first
 
 
-def test_success_does_not_lift_an_active_bench() -> None:
-    clock = _Clock()
-    tracker = _tracker(clock, threshold=1, duration_s=60.0)
-    tracker.record_failure("a")
-    tracker.record_success("a")
-    assert tracker.is_benched("a")  # the bench is time-based; a success does not cut it short
+def test_record_success_resets_the_streak() -> None:
+    tracker, _clock = _tracker(threshold=3)
+    tracker.record_failure("goose")
+    tracker.record_failure("goose")
+    tracker.record_success("goose")  # a clean turn clears the streak
+    tracker.record_failure("goose")
+    tracker.record_failure("goose")
+    assert tracker.is_benched("goose") is False  # only two failures since the reset
+    tracker.record_failure("goose")
+    assert tracker.is_benched("goose") is True
 
 
-def test_threshold_zero_disables_cooldown() -> None:
-    clock = _Clock()
-    tracker = _tracker(clock, threshold=0)
-    assert not tracker.enabled
+def test_keyed_per_agent_independently() -> None:
+    tracker, _clock = _tracker(threshold=2)
+    tracker.record_failure("goose")
+    tracker.record_failure("goose")
+    assert tracker.is_benched("goose") is True
+    assert tracker.is_benched("opencode") is False  # a different agent's bench is independent
+
+
+def test_zero_threshold_disables_cooldown() -> None:
+    tracker, _clock = _tracker(threshold=0)
+    assert tracker.enabled is False
     for _ in range(10):
-        tracker.record_failure("a")
-    tracker.record_success("a")  # also a no-op when disabled
-    assert not tracker.is_benched("a")
+        tracker.record_failure("goose")
+    assert tracker.is_benched("goose") is False  # disabled: no agent is ever benched
+    assert tracker.remaining_s("goose") == 0.0
 
 
-def test_remaining_is_zero_for_a_never_benched_adapter() -> None:
-    tracker = _tracker(_Clock(), threshold=1)
-    assert tracker.remaining_s("never-seen") == 0.0
-
-
-def test_adapters_are_tracked_independently() -> None:
-    clock = _Clock()
-    tracker = _tracker(clock, threshold=1)
-    tracker.record_failure("a")
-    assert tracker.is_benched("a")
-    assert not tracker.is_benched("b")
-
-
-def test_benching_resets_the_streak_so_it_does_not_immediately_retrip() -> None:
-    clock = _Clock()
-    tracker = _tracker(clock, threshold=2, duration_s=10.0)
-    tracker.record_failure("a")
-    tracker.record_failure("a")  # benched, streak cleared
-    assert tracker.is_benched("a")
-    clock.advance(10.0)  # bench lifts
-    tracker.record_failure("a")
-    assert not tracker.is_benched("a")  # one failure post-bench, not two
+def test_remaining_s_for_an_unbenched_agent_is_zero() -> None:
+    tracker, _clock = _tracker()
+    assert tracker.remaining_s("never-failed") == 0.0

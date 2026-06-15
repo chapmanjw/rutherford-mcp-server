@@ -31,9 +31,20 @@ class SafetyMode(StrEnum):
 def is_mutating(mode: SafetyMode) -> bool:
     """Return whether a safety mode can modify the workspace (``write`` or ``yolo``).
 
-    Read-only and propose are non-mutating, so they need no trusted-workspace check.
+    Read-only and propose are non-mutating -- propose's edits land in a disposable sandbox and are never
+    applied -- so they need no trusted-workspace check.
     """
     return mode in (SafetyMode.WRITE, SafetyMode.YOLO)
+
+
+def runs_sandboxed(mode: SafetyMode) -> bool:
+    """Whether a mode runs the agent inside an isolated SANDBOX (worktree / temp copy) rather than ``cwd``.
+
+    ``write`` / ``yolo`` (the agent mutates the sandbox, the reviewed diff is applied back) and ``propose``
+    (the agent mutates the sandbox, the diff is captured and discarded). ``read_only`` runs directly in the
+    working directory -- there is nothing to isolate.
+    """
+    return mode in (SafetyMode.PROPOSE, SafetyMode.WRITE, SafetyMode.YOLO)
 
 
 class AuthState(StrEnum):
@@ -125,6 +136,11 @@ class Strategy(StrEnum):
     WEIGHTED = "weighted"
     #: Compare the proposer's verdict against the parity counterweights; disagreement escalates.
     PARITY_PAIR = "parity-pair"
+    #: A two-round preference protocol (F4b): every voice answers, then ranks the OTHER answers
+    #: (anonymized, self-excluded); the panel aggregates the ballots by Borda mean-rank. Unlike the
+    #: one-shot tally strategies it runs a second round, so it is orchestrated by the consensus service,
+    #: not by ``aggregate`` -- the outcome is ``ranked`` (a clear winner) or ``tied`` (a top tie).
+    RANK = "rank"
 
 
 class Effort(StrEnum):
@@ -143,6 +159,46 @@ class Effort(StrEnum):
 
 #: The canonical effort order, least to most, for clamp-to-nearest in ``map_effort``.
 EFFORT_ORDER: tuple[Effort, ...] = (Effort.LOW, Effort.MEDIUM, Effort.HIGH, Effort.XHIGH)
+
+
+class TerminationReason(StrEnum):
+    """Why a debate stopped (F5, 11-D/11-E): the arms of the termination grammar.
+
+    A debate always stops for exactly one reason. ``budget`` and ``quorum_lost`` apply to any debate;
+    ``converged`` and ``stalled`` only fire when convergence is tracked; ``unresolved`` is the default --
+    the round budget ran out without an earlier arm firing.
+    """
+
+    #: The panel reached agreement -- a unanimous verdict across the answering voices (tracked debates).
+    CONVERGED = "converged"
+    #: Positions stopped moving: the decision held unchanged for the stall tolerance, short of agreement.
+    STALLED = "stalled"
+    #: The round budget ran out without converging or stalling (the default terminal).
+    UNRESOLVED = "unresolved"
+    #: A wall-clock time budget finalized the debate at a round boundary (F8a).
+    BUDGET = "budget"
+    #: Fewer than two voices remained to keep arguing, so the debate could not continue.
+    QUORUM_LOST = "quorum_lost"
+
+
+class ReexecutionSafety(StrEnum):
+    """Whether a failed ACP turn may be silently re-issued (transport / model / cross-agent fallback).
+
+    Distinct from "did a side effect happen": after a ``session/prompt`` is accepted a turn can be
+    filesystem-clean yet still unsafe to silently re-run, because cost may have accrued and the agent's
+    state is ambiguous. Only :attr:`SAFE` may enter a retry/fallback path (the gate replaces a bare
+    ``is_retryable`` check). Ordered least to most dangerous.
+    """
+
+    #: A pre-prompt failure (spawn / handshake). The request never ran; re-issuing it elsewhere is safe.
+    SAFE = "safe"
+    #: The prompt was accepted with no observed external side effect, but cost may have accrued and the
+    #: agent saw context, so a silent re-run would double-spend.
+    DUPLICATE_COST = "duplicate_cost"
+    #: It is unknown whether the prompt or a tool call ran (e.g. an ambiguous transport drop).
+    AMBIGUOUS = "ambiguous"
+    #: A known external side effect occurred (``fs/write`` or a terminal command). Never auto-retry.
+    SIDE_EFFECTED = "side_effected"
 
 
 class ActivityEventKind(StrEnum):

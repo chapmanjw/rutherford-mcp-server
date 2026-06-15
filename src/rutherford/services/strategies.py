@@ -25,11 +25,20 @@ from collections.abc import Sequence
 from typing import Any
 
 from ..domain.enums import Stance, Strategy
-from ..domain.models import DiversityReport, Provenance, VoiceVerdict
+from ..domain.models import (
+    DiversityReport,
+    PairwiseAgreement,
+    Provenance,
+    RankEntry,
+    RankReport,
+    VoiceVerdict,
+)
 from ..io.jsontext import iter_json_objects
 
 #: Matches a ``VERDICT: <token>`` line anywhere in an answer; the last match wins.
 _VERDICT_LINE = re.compile(r"^\s*VERDICT:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+#: Matches a ``RANK: A, C, B`` line anywhere in a ballot answer; the last match wins.
+_RANK_LINE = re.compile(r"^\s*RANK:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 
 
 def apply_stance(prompt: str, stance: Stance | None) -> str:
@@ -89,13 +98,27 @@ def _normalize(token: str) -> str:
     return token.strip().lower()
 
 
-def aggregate(strategy: Strategy, voices: list[VoiceVerdict], *, min_quorum: int = 1) -> tuple[str, str | None]:
+def aggregate(
+    strategy: Strategy,
+    voices: list[VoiceVerdict],
+    *,
+    min_quorum: int = 1,
+    correlation_discount: bool = False,
+) -> tuple[str, str | None]:
     """Aggregate verdicts into ``(outcome, decision)`` for ``strategy``.
 
     ``voices`` is the whole panel (including failed/unparseable voices); those stay in the denominator
     so an outcome cannot be certified off a minority of survivors. ``min_quorum`` is the floor on
     parseable voices below which the outcome is ``no_quorum``. ``decision`` is the winning verdict token
     when one was reached, else ``None``. ``all-voices`` never reaches here.
+
+    ``correlation_discount`` (F3 vote-math stretch, opt-in) scales each voting voice by ``1 /
+    lineage-multiplicity`` -- the model-family lineage (5-A, vendor fallback) -- so N voices of one lineage
+    ("one model in N CLI costumes") count as ONE effective vote, not N. It applies to the counting/weighting
+    strategies
+    (``majority`` / ``plurality`` / ``weighted``); ``unanimous`` (agreement, not weight) and
+    ``parity-pair`` (a proposer-vs-counterweight check) are unaffected. Off by default -- the discount
+    changes outcomes for correlated panels, so it is opt-in (no behavior regression).
 
     Outcomes: ``unanimous`` | ``majority`` | ``no_majority`` | ``plurality`` | ``tied`` | ``split`` |
     ``agree`` | ``escalate`` | ``no_quorum``.
@@ -104,21 +127,62 @@ def aggregate(strategy: Strategy, voices: list[VoiceVerdict], *, min_quorum: int
     eligible = len(voices)
     if len(parseable) < min_quorum:
         return ("no_quorum", None)
+    discounts = lineage_discounts(voices) if correlation_discount else None
+
+    def factor(voice: VoiceVerdict) -> float:
+        return discounts.get(id(voice), 1.0) if discounts is not None else 1.0
+
     if strategy is Strategy.UNANIMOUS:
         return _unanimous(parseable, eligible)
     if strategy is Strategy.MAJORITY:
-        return _strict_majority(Counter(str(voice.verdict) for voice in parseable), float(eligible))
-    if strategy is Strategy.PLURALITY:
-        return _plurality(Counter(str(voice.verdict) for voice in parseable))
-    if strategy is Strategy.WEIGHTED:
         sums: dict[str, float] = defaultdict(float)
         for voice in parseable:
-            sums[str(voice.verdict)] += voice.weight
-        total_weight = sum(voice.weight for voice in voices)  # failed voices keep their weight in the denominator
-        return _strict_majority(sums, total_weight)
+            sums[str(voice.verdict)] += factor(voice)
+        return _strict_majority(sums, sum(factor(voice) for voice in voices))
+    if strategy is Strategy.PLURALITY:
+        scores: dict[str, float] = defaultdict(float)
+        for voice in parseable:
+            scores[str(voice.verdict)] += factor(voice)
+        return _plurality(scores)
+    if strategy is Strategy.WEIGHTED:
+        weighted: dict[str, float] = defaultdict(float)
+        for voice in parseable:
+            weighted[str(voice.verdict)] += voice.weight * factor(voice)
+        # Failed voices keep their full weight in the denominator (the discount applies only to a lineage's
+        # ANSWERING voices), so an outcome still cannot be certified off a minority of survivors.
+        total_weight = sum(voice.weight * factor(voice) for voice in voices)
+        return _strict_majority(weighted, total_weight)
     if strategy is Strategy.PARITY_PAIR:
         return _parity_pair(voices)
     return ("split", None)  # defensive; ALL_VOICES does not aggregate
+
+
+def lineage_discounts(voices: list[VoiceVerdict]) -> dict[int, float]:
+    """Per-voice correlation discount factors keyed by ``id(voice)`` (F3 vote-math): ``1 / lineage size``.
+
+    Groups the ANSWERING voices (ok + a parseable verdict) by their model-family lineage (``_lineage_key``:
+    the base model family, falling back to the vendor for an unlisted model) -- the same key F3's diversity
+    uses; each gets ``1 / (voices sharing that lineage)``, so a lineage of three correlated voices contributes
+    one effective vote. A voice whose lineage cannot be resolved is its OWN lineage (factor ``1.0``) -- two
+    unknowns are NOT assumed correlated, keeping the discount conservative. Non-answering voices are absent (a
+    caller reads ``1.0`` for them via ``.get``). Pure.
+    """
+    parseable = [voice for voice in voices if voice.ok and voice.verdict is not None]
+    # Group by the effective LINEAGE (base model family, else vendor) -- the same key F3's effective_lineages
+    # uses -- so two voices of one model line ("claude-opus" in two CLI costumes) are one effective vote, and
+    # claude-opus vs claude-sonnet are NOT collapsed. Typed group keys keep the namespaces disjoint: a
+    # resolved lineage is ``("lineage", key)``, an unresolved voice is ``("unknown", index)`` -- so a real
+    # lineage can NEVER collide with the unknown marker.
+    groups: dict[tuple[str, str | int], list[VoiceVerdict]] = defaultdict(list)
+    for index, voice in enumerate(parseable):
+        key = _lineage_key(voice.provenance)
+        groups[("lineage", key) if key is not None else ("unknown", index)].append(voice)
+    out: dict[int, float] = {}
+    for members in groups.values():
+        factor = 1.0 / len(members)
+        for voice in members:
+            out[id(voice)] = factor
+    return out
 
 
 def _unanimous(parseable: list[VoiceVerdict], eligible: int) -> tuple[str, str | None]:
@@ -191,6 +255,180 @@ def _close(a: float, b: float) -> bool:
     return abs(a - b) <= 1e-9
 
 
+# --- RANK: the two-round preference protocol (F4b) ---------------------------
+
+
+def ranking_instruction(labels: Sequence[str], schema: dict[str, Any] | None) -> str:
+    """Tell a voice how to rank the labelled candidate answers (line mode, or JSON when a schema is set)."""
+    label_list = ", ".join(labels)
+    if schema is not None:
+        return (
+            f"Rank ALL of these answers from best to worst by their labels ({label_list}). When you are "
+            "finished, output on its own final line a single JSON object of the form "
+            '{"ranking": ["<best label>", ..., "<worst label>"]}, listing every label exactly once.'
+        )
+    return (
+        f"Rank ALL of these answers from best to worst by their labels ({label_list}). When you are "
+        "finished, output a final line in exactly this form, most preferred first: RANK: <label>, <label>, ..."
+    )
+
+
+def extract_ranking(text: str, schema: dict[str, Any] | None, valid_labels: Sequence[str]) -> list[str] | None:
+    """Pull an ordered list of candidate labels (best to worst) out of a ballot answer, or ``None``.
+
+    Two modes mirror :func:`extract_verdict`: with a ``schema`` the last JSON object carrying a
+    ``ranking`` / ``rank`` / ``order`` list wins; otherwise the last ``RANK:`` line is read. Either way
+    the result is normalized to the known ``valid_labels`` (case-insensitively), de-duplicated keeping
+    first occurrence, and unknown tokens are dropped -- so a hallucinated label never enters the tally.
+    ``None`` when no usable ranking is found (the caller records the ballot as unparseable).
+    """
+    valid = {label.upper() for label in valid_labels}
+    raw = _ranking_from_json(text) if schema is not None else _ranking_from_line(text)
+    if raw is None:
+        return None
+    return _dedupe_valid(raw, valid)
+
+
+def _ranking_from_line(text: str) -> list[str] | None:
+    matches = _RANK_LINE.findall(text)
+    if not matches:
+        return None
+    return re.split(r"[,\s]+", matches[-1].strip())
+
+
+def _ranking_from_json(text: str) -> list[str] | None:
+    """The ordered labels from the last JSON object carrying a ``ranking`` / ``rank`` / ``order`` list."""
+    chosen: list[Any] | None = None
+    for obj in iter_json_objects(text):
+        for key in ("ranking", "rank", "order"):
+            value = obj.get(key)
+            if isinstance(value, list) and value:
+                chosen = value
+    return [str(item) for item in chosen] if chosen is not None else None
+
+
+def _dedupe_valid(tokens: Sequence[str], valid: set[str]) -> list[str] | None:
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        key = token.strip().upper()
+        if key in valid and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out or None
+
+
+def rank_panel(
+    candidates: Sequence[tuple[str, str]],
+    ballots: Sequence[tuple[str, Sequence[str]]],
+    *,
+    min_quorum: int = 1,
+) -> tuple[str, str | None, RankReport]:
+    """Aggregate ranking ballots into ``(outcome, decision, RankReport)`` by Borda mean-rank (F4b, 7-F).
+
+    ``candidates`` is ``(label, cli)`` for every answer being ranked; ``ballots`` is ``(voter_label,
+    ordered candidate labels best to worst)`` -- each voter's ballot excludes its own answer (7-E), so a
+    candidate is ranked by every voter but itself. The leaderboard sorts by mean ballot position ascending
+    (a Borda-points and label tiebreak keeps it deterministic); the winner is the single best unless the
+    top is an epsilon tie (then ``tied`` with no decision). ``pairwise`` is the Spearman matrix and
+    ``concordance`` the mean pairwise correlation. Below ``min_quorum`` usable ballots the outcome is
+    ``no_quorum``. Pure, so the ranking math is unit-testable on its own.
+    """
+    cand_labels = [label for label, _ in candidates]
+    cand_set = set(cand_labels)
+    cli_of = dict(candidates)
+    usable = [(voter, [c for c in order if c in cand_set]) for voter, order in ballots]
+    usable = [(voter, order) for voter, order in usable if order]
+    ballots_cast = len(usable)
+    ballots_unparseable = len(ballots) - ballots_cast
+    if ballots_cast < min_quorum:
+        return ("no_quorum", None, RankReport(ballots_cast=ballots_cast, ballots_unparseable=ballots_unparseable))
+
+    positions: dict[str, list[int]] = {label: [] for label in cand_labels}
+    points: dict[str, float] = dict.fromkeys(cand_labels, 0.0)
+    for _voter, order in usable:
+        length = len(order)
+        for index, label in enumerate(order):  # index 0 = the voter's top pick
+            positions[label].append(index + 1)
+            points[label] += length - index  # top of an L-candidate ballot earns L, bottom earns 1
+    bottom = float(len(cand_labels) + 1)  # an answer no surviving ballot ranked sinks below every ranked one
+    scored = [
+        (
+            label,
+            sum(positions[label]) / len(positions[label]) if positions[label] else bottom,
+            points[label],
+            len(positions[label]),
+        )
+        for label in cand_labels
+    ]
+    scored.sort(key=lambda entry: (entry[1], -entry[2], entry[0]))
+    leaderboard = [
+        RankEntry(label=label, cli=cli_of[label], rank=index + 1, mean_rank=round(mean, 4), borda_points=pts, ballots=n)
+        for index, (label, mean, pts, n) in enumerate(scored)
+    ]
+    best_mean = scored[0][1]
+    tied_top = [label for label, mean, _, _ in scored if _close(mean, best_mean)]
+    winner = tied_top[0] if len(tied_top) == 1 else None
+    outcome = "ranked" if winner is not None else "tied"
+    pairwise = _pairwise_matrix(usable)
+    concordance = round(sum(p.correlation for p in pairwise) / len(pairwise), 4) if pairwise else None
+    report = RankReport(
+        leaderboard=leaderboard,
+        winner=winner,
+        tied_top=[] if winner is not None else tied_top,
+        pairwise=pairwise,
+        concordance=concordance,
+        ballots_cast=ballots_cast,
+        ballots_unparseable=ballots_unparseable,
+    )
+    return (outcome, winner, report)
+
+
+def _pairwise_matrix(ballots: Sequence[tuple[str, Sequence[str]]]) -> list[PairwiseAgreement]:
+    """The Spearman rank-correlation between every voter pair over the answers they BOTH ranked (7-F).
+
+    The correlation is over each voter's RELATIVE order of the common answers, re-ranked densely to 1..k --
+    not the absolute ballot positions. Two voters who agree on the common order must score ``1.0`` even when
+    they slotted the non-common answers (a different self-excluded seat each) at different depths; absolute
+    positions would let those gaps drag an identical common order below 1.0.
+    """
+    indexed = [(voter, {label: index + 1 for index, label in enumerate(order)}) for voter, order in ballots]
+    out: list[PairwiseAgreement] = []
+    for first in range(len(indexed)):
+        for second in range(first + 1, len(indexed)):
+            a_label, a_pos = indexed[first]
+            b_label, b_pos = indexed[second]
+            common = [label for label in a_pos if label in b_pos]
+            a_dense = _dense_ranks(common, a_pos)
+            b_dense = _dense_ranks(common, b_pos)
+            corr = _pearson([a_dense[label] for label in common], [b_dense[label] for label in common])
+            if corr is None:
+                continue  # fewer than two answers in common -- no defined correlation
+            out.append(PairwiseAgreement(a=a_label, b=b_label, correlation=round(corr, 4), common=len(common)))
+    return out
+
+
+def _dense_ranks(labels: Sequence[str], positions: dict[str, int]) -> dict[str, int]:
+    """Re-rank ``labels`` densely to ``1..k`` by ballot ``positions``, so gaps from other answers drop out."""
+    ordered = sorted(labels, key=lambda label: positions[label])
+    return {label: rank for rank, label in enumerate(ordered, start=1)}
+
+
+def _pearson(xs: Sequence[int], ys: Sequence[int]) -> float | None:
+    """Pearson correlation of two rank vectors (= Spearman over distinct ranks), or ``None`` if undefined."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    if var_x == 0 or var_y == 0:
+        return None  # a constant vector has no defined correlation
+    return float(cov / (var_x * var_y) ** 0.5)
+
+
 def effective_diversity(provenances: Sequence[Provenance | None], *, min_distinct: int = 2) -> DiversityReport:
     """Summarize how many distinct models/providers a panel's *answering* voices actually spanned (F3).
 
@@ -208,6 +446,7 @@ def effective_diversity(provenances: Sequence[Provenance | None], *, min_distinc
     """
     models: set[str] = set()
     providers: set[str] = set()
+    lineages: set[str] = set()
     unknown = 0
     known_providers = 0
     for prov in provenances:
@@ -220,6 +459,9 @@ def effective_diversity(provenances: Sequence[Provenance | None], *, min_distinc
         if provider_key is not None:
             known_providers += 1
             providers.add(provider_key)
+        lineage_key = _lineage_key(prov)
+        if lineage_key is not None:
+            lineages.add(lineage_key)
     known_models = len(provenances) - unknown
     low_diversity = (known_models >= 2 and len(models) < min_distinct) or (
         known_providers >= 2 and len(providers) < min_distinct
@@ -228,6 +470,11 @@ def effective_diversity(provenances: Sequence[Provenance | None], *, min_distinc
         answered_voices=len(provenances),
         distinct_models=len(models),
         distinct_providers=len(providers),
+        # Effective lineages (item 5 / vote-math stretch): the base-model-FAMILY count, refining the vendor
+        # proxy so claude-opus and claude-sonnet read as two lineages, not one "anthropic" (5-D). The family is
+        # vendor-independent (the same line across two hosting vendors is one correlated lineage), and an
+        # unlisted model falls back to the vendor. A SEPARATE axis from ``low_diversity`` (model + vendor axes).
+        effective_lineages=len(lineages),
         unknown=unknown,
         low_diversity=low_diversity,
         models=sorted(models),
@@ -247,3 +494,71 @@ def _provider_key(prov: Provenance | None) -> str | None:
     if prov is None or not prov.provider:
         return None
     return prov.provider.strip().lower()
+
+
+#: Curated base-model-family table (F3 lineage key, 5-A/5-D): the first table entry whose token appears in a
+#: normalized model id gives the family. Matched on LETTER boundaries (the token may not be glued to a letter
+#: on either side), not raw substring -- so an unrelated id never false-matches (``octopus-v2`` is NOT
+#: ``claude-opus``; ``gemmastone`` is NOT ``gemma``) while a version suffix is still allowed (``gemma3:12b`` IS
+#: ``gemma``, ``gpt-5.2`` IS ``gpt-5``). Only the model LINES worth splitting are listed -- Claude
+#: opus/sonnet/haiku, the GPT generations, the Gemini lines, and Gemma -- so "claude-opus + claude-sonnet"
+#: reads as two lineages, not one "anthropic" (the 5-D de-collapse). An UNLISTED model falls back to its
+#: VENDOR (a generic prefix guess would re-introduce over-reporting, 5-A). A labeled heuristic, not a proof of
+#: independence -- coarse where a line is unlisted (e.g. ``gpt-4o`` is glued to a letter and falls to vendor).
+_MODEL_FAMILIES: tuple[tuple[str, str], ...] = (
+    ("opus", "claude-opus"),
+    ("sonnet", "claude-sonnet"),
+    ("haiku", "claude-haiku"),
+    ("gpt-5", "gpt-5"),
+    ("gpt-4", "gpt-4"),
+    ("gemini-2.5", "gemini-2.5"),  # before the looser "gemini-2" so 2.5 is its own family
+    ("gemini-2", "gemini-2"),
+    ("gemini-1.5", "gemini-1.5"),
+    ("gemma", "gemma"),
+)
+
+
+def _model_family(model: str | None) -> str | None:
+    """The base model family of a model id from the curated table, or ``None`` when unlisted (5-A heuristic).
+
+    A family token never glues to a LETTER on the left. On the RIGHT the boundary depends on the token: a
+    LETTER-ending token (``gemma``, ``opus``) may take a version digit (``gemma3:12b`` -> ``gemma``) but not a
+    letter (``gemmastone`` does not match); a DIGIT-ending token (``gpt-5``, ``gemini-2``) may not take any
+    further alphanumeric, so a longer version is NOT swallowed into an older family (``gpt-50`` / ``gemini-25``
+    do NOT match ``gpt-5`` / ``gemini-2``). ``octopus`` and ``gpt-4o`` (letter-glued) fall back to the vendor.
+    """
+    if not model:
+        return None
+    normalized = model.strip().lower()
+    for needle, family in _MODEL_FAMILIES:
+        # A digit-ending token must not be followed by more alphanumerics (gpt-5 must not eat gpt-50); a
+        # letter-ending token may take a version digit (gemma -> gemma3) but not a letter (not gemmastone).
+        right = r"(?![a-z0-9])" if needle[-1].isdigit() else r"(?![a-z])"
+        if re.search(rf"(?<![a-z]){re.escape(needle)}{right}", normalized):
+            return family
+    return None
+
+
+def _lineage_key(prov: Provenance | None) -> str | None:
+    """The effective-LINEAGE key (F3): the base model family when recognized, else the vendor proxy.
+
+    Refines the coarse vendor key so distinct model lines (claude-opus vs claude-sonnet) count as distinct
+    lineages -- the 5-D de-collapse -- while an UNLISTED model conservatively falls back to the vendor (never
+    a prefix guess). The family is VENDOR-INDEPENDENT by design: the SAME model line served through two
+    vendors (a Claude on Anthropic and on Bedrock, a GPT on OpenAI and on Azure) is genuinely correlated, so
+    it is one lineage -- which is why ``effective_lineages`` is NOT guaranteed ``>= distinct_providers``. A
+    labeled heuristic; ``None`` when neither family nor vendor resolves, so an unknown-lineage voice is
+    excluded rather than assumed same or different.
+    """
+    family = _model_family(prov.model if prov is not None else None)
+    return family if family is not None else _provider_key(prov)
+
+
+def lineage_key(prov: Provenance | None) -> str | None:
+    """The F3 effective-lineage key for a provenance (base model family, else vendor): the public name.
+
+    The same key :func:`lineage_discounts` and :func:`effective_diversity` use within a panel, exposed so the
+    cross-run historical-agreement report can key past verdicts on the SAME lineage. Recomputing it at read
+    time (rather than persisting a frozen key) means an improved family table re-keys historical records too.
+    """
+    return _lineage_key(prov)

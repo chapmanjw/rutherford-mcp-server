@@ -1,1 +1,0 @@
-Error: Invalid API key. Please run `claude auth login` or set ANTHROPIC_API_KEY.

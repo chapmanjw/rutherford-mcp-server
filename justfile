@@ -34,7 +34,7 @@ license-check:
 test:
     uv run pytest
 
-# Enforce the per-file coverage floor on adapters/, services/, runtime/ (needs a prior test run).
+# Enforce the per-file coverage floor across all of src/rutherford (needs a prior test run).
 coverage-per-file:
     uv run python scripts/check_per_file_coverage.py
 

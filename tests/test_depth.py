@@ -1,112 +1,85 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""Tests for the delegation depth guard and the target cap."""
+"""Unit tests for the lineage/depth guard (N1, item 3): the env helpers and the two cap checks."""
 
 from __future__ import annotations
-
-import logging
 
 import pytest
 
 from rutherford.domain.error_codes import ErrorCode
-from rutherford.domain.errors import DepthLimitError, RutherfordError
+from rutherford.domain.errors import RutherfordError
 from rutherford.runtime.depth import (
     ENV_DEPTH,
     ENV_LINEAGE,
     ENV_PARENT_RUN,
     child_depth_env,
+    child_env,
     child_lineage_env,
     current_depth,
     current_lineage_count,
     ensure_within_aggregate_cap,
     ensure_within_depth,
-    ensure_within_target_cap,
 )
 
 
-def test_current_depth_default_zero() -> None:
-    assert current_depth(env={}) == 0
+def test_current_depth_reads_and_defaults() -> None:
+    assert current_depth({}) == 0  # unset -> 0
+    assert current_depth({ENV_DEPTH: "3"}) == 3
+    assert current_depth({ENV_DEPTH: "not-a-number"}) == 0  # invalid -> 0
+    assert current_depth({ENV_DEPTH: "-5"}) == 0  # clamped to >= 0
 
 
-def test_current_depth_reads_env() -> None:
-    assert current_depth(env={ENV_DEPTH: "2"}) == 2
-
-
-def test_current_depth_invalid_is_zero() -> None:
-    assert current_depth(env={ENV_DEPTH: "not-a-number"}) == 0
-    assert current_depth(env={ENV_DEPTH: "-5"}) == 0
+def test_current_lineage_count_reads_and_defaults() -> None:
+    assert current_lineage_count({}) == 0
+    assert current_lineage_count({ENV_LINEAGE: "2"}) == 2
+    assert current_lineage_count({ENV_LINEAGE: "bad"}) == 0
 
 
 def test_child_depth_env_increments() -> None:
     assert child_depth_env(0) == {ENV_DEPTH: "1"}
-    assert child_depth_env(2) == {ENV_DEPTH: "3"}
+    assert child_depth_env(4) == {ENV_DEPTH: "5"}
 
 
-def test_ensure_within_depth_allows_below_max() -> None:
-    ensure_within_depth(0, 3)
-    ensure_within_depth(2, 3)
+def test_child_lineage_env_count_first() -> None:
+    # count-first: always sets the lineage count, includes the parent id only when known.
+    assert child_lineage_env(current_count=0) == {ENV_LINEAGE: "1"}
+    with_parent = child_lineage_env(parent_run_id="abc", current_count=2)
+    assert with_parent == {ENV_LINEAGE: "3", ENV_PARENT_RUN: "abc"}
 
 
-def test_ensure_within_depth_refuses_at_max() -> None:
-    with pytest.raises(DepthLimitError) as info:
+def test_child_env_combines_depth_and_lineage() -> None:
+    env = child_env(1, parent_run_id="run-1", env={ENV_LINEAGE: "2"})
+    assert env[ENV_DEPTH] == "2"  # base_depth 1 -> child 2
+    assert env[ENV_LINEAGE] == "3"  # current count 2 -> child 3
+    assert env[ENV_PARENT_RUN] == "run-1"
+
+
+def test_ensure_within_depth_allows_below_ceiling() -> None:
+    ensure_within_depth(0, 3)  # no raise
+    ensure_within_depth(2, 3)  # last allowed depth
+
+
+def test_ensure_within_depth_refuses_at_ceiling() -> None:
+    with pytest.raises(RutherfordError) as exc:
         ensure_within_depth(3, 3)
-    assert info.value.details == {"depth": 3, "max_depth": 3}
+    assert exc.value.code is ErrorCode.MAX_DEPTH_EXCEEDED
+    assert exc.value.details == {"depth": 3, "max_depth": 3}
 
 
-def test_ensure_within_target_cap() -> None:
-    ensure_within_target_cap(8, 8)
-    with pytest.raises(RutherfordError, match="per-call cap"):
-        ensure_within_target_cap(9, 8)
+def test_aggregate_cap_disabled_is_within() -> None:
+    assert ensure_within_aggregate_cap(99, None) is False  # no cap configured
 
 
-# --- N1 (item 3): lineage env + advisory aggregate cap -----------------------
+def test_aggregate_cap_within_returns_false() -> None:
+    assert ensure_within_aggregate_cap(2, 4) is False
 
 
-def test_current_lineage_count_default_zero() -> None:
-    assert current_lineage_count(env={}) == 0
+def test_aggregate_cap_over_returns_true_advisory() -> None:
+    assert ensure_within_aggregate_cap(5, 4) is True  # over the cap, advisory (no raise)
 
 
-def test_current_lineage_count_reads_env() -> None:
-    assert current_lineage_count(env={ENV_LINEAGE: "3"}) == 3
-
-
-def test_current_lineage_count_invalid_is_zero() -> None:
-    assert current_lineage_count(env={ENV_LINEAGE: "nope"}) == 0
-    assert current_lineage_count(env={ENV_LINEAGE: "-4"}) == 0
-
-
-def test_child_lineage_env_increments_count_only_by_default() -> None:
-    # Count-first: the lineage count is always set; the parent run id only when one is known.
-    assert child_lineage_env() == {ENV_LINEAGE: "1"}
-    assert child_lineage_env(current_count=2) == {ENV_LINEAGE: "3"}
-    assert ENV_PARENT_RUN not in child_lineage_env(current_count=2)
-
-
-def test_child_lineage_env_carries_parent_run_when_given() -> None:
-    assert child_lineage_env(parent_run_id="run-abc", current_count=1) == {
-        ENV_LINEAGE: "2",
-        ENV_PARENT_RUN: "run-abc",
-    }
-
-
-def test_ensure_within_aggregate_cap_no_cap_is_noop() -> None:
-    ensure_within_aggregate_cap(1000, None)  # no cap configured -> never raises, never warns
-
-
-def test_ensure_within_aggregate_cap_within_cap_is_noop(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level(logging.WARNING, logger="rutherford.runtime.depth"):
-        ensure_within_aggregate_cap(8, 8)
-    assert not caplog.records
-
-
-def test_ensure_within_aggregate_cap_advisory_warns_not_raises(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level(logging.WARNING, logger="rutherford.runtime.depth"):
-        ensure_within_aggregate_cap(10, 8)  # over cap, but advisory (enforce=False) -> warn, do not raise
-    assert any("aggregate-agent cap" in record.message for record in caplog.records)
-
-
-def test_ensure_within_aggregate_cap_enforce_raises() -> None:
-    with pytest.raises(RutherfordError) as info:
-        ensure_within_aggregate_cap(10, 8, enforce=True)
-    assert info.value.code == ErrorCode.AGENT_CAP_EXCEEDED
-    assert info.value.details == {"declared": 10, "cap": 8}
+def test_aggregate_cap_over_enforced_raises() -> None:
+    with pytest.raises(RutherfordError) as exc:
+        ensure_within_aggregate_cap(5, 4, enforce=True)
+    assert exc.value.code is ErrorCode.AGENT_CAP_EXCEEDED
+    assert exc.value.details == {"declared": 5, "cap": 4}

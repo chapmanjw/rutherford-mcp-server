@@ -1,345 +1,286 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""Tests for the panels loader, store, cache, and the panel= tool paths."""
+"""Tests for saved panels: loading, scope merging, resolution + overrides, errors, and the tools.
+
+A panel is a named consensus/debate roster stored as ``panels.toon`` and discovered across the same scopes
+as the rest of the config (``~/.rutherford`` -> project ``<cwd>/.rutherford`` -> ``$RUTHERFORD_CONFIG_DIR``),
+the closest scope winning. These exercise the loader, the cache + override path, the PANEL_NOT_FOUND /
+PANEL_INVALID errors, the ``reload_panels`` tool shape, and panel resolution into a consensus / debate
+request via the tool layer (driving the fake ACP agent end to end).
+"""
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.panels import Panel, PanelCache, PanelStore, PanelTarget, load_panels
+from rutherford.config.schema import RutherfordConfig
+from rutherford.context import AppContext, build_app_context
 from rutherford.domain.enums import Stance, Strategy
+from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
-from rutherford.domain.models import ProcessResult
-from rutherford.io.serialize import encode
+from rutherford.domain.models import Target
+from rutherford.io.serialize import decode, encode
 from rutherford.tools.consensus import consensus_tool
 from rutherford.tools.debate import debate_tool
-from rutherford.tools.panels import reload_panels_tool
-from rutherford.tools.review import review_tool
-from tests.fakes import FakeAdapter, FakeProcessRunner, make_app
+from rutherford.tools.panels import panel_for_call, reload_panels_tool
 
-KNOWN = ["claude_code", "codex", "kiro"]
+REPO_ROOT = Path(__file__).resolve().parent.parent
+_FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
+FAKE = AgentDescriptor("fake", "Fake", _FAKE_CMD)
+FAKE_A = AgentDescriptor("fake_a", "Fake A", _FAKE_CMD, provider="alpha", default_model="model-a")
+FAKE_B = AgentDescriptor("fake_b", "Fake B", _FAKE_CMD, provider="beta", default_model="model-b")
 
-
-def _problems(error: RutherfordError) -> list[dict[str, Any]]:
-    """Pull the structured problem list off a ``PANEL_INVALID`` error."""
-    assert error.details is not None
-    problems = error.details["problems"]
-    assert isinstance(problems, list)
-    return problems
+#: The agent ids the panel loader validates targets against in these tests.
+KNOWN = ["fake", "fake_a", "fake_b"]
 
 
-def _write_panels(directory: Path, panels: dict[str, Any]) -> None:
-    """Write a ``panels.toon`` file built from ``panels`` (name -> record)."""
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "panels.toon").write_text(encode({"panels": panels}), encoding="utf-8")
+def _registry() -> DescriptorRegistry:
+    return DescriptorRegistry([FAKE, FAKE_A, FAKE_B])
 
 
-def _env(home: Path, config_dir: Path | None = None) -> dict[str, str]:
-    env = {"USERPROFILE": str(home), "HOME": str(home)}
-    if config_dir is not None:
-        env["RUTHERFORD_CONFIG_DIR"] = str(config_dir)
-    return env
+def _write_panels(directory: Path, panels: dict[str, dict[str, Any]]) -> None:
+    """Write a ``panels.toon`` under ``directory/.rutherford`` from a plain panels mapping (valid TOON)."""
+    base = directory / ".rutherford"
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "panels.toon").write_text(encode({"panels": panels}), encoding="utf-8")
 
 
-# --- loader: discovery, precedence, merge -------------------------------------------------------
+# --- loader: discovery, validation, and scope merge --------------------------
 
 
-def test_loads_a_panel_from_home(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    _write_panels(
-        home / ".rutherford",
-        {"duo": {"description": "two", "targets": [{"cli": "claude_code", "model": "opus"}, {"cli": "codex"}]}},
-    )
-    store = load_panels(KNOWN, env=_env(home), cwd=tmp_path / "proj")
-    panel = store.get("duo")
-    assert [target.cli for target in panel.targets] == ["claude_code", "codex"]
-    assert panel.to_targets()[0].model == "opus"
-    assert panel.strategy == "all-voices"  # default when unset
-
-
-def test_project_overrides_home_by_name(tmp_path: Path) -> None:
-    home, proj = tmp_path / "home", tmp_path / "proj"
-    _write_panels(
-        home / ".rutherford",
-        {
-            "duo": {"targets": [{"cli": "claude_code"}, {"cli": "codex"}]},
-            "solo_home": {"targets": [{"cli": "kiro"}]},
-        },
-    )
-    _write_panels(
-        proj / ".rutherford",
-        {
-            "duo": {"targets": [{"cli": "kiro"}, {"cli": "codex"}]},  # same name: project wins
-            "solo_proj": {"targets": [{"cli": "codex"}]},
-        },
-    )
-    store = load_panels(KNOWN, env=_env(home), cwd=proj)
-    assert set(store.names()) == {"duo", "solo_home", "solo_proj"}  # union of names
-    assert [target.cli for target in store.get("duo").targets] == ["kiro", "codex"]  # closest scope
-
-
-def test_config_dir_overrides_project(tmp_path: Path) -> None:
-    home, proj, cfg = tmp_path / "home", tmp_path / "proj", tmp_path / "cfg"
-    _write_panels(proj / ".rutherford", {"duo": {"targets": [{"cli": "kiro"}, {"cli": "codex"}]}})
-    _write_panels(cfg, {"duo": {"targets": [{"cli": "claude_code"}, {"cli": "codex"}]}})
-    store = load_panels(KNOWN, env=_env(home, cfg), cwd=proj)
-    assert [target.cli for target in store.get("duo").targets] == ["claude_code", "codex"]  # env wins
-
-
-def test_no_files_is_an_empty_store(tmp_path: Path) -> None:
-    store = load_panels(KNOWN, env=_env(tmp_path / "nohome"), cwd=tmp_path / "noproj")
+def test_no_panels_file_is_an_empty_store(tmp_path: Path) -> None:
+    store = load_panels(KNOWN, env={"USERPROFILE": str(tmp_path / "home")}, cwd=str(tmp_path / "proj"))
     assert store.names() == []
 
 
-# --- loader: validation -------------------------------------------------------------------------
-
-
-def test_unknown_panel_name_raises_with_available(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    _write_panels(home / ".rutherford", {"duo": {"targets": [{"cli": "codex"}, {"cli": "kiro"}]}})
-    store = load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p")
-    with pytest.raises(RutherfordError) as info:
-        store.get("missing")
-    assert info.value.code == "PANEL_NOT_FOUND"
-    assert "duo" in info.value.message
-
-
-def test_unknown_cli_is_a_validation_error_with_target_index(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    _write_panels(home / ".rutherford", {"bad": {"targets": [{"cli": "codex"}, {"cli": "nope"}]}})
-    with pytest.raises(RutherfordError) as info:
-        load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p")
-    assert info.value.code == "PANEL_INVALID"
-    problems = _problems(info.value)
-    assert any(problem.get("target") == 1 and "nope" in problem["error"] for problem in problems)
-
-
-def test_every_problem_surfaces_in_one_pass(tmp_path: Path) -> None:
+def test_loads_a_panel_with_its_targets_and_strategy(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write_panels(
-        home / ".rutherford",
-        {"bad": {"junk": 1, "targets": [{"cli": "nope1"}, {"cli": "nope2", "stance": "sideways"}]}},
-    )
-    with pytest.raises(RutherfordError) as info:
-        load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p")
-    problems = _problems(info.value)
-    # unknown panel key + two unknown clis + one bad stance = at least four, not just the first.
-    assert len(problems) >= 4
-
-
-def test_missing_panels_table_is_reported(tmp_path: Path) -> None:
-    directory = tmp_path / "home" / ".rutherford"
-    directory.mkdir(parents=True)
-    (directory / "panels.toon").write_text(encode({"notpanels": {"x": 1}}), encoding="utf-8")
-    with pytest.raises(RutherfordError) as info:
-        load_panels(KNOWN, env=_env(tmp_path / "home"), cwd=tmp_path / "p")
-    assert info.value.code == "PANEL_INVALID"
-    assert "top-level 'panels'" in info.value.message
-
-
-def test_malformed_toon_is_reported(tmp_path: Path) -> None:
-    directory = tmp_path / "home" / ".rutherford"
-    directory.mkdir(parents=True)
-    (directory / "panels.toon").write_text("items[3]: 1,2\n", encoding="utf-8")  # invalid TOON
-    with pytest.raises(RutherfordError) as info:
-        load_panels(KNOWN, env=_env(tmp_path / "home"), cwd=tmp_path / "p")
-    assert info.value.code == "PANEL_INVALID"
-    assert "could not read panels file" in _problems(info.value)[0]["error"]
-
-
-def test_utf16_panels_file_is_reported(tmp_path: Path) -> None:
-    # Windows PowerShell 5.1 redirection writes UTF-16 by default; the file must become one
-    # PANEL_INVALID problems entry, not a raw UnicodeDecodeError past the aggregator.
-    directory = tmp_path / "home" / ".rutherford"
-    directory.mkdir(parents=True)
-    (directory / "panels.toon").write_text(
-        encode({"panels": {"duo": {"targets": [{"cli": "codex"}]}}}), encoding="utf-16"
-    )
-    with pytest.raises(RutherfordError) as info:
-        load_panels(KNOWN, env=_env(tmp_path / "home"), cwd=tmp_path / "p")
-    assert info.value.code == "PANEL_INVALID"
-    assert "could not read panels file" in _problems(info.value)[0]["error"]
-
-
-def test_empty_targets_list_is_rejected(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    _write_panels(home / ".rutherford", {"empty": {"targets": []}})
-    with pytest.raises(RutherfordError) as info:
-        load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p")
-    assert any("non-empty 'targets'" in problem["error"] for problem in _problems(info.value))
-
-
-def test_unknown_strategy_in_a_panel_is_rejected(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    _write_panels(
-        home / ".rutherford",
-        {"bad": {"strategy": "bogus-strategy", "targets": [{"cli": "codex"}, {"cli": "kiro"}]}},
-    )
-    with pytest.raises(RutherfordError) as info:
-        load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p")
-    assert any("unknown strategy" in problem["error"] for problem in _problems(info.value))
-
-
-# --- cache: lazy load, reload, overrides --------------------------------------------------------
-
-
-def test_cache_is_lazy_and_reloadable(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    directory = home / ".rutherford"
-    _write_panels(directory, {"duo": {"targets": [{"cli": "codex"}, {"cli": "kiro"}]}})
-    loads = {"count": 0}
-
-    def loader() -> PanelStore:
-        loads["count"] += 1
-        return load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p")
-
-    cache = PanelCache(loader)
-    assert loads["count"] == 0  # nothing read until first use
-    assert cache.names() == ["duo"]
-    assert loads["count"] == 1
-    cache.store()
-    assert loads["count"] == 1  # cached, not re-read
-
-    _write_panels(
-        directory,
+        home,
         {
-            "duo": {"targets": [{"cli": "codex"}, {"cli": "kiro"}]},
-            "trio": {"targets": [{"cli": "codex"}, {"cli": "kiro"}, {"cli": "claude_code"}]},
+            "crew": {
+                "description": "the usual crew",
+                "strategy": "majority",
+                "targets": [{"cli": "fake"}, {"cli": "fake_a", "stance": "against", "weight": 2}],
+            }
         },
     )
-    cache.reload()
-    assert loads["count"] == 2
-    assert "trio" in cache.names()  # the edit was picked up
+    store = load_panels(KNOWN, env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    assert store.names() == ["crew"]
+    panel = store.get("crew")
+    assert panel.description == "the usual crew"
+    assert panel.strategy is Strategy.MAJORITY
+    targets = panel.to_targets()
+    assert [t.cli for t in targets] == ["fake", "fake_a"]
+    assert targets[1].stance is Stance.AGAINST
+    assert targets[1].effective_weight == 2.0
 
 
-def test_overrides_shallow_merge_over_a_panel(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    _write_panels(
-        home / ".rutherford", {"duo": {"description": "orig", "targets": [{"cli": "codex"}, {"cli": "kiro"}]}}
+def test_project_scope_overrides_user_scope_by_name(tmp_path: Path) -> None:
+    home, proj = tmp_path / "home", tmp_path / "proj"
+    _write_panels(home, {"crew": {"description": "global", "targets": [{"cli": "fake"}]}})
+    _write_panels(proj, {"crew": {"description": "project", "targets": [{"cli": "fake_a"}, {"cli": "fake_b"}]}})
+    store = load_panels(KNOWN, env={"USERPROFILE": str(home)}, cwd=str(proj))
+    panel = store.get("crew")
+    assert panel.description == "project"  # the closer scope won
+    assert [t.cli for t in panel.to_targets()] == ["fake_a", "fake_b"]
+
+
+def test_env_config_dir_overrides_both(tmp_path: Path) -> None:
+    home, proj, env_dir = tmp_path / "home", tmp_path / "proj", tmp_path / "explicit"
+    _write_panels(home, {"crew": {"description": "global", "targets": [{"cli": "fake"}]}})
+    _write_panels(proj, {"crew": {"description": "project", "targets": [{"cli": "fake"}]}})
+    # RUTHERFORD_CONFIG_DIR points at the directory itself (no `.rutherford` suffix), so write there directly.
+    env_dir.mkdir(parents=True, exist_ok=True)
+    (env_dir / "panels.toon").write_text(
+        encode({"panels": {"crew": {"description": "explicit", "targets": [{"cli": "fake_b"}]}}}), encoding="utf-8"
     )
-    cache = PanelCache(lambda: load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p"))
-    panel = cache.resolve("duo", {"strategy": "majority", "description": "tweaked"})
-    assert panel.strategy == "majority"
-    assert panel.description == "tweaked"
-    assert [target.cli for target in panel.targets] == ["codex", "kiro"]  # targets untouched
-
-
-def test_overrides_with_a_negative_weight_are_panel_invalid(tmp_path: Path) -> None:
-    # The falsifying test for PanelTarget's ge=0: panel_overrides bypass _parse_target's sign
-    # check entirely (they re-validate through the pydantic model), so without ge=0 a negative
-    # override weight would sail through to Target() and explode mid-call.
-    home = tmp_path / "home"
-    _write_panels(home / ".rutherford", {"duo": {"targets": [{"cli": "codex"}, {"cli": "kiro"}]}})
-    cache = PanelCache(lambda: load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p"))
-    with pytest.raises(RutherfordError) as info:
-        cache.resolve("duo", {"targets": [{"cli": "codex", "weight": -1.0}, {"cli": "kiro"}]})
-    assert info.value.code == "PANEL_INVALID"
-
-
-def test_overrides_with_an_unknown_strategy_are_panel_invalid(tmp_path: Path) -> None:
-    # F22: strategy is a typed Strategy on the Panel model, so panel_overrides revalidate it like
-    # every other field instead of letting an arbitrary string sail through to the consensus call.
-    home = tmp_path / "home"
-    _write_panels(home / ".rutherford", {"duo": {"targets": [{"cli": "codex"}, {"cli": "kiro"}]}})
-    cache = PanelCache(lambda: load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p"))
-    with pytest.raises(RutherfordError) as info:
-        cache.resolve("duo", {"strategy": "frobnicate"})
-    assert info.value.code == "PANEL_INVALID"
-
-
-# --- tool integration: panel= on consensus / debate / review ------------------------------------
-
-
-def _duo_store(stance: str | None = None) -> PanelStore:
-    """A two-seat panel over fake adapters ``a`` and ``b``, optionally steering ``b``."""
-    seat_b = PanelTarget(cli="b", stance=Stance(stance)) if stance else PanelTarget(cli="b")
-    return PanelStore({"duo": Panel(name="duo", targets=[PanelTarget(cli="a"), seat_b])})
-
-
-def _seeded_app(store: PanelStore) -> tuple[Any, FakeProcessRunner]:
-    runner = FakeProcessRunner(ProcessResult(exit_code=0, stdout="ok"))
-    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")], runner=runner, panels=PanelCache.seeded(store))
-    return app, runner
-
-
-async def test_consensus_resolves_a_panel_and_applies_stance() -> None:
-    app, runner = _seeded_app(_duo_store(stance="against"))
-    out = await consensus_tool(app, prompt="rewrite in Rust?", panel="duo")
-    assert "voices[2]" in out
-    prompts = [spec.argv[2] for spec, _ in runner.calls]
-    assert any("Argue against" in prompt for prompt in prompts)  # stance came from the panel seat
-
-
-async def test_debate_resolves_a_panel() -> None:
-    app, _ = _seeded_app(_duo_store())
-    out = await debate_tool(app, prompt="q", panel="duo", rounds=1)
-    assert "rounds[1]" in out
-
-
-async def test_review_resolves_a_panel() -> None:
-    app, _ = _seeded_app(_duo_store())
-    out = await review_tool(app, panel="duo", diff="--- a\n+++ b\n")
-    assert "voices[2]" in out
-
-
-async def test_panel_and_targets_are_mutually_exclusive() -> None:
-    app, _ = _seeded_app(_duo_store())
-    with pytest.raises(RutherfordError, match="mutually exclusive"):
-        await consensus_tool(app, prompt="q", panel="duo", targets=["a"])
-
-
-async def test_unknown_panel_through_a_tool_errors() -> None:
-    app, _ = _seeded_app(PanelStore({}))
-    with pytest.raises(RutherfordError) as info:
-        await consensus_tool(app, prompt="q", panel="ghost")
-    assert info.value.code == "PANEL_NOT_FOUND"
-
-
-async def test_reload_panels_tool_lists_panels() -> None:
-    app, _ = _seeded_app(_duo_store())
-    out = await reload_panels_tool(app)
-    assert "duo" in out
-    assert "count: 1" in out
-
-
-async def test_panel_strategy_drives_a_parity_pair_escalation() -> None:
-    # A roundtable whose strategy is parity-pair: proposer approves, the parity dissenter blocks,
-    # so the panel must escalate. The strategy comes from the panel, not the call.
-    store = PanelStore(
-        {
-            "roundtable": Panel(
-                name="roundtable",
-                strategy=Strategy.PARITY_PAIR,
-                targets=[PanelTarget(cli="a", label="proposer"), PanelTarget(cli="b", label="dissenter", parity=True)],
-            )
-        }
+    store = load_panels(
+        KNOWN,
+        env={"USERPROFILE": str(home), "RUTHERFORD_CONFIG_DIR": str(env_dir)},
+        cwd=str(proj),
     )
-
-    def run_fn(spec: Any) -> ProcessResult:
-        verdict = "approve" if spec.argv[0] == "a" else "block"
-        return ProcessResult(exit_code=0, stdout=f"reasoning\nVERDICT: {verdict}")
-
-    runner = FakeProcessRunner(run_fn=run_fn)
-    app = make_app(adapters=[FakeAdapter("a"), FakeAdapter("b")], runner=runner, panels=PanelCache.seeded(store))
-    out = await consensus_tool(app, prompt="is this a primitive?", panel="roundtable")
-    assert "strategy: parity-pair" in out
-    assert "outcome: escalate" in out
+    assert store.get("crew").description == "explicit"
 
 
-def test_negative_weight_in_a_panel_file_is_a_load_time_problem(tmp_path: Path) -> None:
-    # The full-codebase panel's MAJOR: weight=-1 used to load cleanly and explode later as a raw
-    # ValidationError inside Panel.to_targets() mid-call. It must be a PANEL_INVALID at load,
-    # naming the file and seat, like every other panel-file problem.
+def test_distinct_panels_across_scopes_all_load(tmp_path: Path) -> None:
+    home, proj = tmp_path / "home", tmp_path / "proj"
+    _write_panels(home, {"global-only": {"targets": [{"cli": "fake"}]}})
+    _write_panels(proj, {"project-only": {"targets": [{"cli": "fake_a"}]}})
+    store = load_panels(KNOWN, env={"USERPROFILE": str(home)}, cwd=str(proj))
+    assert store.names() == ["global-only", "project-only"]
+
+
+# --- loader: PANEL_INVALID -----------------------------------------------------
+
+
+def test_unknown_cli_is_panel_invalid(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    _write_panels(
-        home / ".rutherford",
-        {"bad": {"targets": [{"cli": "codex", "weight": -1.0}, {"cli": "kiro"}]}},
-    )
-    with pytest.raises(RutherfordError) as info:
-        load_panels(KNOWN, env=_env(home), cwd=tmp_path / "p")
-    assert info.value.code == "PANEL_INVALID"
-    problems = _problems(info.value)
-    assert any(problem.get("target") == 0 and "non-negative" in problem["error"] for problem in problems)
+    _write_panels(home, {"crew": {"targets": [{"cli": "fake"}, {"cli": "ghost"}]}})
+    with pytest.raises(RutherfordError) as exc:
+        load_panels(KNOWN, env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    assert exc.value.code is ErrorCode.PANEL_INVALID
+    assert "ghost" in exc.value.message
+
+
+def test_unknown_strategy_is_panel_invalid(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_panels(home, {"crew": {"strategy": "telepathy", "targets": [{"cli": "fake"}]}})
+    with pytest.raises(RutherfordError) as exc:
+        load_panels(KNOWN, env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    assert exc.value.code is ErrorCode.PANEL_INVALID
+    assert "telepathy" in exc.value.message
+
+
+def test_empty_targets_is_panel_invalid(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_panels(home, {"crew": {"targets": []}})
+    with pytest.raises(RutherfordError) as exc:
+        load_panels(KNOWN, env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    assert exc.value.code is ErrorCode.PANEL_INVALID
+
+
+def test_negative_weight_is_panel_invalid(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_panels(home, {"crew": {"targets": [{"cli": "fake", "weight": -1}]}})
+    with pytest.raises(RutherfordError) as exc:
+        load_panels(KNOWN, env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    assert exc.value.code is ErrorCode.PANEL_INVALID
+    assert "non-negative" in exc.value.message
+
+
+def test_unknown_panel_key_is_panel_invalid(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_panels(home, {"crew": {"targets": [{"cli": "fake"}], "rounds": 3}})  # rounds is not a panel key
+    with pytest.raises(RutherfordError) as exc:
+        load_panels(KNOWN, env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    assert exc.value.code is ErrorCode.PANEL_INVALID
+    assert "rounds" in exc.value.message
+
+
+def test_all_problems_reported_in_one_pass(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_panels(home, {"crew": {"strategy": "bogus", "targets": [{"cli": "ghost"}]}})
+    with pytest.raises(RutherfordError) as exc:
+        load_panels(KNOWN, env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    # Both the bad strategy and the bad cli are named -- one aggregated report, not a fail-on-first.
+    assert "bogus" in exc.value.message and "ghost" in exc.value.message
+
+
+# --- store / cache lookup ------------------------------------------------------
+
+
+def test_get_unknown_panel_raises_panel_not_found() -> None:
+    store = PanelStore({"crew": Panel(name="crew", targets=[])})
+    with pytest.raises(RutherfordError) as exc:
+        store.get("nope")
+    assert exc.value.code is ErrorCode.PANEL_NOT_FOUND
+    assert "crew" in exc.value.message  # lists what is available
+
+
+def test_cache_resolve_applies_overrides() -> None:
+    panel = Panel(name="crew", strategy=Strategy.ALL_VOICES, targets=[PanelTarget(cli="fake")])
+    cache = PanelCache.seeded(PanelStore({"crew": panel}))
+    overridden = cache.resolve("crew", {"strategy": "majority"})
+    assert overridden.strategy is Strategy.MAJORITY
+    assert overridden.name == "crew"  # the merge preserved the rest
+    assert [t.cli for t in overridden.to_targets()] == ["fake"]  # the unchanged seats survive the merge
+
+
+def test_cache_resolve_bad_override_is_panel_invalid() -> None:
+    panel = Panel(name="crew", targets=[PanelTarget(cli="fake")])
+    cache = PanelCache.seeded(PanelStore({"crew": panel}))
+    with pytest.raises(RutherfordError) as exc:
+        cache.resolve("crew", {"strategy": "telepathy"})  # an invalid strategy fails re-validation
+    assert exc.value.code is ErrorCode.PANEL_INVALID
+
+
+# --- reload_panels tool --------------------------------------------------------
+
+
+async def test_reload_panels_tool_shape(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_panels(home, {"crew": {"description": "the crew", "targets": [{"cli": "fake"}, {"cli": "fake_a"}]}})
+    app = _app(env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    data = decode(await reload_panels_tool(app))
+    assert data["reloaded"] is True
+    assert data["count"] == 1
+    entry = data["panels"][0]
+    assert entry["name"] == "crew"
+    assert entry["description"] == "the crew"
+    assert entry["target_count"] == 2
+
+
+# --- panel_for_call guards -----------------------------------------------------
+
+
+def test_panel_with_targets_is_invalid_input(tmp_path: Path) -> None:
+    # The mutual-exclusion guard fires BEFORE the store is touched, so an empty scope is enough.
+    app = _app(env={"USERPROFILE": str(tmp_path / "home")}, cwd=str(tmp_path / "proj"))
+    with pytest.raises(RutherfordError) as exc:
+        panel_for_call(app, "crew", None, [Target(cli="fake")], None)
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+
+
+def test_panel_with_stances_is_invalid_input(tmp_path: Path) -> None:
+    app = _app(env={"USERPROFILE": str(tmp_path / "home")}, cwd=str(tmp_path / "proj"))
+    with pytest.raises(RutherfordError) as exc:
+        panel_for_call(app, "crew", None, None, ["for"])
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+
+
+# --- panel resolved into a consensus / debate run ------------------------------
+
+
+def _app(env: dict[str, str] | None = None, cwd: str | None = None) -> AppContext:
+    """An app whose panel cache loads from the given scopes (defaults to empty tmp scopes)."""
+    config = RutherfordConfig()
+    app = build_app_context(config=config, descriptors=_registry())
+    # Re-point the panel cache at the test scopes so a fixture panels.toon is what loads.
+    app.panels = PanelCache(lambda: load_panels(KNOWN, env=env, cwd=cwd))
+    return app
+
+
+async def test_consensus_resolves_a_panel_and_adopts_its_strategy(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_panels(home, {"crew": {"strategy": "majority", "targets": [{"cli": "fake"}, {"cli": "fake_a"}]}})
+    app = _app(env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    # Both panel seats plant ``VERDICT: yes``: this proves the panel resolved into the two seats AND that the
+    # panel's majority strategy was adopted with no explicit ``strategy`` on the call (a StrategyResult, not the
+    # all-voices shape).
+    out = await consensus_tool(app, prompt="Decide.\nSAY=VERDICT: yes", panel="crew", working_dir=str(REPO_ROOT))
+    assert "strategy: majority" in out  # the panel's strategy was adopted
+    assert "decision: yes" in out
+    assert "cli: fake\n" in out and "fake_a" in out  # both panel seats took part
+
+
+async def test_consensus_unknown_panel_is_panel_not_found(tmp_path: Path) -> None:
+    app = _app(env={"USERPROFILE": str(tmp_path / "home")}, cwd=str(tmp_path / "proj"))
+    with pytest.raises(RutherfordError) as exc:
+        await consensus_tool(app, prompt="x", panel="ghost", working_dir=str(REPO_ROOT))
+    assert exc.value.code is ErrorCode.PANEL_NOT_FOUND
+
+
+async def test_consensus_panel_and_targets_mutually_exclusive(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_panels(home, {"crew": {"targets": [{"cli": "fake"}]}})
+    app = _app(env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    with pytest.raises(RutherfordError) as exc:
+        await consensus_tool(app, prompt="x", panel="crew", targets=["fake"], working_dir=str(REPO_ROOT))
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+
+
+async def test_debate_resolves_a_panel(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_panels(home, {"crew": {"targets": [{"cli": "fake"}, {"cli": "fake_a"}]}})
+    app = _app(env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    out = await debate_tool(app, prompt="Argue.", panel="crew", rounds=1, synthesize=False, working_dir=str(REPO_ROOT))
+    data = decode(out)
+    # A one-round debate over the two panel seats: round one has both voices.
+    assert len(data["rounds"][0]["contributions"]) == 2

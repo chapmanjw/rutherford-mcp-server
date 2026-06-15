@@ -1,1 +1,0 @@
-Error: not authenticated. Run `cn login`.

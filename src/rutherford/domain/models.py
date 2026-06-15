@@ -22,10 +22,12 @@ from .enums import (
     Effort,
     JobStatus,
     OutputMode,
+    ReexecutionSafety,
     Runtime,
     SafetyMode,
     Stance,
     Strategy,
+    TerminationReason,
 )
 from .error_codes import ErrorCode
 
@@ -155,10 +157,85 @@ class DiversityReport(BaseModel):
     answered_voices: int
     distinct_models: int
     distinct_providers: int
+    #: The number of EFFECTIVE LINEAGES behind the answers (F3): how many genuinely independent sources the
+    #: panel actually spanned, keyed on the base MODEL FAMILY (a curated heuristic) and falling back to the
+    #: vendor for an unlisted model -- so claude-opus and claude-sonnet read as two lineages, not one
+    #: "anthropic" (5-D de-collapse). The family is vendor-independent (the same model line served through two
+    #: vendors is ONE correlated lineage), so this is NOT guaranteed ``>= distinct_providers``. A SEPARATE axis
+    #: from ``low_diversity`` (which keeps the raw-model + vendor axes), so a same-vendor panel can read "2
+    #: effective lineages" yet still flag low diversity. A conservative trust signal: "1 effective lineage" is
+    #: a real warning; a higher count is only as good as the provenance inference (unresolved voices land in
+    #: ``unknown``, not a lineage) and the family table's coverage.
+    effective_lineages: int
     unknown: int
     low_diversity: bool
     models: list[str] = Field(default_factory=list)
     providers: list[str] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def headline(self) -> str:
+        """A one-sentence TRUST summary, serialized onto the result so it rides the wire, not just the fields.
+
+        A diversity statement, NOT an agreement or transport claim -- it reports how many independent lineages
+        produced the answers, so a reader can weigh the panel's outcome against its real independence (item 5,
+        5-C). Reads as a sentence: ``"2 effective lineage(s) among 5 answering voice(s)"`` -- with
+        ``"; LOW DIVERSITY"`` appended when the model OR vendor count collapsed below the floor, and an
+        ``"N unresolved"`` note when some voices' provenance could not be inferred (those count toward no
+        lineage, keeping the lineage count conservative). The ``effective_lineages`` count and the
+        ``low_diversity`` flag are separate signals on separate axes: a low count is the conservative lineage
+        signal, while the flag also watches the model axis -- so ``"0 effective lineage(s); LOW DIVERSITY"``
+        is honest (e.g. two same-model voices whose vendor was unresolved: no measurable lineage, yet the
+        model axis still caught the duplication).
+        """
+        text = f"{self.effective_lineages} effective lineage(s) among {self.answered_voices} answering voice(s)"
+        if self.unknown:
+            text += f", {self.unknown} unresolved"
+        return f"{text}; LOW DIVERSITY" if self.low_diversity else text
+
+
+class LineageAgreement(BaseModel):
+    """How often two DISTINCT model lineages reached the same verdict when they co-voted across kept panels.
+
+    A lineage contributes one verdict to a panel only when its voices were internally unanimous (an internally
+    split lineage is excluded for that panel, never coin-flipped). ``panels`` is how many kept panels both
+    lineages cast such a verdict on; ``agreements`` is how many of those they reached the SAME verdict on;
+    ``agreement_rate`` is ``agreements / panels``. OBSERVATIONAL ONLY -- agreement is not correctness, so this
+    never feeds a vote discount (see :class:`HistoricalAgreementReport`). ``a`` < ``b`` (sorted, so a pair is
+    listed once and never self-paired -- the same-lineage correlation is the structural prior the family key
+    already encodes, not something this measures).
+    """
+
+    a: str
+    b: str
+    panels: int
+    agreements: int
+    agreement_rate: float
+
+
+class HistoricalAgreementReport(BaseModel):
+    """Cross-run agreement across the kept consensus corpus (F3): which model lineages tended to agree.
+
+    A DELIBERATE non-control surface. It reports correlation; it does NOT down-weight it. An agreement-based
+    discount is unsound -- two lineages that agree because they are both RIGHT would be penalized for being
+    correct, conflating correlation with redundancy. So this informs a HUMAN's roster choice (e.g. drop a
+    lineage that never adds a dissent), it never silently reshapes a live vote. The live, WITHIN-panel
+    model-family discount (opt-in, F3 vote-math) is the sound control -- it keys on a structural prior on
+    independence decided before any answer is seen; this is its read-only, across-panel companion.
+
+    ``panels_scanned`` is the count of kept consensus panels that contributed at least one lineage pair (>= 2
+    distinct lineages each with a parseable, internally-consistent verdict). ``pairs`` is every co-voting
+    lineage pair, most-co-voted first. ``lineages`` is the distinct lineage keys seen. ``dropped_lineage_panels``
+    counts panels where at least one lineage was dropped because its provenance did not resolve to a lineage OR
+    its voices split internally -- surfaced so the report is never silently thin. ``notes`` carries advisory
+    context (e.g. how many kept consensus records carried verdicts at all).
+    """
+
+    panels_scanned: int
+    pairs: list[LineageAgreement] = Field(default_factory=list)
+    lineages: list[str] = Field(default_factory=list)
+    dropped_lineage_panels: int = 0
+    notes: list[str] = Field(default_factory=list)
 
 
 class RunRollup(BaseModel):
@@ -195,6 +272,11 @@ class ErrorInfo(BaseModel):
     code: ErrorCode
     message: str
     details: dict[str, Any] | None = None
+    #: For an ACP failure, whether the turn may be silently re-issued (transport/model/cross-agent
+    #: fallback). Only ``SAFE`` may enter a retry path -- the finer gate that replaces a bare
+    #: ``is_retryable`` check once a turn could have produced cost or side effects. ``None`` for
+    #: non-ACP errors or where re-execution safety is not yet classified.
+    reexecution_safety: ReexecutionSafety | None = None
 
 
 # --- Adapter value objects ---------------------------------------------------
@@ -403,6 +485,11 @@ class DelegationRequest(BaseModel):
     #: When set, this delegation is a voice of a persisted panel: its run record is written as a child
     #: of this parent run id (consensus/debate set it on each voice). ``None`` for a top-level run.
     parent_run_id: str | None = None
+    #: When set, this delegation CONTINUES a prior persisted run (item 9): its leaf record records the link
+    #: (``RunRecord.continued_from``) so the continuation chain is traceable. Distinct from ``parent_run_id``
+    #: (a panel voice's parent); a continuation is a fresh top-level run that builds on an earlier one's
+    #: context. ``None`` for a non-continuation run.
+    continues_run_id: str | None = None
     #: Per-call confirmation that a write/yolo delegation may mutate ``working_dir`` even when
     #: it is not on the configured trusted-workspace allowlist.
     trust_workspace: bool = False
@@ -445,12 +532,31 @@ class DelegationResult(BaseModel):
     #: The effective provider/model/CLI-version that actually answered (F3). ``None`` when none could
     #: be determined, so the field is absent from the wire rather than reported as a guess.
     provenance: Provenance | None = None
-    #: The git working-tree changes under ``working_dir`` captured *after* a mutating (write/yolo) run,
-    #: best-effort and only when the run is **persisted** (it feeds the run record). The jobs directory
-    #: is excluded. ``None`` when not captured (read-only run, ephemeral run, not a git repo, or git
-    #: unavailable). Caveat: in a tree that was already dirty before the run, this reflects the current
-    #: worktree state, not strictly this run's delta -- it is "what changed", not a proven attribution.
+    #: The files a mutating (``write`` / ``propose`` / ``yolo``) run changed, computed from the isolated
+    #: SANDBOX the agent ran in (an ephemeral git worktree, or a temp copy for a non-git working_dir) -- the
+    #: created and edited paths, repo-relative. Sound per-delegation: the sandbox starts clean from the repo's
+    #: ``HEAD``, so this is strictly this run's delta, not the current dirty state of a shared tree. For
+    #: ``write`` / ``yolo`` these are the files applied back to the real ``working_dir``; for ``propose`` they
+    #: are what the discarded worktree contained (nothing was applied). ``None`` for a read-only run.
     changed_files: list[str] | None = None
+    #: The unified diff a sandboxed mutating run produced (the worktree's ``git diff --cached --binary``, or a
+    #: text diff for a non-git copy). For ``propose`` this is the deliverable -- the patch is returned and the
+    #: real ``working_dir`` is left untouched; for ``write`` / ``yolo`` it is the patch that was applied back.
+    #: ``None`` for a read-only run, a non-sandboxed run, or a mutating run that changed nothing.
+    diff: str | None = None
+    #: Whether a sandboxed mutating run's changes were APPLIED back to the real ``working_dir``: ``True`` for
+    #: ``write`` / ``yolo`` (the patch was applied), ``False`` for ``propose`` (nothing applied -- the diff is
+    #: a proposal). ``None`` for a read-only or non-sandboxed run.
+    changes_applied: bool | None = None
+    #: The resolved launch argv this run was issued with (F2 replay-completeness): the agent's ACP-server
+    #: command plus any effort-override extra args -- the LOGICAL launch, not the platform-resolved npm-shim
+    #: path (which carries machine-specific absolute paths). With ``target.model``, ``safety_mode``, the
+    #: prompt/role/files, and ``cwd`` it is enough to recompose and re-issue the run. ``None`` when nothing
+    #: launched (an up-front guard refused the run before a session was built). EXCLUDED from the serialized
+    #: result envelope (``exclude=True``): it is an internal carrier to the F2 persistence layer (which pins
+    #: it on the ``RunRecord``), not part of the normalized result a client reads -- and keeping it off the
+    #: wire avoids carrying a colon-bearing inline array the TOON reader cannot round-trip into every result.
+    argv: list[str] | None = Field(default=None, exclude=True)
     #: The directory this run was persisted to when it was run as a durable job
     #: (``<jobs_dir>/<run_id>``). ``None`` for an ephemeral run (Model A: nothing on disk unless asked).
     run_dir: str | None = None
@@ -484,7 +590,7 @@ class DelegationResult(BaseModel):
     #: sums this into :attr:`Topology.realized_delegations`, so a fallback's extra agents are counted. Scope
     #: note: this is the chain aggregate on the RETURNED result (what the panel rolls up); a cross-target
     #: fallback's alternates each persist their OWN leaf record (their own count) and the failed primary is
-    #: not persisted, so a standalone ``persist=True`` cross-target fallback's leaf ``state.toon`` records the
+    #: not persisted, so a standalone ``persist=True`` cross-target fallback's leaf ``state.json`` records the
     #: winning run rather than the whole chain -- the chain total is on this returned field. A best-effort
     #: count (3-B-limit): a voice cut mid-fallback contributes a floor of 1 (its cancelled task is opaque).
     delegation_call_count: int = 1
@@ -550,6 +656,27 @@ class ConsensusRequest(BaseModel):
     #: first successful voice when unset; pass a distinct CLI so an independent, non-participant judge
     #: combines the panel instead of one of the debaters.
     judge: Target | None = None
+    #: No-self-approval hard guard (F4a, 4-A): refuse a synthesis that would be authored by a panel
+    #: participant -- for a binding verdict, name a non-participant ``judge``. Opt-in (default off, so no
+    #: behavior regression); when off, a self-authored synthesis still runs but is flagged ``self_authored``.
+    require_independent_judge: bool = False
+    #: Surface the RANK losing/lowest-ranked positions and why (F4b, 7-G): when set, every non-winning
+    #: candidate is stamped with its standing on the ``dissent`` field so a minority position is first-class,
+    #: not buried in the matrix. Opt-in (default off); composes with ``require_dissent`` in config.
+    require_dissent: bool = False
+    #: Discount correlated votes by model-family lineage (vendor fallback) when aggregating (F3 vote-math
+    #: stretch, opt-in): N voices of one lineage count as one effective vote, so a panel of "one model in N CLI
+    #: costumes" cannot over-count under ``majority`` / ``plurality`` / ``weighted``. Off by default (it changes
+    #: outcomes for correlated panels); composes with ``discount_correlated_votes`` in config.
+    discount_correlated: bool = False
+    #: Per-voice resume handles, parallel to ``targets`` (item 9 panel continuation): when set, each voice
+    #: resumes its prior ACP session (``session/load``) so the panel continues a kept consensus job instead of
+    #: starting cold. A seat whose agent cannot reload (or whose handle is ``None``) is a clean ``RESUME_FAILED``
+    #: voice, recorded not silently dropped. ``None`` for a fresh panel.
+    resume_session_ids: list[str | None] | None = None
+    #: The run id this panel CONTINUES (item 9): stamped onto the persisted parent's ``continued_from`` so the
+    #: continuation chain is traceable. ``None`` for a non-continuation panel.
+    continued_from: str | None = None
     #: Persist this panel as a durable job (F2): a parent record plus a child record per voice, under
     #: ``<jobs_dir>/``. ``None`` follows ``default_persistence``; ``True`` / ``False`` force it.
     persist: bool | None = None
@@ -596,6 +723,11 @@ class ConsensusResult(BaseModel):
     #: The display label of the target that wrote the synthesis (a judge if one was named, else the
     #: first successful voice), so a reader can see whether the synthesizer was a panel participant.
     synthesis_by: str | None = None
+    #: No-self-approval transparency floor (F4a, 4-A): ``True`` when the synthesizer was itself a panel
+    #: participant (the default judge = the first voice's agent), so a self-authored verdict is never
+    #: silent. ``False`` when an independent (non-participant) judge wrote it. Opt into a hard refusal of
+    #: self-authorship with ``require_independent_judge``.
+    self_authored: bool = False
     skipped: list[SkippedTarget] = Field(default_factory=list)
     #: Effective model/provider diversity across the answering voices (F3). ``None`` when no voice
     #: answered (nothing to measure).
@@ -640,6 +772,12 @@ class VoiceVerdict(BaseModel):
     #: errored), ``unparseable`` (it answered but no verdict could be extracted), or ``None`` when a
     #: verdict was extracted. Lets a reader tell a mis-parse from an abstention.
     no_verdict_reason: str | None = None
+    #: No-silent-dismissal (F4a, 4-B): why this voice's PARSEABLE verdict was set aside -- a structural
+    #: reason the aggregator stamps when a real verdict lost ("minority: 2 of 5 voted 'no'; the panel
+    #: majority 'yes'"). DISTINCT from ``no_verdict_reason`` (which means the voice had NO verdict): a
+    #: dissenting voice HAS a verdict, it just did not win. ``None`` for the winning verdict(s) and for voices
+    #: with no verdict. F4b's required-dissent enriches this same field.
+    dissent: str | None = None
     text: str = ""
     #: The effective provider/model that answered this seat (F3), carried from the voice's result so a
     #: strategy reader sees per-voice identity. ``None`` when undetermined.
@@ -647,6 +785,65 @@ class VoiceVerdict(BaseModel):
     #: The effort tier this seat actually applied (F8a, 2-L), carried from the voice's result. ``None``
     #: when the adapter has no effort knob or no effort was requested.
     effort_applied: Effort | None = None
+    #: This answer's 1-based standing in the RANK leaderboard (F4b), 1 = best. ``None`` for every other
+    #: strategy and for a voice that failed round 1 (no answer to rank). Set from the :class:`RankReport`.
+    rank: int | None = None
+    #: The correlation discount applied to this voice when ``discount_correlated`` was on (F3 vote-math):
+    #: ``1 / (voices sharing its model-family lineage)``, so a reader sees a correlated vote was down-weighted --
+    #: ``0.5`` means it shared its lineage with one other voice. ``None`` when the discount was not applied.
+    lineage_weight: float | None = None
+
+
+class RankEntry(BaseModel):
+    """One answer's standing in the RANK Borda leaderboard (F4b, 7-C).
+
+    ``mean_rank`` is the average 1-based ballot position this answer received across the voters who ranked
+    it (lower is better, so the leaderboard sorts ascending); ``borda_points`` is the summed Borda score
+    (a top placement on an ``L``-candidate ballot earns ``L`` points down to ``1``); ``ballots`` is how
+    many voters ranked it (every voter but its own author, minus any whose ballot was unparseable).
+    """
+
+    label: str
+    cli: str
+    rank: int
+    mean_rank: float
+    borda_points: float
+    ballots: int
+
+
+class PairwiseAgreement(BaseModel):
+    """Rank agreement between two voters' ballots over the answers they BOTH ranked (F4b, 7-F).
+
+    ``correlation`` is the Spearman rank correlation in ``[-1, 1]`` over the ``common`` answers both
+    voters ranked (``1`` = identical order, ``-1`` = reversed); only pairs with at least two common
+    answers are reported, since a correlation needs two points. The pairwise matrix is the panel's
+    disagreement map -- where two voters saw the field differently.
+    """
+
+    a: str
+    b: str
+    correlation: float
+    common: int
+
+
+class RankReport(BaseModel):
+    """The RANK strategy's structured outcome (F4b, 7-C): the leaderboard, pairwise matrix, and concordance.
+
+    ``concordance`` is the panel's overall agreement strength -- the mean of the pairwise rank
+    correlations (a Kendall's-W-style measure that tolerates the self-excluded, unequal-length ballots
+    that 7-E produces, where the textbook W is undefined). ``None`` when fewer than two comparable ballots
+    were cast. ``winner`` is the top label, ``None`` on a top tie (then ``tied_top`` lists the labels
+    within an epsilon of the best mean-rank). ``ballots_cast`` / ``ballots_unparseable`` account for how
+    many voters produced a usable ranking, so a thin aggregation is never silent.
+    """
+
+    leaderboard: list[RankEntry] = Field(default_factory=list)
+    winner: str | None = None
+    tied_top: list[str] = Field(default_factory=list)
+    pairwise: list[PairwiseAgreement] = Field(default_factory=list)
+    concordance: float | None = None
+    ballots_cast: int = 0
+    ballots_unparseable: int = 0
 
 
 class StrategyResult(BaseModel):
@@ -666,6 +863,13 @@ class StrategyResult(BaseModel):
     skipped: list[SkippedTarget] = Field(default_factory=list)
     #: Effective model/provider diversity across the answering voices (F3). ``None`` when none answered.
     diversity: DiversityReport | None = None
+    #: The RANK strategy's leaderboard / pairwise matrix / concordance (F4b). ``None`` for every other
+    #: strategy.
+    rank: RankReport | None = None
+    #: Whether the aggregation discounted correlated votes by model-family lineage (F3 vote-math, opt-in): when
+    #: ``True``, voices sharing a lineage were down-weighted (each voice's :attr:`VoiceVerdict.lineage_weight`
+    #: shows by how much), so a panel of "one model in N costumes" did not over-count. ``False`` by default.
+    correlation_discounted: bool = False
     #: Advisory, non-fatal notices for the caller (e.g. a suggestion to keep this panel as a job).
     notice: str | None = None
     #: The directory this panel was persisted to when kept as a job (parent + a child record per voice).
@@ -708,8 +912,13 @@ class DebateRequest(BaseModel):
     #: An optional target to write the closing synthesis. Defaults to the first surviving voice when
     #: unset; pass a distinct CLI for an independent, non-participant judge.
     judge: Target | None = None
-    #: Persist this debate as a durable job (F2): a parent record plus a child record per voice/round,
-    #: under ``<jobs_dir>/``. ``None`` follows ``default_persistence``; ``True`` / ``False`` force it.
+    #: No-self-approval hard guard (F4a, 4-A): refuse a closing that would be authored by a debate
+    #: participant -- name a non-participant ``judge`` for a binding verdict. Opt-in (default off).
+    require_independent_judge: bool = False
+    #: Persist this debate as a durable job (F2): a parent record plus the full ``transcript.md`` artifact,
+    #: under ``<jobs_dir>/``. A debate drives its turns over persistent sessions (not via ``delegate``), so
+    #: there are no per-turn child records -- the transcript carries the run. ``None`` follows
+    #: ``default_persistence``; ``True`` / ``False`` force it.
     persist: bool | None = None
     #: Suppress the suggest-a-job advisory notice when an external orchestrator already tracks this run.
     external_tracking: bool = False
@@ -726,6 +935,24 @@ class DebateRequest(BaseModel):
     #: (today equivalent to ``harvest``; the deliberate come-back rides the item-9 primitive). ``None``
     #: follows the configured ``default_on_budget`` (``harvest`` out of the box).
     on_budget: OnBudget | None = None
+    #: F5 (11-B): each later round re-sends the FULL prior transcript verbatim (every round, every voice)
+    #: instead of only the previous round's positions. Off by default -- the delta + the persistent session
+    #: is the cheaper default; carry-forward trades tokens for an explicit history (useful where session
+    #: memory is weak), bounded by ``time_budget_s``.
+    carry_forward: bool = False
+    #: F5 (11-C): track convergence -- ask each voice for a one-word verdict each round, aggregate it, and
+    #: stop early when the panel CONVERGES (a unanimous verdict) or STALLS (the decision holds unchanged for
+    #: the configured tolerance). Off by default (a debate is free-form argument); on, it adds the termination
+    #: grammar and a populated ``outcome``.
+    track_convergence: bool = False
+    #: Per-seat resume handles, parallel to ``targets`` (item 9 panel continuation): when set, each seat
+    #: resumes its prior ACP session so the debate CONTINUES a kept debate job -- the agent recalls the prior
+    #: argument and ``rounds`` more rounds are run. A seat whose agent cannot reload is a failed contribution,
+    #: recorded not silently dropped. ``None`` for a fresh debate.
+    resume_session_ids: list[str | None] | None = None
+    #: The run id this debate CONTINUES (item 9): stamped onto the persisted parent's ``continued_from`` so the
+    #: continuation chain is traceable. ``None`` for a non-continuation debate.
+    continued_from: str | None = None
 
 
 class DebateContribution(BaseModel):
@@ -749,12 +976,22 @@ class DebateContribution(BaseModel):
     role: str | None = None
     ok: bool
     text: str = ""
+    #: The seat's ROUND-1 (blind, pre-exposure) position, carried onto each LATER round's contribution so a
+    #: reader sees pre-vs-post movement (F4a, 4-C): round 1 is committed before any voice sees the others, so
+    #: a shift from this to ``text`` is real movement, not anchoring. ``None`` on a round-1 contribution (it
+    #: IS the pre-commitment) and when the seat had no usable round-1 answer. Feeds F5 convergence + F4b.
+    pre_commit: str | None = None
+    #: No-silent-dismissal (F4a, 4-B): why this seat was set aside, stamped at the prune step on the round
+    #: where a voice drops out (e.g. "set aside: no usable answer in round 2"). DISTINCT from ``error`` (a
+    #: turn fault): a pruned seat may have answered earlier rounds. ``None`` for a surviving/answering seat.
+    #: The closing names the dissent it sets aside.
+    dissent: str | None = None
     raw: str | None = None
     duration_s: float = 0.0
     error: ErrorInfo | None = None
     fallback_from: str | None = None
     #: This turn's resume session handle, carried from the voice's result so the debate parent's roster can
-    #: record each seat's handle in ``state.toon`` for a later continuation (F8a, 2-I). ``None`` when the
+    #: record each seat's handle in ``state.json`` for a later continuation (F8a, 2-I). ``None`` when the
     #: CLI established no resumable session.
     session_id: str | None = None
     #: stdout this turn streamed before a time-budget deadline cut it (F8a, 2-F: capture always). A debate
@@ -766,7 +1003,7 @@ class DebateContribution(BaseModel):
     #: ``None`` when undetermined.
     provenance: Provenance | None = None
     #: The cost this turn reported, carried from the voice's result, so a persisted debate's parent can
-    #: roll up panel cost into ``state.toon`` (decision 1-D). ``None`` when the CLI reported none.
+    #: roll up panel cost into ``state.json`` (decision 1-D). ``None`` when the CLI reported none.
     cost: Cost | None = None
     #: The effort tier this turn actually applied (F8a, 2-L), carried from the voice's result. ``None``
     #: when the adapter has no effort knob or no effort was requested.
@@ -781,9 +1018,51 @@ class DebateContribution(BaseModel):
     #: The files this turn changed (a write-mode debate), carried from the voice's result so the parent
     #: rolls up the panel's changed-file union (decision 1-D), mirroring consensus. Empty for a read run.
     changed_files: list[str] = Field(default_factory=list)
+    #: The resolved launch argv this turn was issued with (F2 replay-completeness), carried from the voice's
+    #: result so each turn's record pins its own invocation. ``None`` when nothing launched. EXCLUDED from
+    #: the serialized envelope (an internal carrier to the F2 persistence layer, not part of the transcript a
+    #: client reads).
+    argv: list[str] | None = Field(default=None, exclude=True)
     #: The directory this turn was persisted to when the debate was kept as a job (the child record of
     #: the panel parent). ``None`` for an ephemeral debate.
     run_dir: str | None = None
+
+
+class ProgressLedger(BaseModel):
+    """One round's convergence snapshot (F5, 11-C): the aggregated verdict and how stable it is.
+
+    Recorded on a round only when the debate tracks convergence. ``decision`` is the round's aggregated
+    verdict (the convergence strategy over each voice's extracted verdict), ``outcome`` the aggregate
+    category (``unanimous`` / ``majority`` / ...), ``tally`` the per-verdict head count, ``changed`` whether
+    the decision moved from the prior round, ``stall_count`` how many consecutive rounds the (non-converged)
+    decision has held, and ``converged`` whether the panel reached agreement this round. Deterministic and
+    pure -- no extra subprocess -- so it is replayable.
+    """
+
+    round_index: int
+    outcome: str
+    decision: str | None = None
+    tally: dict[str, int] = Field(default_factory=dict)
+    changed: bool = False
+    stall_count: int = 0
+    converged: bool = False
+
+
+class DebateOutcome(BaseModel):
+    """Why a debate terminated and what it concluded (F5, 11-D): metadata atop the transcript + closing.
+
+    Not a new result shape -- a debate is still a transcript and an optional closing; this rides on
+    :class:`DebateResult` as the termination-grammar verdict. ``termination`` is the arm that stopped it,
+    ``rounds_run`` how many rounds were actually held, ``converged`` whether the panel agreed, ``decision``
+    the final aggregated verdict when convergence was tracked (else ``None``), and ``stall_count`` the
+    trailing run of unchanged rounds.
+    """
+
+    termination: TerminationReason
+    rounds_run: int
+    converged: bool = False
+    decision: str | None = None
+    stall_count: int = 0
 
 
 class DebateRound(BaseModel):
@@ -791,6 +1070,8 @@ class DebateRound(BaseModel):
 
     index: int
     contributions: list[DebateContribution] = Field(default_factory=list)
+    #: The round's convergence snapshot (F5, 11-C), set when the debate tracks convergence; ``None`` otherwise.
+    ledger: ProgressLedger | None = None
 
 
 class DebateResult(BaseModel):
@@ -808,9 +1089,13 @@ class DebateResult(BaseModel):
     #: The display label of the target that wrote the closing synthesis (a judge if named, else the
     #: first surviving voice).
     synthesis_by: str | None = None
+    #: No-self-approval transparency (F4a, 4-A): ``True`` when the closing was written by a panel
+    #: participant (the default judge = the first surviving voice). ``False`` for an independent judge.
+    self_authored: bool = False
     skipped: list[SkippedTarget] = Field(default_factory=list)
-    #: Effective model/provider diversity across the final round's answering voices (F3). ``None``
-    #: when no voice survived to the final round.
+    #: Effective model/provider diversity (F3) across the LAST USABLE round's answering voices -- the round
+    #: the closing summarizes, which a budget-cut final round falls back from. ``None`` when no voice survived
+    #: to a usable round.
     diversity: DiversityReport | None = None
     #: Advisory, non-fatal notices for the caller (e.g. a suggestion to keep this debate as a job).
     notice: str | None = None
@@ -824,6 +1109,9 @@ class DebateResult(BaseModel):
     rollup: RunRollup | None = None
     #: Process/agent fan-out observed for this debate (N1, item 3). ``None`` when not measured.
     topology: Topology | None = None
+    #: Why the debate terminated and what it concluded (F5, 11-D): the termination-grammar arm, rounds run,
+    #: and -- when convergence was tracked -- whether the panel converged and on what. Always set.
+    outcome: DebateOutcome | None = None
 
 
 # --- Jobs --------------------------------------------------------------------
@@ -851,20 +1139,26 @@ class Job(BaseModel):
 
 
 class PanelTarget(BaseModel):
-    """One seat of a persisted panel's resolved roster: the CLI, its model, stance, and resume handle."""
+    """One seat of a persisted panel's resolved roster: the CLI, its model, stance, steering, and resume handle."""
 
     cli: str
     model: str | None = None
     stance: Stance | None = None
-    #: The seat's resume session handle, recorded in the parent ``state.toon`` so a later continuation can
+    #: The seat's resume session handle, recorded in the parent ``state.json`` so a later continuation can
     #: resume it (F8a, 2-I) -- in particular a voice cut at the time budget, which has no child record of its
     #: own (its handle is recovered from the harvested partial). ``None`` when the seat established no session.
     session_id: str | None = None
+    #: The seat's voting weight (``weighted`` strategy) and parity-counterweight flag, persisted so a strategy
+    #: panel CONTINUATION (item 9) replays the seat's steering faithfully instead of re-defaulting it.
+    weight: float = 1.0
+    parity: bool = False
+    #: The per-seat role persona this seat argued under, part of the recomposable continuation input.
+    role: str | None = None
 
 
 class PanelInputs(BaseModel):
     """The resolved orchestration config of a persisted consensus/debate, captured on the panel PARENT
-    record so the panel -- not just each voice -- can be replayed or continued from ``state.toon`` alone
+    record so the panel -- not just each voice -- can be replayed or continued from ``state.json`` alone
     (decision 1-D for the panel parent). Leaf child records capture each voice's per-invocation argv/model;
     these are the panel-level semantics that live on no child: the seat roster, the consensus aggregation
     ``strategy``, whether a ``synthesize`` pass was requested, a debate's ``rounds``, and any ``judge``.
@@ -875,12 +1169,33 @@ class PanelInputs(BaseModel):
     synthesize: bool | None = None
     rounds: int | None = None
     judge: str | None = None
+    #: The verdict schema a strategy panel asked each voice to emit (JSON-mode), persisted so a continuation
+    #: replays the same verdict shape. ``None`` for the line-mode / all-voices default.
+    verdict_schema: dict[str, Any] | None = None
+
+
+class StoredVerdict(BaseModel):
+    """One voice's recorded verdict on a kept consensus panel (F3 cross-run): enough to later compute which
+    model lineages tended to agree, without re-running anything.
+
+    The lineage is deliberately NOT frozen here -- ``provider`` + ``model`` are stored raw and the base model
+    FAMILY is recomputed at read time, so an improved family table benefits historical records too. ``verdict``
+    is the extracted token (``None`` for a failed or unparseable voice, which is excluded from agreement). A
+    slim projection of :class:`VoiceVerdict`: only the fields a cross-run agreement report needs.
+    """
+
+    label: str
+    cli: str
+    provider: str | None = None
+    model: str | None = None
+    verdict: str | None = None
+    ok: bool = True
 
 
 class RunRecord(BaseModel):
     """A durable, replay-complete record of one run, persisted as a job (F2).
 
-    Written to ``<jobs_dir>/<run_id>/state.toon`` when a call opts into persistence -- Model A:
+    Written to ``<jobs_dir>/<run_id>/state.json`` when a call opts into persistence -- Model A:
     durability is opt-in, an ephemeral run leaves nothing on disk, so the corpus is the runs you
     chose to keep. Distinct from the in-memory, mutable, TTL-evicted :class:`Job`: a ``RunRecord``
     is an immutable audit/replay entry. ``schema_version`` is pinned from day one so records written
@@ -898,8 +1213,9 @@ class RunRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    #: Bumped when the persisted shape changes; a reader checks it before trusting a field.
-    schema_version: int = 1
+    #: Bumped when the persisted shape changes; a reader checks it before trusting a field. v2 added
+    #: ``verdicts`` (F3 cross-run); the field is optional, so a v1 record (no ``verdicts``) still validates.
+    schema_version: int = 2
     run_id: str
     #: ``delegate`` | ``consensus`` | ``debate`` -- which tool produced this run.
     kind: str
@@ -910,6 +1226,13 @@ class RunRecord(BaseModel):
     duration_s: float = 0.0
     #: A parent run's id when this record is a child of a panel (consensus/debate); ``None`` at top level.
     parent_run_id: str | None = None
+    #: The agent session id this run produced, so a later continuation can resume the exact conversation
+    #: (item 9, ACP ``session/load``). ``None`` when the adapter minted no resumable session.
+    session_id: str | None = None
+    #: The run id this record CONTINUES (item 9, 9-B): a continuation links forward to the run it built on,
+    #: forming a traceable chain without mutating the parent. Distinct from ``parent_run_id`` (a panel
+    #: voice's parent). ``None`` for a run that did not continue another.
+    continued_from: str | None = None
     #: For a panel record (``kind`` consensus/debate), the run ids of the child voice records so a reader
     #: can reassemble the panel from its parts: one child per voice in panel order for a consensus, and
     #: one child per turn in round-major order (round 1's voices, then round 2's, ...) for a debate. Empty
@@ -944,6 +1267,11 @@ class RunRecord(BaseModel):
     #: For a panel PARENT record, the resolved panel orchestration config (seat roster, strategy,
     #: synthesize, rounds, judge) so the panel replays from here; ``None`` for a leaf delegate record.
     panel: PanelInputs | None = None
+    #: For a kept consensus panel run under a tally STRATEGY, each voice's recorded verdict (F3 cross-run,
+    #: schema v2): seat identity + provider/model + the extracted verdict token, so a later historical-agreement
+    #: report can see which model lineages tended to agree across kept panels. ``None`` for a leaf, a debate, or
+    #: an all-voices consensus (no per-voice verdicts to record).
+    verdicts: list[StoredVerdict] | None = None
     # --- outputs ---
     ok: bool = True
     error_code: ErrorCode | None = None

@@ -18,8 +18,7 @@ last one. The implementation is robust where a hand-rolled brace counter is not:
   ``... {"verdict":"x"}\\nRelated: [{"verdict":"ignore"}`` still returns the real verdict. A prose
   bracket whose contents are not JSON (``see [link]``) falls back to the one-character step.
 
-Pure and dependency-free, in the bottom layer so both the services (consensus strategies) and the
-adapters can use it.
+Pure and dependency-free, in the bottom layer so the consensus strategies can use it.
 """
 
 from __future__ import annotations

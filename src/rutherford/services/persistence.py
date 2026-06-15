@@ -2,11 +2,11 @@
 # Copyright (c) 2026 John Chapman
 """Panel-level run persistence (F2): write the parent record that links a panel's child voices.
 
-A persisted consensus/debate is one parent job directory whose ``state.toon`` is a :class:`RunRecord`
+A persisted consensus/debate is one parent job directory whose ``state.json`` is a :class:`RunRecord`
 of ``kind`` ``consensus`` / ``debate`` carrying ``child_run_ids`` -- the run ids of the per-voice child
 records (each a normal leaf delegate record persisted under its own dir with ``parent_run_id`` set). The
 parent's ``artifacts/answer.md`` holds the synthesis, a consensus adds one ``artifacts/voices/voice-N.md``
-per voice (and ``voices/skipped.md`` for an auto-panel's skipped adapters), and a debate adds
+per voice (and ``voices/skipped.md`` for an auto-panel's skipped agents), and a debate adds
 ``artifacts/transcript.md``. So a reader can open the parent and walk to every voice. This module owns only
 the *parent* write; the child voice records are written by the delegation service as each voice runs.
 
@@ -18,51 +18,12 @@ files, and the summed cost -- rather than leaving the parent a thin link record.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 
 from ..domain.enums import JobStatus, SafetyMode
-from ..domain.models import Cost, PanelInputs, RunRecord, RunRollup, Topology
+from ..domain.models import Cost, PanelInputs, RunRecord, RunRollup, StoredVerdict, Topology
 from ..io.ledger import RunLedger
 from ..runtime.logging import log_event
-
-
-async def live_tee(ledger: RunLedger, run_id: str, prefix: str, partials: list[list[str]], stop: asyncio.Event) -> None:
-    """Periodically tee ``partials`` (per-voice line lists) to the job's live artifacts (F8a, 2-G).
-
-    Shared by the consensus panel and each debate round. Snapshots ``partials`` in THIS (event-loop)
-    thread -- so the join never races the ``on_stdout`` appends, which also run in the loop thread -- then
-    writes off-thread. Stopped by SETTING ``stop`` (never by cancelling the task): on stop it writes one
-    final snapshot then returns, so this is the only writer and its writes are strictly sequential -- no
-    stale worker write can land after, and overwrite, the final snapshot. A coarse 0.5s tick keeps the I/O
-    cost negligible. ``prefix`` namespaces the live files (``voice`` / ``round-<n>-voice``).
-    """
-    while True:
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=0.5)
-            stopping = True
-        except TimeoutError:
-            stopping = False  # a 0.5s tick, not a stop
-        snapshot = ["\n".join(lines) for lines in partials]
-        await asyncio.to_thread(_write_live_safe, ledger, run_id, prefix, snapshot)
-        if stopping:
-            return  # the write above is the final snapshot
-
-
-async def stop_live_tee(tee_task: asyncio.Task[None] | None, stop: asyncio.Event) -> None:
-    """Signal the live-tee loop to write its final snapshot and exit, then await it (see :func:`live_tee`)."""
-    if tee_task is None:
-        return
-    stop.set()
-    await asyncio.gather(tee_task, return_exceptions=True)
-
-
-def _write_live_safe(ledger: RunLedger, run_id: str, prefix: str, voices: list[str]) -> None:
-    """Best-effort live-tee write -- a failed tee must never fail the panel it is mirroring (2-G)."""
-    try:
-        ledger.write_live_voices(run_id, voices, prefix=prefix)
-    except OSError:
-        return
 
 
 @dataclass(frozen=True)
@@ -71,9 +32,9 @@ class PanelVoice:
 
     ``run_id`` is the voice's child-record id (the basename of its run dir), or ``None`` when that voice
     did not persist. ``text`` and ``error`` feed the per-voice ``voices/voice-N.md`` artifact; ``cost`` and
-    ``changed_files`` feed the parent's rollup (decision 1-D). ``partial`` is the stdout a voice streamed
-    before a time-budget cut (F8a, 2-G): a cut voice has no ``text``, but its partial is persisted into the
-    voice artifact so the in-flight work is not lost. ``None`` for a voice that finished cleanly.
+    ``changed_files`` feed the parent's rollup (decision 1-D). ``partial`` is the text a voice streamed
+    before a time-budget cut (F8a): a cut voice has no ``text``, but its partial is persisted into the voice
+    artifact so the in-flight work is not lost. ``None`` for a voice that finished cleanly.
     """
 
     label: str
@@ -106,9 +67,11 @@ def write_panel_record(
     files: list[str] | None = None,
     role: str | None = None,
     panel: PanelInputs | None = None,
+    verdicts: list[StoredVerdict] | None = None,
     stop_reason: str | None = None,
     rollup: RunRollup | None = None,
     topology: Topology | None = None,
+    continued_from: str | None = None,
     extra_artifacts: dict[str, str] | None = None,
 ) -> str | None:
     """Write a panel's parent :class:`RunRecord` linking its child voice records; return its run_dir.
@@ -119,7 +82,8 @@ def write_panel_record(
     ``ok`` flags decide the parent ``status`` (succeeded when any voice answered, else failed), and their
     ``cost`` / ``changed_files`` roll up onto the parent. ``safety_mode`` / ``cwd`` / ``files`` / ``role`` /
     ``panel`` are the panel request's (``panel`` is the resolved orchestration config -- roster, strategy,
-    rounds, ...), captured so the parent record is replay-complete (decision 1-D). ``stop_reason`` /
+    rounds, ...), captured so the parent record is replay-complete (decision 1-D). ``verdicts`` is the
+    per-voice verdict projection of a tally-strategy consensus (F3 cross-run), ``None`` otherwise. ``stop_reason`` /
     ``rollup`` record a time-budget harvest (F8a): ``"budget"`` and the per-run rollup when a budget cut the
     panel, both ``None`` on a normal completion. ``topology`` is the panel's observed process/agent fan-out
     (N1, item 3), ``None`` when not measured. ``extra_artifacts`` carries the parent's audit artifacts --
@@ -138,12 +102,17 @@ def write_panel_record(
         finished_at=finished_at,
         duration_s=max(0.0, finished_at - created_at),
         child_run_ids=[voice.run_id for voice in voices if voice.run_id],
+        # item 9: the panel this run continues, so a panel continuation chain is traceable from the parent.
+        continued_from=continued_from,
         cli=",".join(clis) if clis else kind,
         safety_mode=safety_mode,
         cwd=cwd,
         role=role,
         files=list(files or []),
         panel=panel,
+        # F3 cross-run (schema v2): the per-voice verdicts of a tally-strategy consensus, so a later
+        # historical-agreement report can read which lineages agreed. ``None`` for all-voices / debate.
+        verdicts=verdicts,
         prompt=prompt,
         changed_files=_union_changed_files(voices),
         cost=_rollup_cost(voices),
@@ -180,7 +149,7 @@ def render_panel_voice_files(voices: list[PanelVoice], skipped: list[tuple[str, 
             body = voice.text.strip()
         elif voice.partial and voice.partial.strip():
             # A voice cut at the time-budget deadline: no final answer, but the partial it streamed before
-            # the cut is preserved here so the in-flight work lands in the job artifacts (F8a, 2-G).
+            # the cut is preserved here so the in-flight work lands in the job artifacts (F8a).
             reason = voice.error or "(cut at the time-budget deadline)"
             body = f"{reason}\n\n## Partial output (harvested at the cut)\n\n{voice.partial.strip()}"
         else:

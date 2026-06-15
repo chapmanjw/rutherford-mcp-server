@@ -1,42 +1,85 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""The ``capabilities`` and ``doctor`` tools."""
+"""The ``capabilities`` and ``doctor`` tools: list the ACP agents, and probe whether they actually drive."""
 
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
+from ..acp.conformance import probe_agent, probe_connection
+from ..acp.descriptors import AgentDescriptor
 from ..context import AppContext, tool_success
-from ..services.probing import probe_all, verify_live
+from .common import ensure_known_agent
+
+#: Local-model runtimes whose FIRST prompt can be slow (the model loads from disk on a cold start), so a
+#: doctor probe budgets them more generously than a cloud agent -- otherwise a cold-but-healthy local model
+#: false-flags as broken at the cloud default. Keyed off the provider the backend/auto-detect stamps.
+_LOCAL_PROVIDERS = frozenset({"ollama", "lmstudio"})
+#: The probe budget for a local-model agent (cold start headroom). Applied as a floor over the call's
+#: ``timeout_s``, so an explicit larger ``timeout_s`` still wins and a cloud agent keeps the shorter default.
+_LOCAL_PROBE_TIMEOUT_S = 180.0
+
+
+def _probe_timeout(descriptor: AgentDescriptor, default: float) -> float:
+    """The probe budget for one agent: a generous floor for a local-model agent, else the call default.
+
+    A local agent is one whose provider is a local runtime (Ollama / LM Studio -- set by the backend builders
+    and auto-detect), or whose env points at a localhost endpoint (a configured ``backend`` agent). Cold local
+    models load on the first prompt, so the cloud-agent default reliably false-flags them; give them headroom.
+    """
+    if descriptor.provider in _LOCAL_PROVIDERS:
+        return max(default, _LOCAL_PROBE_TIMEOUT_S)
+    # URL hosts are case-insensitive, so a configured ``http://LOCALHOST:1234`` endpoint is local too.
+    if any("localhost" in value.lower() or "127.0.0.1" in value for _, value in descriptor.env_overrides):
+        return max(default, _LOCAL_PROBE_TIMEOUT_S)
+    return default
 
 
 async def capabilities_tool(app: AppContext) -> str:
-    """List every known CLI: whether it is installed, its auth status, and its models."""
-    statuses = await probe_all(app.registry, default_model_for=app.config.default_model_for)
-    return tool_success(statuses)
+    """Return the registered ACP agents (id, display name, launch command, provider) -- the cheap snapshot."""
+    agents: list[dict[str, Any]] = [
+        {
+            "id": descriptor.id,
+            "display_name": descriptor.display_name,
+            "command": " ".join(descriptor.command),
+            "provider": descriptor.provider,
+        }
+        for descriptor in app.descriptors.all()
+    ]
+    return tool_success({"agents": agents})
 
 
-async def doctor_tool(app: AppContext, *, live: bool = True) -> str:
-    """Health-probe every adapter, verifying auth that cannot be checked cheaply.
+async def doctor_tool(
+    app: AppContext, *, agent: str | None = None, timeout_s: float = 60.0, connect_only: bool = False
+) -> str:
+    """Probe each agent (or one named ``agent``) with a real read-only ACP round trip and report conformance.
 
-    `doctor` confirms each CLI is installed and reads its auth state. Some CLIs (Antigravity) have
-    no non-interactive auth check, so their cheap state is ``unknown``. With ``live=True`` (the
-    default), any installed adapter that is still ``unknown`` is verified with a minimal read-only
-    round trip and reclassified by the outcome -- the only trustworthy signal when there is no
-    ``whoami``. That spends a small model call for each such adapter; pass ``live=False`` for a
-    metadata-only check with no model calls (``capabilities`` is the always-cheap snapshot).
+    The only trustworthy health signal for an ACP agent: whether it spawns, handshakes, and answers. Probes
+    run in parallel; each report says ok / no_answer / handshake_failed / not_installed / error.
+    ``timeout_s`` is the per-agent budget; a LOCAL-model agent (Ollama / LM Studio) gets a generous floor over
+    it, because a cold local model loads on its first prompt and the cloud default would false-flag it.
+
+    ``connect_only`` runs the LIGHTER handshake-only check instead: it opens a session (spawn + handshake, no
+    prompt) and reports ``reachable`` / ``handshake_failed`` / ``not_installed`` plus the agent's advertised
+    models -- proving Rutherford can talk to and configure the agent without a model call. Useful for an agent
+    that connects but cannot complete a turn for a reason outside ACP (an auth / entitlement / quota issue,
+    e.g. Grok without a SuperGrok subscription), which the full probe would report as a turn ``error``.
     """
-    if app.probe_cache is not None:
-        app.probe_cache.invalidate()  # a diagnostic run wants fresh probes, not cached metadata
-    statuses = await probe_all(app.registry, diagnostic=True, default_model_for=app.config.default_model_for)
-    if live:
-        statuses = await verify_live(
-            app.delegation, statuses, correlation_id_factory=app.new_correlation_id, base_depth=app.base_depth
+    if agent is not None:
+        ensure_known_agent(app.descriptors, agent)
+        descriptors = [app.descriptors.get(agent)]
+    else:
+        descriptors = app.descriptors.all()
+    if connect_only:
+        connect_reports = await asyncio.gather(
+            *(
+                probe_connection(descriptor, timeout_s=_probe_timeout(descriptor, timeout_s))
+                for descriptor in descriptors
+            )
         )
-    payload = {
-        "adapters": statuses,
-        "depth": app.base_depth,
-        "max_depth": app.config.max_depth,
-        "max_targets": app.config.max_targets,
-        "max_concurrency": app.config.max_concurrency,
-        "default_safety_mode": app.config.default_safety_mode,
-    }
-    return tool_success(payload)
+        return tool_success({"agents": list(connect_reports)})
+    reports = await asyncio.gather(
+        *(probe_agent(descriptor, timeout_s=_probe_timeout(descriptor, timeout_s)) for descriptor in descriptors)
+    )
+    return tool_success({"agents": list(reports)})

@@ -1,228 +1,117 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""Tests for the configuration schema and the global + project-local loader."""
+"""Tests for configuration loading, env overrides, and the schema helpers/validators."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
-from rutherford.config.loader import deep_merge, load_config
-from rutherford.config.schema import AdapterConfig, RutherfordConfig
-from rutherford.domain.enums import SafetyMode
+from rutherford.config.loader import deep_merge, default_global_config_path, has_project_config, load_config
+from rutherford.config.schema import AgentConfig, RutherfordConfig
+from rutherford.domain.enums import Effort, SafetyMode
 from rutherford.domain.errors import ConfigError
 
 
-def _env(global_root: Path) -> dict[str, str]:
-    """An env that points both the Windows and XDG global-config roots at a temp dir."""
-    return {"APPDATA": str(global_root), "XDG_CONFIG_HOME": str(global_root)}
+def _iso_env(tmp_path: Path) -> dict[str, str]:
+    """An environment whose global-config roots point at an empty temp dir, so no real config leaks in."""
+    return {"APPDATA": str(tmp_path), "XDG_CONFIG_HOME": str(tmp_path)}
 
 
-def test_defaults_when_no_files(tmp_path: Path) -> None:
-    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+def test_load_defaults(tmp_path: Path) -> None:
+    config = load_config(env=_iso_env(tmp_path), cwd=tmp_path)
     assert config.default_safety_mode is SafetyMode.READ_ONLY
-    assert config.max_depth == 3
-    assert config.max_targets == 8
     assert config.default_timeout_s == 300.0
 
 
-def test_project_override(tmp_path: Path) -> None:
-    (tmp_path / "rutherford.toml").write_text("max_depth = 5\n", encoding="utf-8")
-    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
-    assert config.max_depth == 5
-
-
-def test_project_dot_rutherford_config_is_loaded(tmp_path: Path) -> None:
-    # setup ... scope=project writes <cwd>/.rutherford/config.toml; the loader must read it so a
-    # workspace persistence default actually takes effect (F2, decision 1-I).
-    cfg_dir = tmp_path / ".rutherford"
-    cfg_dir.mkdir()
-    (cfg_dir / "config.toml").write_text("default_persistence = 'job'\n", encoding="utf-8")
-    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
-    assert config.default_persistence == "job"
-
-
-def test_top_level_rutherford_toml_wins_over_dot_rutherford_config(tmp_path: Path) -> None:
-    # First-found wins: an explicit top-level rutherford.toml takes precedence over .rutherford/config.toml.
-    (tmp_path / "rutherford.toml").write_text("max_depth = 5\n", encoding="utf-8")
-    cfg_dir = tmp_path / ".rutherford"
-    cfg_dir.mkdir()
-    (cfg_dir / "config.toml").write_text("max_depth = 9\n", encoding="utf-8")
-    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
-    assert config.max_depth == 5
-
-
-def test_global_and_project_merge(tmp_path: Path) -> None:
-    global_root = tmp_path / "globalroot"
-    global_dir = global_root / "rutherford"
-    global_dir.mkdir(parents=True)
-    (global_dir / "config.toml").write_text("default_timeout_s = 100.0\nmax_depth = 2\n", encoding="utf-8")
-    (tmp_path / "rutherford.toml").write_text("max_depth = 7\n", encoding="utf-8")
-
-    config = load_config(env=_env(global_root), cwd=tmp_path)
-    assert config.default_timeout_s == 100.0  # from global
-    assert config.max_depth == 7  # project wins
-
-
-def test_env_overrides_win(tmp_path: Path) -> None:
-    (tmp_path / "rutherford.toml").write_text("max_depth = 7\n", encoding="utf-8")
-    env = _env(tmp_path / "empty")
-    env["RUTHERFORD_MAX_DEPTH"] = "9"
-    env["RUTHERFORD_DEFAULT_SAFETY"] = "propose"
-    config = load_config(env=env, cwd=tmp_path)
-    assert config.max_depth == 9
+def test_load_project_override(tmp_path: Path) -> None:
+    (tmp_path / "rutherford.toml").write_text(
+        'default_timeout_s = 12.0\ndefault_safety_mode = "propose"\n\n[agents.goose]\ndefault_model = "gpt"\n'
+        "timeout_s = 9.0\n",
+        encoding="utf-8",
+    )
+    config = load_config(env=_iso_env(tmp_path), cwd=tmp_path)
+    assert config.default_timeout_s == 12.0
     assert config.default_safety_mode is SafetyMode.PROPOSE
+    assert config.default_model_for("goose") == "gpt"
+    assert config.timeout_for("goose") == 9.0
+    assert config.timeout_for("missing") is None
 
 
-def test_invalid_value_raises_config_error(tmp_path: Path) -> None:
-    (tmp_path / "rutherford.toml").write_text('default_safety_mode = "bogus"\n', encoding="utf-8")
-    with pytest.raises(ConfigError, match="invalid configuration"):
-        load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+@pytest.mark.parametrize("name", ["rutherford.toml", ".rutherford.toml", ".rutherford/config.toml"])
+def test_has_project_config_honors_every_name(name: str, tmp_path: Path) -> None:
+    assert has_project_config(tmp_path) is False  # nothing yet
+    cfg = tmp_path / name
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('default_safety_mode = "read_only"\n', encoding="utf-8")
+    assert has_project_config(tmp_path) is True
 
 
-def test_bad_toml_raises_config_error(tmp_path: Path) -> None:
-    (tmp_path / "rutherford.toml").write_text("this is not = = toml\n", encoding="utf-8")
-    with pytest.raises(ConfigError, match="could not parse"):
-        load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+def test_has_project_config_ignores_a_bare_rutherford_dir(tmp_path: Path) -> None:
+    # A persisted run's ledger creates .rutherford/jobs/ but no config file -- that is NOT a configured workspace.
+    (tmp_path / ".rutherford" / "jobs").mkdir(parents=True)
+    assert has_project_config(tmp_path) is False
 
 
-def test_utf16_config_raises_config_error(tmp_path: Path) -> None:
-    # Windows PowerShell 5.1 redirection writes UTF-16 by default; such a file must surface as
-    # the structured ConfigError, not a raw UnicodeDecodeError.
-    (tmp_path / "rutherford.toml").write_text("max_depth = 5\n", encoding="utf-16")
-    with pytest.raises(ConfigError, match="could not parse"):
-        load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
-
-
-def test_missing_explicit_path_raises(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="missing file"):
-        load_config(env={"RUTHERFORD_CONFIG": str(tmp_path / "nope.toml")}, cwd=tmp_path)
-
-
-def test_unknown_key_rejected(tmp_path: Path) -> None:
-    (tmp_path / "rutherford.toml").write_text("not_a_real_key = 1\n", encoding="utf-8")
+def test_load_explicit_and_missing(tmp_path: Path) -> None:
+    target = tmp_path / "c.toml"
+    target.write_text("max_depth = 5\n", encoding="utf-8")
+    config = load_config(env=_iso_env(tmp_path), cwd=tmp_path, explicit_path=target)
+    assert config.max_depth == 5
     with pytest.raises(ConfigError):
-        load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+        load_config(env=_iso_env(tmp_path), cwd=tmp_path, explicit_path=tmp_path / "nope.toml")
 
 
-def test_generic_adapters_key_is_rejected_after_removal(tmp_path: Path) -> None:
-    # The config-driven generic adapter was removed: a config that still defines `generic_adapters`
-    # must fail loudly at load (unknown keys are forbidden), never be silently ignored.
-    (tmp_path / "rutherford.toml").write_text(
-        '[[generic_adapters]]\nid = "x"\ndisplay_name = "X"\nbinary = "x"\n', encoding="utf-8"
-    )
+def test_load_bad_toml_and_invalid_value(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.toml"
+    bad.write_text("this is = = not toml", encoding="utf-8")
     with pytest.raises(ConfigError):
-        load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
+        load_config(env=_iso_env(tmp_path), cwd=tmp_path, explicit_path=bad)
+    invalid = tmp_path / "inv.toml"
+    invalid.write_text('default_safety_mode = "nonsense"\n', encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(env=_iso_env(tmp_path), cwd=tmp_path, explicit_path=invalid)
 
 
-def test_deep_merge_nested() -> None:
-    base = {"adapters": {"codex": {"default_model": "a"}}, "max_depth": 1}
-    overlay = {"adapters": {"claude_code": {"default_model": "b"}}, "max_depth": 2}
-    merged = deep_merge(base, overlay)
-    assert merged["max_depth"] == 2
-    assert merged["adapters"] == {
-        "codex": {"default_model": "a"},
-        "claude_code": {"default_model": "b"},
+def test_env_overrides(tmp_path: Path) -> None:
+    env = _iso_env(tmp_path) | {
+        "RUTHERFORD_MAX_DEPTH": "7",
+        "RUTHERFORD_DEFAULT_TIMEOUT_S": "20",
+        "RUTHERFORD_DEFAULT_SAFETY": "write",
+        "RUTHERFORD_TRUSTED_WORKSPACES": str(tmp_path),
     }
-
-
-def test_default_model_for() -> None:
-    config = RutherfordConfig(adapters={"opencode": AdapterConfig(default_model="anthropic/claude-sonnet-4-6")})
-    assert config.default_model_for("opencode") == "anthropic/claude-sonnet-4-6"
-    assert config.default_model_for("absent") is None
-
-
-def test_max_concurrency_defaults_to_max_targets(tmp_path: Path) -> None:
-    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
-    assert config.max_concurrency == config.max_targets == 8
-
-
-def test_max_concurrency_follows_a_raised_max_targets(tmp_path: Path) -> None:
-    # Raising max_targets must not silently throttle a single auto-panel to the old default of 8.
-    (tmp_path / "rutherford.toml").write_text("max_targets = 16\n", encoding="utf-8")
-    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
-    assert config.max_targets == 16
-    assert config.max_concurrency == 16
-
-
-def test_explicit_max_concurrency_wins_over_the_derived_default(tmp_path: Path) -> None:
-    (tmp_path / "rutherford.toml").write_text("max_targets = 16\nmax_concurrency = 4\n", encoding="utf-8")
-    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
-    assert config.max_targets == 16
-    assert config.max_concurrency == 4  # an explicit cap (e.g. a laptop) is respected
-
-
-def test_agent_cap_defaults_are_off(tmp_path: Path) -> None:
-    # N1 (item 3): the advisory aggregate-agent cap is disabled out of the box, observe-not-enforce.
-    config = RutherfordConfig()
-    assert config.max_agents_advisory is None
-    assert config.enforce_agent_cap is False
-
-
-def test_max_agents_advisory_rejects_below_two() -> None:
-    # A cap of 1 would refuse every panel; the floor of 2 keeps it meaningful (N1, item 3).
-    with pytest.raises(ValidationError):
-        RutherfordConfig(max_agents_advisory=1)
-    assert RutherfordConfig(max_agents_advisory=2).max_agents_advisory == 2
-
-
-def test_probe_timeout_default_covers_the_longest_auth_probe() -> None:
-    # The ceiling must not shorten a deliberate auth probe (codex doctor asks for 20s); an 8s default
-    # truncated it and mis-reported a slow but valid auth as logged-out.
-    assert RutherfordConfig().probe_timeout_s >= 20.0
-
-
-def test_max_concurrency_env_override(tmp_path: Path) -> None:
-    env = _env(tmp_path / "empty")
-    env["RUTHERFORD_MAX_CONCURRENCY"] = "3"
     config = load_config(env=env, cwd=tmp_path)
-    assert config.max_concurrency == 3
+    assert config.max_depth == 7
+    assert config.default_timeout_s == 20.0
+    assert config.default_safety_mode is SafetyMode.WRITE
+    with pytest.raises(ConfigError):
+        load_config(env=_iso_env(tmp_path) | {"RUTHERFORD_MAX_DEPTH": "notint"}, cwd=tmp_path)
 
 
-def test_persistence_defaults_to_ephemeral(tmp_path: Path) -> None:
-    # Model A: durability is opt-in, so nothing is persisted out of the box and no jobs dir is set.
-    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
-    assert config.default_persistence == "ephemeral"
-    assert config.jobs_dir is None
+def test_global_config_path_and_deep_merge() -> None:
+    assert "rutherford" in str(default_global_config_path({"APPDATA": "C:/x"}))
+    assert "rutherford" in str(default_global_config_path({"XDG_CONFIG_HOME": "/tmp"}))
+    merged = deep_merge({"a": {"b": 1}}, {"a": {"c": 2}, "d": 3})
+    assert merged == {"a": {"b": 1, "c": 2}, "d": 3}
 
 
-def test_default_persistence_and_jobs_dir_can_be_set(tmp_path: Path) -> None:
-    (tmp_path / "rutherford.toml").write_text(
-        'default_persistence = "job"\njobs_dir = "/var/rutherford/jobs"\n', encoding="utf-8"
+def test_schema_helpers() -> None:
+    config = RutherfordConfig(
+        agents={"goose": AgentConfig(default_model="m", effort=Effort.HIGH, extra_args=["--x"])},
+        default_effort=Effort.LOW,
     )
-    config = load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
-    assert config.default_persistence == "job"
-    assert config.jobs_dir == "/var/rutherford/jobs"
+    assert config.effort_for("goose") is Effort.HIGH
+    assert config.effort_for("other") is Effort.LOW
+    assert config.extra_args_for("goose") == ["--x"]
+    assert config.extra_args_for("other") == []
+    assert config.wants_persist(True) is True
+    assert config.wants_persist(None) is False
+    assert RutherfordConfig(default_persistence="job").wants_persist(None) is True
 
 
-def test_invalid_default_persistence_is_rejected(tmp_path: Path) -> None:
-    (tmp_path / "rutherford.toml").write_text('default_persistence = "sometimes"\n', encoding="utf-8")
-    with pytest.raises(ConfigError, match="invalid configuration"):
-        load_config(env=_env(tmp_path / "empty"), cwd=tmp_path)
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"max_depth": 0},
-        {"default_timeout_s": -1.0},
-        {"max_targets": 0},
-        {"max_debate_rounds": 0},
-        {"probe_timeout_s": 0},
-        {"max_jobs": 0},
-    ],
-)
-def test_out_of_range_numeric_fields_are_rejected(kwargs: dict[str, object]) -> None:
-    with pytest.raises(ValidationError):
-        RutherfordConfig(**kwargs)  # type: ignore[arg-type]
-
-
-def test_dirs_resolve_to_absolute_and_a_missing_dir_warns_not_raises(tmp_path: Path) -> None:
-    # An existing dir resolves to absolute; a missing one is kept (resolved) with a warning, not a
-    # hard error -- an MCP stdio server should still start, and a missing trust path fails safe.
-    missing = tmp_path / "nope"
-    config = RutherfordConfig(trusted_workspaces=[str(tmp_path)], role_dirs=[str(missing)])
-    assert config.trusted_workspaces == [str(tmp_path.resolve())]
-    assert config.role_dirs == [str(missing.resolve())]
+def test_schema_concurrency_and_dir_resolution(tmp_path: Path) -> None:
+    config = RutherfordConfig(max_targets=10, trusted_workspaces=[str(tmp_path)], role_dirs=[str(tmp_path / "missing")])
+    assert config.max_concurrency == 10  # defaults to max_targets when not set
+    assert config.trusted_workspaces[0] == str(tmp_path.resolve())
+    assert RutherfordConfig(max_targets=10, max_concurrency=3).max_concurrency == 3

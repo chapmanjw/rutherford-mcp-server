@@ -1,11 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""Background jobs: start, poll, result, with a TTL'd in-memory store.
+"""The in-memory background-job store: run long ACP work off the request path (item 9).
 
-Long tasks and parallel consensus can run in the background: a tool returns a job id immediately,
-and the caller polls ``job_status`` / ``job_result``. Jobs and their results live in memory with a
-TTL; nothing is persisted. The :class:`JobService` schedules the work as an asyncio task and
-updates the :class:`JobStore` as it progresses and completes.
+A sync tool awaits its service and returns the envelope; an async tool hands the same coroutine to this
+store, gets a ``job_id`` back immediately, and the work runs under an :func:`asyncio.create_task`. The
+store is the single owner of a job's lifecycle: it transitions ``pending`` -> ``running`` -> a terminal
+state, captures the encoded result envelope (or a structured error) so it can be served later, and never
+lets a background task crash the server -- any exception the work raises is folded into the job's error.
+
+In-memory and process-global: jobs do not survive a restart (durable, replayable runs are the separate F2
+:class:`~rutherford.domain.models.RunRecord` corpus). Two bounds keep the store from growing without
+limit -- a ``max_jobs`` cap (evict the oldest finished job to make room, else refuse with
+``TOO_MANY_JOBS``) and a ``job_ttl_s`` retention window (finished jobs older than the window are evicted
+on access). The coroutine a tool submits must produce the SAME encoded envelope its sync path returns, so
+async and sync results are byte-for-byte identical.
 """
 
 from __future__ import annotations
@@ -14,256 +22,233 @@ import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 
 from ..domain.enums import JobStatus
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
-from ..domain.models import (
-    ActivityEvent,
-    ConsensusResult,
-    DebateResult,
-    DelegationResult,
-    ErrorInfo,
-    Job,
-    StrategyResult,
-)
-from ..runtime.logging import log_event
+from ..domain.models import ActivityEvent
+from .delegation import ActivityCallback
 
-#: A job body: given a string-progress callback, a structured activity callback, and an interim-result sink,
-#: produces a delegation, consensus, debate, or strategy result. The activity callback (N1, item 3, decision
-#: 3-K) carries the structured :class:`ActivityEvent` stream into the job's poll buffer; the interim sink
-#: (F8a, 2-M ``on_budget=continue``) lets a long body publish a best-effort result while it keeps running --
-#: so a poller sees the harvested-so-far set before the stragglers finish; a body with no interim never calls it.
-JobResult = DelegationResult | ConsensusResult | DebateResult | StrategyResult
-JobBody = Callable[
-    [Callable[[str], None], Callable[[ActivityEvent], None], Callable[[JobResult], None]],
-    Awaitable[JobResult],
-]
+#: A factory that builds the coroutine to run, given the job's live-activity sink (N1, item 3). A factory
+#: (not a bare coroutine) so the coroutine is created inside the background task, never awaited on the
+#: caller's path; it is handed the per-job ``on_activity`` sink so a panel's structured stream lands in this
+#: job's :class:`JobRecord.activity` buffer (the per-voice ``activity`` poll table).
+CoroFactory = Callable[[ActivityCallback], Awaitable[str]]
 
-#: Job states past which nothing more happens: eligible for TTL eviction and not cancellable.
-_TERMINAL_STATUSES = frozenset({JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED})
+#: The wall-clock source, injectable for tests (default :func:`time.time`).
+Clock = Callable[[], float]
+
+#: The job statuses that are finished (terminal): eligible for TTL eviction and cap-eviction.
+_TERMINAL: frozenset[JobStatus] = frozenset({JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED})
 
 #: Cap the per-job structured activity buffer so a long debate cannot grow it without bound; the activity
-#: tool only needs the latest per-voice state, comfortably within this recent-window cap.
+#: tool only needs the latest per-voice state, comfortably within this recent-window cap (N1, item 3, 3-K).
 _MAX_ACTIVITY_EVENTS = 500
 
 
+@dataclass(slots=True)
+class JobError:
+    """The error a failed job carries: a stable code plus a human message."""
+
+    code: ErrorCode
+    message: str
+
+
+@dataclass(slots=True)
+class JobRecord:
+    """One background job's mutable state, owned entirely by the :class:`JobStore`.
+
+    ``result`` holds the encoded envelope STRING (the same payload the sync tool returns) once the job
+    succeeds, so a later ``job_result`` serves it verbatim; ``error`` carries the structured failure when
+    it fails. ``summary`` is a short, cheap one-line label (tool + a target/prompt snippet) so a listing
+    is readable without the heavy result. Timestamps are wall-clock seconds from the store's clock.
+    """
+
+    job_id: str
+    tool: str
+    summary: str
+    status: JobStatus = JobStatus.PENDING
+    created_at: float = 0.0
+    started_at: float | None = None
+    finished_at: float | None = None
+    result: str | None = None
+    error: JobError | None = None
+    #: The structured live-activity buffer (N1, item 3, decision 3-K): the same :class:`ActivityEvent`
+    #: stream the sync path pushes, captured here so the ``activity`` tool can render the per-voice in-flight
+    #: table (cli/model/role/status/observed/budget). Bounded to a recent window so a long run cannot grow it.
+    activity: list[ActivityEvent] = field(default_factory=list)
+    #: The running asyncio task, so the store can cancel it. Never serialized.
+    task: asyncio.Task[None] | None = field(default=None, repr=False)
+
+    @property
+    def is_finished(self) -> bool:
+        """Whether the job has reached a terminal state (succeeded / failed / cancelled)."""
+        return self.status in _TERMINAL
+
+
 class JobStore:
-    """An in-memory job store with a time-to-live for terminal jobs and a creation cap."""
+    """An async-safe, in-memory store of background jobs (item 9).
 
-    def __init__(
-        self,
-        ttl_s: float = 3600.0,
-        max_jobs: int = 100,
-        clock: Callable[[], float] = time.time,
-    ) -> None:
-        self._jobs: dict[str, Job] = {}
-        self._ttl_s = ttl_s
+    One per :class:`~rutherford.context.AppContext`, built from config (``max_jobs`` / ``job_ttl_s``).
+    All mutation goes through an :class:`asyncio.Lock`, so concurrent submits and the background tasks'
+    own status transitions never race on the dict.
+    """
+
+    def __init__(self, *, max_jobs: int = 100, job_ttl_s: float = 3600.0, clock: Clock = time.time) -> None:
         self._max_jobs = max_jobs
+        self._job_ttl_s = job_ttl_s
         self._clock = clock
+        self._jobs: dict[str, JobRecord] = {}
+        self._lock = asyncio.Lock()
 
-    def create(self, kind: str) -> Job:
-        """Create and store a new pending job, enforcing the ``max_jobs`` cap.
+    async def submit(self, tool: str, coro_factory: CoroFactory, *, summary: str = "") -> str:
+        """Create a job for ``tool``, schedule ``coro_factory`` to run in the background, and return its id.
 
-        Expired terminal jobs are evicted first, so a finished-but-not-yet-evicted job frees a slot
-        before the cap bites. A genuinely full store raises ``TOO_MANY_JOBS`` rather than growing
-        unbounded.
+        Returns immediately -- the work runs under an :func:`asyncio.create_task`. Evicts expired and (if
+        at the cap) the oldest finished job first; raises ``TOO_MANY_JOBS`` when the cap is full of jobs
+        that are still running. The background task captures any exception into the job's error, so a
+        failing coroutine can never crash the server.
         """
-        self._evict_expired()
-        if len(self._jobs) >= self._max_jobs:
-            raise RutherfordError(
-                ErrorCode.TOO_MANY_JOBS,
-                f"too many background jobs (cap {self._max_jobs}); wait for some to finish, cancel one, "
-                "or raise max_jobs",
-            )
-        now = self._clock()
-        job = Job(id=uuid.uuid4().hex, kind=kind, status=JobStatus.PENDING, created_at=now, updated_at=now)
-        self._jobs[job.id] = job
-        return job
+        async with self._lock:
+            self._evict_expired_locked()
+            self._make_room_locked()
+            job_id = uuid.uuid4().hex[:12]
+            now = self._clock()
+            record = JobRecord(job_id=job_id, tool=tool, summary=summary or tool, created_at=now)
+            self._jobs[job_id] = record
+            record.task = asyncio.create_task(self._run(record, coro_factory))
+        return job_id
 
-    def list_jobs(self) -> list[Job]:
-        """Return all live jobs (expired terminal ones evicted), newest first."""
-        self._evict_expired()
-        return sorted(self._jobs.values(), key=lambda job: job.created_at, reverse=True)
+    def now(self) -> float:
+        """The store's current wall-clock time, from its (injectable) clock.
 
-    def cancel(self, job_id: str) -> Job:
-        """Mark a non-terminal job ``CANCELLED`` and return it; a terminal job is returned unchanged.
-
-        Raises ``JOB_NOT_FOUND`` for an unknown id. The actual asyncio task cancellation (and the CLI
-        process-tree kill) is driven by :class:`JobService`.
+        Exposed so a reader computing a live elapsed -- the ``activity`` snapshot -- measures against the
+        same clock that stamped ``started_at`` / ``created_at``, rather than a second, possibly-skewed one.
         """
-        job = self.get(job_id)
-        if job.status not in _TERMINAL_STATUSES:
-            job.status = JobStatus.CANCELLED
-            job.updated_at = self._clock()
-        return job
+        return self._clock()
 
-    def get(self, job_id: str) -> Job:
-        """Return the job, evicting expired completed jobs first, or raise if unknown."""
-        self._evict_expired()
-        try:
-            return self._jobs[job_id]
-        except KeyError:
-            raise RutherfordError(ErrorCode.JOB_NOT_FOUND, f"unknown job id {job_id!r}") from None
-
-    def mark_running(self, job_id: str) -> None:
-        self._touch(job_id, JobStatus.RUNNING)
-
-    def append_progress(self, job_id: str, line: str) -> None:
-        job = self._jobs.get(job_id)
-        if job is not None:
-            job.progress.append(line)
-            job.updated_at = self._clock()
+    async def get(self, job_id: str) -> JobRecord:
+        """Return the job ``job_id``, evicting expired jobs first; raise ``JOB_NOT_FOUND`` if unknown."""
+        async with self._lock:
+            self._evict_expired_locked()
+            record = self._jobs.get(job_id)
+            if record is None:
+                raise RutherfordError(ErrorCode.JOB_NOT_FOUND, f"no job with id {job_id!r}")
+            return record
 
     def append_activity(self, job_id: str, event: ActivityEvent) -> None:
         """Buffer a structured :class:`ActivityEvent` on the job (N1, item 3, the poll sink of decision 3-K).
 
-        Kept to a bounded recent window so a long run cannot grow it without limit; the activity tool reads
-        only the latest per-voice state from it.
+        Kept to a bounded recent window so a long run cannot grow it without limit; the ``activity`` tool reads
+        only the latest per-voice state from it. Lock-free by design -- a list ``append`` and a bounded trim
+        are atomic enough for a single event-loop writer, and taking the store lock per event would serialize
+        every voice's emission against the store's own bookkeeping. A no-op for an unknown id.
         """
-        job = self._jobs.get(job_id)
-        if job is not None:
-            job.activity.append(event)
-            if len(job.activity) > _MAX_ACTIVITY_EVENTS:
-                del job.activity[: len(job.activity) - _MAX_ACTIVITY_EVENTS]
-            job.updated_at = self._clock()
+        record = self._jobs.get(job_id)
+        if record is None:
+            return
+        record.activity.append(event)
+        if len(record.activity) > _MAX_ACTIVITY_EVENTS:
+            del record.activity[: len(record.activity) - _MAX_ACTIVITY_EVENTS]
 
-    def set_interim_result(self, job_id: str, result: JobResult) -> None:
-        """Publish a best-effort interim result for a still-running job (F8a, 2-M ``on_budget=continue``).
+    async def list(self) -> list[JobRecord]:
+        """Return every retained job, newest first, evicting expired jobs first."""
+        async with self._lock:
+            self._evict_expired_locked()
+            return sorted(self._jobs.values(), key=lambda record: record.created_at, reverse=True)
 
-        Sets ``result`` while the job stays ``RUNNING`` (status unchanged), so ``job_result`` can return the
-        harvested-so-far set before the body finishes the stragglers. A no-op once the job is terminal, so a
-        late interim cannot resurrect a cancelled/finished job. The final :meth:`complete` overwrites it.
+    async def cancel(self, job_id: str) -> JobRecord:
+        """Cancel job ``job_id``: cancel its task and mark it ``cancelled``; raise ``JOB_NOT_FOUND`` if unknown.
+
+        A finished job is returned unchanged (cancelling a completed job is a no-op, not an error). The
+        terminal ``cancelled`` status is written by the background task's cancellation handler when the
+        task was still in flight, so a just-cancelled record may still read ``running`` until the task
+        unwinds; the status is forced here so the caller sees ``cancelled`` synchronously.
         """
-        job = self._jobs.get(job_id)
-        if job is not None and job.status not in _TERMINAL_STATUSES:
-            job.result = result
-            job.updated_at = self._clock()
+        async with self._lock:
+            self._evict_expired_locked()
+            record = self._jobs.get(job_id)
+            if record is None:
+                raise RutherfordError(ErrorCode.JOB_NOT_FOUND, f"no job with id {job_id!r}")
+            if record.is_finished:
+                return record
+            if record.task is not None:
+                record.task.cancel()
+            record.status = JobStatus.CANCELLED
+            record.finished_at = self._clock()
+            return record
 
-    def complete(self, job_id: str, result: JobResult) -> None:
-        """Record a finished job. The job succeeded even if its delegation result is ``ok=false``.
+    async def _run(self, record: JobRecord, coro_factory: CoroFactory) -> None:
+        """Run one job's coroutine to completion, recording its result or error. Never raises out.
 
-        A no-op if the job is already terminal -- e.g. it was cancelled while its body ran (and the
-        body swallowed the cancellation and returned), so a late ``complete`` cannot flip CANCELLED
-        back to SUCCEEDED.
+        Transitions ``pending`` -> ``running``, awaits the factory's coroutine, and stores the encoded
+        envelope on success. A :class:`RutherfordError` becomes a structured job error; any other
+        exception becomes an ``INTERNAL`` job error -- the background task swallows everything so an
+        exception can never escape onto the event loop and bring the server down. A cancellation
+        (from :meth:`cancel`) is left as the ``cancelled`` status the canceller already set.
         """
-        job = self._jobs.get(job_id)
-        if job is not None and job.status not in _TERMINAL_STATUSES:
-            job.result = result
-            job.status = JobStatus.SUCCEEDED
-            job.updated_at = self._clock()
+        async with self._lock:
+            record.status = JobStatus.RUNNING
+            record.started_at = self._clock()
 
-    def fail(self, job_id: str, error: ErrorInfo) -> None:
-        """Record that the job itself errored (an exception, not a delegation failure).
+        def on_activity(event: ActivityEvent) -> None:
+            # N1 (decision 3-K): the structured stream feeds THIS job's poll buffer, so the ``activity`` tool
+            # can read the per-voice in-flight table while the job runs.
+            self.append_activity(record.job_id, event)
 
-        A no-op if the job is already terminal (e.g. cancelled), so a late failure cannot overwrite it.
-        """
-        job = self._jobs.get(job_id)
-        if job is not None and job.status not in _TERMINAL_STATUSES:
-            job.error = error
-            job.status = JobStatus.FAILED
-            job.updated_at = self._clock()
+        try:
+            result = await coro_factory(on_activity)
+        except asyncio.CancelledError:
+            async with self._lock:
+                record.status = JobStatus.CANCELLED
+                if record.finished_at is None:
+                    record.finished_at = self._clock()
+            raise
+        except RutherfordError as exc:
+            await self._finish_error(record, JobError(code=exc.code, message=exc.message))
+        except Exception as exc:  # a background task must never crash the server -- capture everything
+            await self._finish_error(record, JobError(code=ErrorCode.INTERNAL, message=str(exc) or "internal error"))
+        else:
+            async with self._lock:
+                record.status = JobStatus.SUCCEEDED
+                record.result = result
+                record.finished_at = self._clock()
 
-    def _touch(self, job_id: str, status: JobStatus) -> None:
-        job = self._jobs.get(job_id)
-        if job is not None and job.status not in _TERMINAL_STATUSES:
-            job.status = status
-            job.updated_at = self._clock()
+    async def _finish_error(self, record: JobRecord, error: JobError) -> None:
+        """Mark ``record`` failed with ``error`` under the lock."""
+        async with self._lock:
+            record.status = JobStatus.FAILED
+            record.error = error
+            record.finished_at = self._clock()
 
-    def _evict_expired(self) -> None:
-        now = self._clock()
+    def _evict_expired_locked(self) -> None:
+        """Drop finished jobs older than ``job_ttl_s``. The caller must hold the lock."""
+        cutoff = self._clock() - self._job_ttl_s
         expired = [
             job_id
-            for job_id, job in self._jobs.items()
-            if job.status in _TERMINAL_STATUSES and now - job.updated_at > self._ttl_s
+            for job_id, record in self._jobs.items()
+            if record.is_finished and (record.finished_at or record.created_at) < cutoff
         ]
         for job_id in expired:
             del self._jobs[job_id]
 
+    def _make_room_locked(self) -> None:
+        """Ensure there is room for one more job: evict the oldest finished, else raise ``TOO_MANY_JOBS``.
 
-class JobService:
-    """Schedules job bodies as asyncio tasks and tracks them in a :class:`JobStore`."""
-
-    def __init__(self, store: JobStore | None = None) -> None:
-        self._store = store or JobStore()
-        #: Live tasks keyed by job id, so ``cancel`` can find and cancel the right one.
-        self._tasks: dict[str, asyncio.Task[None]] = {}
-
-    @property
-    def store(self) -> JobStore:
-        return self._store
-
-    def submit(self, kind: str, body: JobBody) -> Job:
-        """Create a job and schedule ``body`` to run in the background. Returns the new job.
-
-        ``create`` enforces the ``max_jobs`` cap before anything is scheduled, so a full store raises
-        ``TOO_MANY_JOBS`` instead of launching an unbounded task.
+        The caller must hold the lock. Eviction is oldest-finished-first (by ``created_at``); when the
+        store is full of jobs that are all still running, there is nothing safe to drop, so the new
+        submission is refused.
         """
-        job = self._store.create(kind)
-        task = asyncio.create_task(self._run(job.id, body))
-        self._tasks[job.id] = task
-        task.add_done_callback(self._on_task_done)
-        log_event("job_submitted", job_id=job.id, kind=kind)
-        return job
-
-    def _on_task_done(self, task: asyncio.Task[None]) -> None:
-        """Drop a finished task from the live-task map (registered as the task's done callback)."""
-        for job_id, tracked in list(self._tasks.items()):
-            if tracked is task:
-                del self._tasks[job_id]
-                return
-
-    async def _run(self, job_id: str, body: JobBody) -> None:
-        self._store.mark_running(job_id)
-
-        def on_activity(event: ActivityEvent) -> None:
-            # One stream, two sinks (decision 3-K): buffer the structured event for the activity table AND
-            # project its human message into job.progress for the existing string poll (job_status).
-            self._store.append_activity(job_id, event)
-            if event.message:
-                self._store.append_progress(job_id, event.message)
-
-        try:
-            result = await body(
-                lambda line: self._store.append_progress(job_id, line),
-                on_activity,
-                lambda interim: self._store.set_interim_result(job_id, interim),
+        if len(self._jobs) < self._max_jobs:
+            return
+        finished = sorted(
+            (record for record in self._jobs.values() if record.is_finished),
+            key=lambda record: record.created_at,
+        )
+        if not finished:
+            raise RutherfordError(
+                ErrorCode.TOO_MANY_JOBS,
+                f"the background-job cap of {self._max_jobs} is reached and every job is still running",
             )
-            self._store.complete(job_id, result)
-            log_event("job_finished", job_id=job_id, status=JobStatus.SUCCEEDED.value)
-        except asyncio.CancelledError:
-            # Cancellation (via cancel()) records CANCELLED, not FAILED; re-raise so the task ends
-            # cancelled. The underlying AsyncProcessRunner already killed the CLI process tree.
-            self._store.cancel(job_id)
-            raise
-        except RutherfordError as exc:
-            # A typed failure keeps its code and details (the sync tool path already preserves them);
-            # flattening it to INTERNAL would hide e.g. INVALID_INPUT from job_result.
-            self._store.fail(job_id, ErrorInfo(code=exc.code, message=exc.message, details=exc.details))
-            log_event("job_finished", job_id=job_id, status=JobStatus.FAILED.value, error_type=type(exc).__name__)
-        except Exception as exc:  # a crashing job body becomes a failed job, not a server crash
-            self._store.fail(job_id, ErrorInfo(code=ErrorCode.INTERNAL, message=str(exc)))
-            # Log only the exception TYPE, not str(exc): a crashing body's message could carry prompt
-            # or file content. The full message is still on the job's result for job_result to return.
-            log_event("job_finished", job_id=job_id, status=JobStatus.FAILED.value, error_type=type(exc).__name__)
-
-    def cancel(self, job_id: str) -> Job:
-        """Cancel a running/pending job, killing its CLI process tree; return the updated job.
-
-        Marks the store entry ``CANCELLED`` (raising ``JOB_NOT_FOUND`` for an unknown id) and cancels
-        the asyncio task; a job already in a terminal state is returned unchanged.
-        """
-        job = self._store.cancel(job_id)
-        task = self._tasks.get(job_id)
-        if task is not None and not task.done():
-            task.cancel()
-        log_event("job_cancelled", job_id=job_id, status=job.status.value)
-        return job
-
-    def list_jobs(self) -> list[Job]:
-        """Return all live jobs, newest first."""
-        return self._store.list_jobs()
-
-    def get(self, job_id: str) -> Job:
-        """Return the current state of a job, or raise if unknown/expired."""
-        return self._store.get(job_id)
+        del self._jobs[finished[0].job_id]

@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""Tests for the durable run ledger writer (F2): state.toon + Markdown artifacts."""
+"""Tests for the durable run ledger writer + reader (F2): state.json + Markdown artifacts."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from rutherford.domain.models import RunRecord
-from rutherford.io.ledger import RunLedger
-from rutherford.io.serialize import decode, encode
+from rutherford.io.ledger import RECORD_FILENAME, RunLedger, read_record
 
 
 def _record(**kwargs: object) -> RunRecord:
@@ -19,33 +16,17 @@ def _record(**kwargs: object) -> RunRecord:
     return RunRecord(**base)  # type: ignore[arg-type]
 
 
-def test_write_live_voices_writes_a_live_file_per_nonempty_voice(tmp_path: Path) -> None:
-    # F8a 2-G: the incremental tee writes each voice's accumulated stdout to voices/voice-N.live.md while
-    # the panel runs. An empty voice (nothing streamed yet) leaves no file; a rewrite is idempotent.
-    ledger = RunLedger(tmp_path / "jobs")
-    ledger.write_live_voices("p1", ["voice one so far", "", "voice three so far"])
-    voices = tmp_path / "jobs" / "p1" / "artifacts" / "voices"
-    assert (voices / "voice-1.live.md").read_text(encoding="utf-8") == "voice one so far"
-    assert not (voices / "voice-2.live.md").exists()  # empty voice -> no file
-    assert (voices / "voice-3.live.md").read_text(encoding="utf-8") == "voice three so far"
-    # A later snapshot overwrites with the fuller accumulation (idempotent, crash-safe).
-    ledger.write_live_voices("p1", ["voice one so far, and more", "", "voice three so far"])
-    assert (voices / "voice-1.live.md").read_text(encoding="utf-8") == "voice one so far, and more"
-
-
 def test_write_creates_state_and_answer(tmp_path: Path) -> None:
     ledger = RunLedger(tmp_path / "jobs")
-    run_dir = ledger.write(_record(argv=["fake", "run", "gemma3:12b"]), answer="hello world")
+    run_dir = ledger.write(_record(argv=["goose", "acp"], prompt="hello?"), answer="hello world")
     assert run_dir == tmp_path / "jobs" / "abc123"
-    assert (run_dir / "state.toon").is_file()
+    assert (run_dir / RECORD_FILENAME).is_file()
     assert (run_dir / "artifacts" / "answer.md").read_text(encoding="utf-8") == "hello world"
-    # state.toon is the human/LLM-readable record; assert its content as text, not via decode() --
-    # python-toon 0.1.3 cannot round-trip an inline array with a quoted element (see RunLedger).
-    state = (run_dir / "state.toon").read_text(encoding="utf-8")
-    assert "run_id: abc123" in state
-    assert "kind: delegate" in state
-    assert "schema_version: 1" in state
-    assert "gemma3:12b" in state  # the pinned argv element survives the write verbatim
+    record = read_record(run_dir)  # the record round-trips through the reader the way continuation will read it
+    assert record.run_id == "abc123" and record.kind == "delegate" and record.schema_version == 2
+    assert record.argv == ["goose", "acp"]
+    # env is NEVER persisted -- it can carry API keys; the record has no env field, so it is absent from disk.
+    assert "env" not in (run_dir / RECORD_FILENAME).read_text(encoding="utf-8")
 
 
 def test_empty_answer_writes_a_placeholder(tmp_path: Path) -> None:
@@ -68,19 +49,63 @@ def test_no_diff_artifact_when_absent_or_blank(tmp_path: Path) -> None:
     assert not (run_dir / "artifacts" / "diff.md").exists()
 
 
+def test_extra_artifacts_create_nested_files(tmp_path: Path) -> None:
+    ledger = RunLedger(tmp_path / "jobs")
+    run_dir = ledger.write(
+        _record(),
+        answer="x",
+        extra_artifacts={"voices/voice-1.md": "# fake\n\n42", "voices/skipped.md": "# Skipped\n\n- dead: down"},
+    )
+    assert (run_dir / "artifacts" / "voices" / "voice-1.md").read_text(encoding="utf-8") == "# fake\n\n42"
+    assert "down" in (run_dir / "artifacts" / "voices" / "skipped.md").read_text(encoding="utf-8")
+
+
+def test_blank_extra_artifact_writes_a_placeholder(tmp_path: Path) -> None:
+    ledger = RunLedger(tmp_path / "jobs")
+    run_dir = ledger.write(_record(), answer="x", extra_artifacts={"voices/voice-1.md": "   "})
+    assert (run_dir / "artifacts" / "voices" / "voice-1.md").read_text(encoding="utf-8") == "(empty)"
+
+
 def test_root_property_exposes_the_jobs_dir(tmp_path: Path) -> None:
     ledger = RunLedger(tmp_path / "jobs")
     assert ledger.root == tmp_path / "jobs"
 
 
-@pytest.mark.xfail(
-    reason="python-toon 0.1.3 cannot round-trip an inline array with quoted elements; the F2 "
-    "reader-side roadmap (job continuation) must fix the codec or add a tolerant reader",
-    strict=True,
-)
-def test_state_record_round_trips_a_colon_bearing_argv() -> None:
-    # Tracks the documented limitation: a real argv has colon-bearing elements (e.g. gemma3:12b) that
-    # get quoted on encode and currently break decode. strict=True, so a future python-toon fix flips
-    # this to a loud xpass and signals that the machine reader can be enabled.
-    record = RunRecord(run_id="x", kind="delegate", cli="ollama", argv=["ollama", "run", "gemma3:12b"])
-    assert decode(encode(record)) is not None
+def test_remove_drops_a_child_but_refuses_to_escape(tmp_path: Path) -> None:
+    # remove deletes one run's own directory (the failed-resume probe cleanup, item 9); a malformed id that
+    # could reach the root or its parent (``..`` / a separator) is a no-op, so a delete can never escape.
+    ledger = RunLedger(tmp_path / "jobs")
+    run_dir = ledger.write(_record(), answer="x")
+    assert run_dir.exists()
+    ledger.remove("abc123")
+    assert not run_dir.exists()  # the child was removed
+    sentinel = tmp_path / "sentinel"  # a sibling of the jobs root: a ``..`` escape must NOT touch it
+    sentinel.mkdir()
+    for bad in ("..", ".", "", "../sentinel", "a/b"):
+        ledger.remove(bad)
+    assert sentinel.exists() and (tmp_path / "jobs").exists()  # nothing outside a direct child was deleted
+
+
+def test_state_record_round_trips_clean_inputs(tmp_path: Path) -> None:
+    # The replay-complete inputs round-trip through the reader: argv (the launch command), prompt, model, cwd.
+    # env is absent. This is what continuation recomposes a run from.
+    ledger = RunLedger(tmp_path / "jobs")
+    run_dir = ledger.write(
+        _record(argv=["goose", "acp"], prompt="what is 17 + 25?", model="m", cwd="/work"), answer="x"
+    )
+    record = read_record(run_dir)
+    assert record.argv == ["goose", "acp"]
+    assert record.prompt == "what is 17 + 25?"
+    assert record.model == "m"
+    assert record.cwd == "/work"
+
+
+def test_state_record_round_trips_a_colon_bearing_argv(tmp_path: Path) -> None:
+    # The case the TOON codec could not round-trip (a colon-bearing argv element: a Windows path, an
+    # ``ollama run gemma3:12b``). state.json is JSON -- an internal record no LLM consumes -- so it round-trips
+    # losslessly, which is what unblocks the F2 reader side (job continuation).
+    ledger = RunLedger(tmp_path / "jobs")
+    run_dir = ledger.write(
+        RunRecord(run_id="x", kind="delegate", cli="ollama", argv=["ollama", "run", "gemma3:12b"]), answer="x"
+    )
+    assert read_record(run_dir).argv == ["ollama", "run", "gemma3:12b"]

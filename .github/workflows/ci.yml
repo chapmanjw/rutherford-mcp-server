@@ -55,7 +55,7 @@ jobs:
         run: uv run pytest
 
       # The aggregate floor can hide a near-zero module behind a well-covered core; this one
-      # catches a new dead zone in the operational-risk trees (adapters/services/runtime).
+      # catches a new dead zone anywhere under src/rutherford (every source file is checked per-file).
       - name: Per-file coverage floor
         run: uv run python scripts/check_per_file_coverage.py
 

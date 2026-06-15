@@ -1,8 +1,0 @@
-{"type":"session","version":3,"id":"019ec2e3-3d86-76e7-8991-03662beab98f","timestamp":"2026-06-13T21:28:52.870Z","cwd":"/tmp/work"}
-{"type":"agent_start"}
-{"type":"turn_start"}
-{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"What is the capital of France?"}]}}
-{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"What is the capital of France?"}]}}
-{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Simple question."},{"type":"text","text":"The capital of France is Paris."}],"provider":"huggingface","model":"moonshotai/Kimi-K2.6","usage":{"input":883,"output":34,"cacheRead":148,"cacheWrite":0,"totalTokens":1065,"cost":{"input":0.00083885,"output":0.000136,"cacheRead":0.00002368,"cacheWrite":0,"total":0.00099853}}}}
-{"type":"turn_end"}
-{"type":"agent_end"}

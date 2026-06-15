@@ -17,31 +17,76 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ..domain.enums import Effort, SafetyMode
+from ..domain.enums import Effort, SafetyMode, Strategy
 from ..domain.models import OnBudget
 
 _log = logging.getLogger(__name__)
 
 
-class AdapterConfig(BaseModel):
-    """Per-adapter overrides applied to a built-in adapter."""
+class AgentConfig(BaseModel):
+    """Per-agent configuration: override a built-in agent, or define a brand-new ACP agent.
+
+    Under ACP an agent is just how to launch it as an ACP server plus a few quirks -- there is no
+    hand-written per-CLI parser -- so an agent can be declared entirely in config. An id that matches a
+    built-in agent overrides its fields (or removes it with ``enabled = false``); an id that does NOT
+    match a built-in defines a new agent and must supply ``command``. The launch fields mirror the
+    Zed/Cline ``acp.json`` shape, so an imported ``agent_servers`` block lands here directly.
+    """
 
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     enabled: bool = True
+    #: The launch argv for this agent's ACP server (e.g. ``["codex-acp"]`` or ``["node", "./agent.js"]``).
+    #: Required to DEFINE a new agent; for a built-in agent it replaces the default launch command.
+    command: list[str] | None = None
+    #: Environment variables SET for the agent subprocess, layered on top of the inherited environment
+    #: (so the agent's own credential discovery still works). Populated from an acp.json ``env`` block.
+    env: dict[str, str] = Field(default_factory=dict)
+    #: The fixed model vendor when known (e.g. ``"openai"``), recorded as provenance; ``None`` keeps the
+    #: built-in value (or stays unknown for a new agent).
+    provider: str | None = None
     default_model: str | None = None
-    #: Per-adapter run timeout in seconds. Overrides the global ``default_timeout_s`` for this
-    #: adapter when a call names no ``timeout_s``; ``None`` falls back to the global default. Useful
-    #: for a slow local model (e.g. Ollama on a CPU, or LM Studio's JIT model load) whose cold load
-    #: can exceed the global budget.
+    #: Seconds for the initialize + new_session handshake before it is judged failed; ``None`` keeps the
+    #: built-in value (or the 30s default for a new agent). Raise it for a heavyweight agent.
+    handshake_timeout_s: float | None = Field(default=None, gt=0)
+    #: Per-agent run timeout in seconds. Overrides the global ``default_timeout_s`` for this agent when a
+    #: call names no ``timeout_s``; ``None`` falls back to the global default.
     timeout_s: float | None = Field(default=None, gt=0)
-    #: Extra command-line arguments appended verbatim to the adapter's invocation. Honored by the
-    #: local-model adapters -- Ollama (e.g. ``["--keepalive", "30s"]``) and LM Studio (e.g.
-    #: ``["--ttl", "3600"]``).
+    #: Extra arguments appended to the launch argv (after ``command``). Lets a built-in agent gain a flag
+    #: without restating its whole command.
     extra_args: list[str] = Field(default_factory=list)
-    #: Per-adapter default reasoning-effort tier (F8a). Used when a call names no ``effort``; ``None``
-    #: falls back to the global ``default_effort``. A no-op for an adapter with no effort knob.
+    #: Per-agent default reasoning-effort tier (F8a). Used when a call names no ``effort``; ``None``
+    #: falls back to the global ``default_effort``. A no-op for an agent with no effort knob.
     effort: Effort | None = None
+    #: The model to retry with when the requested model is unavailable (F7 model fallback). ``None`` (the
+    #: default) means this agent exposes no fallback model, so a model-unavailable failure does not retry the
+    #: same agent on another model. Set it for an agent that can decline a named model and recover on a
+    #: known-good one (most ACP agents cannot, so this stays unset for them).
+    fallback_model: str | None = None
+    #: Reuse a BUILT-IN agent's launch command under this new id (e.g. ``base = "goose"``). The convenient
+    #: way to clone a built-in -- typically paired with ``backend`` to point it at a local model runtime,
+    #: or with ``default_model`` to pin a model. Mutually exclusive with ``command``.
+    base: str | None = None
+    #: Point this agent at a LOCAL model runtime: ``"ollama"`` or ``"lmstudio"``. Rutherford fills in the
+    #: right provider env for the ``base`` agent (only ``goose`` is supported as a base today), so a local
+    #: model becomes a first-class ACP voice. Requires ``model``; ``base`` defaults to the built-in matching
+    #: this id when unset. See ``host`` for a non-default endpoint.
+    backend: Literal["ollama", "lmstudio"] | None = None
+    #: The model id served by ``backend`` (e.g. ``"gemma3:12b"`` for Ollama, ``"openai/gpt-oss-120b"`` for
+    #: LM Studio). Required when ``backend`` is set; becomes the agent's default model.
+    model: str | None = None
+    #: The ``backend`` endpoint as ``host:port``; defaults to ``localhost:11434`` (Ollama) or
+    #: ``localhost:1234`` (LM Studio).
+    host: str | None = None
+
+    @model_validator(mode="after")
+    def _check_backend(self) -> AgentConfig:
+        """A local-backend agent needs a model; ``backend`` and a raw ``command`` are mutually exclusive."""
+        if self.backend is not None and not self.model:
+            raise ValueError("a local 'backend' agent requires 'model' (the model id the runtime serves)")
+        if self.command is not None and (self.base is not None or self.backend is not None):
+            raise ValueError("'command' cannot be combined with 'base'/'backend' (choose a raw command OR a base)")
+        return self
 
 
 class RutherfordConfig(BaseModel):
@@ -49,10 +94,16 @@ class RutherfordConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    #: Restrict the registry to these adapter ids; ``None`` enables every known adapter.
-    enabled_adapters: list[str] | None = None
-    #: Per-adapter overrides keyed by adapter id.
-    adapters: dict[str, AdapterConfig] = Field(default_factory=dict)
+    #: Restrict the registry to these agent ids; ``None`` enables every known + configured agent.
+    enabled_agents: list[str] | None = None
+    #: Agent definitions and overrides keyed by agent id (built-in overrides and new agents alike).
+    agents: dict[str, AgentConfig] = Field(default_factory=dict)
+    #: Zero-config local models: when ``True`` (the default), probe a running Ollama (``:11434``) and
+    #: LM Studio (``:1234``) at registry-build time and register each tool-capable model as a
+    #: ``goose``-based ACP agent automatically (id ``ollama-<model>`` / ``lmstudio-<model>``). A
+    #: built-in or explicit ``[agents.<id>]`` of the same id always wins; a backend that is down is
+    #: silently skipped and never breaks startup. Set ``False`` to require explicit local-agent config.
+    auto_detect_local_models: bool = True
     #: Default safety posture when a caller does not specify one.
     default_safety_mode: SafetyMode = SafetyMode.READ_ONLY
     #: Default per-run timeout in seconds.
@@ -82,6 +133,16 @@ class RutherfordConfig(BaseModel):
     enforce_agent_cap: bool = False
     #: Maximum number of rounds a single debate call may run (each round is a full panel pass).
     max_debate_rounds: int = Field(default=4, ge=1, le=10)
+    #: F5 (11-C): how many consecutive rounds a convergence-tracked debate's decision may hold UNCHANGED
+    #: (short of agreement) before it is declared STALLED and stopped early. Default 2.
+    debate_stall_tolerance: int = Field(default=2, ge=1)
+    #: F5 (11-C): the aggregation strategy used to read a convergence-tracked debate's per-round decision.
+    #: Default ``majority``; ``unanimous`` makes the convergence test the strictest.
+    debate_convergence_strategy: Strategy = Strategy.MAJORITY
+    #: F3 vote-math stretch (opt-in): workspace-wide default for discounting correlated votes by model-family
+    #: lineage in a consensus aggregation; the per-call ``discount_correlated`` is the usual opt-in. Off by
+    #: default -- the discount changes outcomes for correlated panels, so it is never on out of the box.
+    discount_correlated_votes: bool = False
     #: Minimum number of parseable voices (ok, with an extracted verdict) an aggregating consensus
     #: strategy needs before it will return a decision; below it the outcome is ``no_quorum``. Guards
     #: against certifying an outcome off one surviving voice when the rest failed.
@@ -92,12 +153,11 @@ class RutherfordConfig(BaseModel):
     #: its CLI count implied. Default 2 (two same-model or same-vendor voices flag); raise it to demand
     #: wider diversity.
     min_distinct: int = Field(default=2, ge=1)
-    #: Maximum CLI subprocess delegations Rutherford runs at once, across every panel (a global
-    #: semaphore in the delegation primitive). Decouples panel width from host process pressure: a
-    #: wide consensus or a multi-round debate cannot launch more than this many heavy agent
-    #: subprocesses simultaneously. When not set explicitly it defaults to ``max_targets`` (see the
-    #: validator below), so raising ``max_targets`` does not silently throttle a single auto-panel;
-    #: set it explicitly to pin a different cap (e.g. lower on a laptop). Read once at startup.
+    #: Ceiling on how many live ACP agent sessions Rutherford runs at once across a panel, to decouple panel
+    #: width from host pressure (N1 / reliability). Enforced by an :class:`asyncio.Semaphore` the delegation
+    #: primitive holds around each ACP turn and that the consensus budget-harvest and a debate's round turns
+    #: also acquire, so a wide panel cannot spawn more than this many agents at once on any path. Defaults to
+    #: ``max_targets`` (see the validator below).
     max_concurrency: int = Field(default=8, ge=1)
     #: Cooldown (F7): how many *unhealthy* failures (down / throttled / mis-launching -- not a bad
     #: prompt) an adapter may have within ``cooldown_window_s`` before it is benched for
@@ -113,6 +173,13 @@ class RutherfordConfig(BaseModel):
     trusted_workspaces: list[str] = Field(default_factory=list)
     #: Whether consensus synthesizes server-side by default (off by default per the spec).
     synthesize_default: bool = False
+    #: No-self-approval default (F4a, 4-A): when true, a consensus/debate refuses a synthesis/closing that
+    #: would be authored by a panel participant (name a non-participant judge). Off by default -- the per-call
+    #: ``require_independent_judge`` is the usual opt-in; this is the workspace-wide default for binding verdicts.
+    require_independent_judge: bool = False
+    #: Workspace-wide default for the RANK no-silent-dismissal surfacing (F4b, 7-G); the per-call
+    #: ``require_dissent`` is the usual opt-in. Off by default.
+    require_dissent: bool = False
     #: Opt-in: after a *successful* ``read_only`` or ``propose`` delegation whose working directory is
     #: a git repo, fingerprint the tree under ``working_dir`` before and after (status with
     #: ``--ignored=matching`` plus the unstaged and staged diffs, scoped to that subtree) and fail the
@@ -144,7 +211,7 @@ class RutherfordConfig(BaseModel):
     #: Whether a run is persisted to disk as a durable job by default (F2, Model A: durability is
     #: opt-in). ``ephemeral`` (the default) leaves nothing on disk unless a call passes
     #: ``persist=true``; ``job`` persists every run unless a call passes ``persist=false``. A persisted
-    #: run is written under :attr:`jobs_dir` as ``<run_id>/state.toon`` (TOON) plus Markdown artifacts.
+    #: run is written under :attr:`jobs_dir` as ``<run_id>/state.json`` (JSON) plus Markdown artifacts.
     default_persistence: Literal["ephemeral", "job"] = "ephemeral"
     #: Where durable jobs are written. ``None`` (the default) means ``<cwd>/.rutherford/jobs`` -- the
     #: workspace the server runs in -- so jobs live with the project, not the user's home. Set an
@@ -193,29 +260,29 @@ class RutherfordConfig(BaseModel):
         """
         return persist if persist is not None else (self.default_persistence == "job")
 
-    def default_model_for(self, adapter_id: str) -> str | None:
-        """Return the configured default model for ``adapter_id``, if any."""
-        entry = self.adapters.get(adapter_id)
+    def default_model_for(self, agent_id: str) -> str | None:
+        """Return the configured default model for ``agent_id``, if any."""
+        entry = self.agents.get(agent_id)
         return entry.default_model if entry is not None else None
 
-    def timeout_for(self, adapter_id: str) -> float | None:
-        """Return the configured per-adapter timeout (seconds) for ``adapter_id``, if any."""
-        entry = self.adapters.get(adapter_id)
+    def timeout_for(self, agent_id: str) -> float | None:
+        """Return the configured per-agent timeout (seconds) for ``agent_id``, if any."""
+        entry = self.agents.get(agent_id)
         return entry.timeout_s if entry is not None else None
 
-    def effort_for(self, adapter_id: str) -> Effort | None:
-        """Resolve the default reasoning-effort tier for ``adapter_id`` (F8a): per-adapter, else global.
+    def effort_for(self, agent_id: str) -> Effort | None:
+        """Resolve the default reasoning-effort tier for ``agent_id`` (F8a): per-agent, else global.
 
         Used when a call names no ``effort``; ``None`` means "let the CLI decide" (no effort flag).
         """
-        entry = self.adapters.get(adapter_id)
+        entry = self.agents.get(agent_id)
         if entry is not None and entry.effort is not None:
             return entry.effort
         return self.default_effort
 
-    def extra_args_for(self, adapter_id: str) -> list[str]:
-        """Return the configured extra CLI args for ``adapter_id`` (empty when none)."""
-        entry = self.adapters.get(adapter_id)
+    def extra_args_for(self, agent_id: str) -> list[str]:
+        """Return the configured extra CLI args for ``agent_id`` (empty when none)."""
+        entry = self.agents.get(agent_id)
         return list(entry.extra_args) if entry is not None else []
 
 

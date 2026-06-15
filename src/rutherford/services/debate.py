@@ -1,114 +1,118 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 John Chapman
-"""The debate service: several targets argue a question across multiple rounds.
+"""The debate service: several ACP agents argue a question across rounds, each on a persistent session.
 
-Where :class:`~rutherford.services.consensus.ConsensusService` asks each voice once in isolation,
-a debate runs in rounds. Round one collects every voice's independent answer; each later round
-shows a voice the other voices' latest positions and asks it to critique and revise its own. Every
-turn is recorded as a :class:`~rutherford.domain.models.DebateContribution`, so the returned
-:class:`~rutherford.domain.models.DebateResult` is a full transcript a reader can retrace -- the
-"thinking out loud" that a terse consensus result drops. One failing voice is recorded as a failed
-turn and falls out of later rounds; it never aborts the debate. The debate spawns up to
-``voices x rounds`` subprocesses, so the per-call target cap and the configured round cap bound it.
+This is the capability the subprocess model could not match. Each voice gets ONE live
+:class:`~rutherford.acp.session.ACPSession` held across every round, so round 1 sends the full prompt and
+each later round sends only a DELTA (the other voices' latest positions) -- the agent remembers its own
+prior reasoning in-session instead of re-reading the whole transcript as fresh input tokens every round.
+A voice that fails a round drops out; the sessions are always closed at the end.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..acp.descriptors import DescriptorRegistry
+from ..acp.permission import PermissionPolicy
+from ..acp.session import ACPHandshakeError, ACPSession, run_acp_turn
 from ..config.schema import RutherfordConfig
-from ..domain.enums import EFFORT_ORDER, ActivityEventKind, SafetyMode, Stance
+from ..domain.enums import (
+    EFFORT_ORDER,
+    ActivityEventKind,
+    Effort,
+    SafetyMode,
+    Stance,
+    TerminationReason,
+    runs_sandboxed,
+)
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import (
     ActivityEvent,
     Cost,
     DebateContribution,
+    DebateOutcome,
     DebateRequest,
     DebateResult,
     DebateRound,
-    DelegationRequest,
     DelegationResult,
     DiversityReport,
     ErrorInfo,
     PanelInputs,
     PanelTarget,
+    ProgressLedger,
     RunRollup,
     Target,
     Topology,
+    VoiceVerdict,
 )
 from ..io.ledger import RunLedger
-from ..runtime.depth import ensure_within_aggregate_cap, ensure_within_target_cap
-from .delegation import ActivityCallback, DelegationService, PanelLifecycle, ProgressCallback, emit_activity
-from .persistence import PanelVoice, live_tee, stop_live_tee, write_panel_record
-from .strategies import apply_stance, effective_diversity
+from ..runtime.depth import ensure_within_aggregate_cap
+from .delegation import ActivityCallback, DelegationService, PanelLifecycle, emit_activity
+from .persistence import PanelVoice, write_panel_record
+from .strategies import aggregate, effective_diversity, extract_verdict, verdict_instruction
+
+_log = logging.getLogger("rutherford.services.debate")
 
 
 @dataclass(frozen=True)
 class _Voice:
-    """A debate participant: its panel position, resolved target, and steering."""
+    """A debate participant: its panel position, resolved target, label, and steering."""
 
     index: int
     target: Target
     label: str
-    #: A unique key for survival and own-position lookup, so two seats sharing a ``(cli, model)`` --
-    #: and therefore a display ``label`` -- do not collapse into one survivor.
-    seat_id: str
     stance: Stance | None
-    role: str | None
 
 
 class DebateService:
-    """Runs a multi-round debate across targets and returns the full transcript."""
+    """Runs a multi-round debate across ACP agents, each on a persistent session, and returns the transcript."""
 
     def __init__(
         self,
-        delegation: DelegationService,
+        descriptors: DescriptorRegistry,
         config: RutherfordConfig,
+        delegation: DelegationService,
         *,
         ledger: RunLedger | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        self._delegation = delegation
+        self._descriptors = descriptors
         self._config = config
-        #: The durable run ledger (F2) for the debate's parent record; ``None`` disables persistence.
+        #: The delegation service is shared so a debate's turns gate on the SAME concurrency semaphore as
+        #: every other path that spawns an agent (a wide debate cannot exceed ``max_concurrency`` live turns).
+        self._delegation = delegation
+        #: The durable run ledger (F2) for the debate's parent record; ``None`` disables persistence. A debate
+        #: drives its turns over persistent :class:`ACPSession`s (not via ``delegate``), so there are no
+        #: per-turn child records -- the transcript and the parent record carry the run (decision 1-D).
         self._ledger = ledger
+        #: Wall-clock source for parent-record timestamps, injectable so persistence is testable.
         self._clock = clock
 
     async def debate(
         self,
         req: DebateRequest,
         *,
-        correlation_id: str = "",
         base_depth: int = 0,
-        on_progress: ProgressCallback | None = None,
         on_activity: ActivityCallback | None = None,
     ) -> DebateResult:
-        """Run ``req`` across its targets for up to ``rounds`` rounds and return the transcript.
+        """Open one session per voice, run up to ``rounds`` rounds (delta prompts after round 1), and close.
 
-        Round one is independent; later rounds let each voice rebut the others. A voice that fails a
-        round is recorded and drops out, and the debate stops early once fewer than two voices remain.
-        With ``synthesize``, a closing pass over the final positions states where the panel landed.
+        Wraps the debate body in a :class:`PanelLifecycle` (N1, item 3) so the activity stream always closes
+        with exactly one terminal event. ``on_activity`` is the structured live stream; ``base_depth`` is how
+        deep the debate sits in a Rutherford-driving-Rutherford chain, layered onto every voice's session env.
         """
-        # N1 (3-K): wrap the whole debate run so a cancellation at ANY of its awaits (a round's turns, the
-        # live-tee stop, the closing synthesis, the record persist) closes the activity stream with exactly
-        # one terminal event. The lifecycle emits panel_started/finished from inside the body; here a cancel
-        # emits job_cancelled iff the debate started and has not already closed.
         lifecycle = PanelLifecycle("debate", base_depth, on_activity)
         try:
-            return await self._debate_impl(
-                req,
-                lifecycle,
-                correlation_id=correlation_id,
-                base_depth=base_depth,
-                on_progress=on_progress,
-                on_activity=on_activity,
-            )
+            return await self._debate_impl(req, lifecycle, base_depth=base_depth, on_activity=on_activity)
         except asyncio.CancelledError:
             lifecycle.on_cancel()
             raise
@@ -118,200 +122,675 @@ class DebateService:
         req: DebateRequest,
         lifecycle: PanelLifecycle,
         *,
-        correlation_id: str = "",
         base_depth: int = 0,
-        on_progress: ProgressCallback | None = None,
         on_activity: ActivityCallback | None = None,
     ) -> DebateResult:
-        """The debate body; the public :meth:`debate` wraps this with the lifecycle guard."""
-        voices = self._resolve_voices(req)
-        rounds_cap = self._resolve_rounds(req)
+        """The debate body; the public :meth:`debate` wraps this with the lifecycle guard.
+
+        A ``time_budget_s`` bounds the whole debate's wall-clock, enforced at round boundaries: each round runs
+        under the REMAINING budget, a round still in flight at the deadline is cut (its turns finalized as
+        ``BUDGET_EXHAUSTED`` contributions, partial preserved but never promoted to a stance), and the
+        transcript so far is closed. ``on_budget="continue"`` makes the budget advisory -- every round runs to
+        completion. A harvest that leaves fewer than ``min_quorum`` usable positions in the last round is
+        ``BUDGET_EXHAUSTED`` (F8a).
+        """
         created_at = self._clock()
         persist = self._config.wants_persist(req.persist)
-        parent_run_id = uuid.uuid4().hex if persist and self._ledger is not None else None
+        voices = self._resolve_voices(req)
+        rounds_cap = self._resolve_rounds(req)
+        # A panel is deliberation, not file work: a debate cannot run a sandboxed (propose / write / yolo)
+        # mode. It drives its voices over PERSISTENT sessions held across rounds, directly in the real
+        # working_dir -- there is no per-turn worktree to isolate writes into, and no coherent way to merge
+        # edits from several arguing agents, so a mutating mode would let an agent write straight into the
+        # user's tree. Writes go through delegate (one agent, one worktree sandbox, the reviewed diff applied
+        # back). Enforced in the service so the boundary holds no matter which caller set the mode.
+        if runs_sandboxed(req.safety_mode):
+            raise RutherfordError(
+                ErrorCode.INVALID_INPUT,
+                f"debate runs read-only: it cannot run '{req.safety_mode.value}'. A debate is several agents "
+                "arguing a question, not file work; use delegate (a single sandboxed agent) for write / "
+                "propose work.",
+            )
+        cwd = req.working_dir or str(Path.cwd())
+        policy = PermissionPolicy(mode=req.safety_mode)
+        timeout_s = req.timeout_s or self._config.default_timeout_s
+        budget = req.time_budget_s if req.time_budget_s is not None else self._config.default_time_budget_s
+        on_budget = req.on_budget if req.on_budget is not None else self._config.default_on_budget
+        enforce = budget is not None and on_budget != "continue"
 
-        # N1 (item 3): the declared width is the panel size. Check it against the advisory aggregate-agent
-        # cap up front (a no-op unless configured; refuses only with ``enforce_agent_cap``), and announce the
-        # debate as started so a sync caller sees the fan-out before the rounds run.
-        declared_width = len(voices)
-        ensure_within_aggregate_cap(
-            declared_width, self._config.max_agents_advisory, enforce=self._config.enforce_agent_cap
+        # N1 (item 3): the declared width (the panel's voices). Cap-check it up front -- refuse with
+        # AGENT_CAP_EXCEEDED when enforced, else flag ``over_cap`` -- then announce the panel as started.
+        declared = len(voices)
+        over_cap = ensure_within_aggregate_cap(
+            declared, self._config.max_agents_advisory, enforce=self._config.enforce_agent_cap
         )
+        if over_cap:
+            _log.warning(
+                "debate declared width %d exceeds the aggregate-agent cap %d; watch the activity view",
+                declared,
+                self._config.max_agents_advisory,
+            )
         lifecycle.mark_started(
             ActivityEvent(
                 kind=ActivityEventKind.PANEL_STARTED,
                 tool="debate",
                 depth=base_depth,
-                declared=declared_width,
-                message=f"debate started: {declared_width} voice(s), up to {rounds_cap} round(s)",
+                declared=declared,
+                message=f"debate panel started: {declared} voice(s)",
             )
         )
 
-        # Time-budget harvest (F8a, 2-A'/2-where/2-behavior): each round runs under the REMAINING wall-clock
-        # budget via ``asyncio.wait``; a turn still in flight when the deadline is reached is cut (its
-        # process tree killed) and the debate finalizes over the transcript so far. ``continue`` makes the
-        # budget advisory (run every round to completion); ``harvest`` (default) and ``resume`` both cut at
-        # the deadline (``resume``'s deliberate come-back rides the item-9 continuation primitive -- OnBudget).
-        budget = req.time_budget_s if req.time_budget_s is not None else self._config.default_time_budget_s
-        # The disposition: the call value, else the configured default (2-M's per-call + workspace default).
-        on_budget = req.on_budget if req.on_budget is not None else self._config.default_on_budget
-        enforce = budget is not None and on_budget != "continue"
+        sessions: dict[int, ACPSession] = {}
+        open_errors: dict[int, ErrorInfo] = {}
+        await self._open_sessions(req, voices, policy, cwd, sessions, open_errors, base_depth)
+        start = time.monotonic()
         stop_reason: str | None = None
-
-        rounds: list[DebateRound] = []
-        # The voices still in the debate; a failed turn removes its voice from later rounds.
-        active = list(voices)
-        for round_index in range(1, rounds_cap + 1):
-            if round_index > 1 and len(active) < 2:
-                break  # a debate needs at least two voices to rebut one another
-            remaining: float | None = None
-            if enforce and budget is not None:
-                remaining = budget - (self._clock() - created_at)
-                if remaining <= 0:  # the budget is already spent at this boundary -- do not start a round
-                    stop_reason = "budget"
-                    _announce(on_progress, f"debate: time budget ({budget:.0f}s) reached before round {round_index}")
-                    break
-            _announce(on_progress, f"debate: round {round_index} of {rounds_cap} ({len(active)} voices)")
-            previous = rounds[-1] if rounds else None
-            contributions, round_cut = await self._run_round(
-                req,
-                active,
-                round_index,
-                previous,
-                correlation_id,
-                base_depth,
-                on_progress,
-                on_activity,
-                parent_run_id,
-                remaining,
-            )
-            if round_cut:  # turns were cut in-flight at the deadline -- finalize over the transcript so far
-                stop_reason = "budget"
-                # Keep the cut round even when no turn finished: its cut turns carry recovered resume sessions
-                # (2-I) and streamed traces (2-F) that must survive into the result/record. The closing and
-                # the quorum gate below run over the last round with USABLE positions, so a trailing fully-cut
-                # round preserves its handles without being mistaken for the panel's outcome (2-behavior).
-                rounds.append(DebateRound(index=round_index, contributions=contributions))
-                _announce(
-                    on_progress, f"debate: round {round_index} cut at the time budget ({budget:.0f}s); finalizing"
+        try:
+            rounds: list[DebateRound] = []
+            # F4a (4-C): each seat's ROUND-1 (blind, pre-exposure) answer, captured once and carried onto every
+            # later round's contribution so a reader sees pre-vs-post movement without an extra sub-turn.
+            pre_commits: dict[str, str] = {}
+            # F5 (11-D/11-E): the termination-grammar arm this debate stops on (UNRESOLVED until an earlier
+            # arm fires) and the running convergence ledger (the prior round's, for the stall counter).
+            termination = TerminationReason.UNRESOLVED
+            prior_ledger: ProgressLedger | None = None
+            active = [voice for voice in voices if voice.index in sessions]
+            for round_index in range(1, rounds_cap + 1):
+                if round_index > 1 and len(active) < 2:
+                    termination = TerminationReason.QUORUM_LOST
+                    break  # a debate needs at least two voices to keep arguing
+                remaining: float | None = None
+                if enforce and budget is not None:
+                    remaining = budget - (time.monotonic() - start)
+                    if remaining <= 0:  # the budget is spent at this boundary -- do not start another round
+                        stop_reason = "budget"
+                        termination = TerminationReason.BUDGET
+                        break
+                contributions, round_cut = await self._run_round(
+                    req,
+                    voices,
+                    active,
+                    sessions,
+                    open_errors,
+                    round_index,
+                    rounds,  # F5 (11-B): the full history so far, so carry-forward can re-send every round
+                    timeout_s,
+                    remaining,
+                    base_depth,
+                    on_activity,
                 )
-                break
-            rounds.append(DebateRound(index=round_index, contributions=contributions))
-            survivors = {c.seat_id for c in contributions if c.ok}
-            active = [voice for voice in active if voice.seat_id in survivors]
+                if round_index == 1:
+                    # Round 1 is the blind pre-commitment (no voice has seen another's answer yet).
+                    pre_commits = {c.seat_id: c.text for c in contributions if c.ok and c.text.strip()}
+                else:
+                    for contribution in contributions:  # carry the seat's blind round-1 position onto this turn
+                        contribution.pre_commit = pre_commits.get(contribution.seat_id)
+                this_round = DebateRound(index=round_index, contributions=contributions)
+                rounds.append(this_round)
+                # F4a no-silent-dismissal (4-B): a seat that produced no usable answer this round is set aside
+                # -- stamp why on its contribution so a dropped voice is never silent. Stamped BEFORE the
+                # budget-cut break so a seat cut at the deadline (also "no usable answer") is stamped too.
+                survivors = {c.seat_id for c in contributions if c.ok and c.text.strip()}
+                for contribution in contributions:
+                    if contribution.seat_id not in survivors:
+                        contribution.dissent = f"set aside: no usable answer in round {round_index}"
+                if round_cut:  # turns were cut in-flight at the deadline -- finalize over the transcript so far
+                    stop_reason = "budget"
+                    termination = TerminationReason.BUDGET
+                    break
+                # F5 (11-C): read this round's convergence and stop early on agreement (converged) or a frozen
+                # decision (stalled). Deterministic (verdict aggregation), so no extra subprocess and replayable.
+                if req.track_convergence:
+                    ledger = self._convergence_ledger(this_round, prior_ledger)
+                    this_round.ledger = ledger
+                    prior_ledger = ledger
+                    if ledger.converged:
+                        termination = TerminationReason.CONVERGED
+                        break
+                    if ledger.stall_count >= self._config.debate_stall_tolerance:
+                        termination = TerminationReason.STALLED
+                        break
+                active = [voice for voice in active if _seat_id(voice) in survivors]
 
-        # 2-E': a budget harvest that left fewer than min_quorum usable positions (in the last round that has
-        # any) is a genuine failure (BUDGET_EXHAUSTED), raised before any result/persist; otherwise the
-        # harvest is a success. The "last usable round" skips a trailing fully-cut round (kept for its handles).
-        if stop_reason == "budget":
+            if stop_reason == "budget":
+                self._check_quorum(req, rounds, budget, lifecycle, base_depth, declared)
+            final, synthesis_by, self_authored = await self._synthesize(req, rounds, cwd, timeout_s, base_depth)
+            elapsed_s = round(time.monotonic() - start, 3)
+            rollup = self._rollup(req, rounds, budget, stop_reason, elapsed_s) if budget is not None else None
+            topology = self._topology(declared, rounds, over_cap)
             usable_round = _last_usable_round(rounds)
             usable = sum(1 for c in usable_round.contributions if c.ok and c.text.strip()) if usable_round else 0
-            if usable < self._config.min_quorum:
-                # N1 (3-K): a terminal outcome -- close the activity stream with a (failed) panel_finished
-                # BEFORE raising, so the stream/push has a terminal event on this failure path.
-                lifecycle.mark_closed(
-                    ActivityEvent(
-                        kind=ActivityEventKind.PANEL_FINISHED,
-                        tool="debate",
-                        depth=base_depth,
-                        declared=declared_width,
-                        done=usable,
-                        status="failed",
-                        message=f"debate budget exhausted: {usable} usable voice(s), below quorum",
-                    )
+            diversity = self._diversity(usable_round)
+            run_dir: str | None = None
+            if persist and self._ledger is not None:
+                run_dir = await asyncio.to_thread(
+                    self._write_parent,
+                    req,
+                    voices,
+                    rounds,
+                    final,
+                    created_at,
+                    stop_reason if budget is not None else None,
+                    rollup,
+                    topology,
                 )
-                raise RutherfordError(
-                    ErrorCode.BUDGET_EXHAUSTED,
-                    f"time budget ({budget:.0f}s) reached with {usable} usable voice(s), below "
-                    f"min_quorum ({self._config.min_quorum})",
+            # Surface the F3 effective-lineages headline on the transparency stream (item 5, 5-C).
+            finished_message = f"debate panel finished: {len(rounds)} round(s)"
+            if diversity is not None:
+                finished_message += f" -- {diversity.headline}"
+            lifecycle.mark_closed(
+                ActivityEvent(
+                    kind=ActivityEventKind.PANEL_FINISHED,
+                    tool="debate",
+                    depth=base_depth,
+                    declared=declared,
+                    done=usable,
+                    observed_agents=topology.observed_peak_agents,
+                    message=finished_message,
                 )
+            )
+            outcome = DebateOutcome(
+                termination=termination,
+                rounds_run=len(rounds),
+                converged=termination is TerminationReason.CONVERGED,
+                decision=prior_ledger.decision if prior_ledger is not None else None,
+                stall_count=prior_ledger.stall_count if prior_ledger is not None else 0,
+            )
+            return DebateResult(
+                prompt=req.prompt,
+                rounds=rounds,
+                final=final,
+                synthesis_by=synthesis_by,
+                self_authored=self_authored,
+                stop_reason=stop_reason if budget is not None else None,
+                rollup=rollup,
+                topology=topology,
+                diversity=diversity,
+                outcome=outcome,
+                run_dir=run_dir,
+            )
+        finally:
+            await asyncio.gather(*(session.close() for session in sessions.values()), return_exceptions=True)
 
-        final, synthesis_by = await self._synthesize_final(req, rounds, correlation_id, base_depth, on_progress)
-        rollup = (
-            self._rollup(req, rounds, budget, stop_reason, self._clock() - created_at) if budget is not None else None
+    def _write_parent(
+        self,
+        req: DebateRequest,
+        voices: list[_Voice],
+        rounds: list[DebateRound],
+        final: str | None,
+        created_at: float,
+        stop_reason: str | None,
+        rollup: RunRollup | None,
+        topology: Topology,
+    ) -> str | None:
+        """Write the debate's parent record plus the ``transcript.md`` artifact (F2). Best-effort.
+
+        A debate drives its turns over persistent sessions (not via ``delegate``), so there are no per-turn
+        child records -- ``transcript.md`` inlines every turn and the parent record carries the run. The
+        parent's status derives from the turns (succeeded when any voice ever answered); :class:`PanelInputs`
+        captures the resolved roster (each seat + its latest resume handle), the round count, whether a closing
+        synthesis ran, and any judge so the debate replays from ``state.json``. Runs off-thread (file I/O).
+        """
+        assert self._ledger is not None  # guarded by the caller (persist + ledger present)
+        contributions = [c for round_ in rounds for c in round_.contributions]
+        clis = sorted({c.target.cli for c in contributions})
+        # Each seat's latest resume handle across the rounds, recorded in the parent state.json (F8a, 2-I).
+        seat_sessions: dict[str, str] = {c.seat_id: c.session_id for c in contributions if c.session_id is not None}
+        panel_inputs = PanelInputs(
+            targets=[
+                PanelTarget(
+                    cli=voice.target.cli,
+                    model=voice.target.model,
+                    stance=voice.stance,
+                    session_id=seat_sessions.get(_seat_id(voice)),
+                    # item 9 continuation: persist the seat's steering so a debate continuation replays it.
+                    weight=voice.target.effective_weight,
+                    parity=voice.target.is_parity,
+                    role=voice.target.role,
+                )
+                for voice in voices
+            ],
+            synthesize=req.synthesize,
+            rounds=req.rounds,
+            judge=req.judge.display_label if req.judge else None,
         )
-        # N1 (item 3): the debate's observed fan-out across every round.
-        topology = self._topology(declared_width, rounds)
-        result = DebateResult(
+        return write_panel_record(
+            self._ledger,
+            run_id=uuid.uuid4().hex,
+            kind="debate",
             prompt=req.prompt,
-            rounds=rounds,
-            final=final,
-            synthesis_by=synthesis_by,
-            diversity=self._diversity(rounds),
+            clis=clis,
+            voices=[_panel_voice(c) for c in contributions],
+            answer=final or "(no closing synthesis -- see the transcript)",
+            created_at=created_at,
+            finished_at=self._clock(),
+            safety_mode=req.safety_mode,
+            cwd=req.working_dir,
+            files=req.files,
+            role=req.role,
+            panel=panel_inputs,
             stop_reason=stop_reason,
             rollup=rollup,
             topology=topology,
+            continued_from=req.continued_from,
+            extra_artifacts={"transcript.md": _render_transcript(req.prompt, rounds)},
         )
-        if parent_run_id is not None and self._ledger is not None:
-            # Write the parent panel record linking every turn's child record, plus the transcript. The
-            # parent's status is derived from the turns (succeeded when any voice ever answered); the
-            # transcript.md already inlines every turn, so no separate voices.md is needed here.
-            contributions = [c for round_ in rounds for c in round_.contributions]
-            clis = sorted({c.target.cli for c in contributions})
-            # Each seat's latest resume handle across the rounds, so the parent roster records it in
-            # state.toon for a later continuation (F8a, 2-I), matching the consensus parent.
-            seat_sessions: dict[str, str] = {c.seat_id: c.session_id for c in contributions if c.session_id is not None}
-            panel_inputs = PanelInputs(
-                targets=[
-                    PanelTarget(
-                        cli=v.target.cli, model=v.target.model, stance=v.stance, session_id=seat_sessions.get(v.seat_id)
-                    )
-                    for v in voices
-                ],
-                synthesize=req.synthesize,
-                rounds=req.rounds,
-                judge=req.judge.display_label if req.judge else None,
-            )
-            result.run_dir = await asyncio.to_thread(
-                write_panel_record,
-                self._ledger,
-                run_id=parent_run_id,
-                kind="debate",
-                prompt=req.prompt,
-                clis=clis,
-                voices=[_panel_voice(c) for c in contributions],
-                answer=final or "(no closing synthesis -- see the linked voice records)",
-                created_at=created_at,
-                finished_at=self._clock(),
-                safety_mode=req.safety_mode,
-                cwd=req.working_dir,
-                files=req.files,
-                role=req.role,
-                panel=panel_inputs,
-                stop_reason=stop_reason,
-                rollup=rollup,
-                topology=topology,
-                extra_artifacts={"transcript.md": _render_transcript(req.prompt, rounds)},
-            )
-        # N1 (3-K): the terminal panel_finished is the LAST step (no await follows), so the lifecycle guard
-        # never has to choose between this and job_cancelled -- a cancel before here lands in the guard.
-        last_round = _last_usable_round(rounds)
-        lifecycle.mark_closed(
-            ActivityEvent(
-                kind=ActivityEventKind.PANEL_FINISHED,
-                tool="debate",
-                depth=base_depth,
-                declared=declared_width,
-                done=sum(1 for c in last_round.contributions if c.ok) if last_round else 0,
-                observed_agents=topology.observed_peak_agents,
-                message=f"debate finished: {len(rounds)} round(s)",
-            )
-        )
-        return result
 
-    def _diversity(self, rounds: list[DebateRound]) -> DiversityReport | None:
-        """Effective diversity across the last usable round's answering voices, or ``None`` if none.
+    def _diversity(self, usable_round: DebateRound | None) -> DiversityReport | None:
+        """Effective model/provider diversity (F3, item 5) across the LAST USABLE round's answering voices.
 
-        Uses the last round that has usable positions (skipping a trailing fully-cut budget round), so the
-        diversity reflects the positions the closing actually summarized.
+        A debate's trust signal is whose distinct lineages reached the final exchange, so it is measured over
+        the last round that produced answers (the same round the closing summarizes), not every turn ever run.
+        ``None`` when no voice survived to a usable round, mirroring the consensus report's "nothing answered,
+        nothing to measure" contract.
         """
-        usable_round = _last_usable_round(rounds)
         if usable_round is None:
             return None
-        answered = [c.provenance for c in usable_round.contributions if c.ok]
+        answered = [c.provenance for c in usable_round.contributions if c.ok and c.text.strip()]
         if not answered:
             return None
         return effective_diversity(answered, min_distinct=self._config.min_distinct)
+
+    def _topology(self, declared: int, rounds: list[DebateRound], over_cap: bool) -> Topology:
+        """The debate's observed process/agent fan-out (N1, item 3), summed across every turn of every round.
+
+        ``realized_delegations`` counts each turn's subprocess delegations (a round-1 + round-2 turn for the
+        same voice is two delegations -- a debate re-prompts the live session, but each prompt turn is its own
+        agent invocation here), so a multi-round debate's realized count exceeds the declared width by design.
+        ``observed_peak_agents`` is the max local descendant peak any turn sampled (a FLOOR), ``None`` when no
+        turn was sampled. ``over_cap`` flags a declared width over the advisory cap.
+        """
+        contributions = [c for round_ in rounds for c in round_.contributions]
+        observed = [c.observed_peak_agents for c in contributions if c.observed_peak_agents is not None]
+        realized = sum(c.delegation_call_count for c in contributions)
+        return Topology(
+            declared=declared,
+            realized_delegations=realized,
+            observed_peak_agents=max(observed) if observed else None,
+            over_cap=over_cap,
+        )
+
+    def _check_quorum(
+        self,
+        req: DebateRequest,
+        rounds: list[DebateRound],
+        budget: float | None,
+        lifecycle: PanelLifecycle,
+        base_depth: int,
+        declared: int,
+    ) -> None:
+        """Raise ``BUDGET_EXHAUSTED`` when a harvest left fewer than ``min_quorum`` usable last-round positions.
+
+        Closes the activity stream with a (failed) ``panel_finished`` before raising, so the stream/push has a
+        terminal event for the exhausted-harvest outcome rather than being left open (N1, item 3, decision 3-K).
+        """
+        usable_round = _last_usable_round(rounds)
+        usable = sum(1 for c in usable_round.contributions if c.ok and c.text.strip()) if usable_round else 0
+        if usable < self._config.min_quorum:
+            budget_s = budget if budget is not None else 0.0
+            lifecycle.mark_closed(
+                ActivityEvent(
+                    kind=ActivityEventKind.PANEL_FINISHED,
+                    tool="debate",
+                    depth=base_depth,
+                    declared=declared,
+                    done=usable,
+                    status="failed",
+                    message=f"debate budget exhausted: {usable} usable position(s), below quorum",
+                )
+            )
+            raise RutherfordError(
+                ErrorCode.BUDGET_EXHAUSTED,
+                f"time budget ({budget_s:.0f}s) reached with {usable} usable debate position(s), below "
+                f"min_quorum ({self._config.min_quorum})",
+            )
+
+    async def _open_sessions(
+        self,
+        req: DebateRequest,
+        voices: list[_Voice],
+        policy: PermissionPolicy,
+        cwd: str,
+        sessions: dict[int, ACPSession],
+        open_errors: dict[int, ErrorInfo],
+        base_depth: int,
+    ) -> None:
+        """Open one ACP session per voice in parallel; record an unknown-agent or handshake failure.
+
+        Each session carries the debate's producer-effort cap (F8a) and the N1 lineage/depth signal
+        (``base_depth``), so every turn on it runs at the resolved tier and a Rutherford-host voice stays
+        bounded. Each failure keeps its OWN error code (a resume miss is ``RESUME_FAILED``, not a generic
+        handshake failure), so a continuation reports honestly why a seat could not rejoin.
+        """
+
+        async def _open(voice: _Voice) -> None:
+            if not self._descriptors.has(voice.target.cli):
+                open_errors[voice.index] = ErrorInfo(
+                    code=ErrorCode.ACP_HANDSHAKE_FAILED, message=f"unknown agent id {voice.target.cli!r}"
+                )
+                return
+            if _debate_resume_missing(req, voice.index):
+                # item 9 continuation: this seat had no recorded session to resume -> a RESUME_FAILED
+                # contribution, never silently cold-started into the continued debate.
+                open_errors[voice.index] = ErrorInfo(
+                    code=ErrorCode.RESUME_FAILED,
+                    message=f"{voice.target.cli} has no recorded session to continue",
+                )
+                return
+            session = ACPSession(
+                self._descriptors.get(voice.target.cli),
+                policy=policy,
+                cwd=cwd,
+                model=voice.target.model,
+                effort=req.effort,
+                base_depth=base_depth,
+                # item 9 continuation: resume this seat's prior debate session where one was recorded, so the
+                # agent recalls the earlier argument; a seat that cannot reload fails open (RESUME_FAILED) and
+                # is recorded as a failed contribution, never silently dropped.
+                resume_session_id=_debate_resume_id(req, voice.index),
+            )
+            try:
+                await session.open()
+            except ACPHandshakeError as exc:
+                open_errors[voice.index] = ErrorInfo(code=exc.code, message=exc.message)
+                return
+            sessions[voice.index] = session
+
+        await asyncio.gather(*(_open(voice) for voice in voices))
+
+    async def _run_round(
+        self,
+        req: DebateRequest,
+        voices: list[_Voice],
+        active: list[_Voice],
+        sessions: dict[int, ACPSession],
+        open_errors: dict[int, ErrorInfo],
+        round_index: int,
+        history: list[DebateRound],
+        timeout_s: float,
+        remaining_budget: float | None,
+        base_depth: int,
+        on_activity: ActivityCallback | None,
+    ) -> tuple[list[DebateContribution], bool]:
+        """Run one round in parallel; return ``(contributions, was_cut)``.
+
+        Round 1 also emits a failed contribution for any voice whose session never opened, so the transcript
+        shows where a voice fell out. Later rounds run only the surviving active voices. Each turn gates on the
+        shared concurrency semaphore and emits its own ``voice_started`` / ``voice_finished`` activity events
+        (a correlation id per seat). When ``remaining_budget`` is set the round's turns race under that
+        wall-clock deadline: a turn still in flight at the deadline is cut and finalized as a
+        ``BUDGET_EXHAUSTED`` contribution (its streamed partial preserved but NOT promoted to text -- a
+        rebuttal assumes each voice saw the others' complete positions), and ``was_cut`` is ``True``.
+        """
+
+        async def _turn(voice: _Voice) -> DebateContribution:
+            prompt = self._round_prompt(req, voice, history)
+            async with self._delegation.semaphore:
+                emit_activity(
+                    on_activity,
+                    ActivityEvent(
+                        kind=ActivityEventKind.VOICE_STARTED,
+                        correlation_id=_seat_id(voice),  # stable per-seat key across rounds
+                        cli=voice.target.cli,
+                        model=voice.target.model,
+                        role=req.role,
+                        depth=base_depth,
+                        status="started",
+                        message=f"{voice.label} (round {round_index}) started",
+                    ),
+                )
+                result = await sessions[voice.index].prompt(prompt, timeout_s=timeout_s)
+            contribution = _to_contribution(voice, round_index, result)
+            emit_activity(
+                on_activity,
+                ActivityEvent(
+                    kind=ActivityEventKind.VOICE_FINISHED,
+                    correlation_id=_seat_id(voice),
+                    cli=voice.target.cli,
+                    model=result.target.model,
+                    role=req.role,
+                    status="ok" if result.ok else "failed",
+                    elapsed_s=result.duration_s,
+                    observed_agents=result.observed_peak_agents,
+                    depth=base_depth,
+                    message=f"{voice.label} (round {round_index}) {'ok' if result.ok else 'failed'}",
+                ),
+            )
+            return contribution
+
+        tasks = {voice.index: asyncio.create_task(_turn(voice)) for voice in active}
+        cut_indices: set[int] = set()
+        if remaining_budget is not None:
+            _done, pending = await asyncio.wait(tasks.values(), timeout=max(0.0, remaining_budget))
+            if pending:
+                emit_activity(
+                    on_activity,
+                    ActivityEvent(
+                        kind=ActivityEventKind.BUDGET_TICK,
+                        tool="debate",
+                        depth=base_depth,
+                        budget_left_s=0.0,
+                        message=f"time budget reached; cutting {len(pending)} turn(s) in round {round_index}",
+                    ),
+                )
+                seat_by_index = {voice.index: voice for voice in active}
+                for index, task in tasks.items():
+                    if task in pending:
+                        cut_indices.add(index)
+                        task.cancel()
+                        seat = seat_by_index[index]
+                        emit_activity(
+                            on_activity,
+                            ActivityEvent(
+                                kind=ActivityEventKind.CUT,
+                                correlation_id=_seat_id(seat),
+                                tool="debate",
+                                cli=seat.target.cli,
+                                model=seat.target.model,
+                                role=req.role,
+                                depth=base_depth,
+                                status="cut",
+                                message=f"{seat.label} cut at the time budget (round {round_index})",
+                            ),
+                        )
+                await asyncio.gather(*pending, return_exceptions=True)
+        else:
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+        contributions = [
+            self._collect_turn(
+                req, voice, round_index, tasks[voice.index], sessions[voice.index], voice.index in cut_indices
+            )
+            for voice in active
+        ]
+        if round_index == 1:
+            for voice in voices:
+                if voice.index in open_errors:
+                    contributions.append(_failed_contribution(voice, round_index, open_errors[voice.index]))
+        contributions.sort(key=lambda contribution: contribution.seat_id)
+        return contributions, bool(cut_indices)
+
+    def _collect_turn(
+        self,
+        req: DebateRequest,
+        voice: _Voice,
+        round_index: int,
+        task: asyncio.Task[DebateContribution],
+        session: ACPSession,
+        was_cut: bool,
+    ) -> DebateContribution:
+        """Project one finished-or-cut turn into a contribution; a cut turn is a BUDGET_EXHAUSTED position."""
+        if was_cut:
+            return _cut_contribution(
+                voice, round_index, session, req.time_budget_s or self._config.default_time_budget_s
+            )
+        if task.cancelled():  # an external cancel we did not induce -- propagate it
+            raise asyncio.CancelledError()
+        exc = task.exception()
+        if exc is not None:
+            raise exc
+        return task.result()
+
+    def _round_prompt(self, req: DebateRequest, voice: _Voice, history: list[DebateRound]) -> str:
+        """The prompt for one voice this round: the opening question, then either a delta or the full transcript.
+
+        Round 1 is the full question. By default a later round sends only the PREVIOUS round's other-voice
+        positions (a delta): the persistent session remembers this voice's own prior answer, so the delta does
+        not re-send it -- the whole point of holding the session across rounds. With ``carry_forward`` (F5,
+        11-B) a later round instead re-sends the FULL prior transcript verbatim, for a weaker session memory.
+        A steered voice's FOR/AGAINST stance is re-embedded EVERY round (v2 parity); a convergence-tracked
+        debate (F5, 11-C) appends a one-word verdict ask so the round's position can be aggregated.
+        """
+        if not history:
+            return self._with_verdict_ask(req, _with_stance(req.prompt, voice.stance))
+        if req.carry_forward:
+            return self._with_verdict_ask(req, _with_later_stance(self._carry_forward_prompt(history), voice.stance))
+        others = [
+            (contribution.label, contribution.text)
+            for contribution in history[-1].contributions
+            if contribution.seat_id != _seat_id(voice) and contribution.ok and contribution.text.strip()
+        ]
+        block = "\n\n".join(f"## {label}\n{text}" for label, text in others) or "(no other positions)"
+        prompt = (
+            "This is the next round of our debate. Here are the other participants' latest positions:\n\n"
+            f"{block}\n\nCritique them and revise or defend your own answer. End with your current best answer."
+        )
+        return self._with_verdict_ask(req, _with_later_stance(prompt, voice.stance))
+
+    def _carry_forward_prompt(self, history: list[DebateRound]) -> str:
+        """Render the FULL prior transcript (every round, every answering voice) for a carry-forward round (11-B)."""
+        blocks: list[str] = []
+        for round_ in history:
+            answers = "\n\n".join(f"### {c.label}\n{c.text}" for c in round_.contributions if c.ok and c.text.strip())
+            if answers:
+                blocks.append(f"## Round {round_.index}\n\n{answers}")
+        transcript = "\n\n".join(blocks) or "(no prior positions)"
+        return (
+            "This is the next round of our debate. Here is the FULL transcript so far:\n\n"
+            f"{transcript}\n\nCritique the other participants' positions and revise or defend your own answer. "
+            "End with your current best answer."
+        )
+
+    def _with_verdict_ask(self, req: DebateRequest, prompt: str) -> str:
+        """Append a one-word verdict instruction when convergence is tracked, so the round can be aggregated (11-C)."""
+        if not req.track_convergence:
+            return prompt
+        return f"{prompt}\n\n{verdict_instruction(None)}"
+
+    def _convergence_ledger(self, round_: DebateRound, prior: ProgressLedger | None) -> ProgressLedger:
+        """This round's convergence snapshot (F5, 11-C): aggregate the verdicts and update the stall counter.
+
+        Each answering voice's one-word verdict is extracted and aggregated under ``debate_convergence_strategy``.
+        ``converged`` is a unanimous outcome (genuine agreement). The stall counter rises while a non-converged
+        decision holds UNCHANGED across rounds and resets when it moves (or when there is no decision to hold),
+        so ``stalled`` means the panel froze short of agreement. Pure -- no subprocess -- so it is replayable.
+        """
+        verdicts: list[VoiceVerdict] = []
+        for c in round_.contributions:
+            if not (c.ok and c.text.strip()):
+                continue
+            verdict = extract_verdict(c.text, None)
+            verdicts.append(
+                VoiceVerdict(
+                    label=c.label,
+                    cli=c.target.cli,
+                    ok=True,
+                    verdict=verdict,
+                    no_verdict_reason=None if verdict is not None else "unparseable",
+                )
+            )
+        outcome, decision = aggregate(
+            self._config.debate_convergence_strategy, verdicts, min_quorum=self._config.min_quorum
+        )
+        parseable = [v.verdict for v in verdicts if v.verdict is not None]
+        tally = Counter(parseable)
+        prior_decision = prior.decision if prior is not None else None
+        # Convergence is genuine AGREEMENT -- every answering voice gave the SAME verdict -- measured directly,
+        # NOT off the aggregate ``outcome`` (a MAJORITY-strategy panel returns "majority" even when unanimous).
+        converged = (
+            len(parseable) >= self._config.min_quorum
+            and len(parseable) == len(verdicts)  # every answering voice produced a verdict
+            and len(set(parseable)) == 1
+        )
+        held = decision is not None and decision == prior_decision
+        stall_count = (prior.stall_count if prior is not None else 0) + 1 if held and not converged else 0
+        return ProgressLedger(
+            round_index=round_.index,
+            outcome=outcome,
+            decision=decision,
+            tally={str(key): count for key, count in tally.items()},
+            changed=decision != prior_decision,
+            stall_count=stall_count,
+            converged=converged,
+        )
+
+    async def _synthesize(
+        self, req: DebateRequest, rounds: list[DebateRound], cwd: str, timeout_s: float, base_depth: int
+    ) -> tuple[str | None, str | None, bool]:
+        """Run a closing pass over the final positions, or ``(None, None, False)`` when there is nothing to close.
+
+        Uses the caller-named ``judge`` when given (ideally a non-participant), else the first surviving
+        voice's agent, on a fresh one-shot session one level deeper (so a Rutherford-host judge is bounded).
+        Returns ``(closing, label, self_authored)``. F4a no-self-approval (4-A): ``self_authored`` is ``True``
+        when the closing author is a debate participant -- its CLI produced a usable position in ANY round
+        (:func:`_participant_clis`), not just the final one, so a judge that argued then dropped still counts;
+        the default judge always is. ``require_independent_judge`` (per call or config) REFUSES a self-authored
+        closing with ``INVALID_INPUT``. The closing prompt requires it to NAME each set-aside dissent (4-B).
+        """
+        if not req.synthesize or not rounds:
+            return None, None, False
+        final_round = _last_usable_round(rounds)
+        if final_round is None:
+            return None, None, False
+        closing = [c for c in final_round.contributions if c.ok and c.text.strip()]
+        if not closing:
+            return None, None, False
+        judge = req.judge if req.judge is not None else Target(cli=closing[0].target.cli, model=closing[0].target.model)
+        # F4a no-self-approval (4-A): "participant" is ANY agent that produced a usable position in ANY round,
+        # not only one that survived to the close -- a voice that argued then dropped is still a participant,
+        # so a named judge that debated at all is self-authoring even if it is gone by the final round.
+        self_authored = judge.cli in _participant_clis(rounds)
+        if self_authored and (req.require_independent_judge or self._config.require_independent_judge):
+            raise RutherfordError(
+                ErrorCode.INVALID_INPUT,
+                f"require_independent_judge is set, but the closing would be authored by debate participant "
+                f"{judge.cli!r}; name a non-participant judge (judge=<cli>) for a binding verdict",
+            )
+        if not self._descriptors.has(judge.cli):
+            return None, None, False
+        transcript = "\n\n".join(f"## {c.label}\n{c.text}" for c in closing)
+        prompt = (
+            "You are closing out a debate among several AI coding agents on the same question.\n\n"
+            f"The question:\n{req.prompt}\n\nTheir final positions:\n\n{transcript}\n\n"
+        )
+        # F4a no-silent-dismissal (4-B): the closing summarizes only the final round, so a seat that argued an
+        # earlier round then dropped would be invisible -- the judge could not NAME a dissent it never sees.
+        # Surface each set-aside seat's last usable position + why, so the instruction below is fulfillable.
+        set_aside = _set_aside_dissents(rounds, final_round)
+        if set_aside:
+            block = "\n\n".join(f"## {label} -- {reason}\n{text}" for label, reason, text in set_aside)
+            prompt += (
+                "Positions set aside before the final round (you MUST name each one and why it did not "
+                f"carry):\n\n{block}\n\n"
+            )
+        prompt += (
+            "State where they converged, lay out the remaining disagreements, and NAME each dissenting "
+            "position you set aside with a one-line reason it did not carry (F4a no-silent-dismissal). Give "
+            "the strongest case on each side, and end with your best overall answer."
+        )
+        descriptor = self._descriptors.get(judge.cli)
+        result = await run_acp_turn(
+            descriptor,
+            prompt,
+            policy=PermissionPolicy(SafetyMode.READ_ONLY),
+            cwd=cwd,
+            timeout_s=timeout_s,
+            model=judge.model,
+            base_depth=base_depth + 1,
+        )
+        if not result.ok or not result.text.strip():
+            return None, None, False
+        return result.text, judge.display_label, self_authored
 
     def _rollup(
         self,
@@ -321,16 +800,13 @@ class DebateService:
         stop_reason: str | None,
         elapsed_s: float,
     ) -> RunRollup:
-        """Summarize a budget-governed debate: final-round counts, quorum, highest effort, summed cost.
+        """Summarize a time-budgeted debate into its :class:`RunRollup` (F8a).
 
-        Reported over the LAST round (the set the closing runs over). ``cut`` is the turns of that round
-        cancelled at the time-budget deadline (a ``BUDGET_EXHAUSTED`` contribution); ``answered`` is the
-        turns that finished; the rounds-run detail lives on :attr:`DebateResult.rounds` (one entry per
-        round). ``cost`` and the highest applied effort are summed across every turn in every round.
+        ``cut`` counts the literal last round's ``BUDGET_EXHAUSTED`` turns; ``answered`` / ``usable`` are read
+        over the last round that produced a usable position (a trailing fully-cut round does not erase the
+        positions reached). ``effort_requested`` / ``effort_applied`` are the highest tiers across every turn
+        of every round, so the rollup shows what the budget bought.
         """
-        # ``cut`` is the turns cancelled in the LITERAL last round (the one the deadline hit); ``answered`` /
-        # ``usable`` are over the last round with usable positions (the harvested set the closing ran over),
-        # which skips a trailing fully-cut round -- so a fully-cut final round does not zero the usable count.
         last = rounds[-1].contributions if rounds else []
         usable_round = _last_usable_round(rounds)
         usable_contribs = usable_round.contributions if usable_round else []
@@ -340,9 +816,7 @@ class DebateService:
         all_contributions = [c for round_ in rounds for c in round_.contributions]
         applied = [c.effort_applied for c in all_contributions if c.effort_applied is not None]
         effort_applied = max(applied, key=EFFORT_ORDER.index) if applied else None
-        # The RESOLVED requested effort, derived per seat so a per-adapter ``[adapters.<id>].effort`` default
-        # is reflected (not just the global default): the highest tier any turn actually requested.
-        requested = [self._delegation.resolve_effort(c.target.cli, req.effort) for c in all_contributions]
+        requested = [self._resolve_effort(c.target.cli, req.effort) for c in all_contributions]
         present = [tier for tier in requested if tier is not None]
         effort_requested = max(present, key=EFFORT_ORDER.index) if present else None
         return RunRollup(
@@ -356,77 +830,32 @@ class DebateService:
             time_budget_s=budget,
             effort_requested=effort_requested,
             effort_applied=effort_applied,
-            cost=_rollup_contribution_cost(all_contributions),
+            cost=_sum_contribution_cost(all_contributions),
         )
 
-    def _topology(self, declared_width: int, rounds: list[DebateRound]) -> Topology:
-        """The debate's observed process/agent fan-out across every round (N1, item 3).
-
-        ``declared`` is the panel width (intent); ``realized_delegations`` is the TOTAL subprocess delegations
-        Rutherford launched across all rounds, summed per turn and INCLUDING each turn's fallback re-runs
-        (decision 3-A) -- so a 3-voice 2-round debate with no fallback realizes 6, and a fallback pushes it
-        higher. This cumulative fan-out is why ``over_cap`` (realized over the advisory cap) can trip even
-        when the panel width passed the up-front declared-width check. ``observed_peak_agents`` is the max
-        local descendant peak across the turns (a FLOOR; ``None`` when no turn was sampled).
-        """
-        contributions = [c for round_ in rounds for c in round_.contributions]
-        observed = [c.observed_peak_agents for c in contributions if c.observed_peak_agents is not None]
-        realized = sum(c.delegation_call_count for c in contributions)
-        cap = self._config.max_agents_advisory
-        return Topology(
-            declared=declared_width,
-            realized_delegations=realized,
-            observed_peak_agents=max(observed) if observed else None,
-            over_cap=cap is not None and realized > cap,
-        )
+    def _resolve_effort(self, cli: str, effort: Effort | None) -> Effort | None:
+        """The effort tier a ``cli`` debate seat ran at: the call value, else the configured default (F8a)."""
+        return effort if effort is not None else self._config.effort_for(cli)
 
     def _resolve_voices(self, req: DebateRequest) -> list[_Voice]:
-        """Validate the panel and build the ordered list of debate voices."""
         if len(req.targets) < 2:
             raise RutherfordError(
-                ErrorCode.INVALID_INPUT,
-                "a debate needs at least two targets so the voices have someone to argue with",
+                ErrorCode.INVALID_INPUT, "a debate needs at least two targets so the voices have someone to argue with"
             )
-        ensure_within_target_cap(len(req.targets), self._config.max_targets)
-        if req.stances is not None and len(req.stances) != len(req.targets):
+        if len(req.targets) > self._config.max_targets:
             raise RutherfordError(
-                ErrorCode.INVALID_INPUT,
-                f"stances ({len(req.stances)}) must match targets ({len(req.targets)})",
+                ErrorCode.TOO_MANY_TARGETS,
+                f"debate requested {len(req.targets)} targets; the per-call cap is {self._config.max_targets}",
             )
-        # Disambiguate duplicate display labels (two unlabeled same-(cli, model) seats) so the
-        # transcript is unambiguous, while seat_id (index-based) keeps survival/lookup unique. A
-        # generated "#N" suffix skips any label already in use -- an explicit label or one already
-        # assigned -- so a caller who hand-labels a seat "claude_code#2" cannot collide with the
-        # auto-generated suffix for an unlabeled claude_code seat.
-        base_labels = [target.display_label for target in req.targets]
-        duplicated = {label for label in base_labels if base_labels.count(label) > 1}
-        taken: set[str] = set(base_labels)
-        seen: dict[str, int] = {}
+        stances = req.stances if req.stances is not None else []
+        labels = _disambiguate([target.display_label for target in req.targets])
         voices: list[_Voice] = []
         for index, target in enumerate(req.targets):
-            base = target.display_label
-            if base in duplicated:
-                seen[base] = seen.get(base, 0) + 1
-                label = base if seen[base] == 1 else _next_free_label(base, taken)
-            else:
-                label = base
-            taken.add(label)
-            voices.append(
-                _Voice(
-                    index=index,
-                    target=target,
-                    label=label,
-                    seat_id=f"{index}:{base}",
-                    stance=target.stance
-                    if target.stance is not None
-                    else (req.stances[index] if req.stances else None),
-                    role=target.role or req.role,
-                )
-            )
+            stance = target.stance if target.stance is not None else (stances[index] if index < len(stances) else None)
+            voices.append(_Voice(index=index, target=target, label=labels[index], stance=stance))
         return voices
 
     def _resolve_rounds(self, req: DebateRequest) -> int:
-        """Validate the requested round count against the configured cap."""
         if req.rounds < 1:
             raise RutherfordError(ErrorCode.INVALID_INPUT, "rounds must be at least 1")
         if req.rounds > self._config.max_debate_rounds:
@@ -436,325 +865,164 @@ class DebateService:
             )
         return req.rounds
 
-    async def _run_round(
-        self,
-        req: DebateRequest,
-        voices: list[_Voice],
-        round_index: int,
-        previous: DebateRound | None,
-        correlation_id: str,
-        base_depth: int,
-        on_progress: ProgressCallback | None,
-        on_activity: ActivityCallback | None,
-        parent_run_id: str | None,
-        remaining_budget: float | None,
-    ) -> tuple[list[DebateContribution], bool]:
-        """Run one round: every active voice answers (round 1) or rebuts (later rounds) in parallel.
 
-        Returns the contributions plus whether the round was CUT at the time-budget deadline. With
-        ``remaining_budget`` set, the round's turns run as tasks under an ``asyncio.wait`` deadline (F8a,
-        2-where); a turn still in flight at the deadline is cancelled (the runner kills its process tree)
-        and recorded as a ``BUDGET_EXHAUSTED`` contribution, while the turns that finished keep their
-        answers -- so the closing runs over the transcript so far (2-behavior). ``None`` runs every turn to
-        completion (no budget, or ``on_budget`` continue). One seat's escaped exception becomes that seat's
-        failed contribution, never a round abort; an external cancel (e.g. job_cancel) propagates after the
-        tasks are cancelled and drained, so no subprocess tree is leaked.
-        """
+def _seat_id(voice: _Voice) -> str:
+    """A unique seat key, so two voices sharing a ``(cli, model)`` (and label) never merge."""
+    return f"{voice.index}:{voice.target.display_label}"
 
-        # Per-turn stdout accumulators (F8a, 2-F: capture always): a turn cut at the deadline preserves the
-        # stdout it streamed before the cut as a trace on its contribution, even though a cut debate turn is
-        # never promoted to a stance.
-        partials: list[list[str]] = [[] for _ in voices]
 
-        async def one(index: int, voice: _Voice) -> DebateContribution:
-            prompt = self._round_prompt(req, voice, previous)
-            request = DelegationRequest(
-                target=voice.target,
-                prompt=prompt,
-                working_dir=req.working_dir,
-                files=req.files,
-                role=voice.role,
-                safety_mode=req.safety_mode,
-                timeout_s=req.timeout_s,
-                effort=req.effort,  # the debate's producer-effort cap flows to every turn (F8a)
-                include_raw=req.include_raw,
-                # When the debate persists, each turn is a child record under the parent (F2).
-                persist=parent_run_id is not None,
-                parent_run_id=parent_run_id,
-            )
-            result = await self._delegation.delegate(
-                request,
-                correlation_id=f"{correlation_id}:r{round_index}:{voice.index}",
-                base_depth=base_depth,
-                on_progress=on_progress,
-                on_stdout=partials[index].append,
-                on_activity=on_activity,  # N1: each turn emits its own voice_started/voice_finished
-            )
-            return _to_contribution(voice, round_index, result)
+def _debate_resume_id(req: DebateRequest, index: int) -> str | None:
+    """The resume session handle for seat ``index`` (item 9 continuation), or ``None`` for a fresh debate."""
+    handles = req.resume_session_ids
+    return handles[index] if handles is not None and index < len(handles) else None
 
-        tasks = [asyncio.create_task(one(index, voice)) for index, voice in enumerate(voices)]
-        cut: set[int] = set()
-        # Stream-to-job (F8a, 2-G): while a persisted round runs, tee each turn's accumulating stdout into the
-        # job artifacts off-thread (namespaced per round), so a cut turn's in-flight work survives a crash.
-        tee = parent_run_id if (parent_run_id is not None and self._ledger is not None) else None
-        tee_stop = asyncio.Event()
-        tee_task = (
-            asyncio.create_task(live_tee(self._ledger, tee, f"round-{round_index}-voice", partials, tee_stop))
-            if tee and self._ledger is not None
-            else None
-        )
-        try:
-            if remaining_budget is not None:
-                _done, pending = await asyncio.wait(tasks, timeout=max(0.0, remaining_budget))
-                if pending:
-                    # N1: one budget_tick at the round's deadline, then a cut event per turn harvested.
-                    emit_activity(
-                        on_activity,
-                        ActivityEvent(
-                            kind=ActivityEventKind.BUDGET_TICK,
-                            tool="debate",
-                            depth=base_depth,
-                            budget_left_s=0.0,
-                            message=f"round {round_index} reached the time budget; cutting {len(pending)} turn(s)",
-                        ),
-                    )
-                    for index, task in enumerate(tasks):
-                        if task in pending:
-                            cut.add(index)
-                            task.cancel()
-                            emit_activity(
-                                on_activity,
-                                ActivityEvent(
-                                    kind=ActivityEventKind.CUT,
-                                    # The same per-turn correlation id its delegate used, so the cut collapses
-                                    # onto that turn's row (the stable key, robust to a model fallback).
-                                    correlation_id=f"{correlation_id}:r{round_index}:{voices[index].index}",
-                                    tool="debate",
-                                    cli=voices[index].target.cli,
-                                    model=voices[index].target.model,
-                                    role=voices[index].role,
-                                    depth=base_depth,
-                                    status="cut",
-                                    message=f"{voices[index].label} cut at the time budget",
-                                ),
-                            )
-                    # MANDATORY cancel-then-drain: the runner kills the CLI process tree only once the
-                    # cancellation is delivered AND awaited -- skipping this leaks orphaned subprocesses.
-                    await asyncio.gather(*pending, return_exceptions=True)
-            else:
-                await asyncio.gather(*tasks, return_exceptions=True)
-        except asyncio.CancelledError:
-            # An external cancel of the whole debate: asyncio.wait/gather do not cancel the turn tasks for
-            # us, so cancel + drain them (no orphaned trees) before propagating. The terminal job_cancelled
-            # activity event is emitted once by the panel-lifecycle guard in ``debate``.
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-        finally:
-            await stop_live_tee(tee_task, tee_stop)  # final snapshot of the round's live stream, then exit
 
-        contributions: list[DebateContribution] = []
-        for index, (voice, task) in enumerate(zip(voices, tasks, strict=True)):
-            if task.cancelled():
-                if index in cut:
-                    contributions.append(self._cut_contribution(voice, round_index, req, partials[index]))
-                    continue
-                raise asyncio.CancelledError()  # an external cancel we did not induce -- propagate it
-            exc = task.exception()
-            if isinstance(exc, asyncio.CancelledError):
-                raise exc
-            if exc is not None:
-                failed = DelegationResult(
-                    target=voice.target,
-                    ok=False,
-                    error=ErrorInfo(code=ErrorCode.INTERNAL, message=f"voice delegation raised: {exc!r}"),
-                    safety_mode=req.safety_mode,
-                )
-                contributions.append(_to_contribution(voice, round_index, failed))
-            else:
-                contributions.append(task.result())
-        return contributions, bool(cut)
+def _debate_resume_missing(req: DebateRequest, index: int) -> bool:
+    """True when this is a continuation (``resume_session_ids`` set) but this seat has no handle to resume."""
+    return req.resume_session_ids is not None and _debate_resume_id(req, index) is None
 
-    def _cut_contribution(
-        self, voice: _Voice, round_index: int, req: DebateRequest, partial_lines: list[str]
-    ) -> DebateContribution:
-        """A turn cut at the debate's time-budget deadline: a ``BUDGET_EXHAUSTED`` failed contribution.
 
-        A debate turn cut mid-flight is recorded as a failed contribution (not promoted to a partial answer,
-        unlike a consensus voice): a rebuttal round assumes each voice saw the others' complete positions, so
-        a half-streamed turn is a trace, not a position the closing should treat as a stance. The stdout it
-        streamed before the cut is still preserved on ``partial`` (F8a, 2-F: capture always), for the
-        transcript and audit, rather than discarded. The turn ran with the resolved effort, so it is reported
-        (2-L-map); and any resumable session the partial established is recovered (2-I) so the parent roster
-        can record this seat's handle for a later continuation, even though the turn produced no answer.
-        """
-        effort = self._delegation.resolve_effort(voice.target.cli, req.effort)
-        partial = "\n".join(partial_lines).strip() or None
-        cut = DelegationResult(
-            target=voice.target,
-            ok=False,
-            error=ErrorInfo(code=ErrorCode.BUDGET_EXHAUSTED, message="cut at the debate time-budget deadline"),
-            safety_mode=req.safety_mode,
-            stop_reason="budget",
-            partial=partial,
-            session_id=self._delegation.recover_session(voice.target, partial or "", req.safety_mode, effort),
-            effort=effort,
-            effort_applied=self._delegation.applied_effort(voice.target.cli, effort),
-        )
-        return _to_contribution(voice, round_index, cut)
+def _disambiguate(labels: list[str]) -> list[str]:
+    """Suffix ``#n`` to labels that repeat, so two same-(cli, model) seats are distinguishable."""
+    duplicated = {label for label in labels if labels.count(label) > 1}
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for label in labels:
+        if label in duplicated:
+            seen[label] = seen.get(label, 0) + 1
+            out.append(f"{label}#{seen[label]}")
+        else:
+            out.append(label)
+    return out
 
-    def _round_prompt(self, req: DebateRequest, voice: _Voice, previous: DebateRound | None) -> str:
-        """Build the prompt for ``voice`` this round: a fresh answer, or a rebuttal of the others."""
-        if previous is None:
-            return apply_stance(req.prompt, voice.stance)
-        own = _latest_text(previous, voice.seat_id)
-        others = [
-            (contribution.label, contribution.text)
-            for contribution in previous.contributions
-            if contribution.seat_id != voice.seat_id and contribution.ok and contribution.text.strip()
-        ]
-        return _rebuttal_prompt(req.prompt, own, others, voice.stance)
 
-    async def _synthesize_final(
-        self,
-        req: DebateRequest,
-        rounds: list[DebateRound],
-        correlation_id: str,
-        base_depth: int,
-        on_progress: ProgressCallback | None,
-    ) -> tuple[str | None, str | None]:
-        """Delegate a closing pass over the final positions, stating where the panel landed.
+def _with_stance(prompt: str, stance: Stance | None) -> str:
+    if stance is Stance.FOR:
+        return f"{prompt}\n\nArgue in favor of the proposition."
+    if stance is Stance.AGAINST:
+        return f"{prompt}\n\nArgue against the proposition."
+    return prompt
 
-        Returns ``(final, synthesizer_label)``, or ``(None, None)`` when no synthesis was produced --
-        no surviving voice, or the synthesis run itself failed -- so ``synthesis_by`` never names an
-        author for a synthesis that does not exist. Uses the caller-named ``judge`` when given
-        (ideally a non-participant), otherwise the first surviving voice, whose disambiguated debate
-        label is reported so the reader can map it back to a transcript seat.
-        """
-        if not req.synthesize or not rounds:
-            return None, None
-        final_round = _last_usable_round(rounds)  # skip a trailing fully-cut budget round (no positions)
-        if final_round is None:
-            return None, None
-        closing = [c for c in final_round.contributions if c.ok and c.text.strip()]
-        if not closing:
-            return None, None
-        _announce(on_progress, "debate: synthesizing the closing statement")
-        transcript = "\n\n".join(f"## {c.label}\n{c.text}" for c in closing)
-        prompt = (
-            "You are closing out a debate among several AI coding agents on the same question.\n\n"
-            f"The question:\n{req.prompt}\n\n"
-            f"Their final positions:\n\n{transcript}\n\n"
-            "Write the closing summary: state where they converged, lay out the remaining "
-            "disagreements and the strongest case on each side, and give your best overall answer."
-        )
-        judge_target = req.judge or closing[0].target
-        synth_request = DelegationRequest(
-            target=judge_target,
-            prompt=prompt,
-            working_dir=req.working_dir,
-            safety_mode=SafetyMode.READ_ONLY,
-            timeout_s=req.timeout_s,
-            persist=False,  # the closing synthesis is internal; not its own job record (F2)
-        )
-        result = await self._delegation.delegate(
-            synth_request,
-            correlation_id=f"{correlation_id}:final",
-            base_depth=base_depth + 1,
-        )
-        if not result.ok or not result.text.strip():
-            return None, None  # no synthesis produced; do not name an author for one that is absent
-        # For an explicit judge, report the target that actually answered (reflects any model
-        # fallback); for the default first-survivor path, report that seat's disambiguated debate
-        # label so the reader can map synthesis_by back to a transcript seat.
-        synthesizer_label = result.target.display_label if req.judge else closing[0].label
-        return result.text, synthesizer_label
+
+def _with_later_stance(prompt: str, stance: Stance | None) -> str:
+    """Re-embed a steered voice's stance on a later-round delta prompt (v2 parity: ``Keep arguing ...``)."""
+    if stance is Stance.FOR:
+        return f"{prompt}\n\nKeep arguing in favor of the proposition."
+    if stance is Stance.AGAINST:
+        return f"{prompt}\n\nKeep arguing against the proposition."
+    return prompt
+
+
+def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) -> DebateContribution:
+    return DebateContribution(
+        label=voice.label,
+        seat_id=_seat_id(voice),
+        target=result.target,
+        round_index=round_index,
+        stance=voice.stance,
+        ok=result.ok,
+        text=result.text,
+        duration_s=round(result.duration_s, 3),
+        error=result.error,
+        session_id=result.session_id,
+        provenance=result.provenance,
+        cost=result.cost,
+        effort_applied=result.effort_applied,
+        partial=result.partial,
+        # N1 (item 3): carry the turn's observed peak and delegation count up so the debate rolls them into
+        # its panel Topology (a floor for observed; one delegation per turn).
+        observed_peak_agents=result.observed_peak_agents,
+        delegation_call_count=result.delegation_call_count,
+        argv=result.argv,  # F2: the turn's resolved launch argv, carried for replay completeness
+    )
+
+
+def _failed_contribution(voice: _Voice, round_index: int, error: ErrorInfo) -> DebateContribution:
+    return DebateContribution(
+        label=voice.label,
+        seat_id=_seat_id(voice),
+        target=voice.target,
+        round_index=round_index,
+        stance=voice.stance,
+        ok=False,
+        error=error,  # keeps the open failure's own code (RESUME_FAILED / handshake), not a generic one
+    )
+
+
+def _cut_contribution(voice: _Voice, round_index: int, session: ACPSession, budget: float | None) -> DebateContribution:
+    """A turn cut at the time-budget deadline: a ``BUDGET_EXHAUSTED`` failed position (F8a, 2-F).
+
+    The streamed partial is preserved on the contribution for the transcript/audit but NOT promoted to
+    ``text`` -- a rebuttal assumes each voice saw the others' complete positions, so a half-formed stance is a
+    trace, not a position. The recovered session id is kept so a later continuation can resume the cut seat.
+    """
+    partial = session.partial_text.strip() or None
+    budget_s = budget if budget is not None else 0.0
+    return DebateContribution(
+        label=voice.label,
+        seat_id=_seat_id(voice),
+        target=session.target,
+        round_index=round_index,
+        stance=voice.stance,
+        ok=False,
+        error=ErrorInfo(
+            code=ErrorCode.BUDGET_EXHAUSTED,
+            message=f"{voice.target.cli} was cut at the {budget_s:.0f}s time budget mid-round",
+        ),
+        session_id=session.session_id,
+        partial=partial,
+        effort_applied=session.effort_applied,
+        # N1 (item 3): a cut turn still spun up a subprocess (count 1) and carries the peak its session
+        # sampled before the cut, so the panel topology floor reflects the cut work too.
+        observed_peak_agents=session.observed_peak_agents,
+        delegation_call_count=1,
+    )
 
 
 def _last_usable_round(rounds: list[DebateRound]) -> DebateRound | None:
-    """The last round that holds at least one usable position (an ``ok`` turn with text), or ``None``.
-
-    A budget cut can leave a trailing round with no completed turns (kept for its recovered resume handles
-    and traces, F8a 2-I/2-F); this skips past it to the round whose positions the closing should summarize
-    and the quorum gate should weigh.
-    """
     for round_ in reversed(rounds):
         if any(c.ok and c.text.strip() for c in round_.contributions):
             return round_
     return None
 
 
-def _next_free_label(base: str, taken: set[str]) -> str:
-    """Return the first ``base#n`` (n >= 2) not already in ``taken``.
+def _participant_clis(rounds: list[DebateRound]) -> set[str]:
+    """Every agent CLI that produced a usable position in ANY round (the F4a 4-A participant set).
 
-    Used to disambiguate duplicate seat labels without ever colliding with a label that already
-    exists -- an explicit caller-supplied one or a previously assigned generated one.
+    A voice that argued then dropped is still a debate participant, so the no-self-approval guard must see it,
+    not just the final round's survivors. The default judge (always a final-round survivor) is in this set.
     """
-    n = 2
-    while f"{base}#{n}" in taken:
-        n += 1
-    return f"{base}#{n}"
+    return {c.target.cli for round_ in rounds for c in round_.contributions if c.ok and c.text.strip()}
 
 
-def _latest_text(round_: DebateRound, seat_id: str) -> str:
-    """Return this seat's answer text from a round, or empty if it did not contribute."""
-    for contribution in round_.contributions:
-        if contribution.seat_id == seat_id:
-            return contribution.text
-    return ""
+def _set_aside_dissents(rounds: list[DebateRound], final_round: DebateRound) -> list[tuple[str, str, str]]:
+    """Each seat set aside before the final usable round, as ``(label, reason, its last usable text)`` (F4a 4-B).
 
-
-def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) -> DebateContribution:
-    """Fold a delegation result into a transcript contribution for ``voice``."""
-    return DebateContribution(
-        label=voice.label,
-        seat_id=voice.seat_id,
-        target=result.target,
-        round_index=round_index,
-        stance=voice.stance,
-        role=voice.role,
-        ok=result.ok,
-        text=result.text,
-        raw=result.raw,
-        duration_s=result.duration_s,
-        error=result.error,
-        fallback_from=result.fallback_from,
-        session_id=result.session_id,  # the resume handle, carried so the parent roster can record it (2-I)
-        partial=result.partial,  # stdout streamed before a time-budget cut, preserved as a trace (F8a, 2-F)
-        provenance=result.provenance,
-        cost=result.cost,
-        effort_applied=result.effort_applied,
-        observed_peak_agents=result.observed_peak_agents,  # N1: carried so the parent rolls panel topology
-        delegation_call_count=result.delegation_call_count,  # N1 (3-A): incl. this turn's fallback re-runs
-        changed_files=list(result.changed_files or []),
-        run_dir=result.run_dir,
-    )
-
-
-def _rollup_contribution_cost(contributions: list[DebateContribution]) -> Cost | None:
-    """Sum the turns' reported costs into one debate cost for the rollup, or ``None`` when none reported.
-
-    Each field is summed only over the turns that reported it (a missing field never zeros the total); a
-    field no turn reported stays ``None``, so an all-unpriced debate rolls up to ``None`` not a fake zero.
+    The closing summarizes only ``final_round``, so a seat that argued an earlier round then dropped would be
+    invisible to the judge -- it could not NAME a dissent it never sees. This gathers each such seat's LAST
+    usable position and the reason it was set aside, so the closing prompt can carry it. A seat that never
+    produced a usable position (a pure failure) has no position to name and is omitted; a seat still answering
+    in the final round is already in the transcript and is skipped.
     """
-    costs = [c.cost for c in contributions if c.cost is not None]
-    usd = [cost.usd for cost in costs if cost.usd is not None]
-    input_tokens = [cost.input_tokens for cost in costs if cost.input_tokens is not None]
-    output_tokens = [cost.output_tokens for cost in costs if cost.output_tokens is not None]
-    total_tokens = [cost.total_tokens for cost in costs if cost.total_tokens is not None]
-    if not (usd or input_tokens or output_tokens or total_tokens):
-        return None
-    return Cost(
-        usd=sum(usd) if usd else None,
-        input_tokens=sum(input_tokens) if input_tokens else None,
-        output_tokens=sum(output_tokens) if output_tokens else None,
-        total_tokens=sum(total_tokens) if total_tokens else None,
-    )
+    survivors = {c.seat_id for c in final_round.contributions if c.ok and c.text.strip()}
+    last_usable: dict[str, DebateContribution] = {}
+    reason: dict[str, str] = {}
+    for round_ in rounds:
+        for contribution in round_.contributions:
+            if contribution.ok and contribution.text.strip():
+                last_usable[contribution.seat_id] = contribution
+            if contribution.dissent is not None:
+                reason[contribution.seat_id] = contribution.dissent
+    out: list[tuple[str, str, str]] = []
+    for seat_id, contribution in last_usable.items():
+        if seat_id in survivors:
+            continue
+        out.append((contribution.label, reason.get(seat_id, "set aside before the final round"), contribution.text))
+    return out
 
 
 def _panel_voice(contribution: DebateContribution) -> PanelVoice:
-    """Project one debate turn into the panel-parent's :class:`PanelVoice` summary (status + child link)."""
+    """Project one debate turn into the panel-parent's :class:`PanelVoice` summary (status + rollup)."""
     return PanelVoice(
         label=contribution.label,
         ok=contribution.ok,
@@ -778,40 +1046,25 @@ def _render_transcript(prompt: str, rounds: list[DebateRound]) -> str:
                 if contribution.ok and contribution.text.strip()
                 else (contribution.error.message if contribution.error else "(no answer)")
             )
-            # A turn cut at the time budget keeps the stdout it streamed before the cut as a trace (F8a, 2-F).
+            # A turn cut at the time budget keeps the text it streamed before the cut as a trace (F8a, 2-F).
             if not contribution.ok and contribution.partial and contribution.partial.strip():
                 body += f"\n\n#### Partial output (streamed before the cut)\n\n{contribution.partial.strip()}"
             lines.append(f"\n### {contribution.label}{status}\n\n{body}\n")
     return "".join(lines)
 
 
-def _rebuttal_prompt(
-    question: str,
-    own: str,
-    others: list[tuple[str, str]],
-    stance: Stance | None,
-) -> str:
-    """Build a later-round prompt: show a voice its own and the others' positions and ask it to revise."""
-    others_block = "\n\n".join(f"## {label}\n{text}" for label, text in others) or "(no other positions)"
-    parts = [
-        "You are in a multi-round debate among several AI coding agents on this question:",
-        question,
-        "Your previous position:",
-        own or "(you did not answer yet)",
-        "The other participants' latest positions:",
-        others_block,
-        "Critique the other positions and revise or defend your own. Be specific about where you "
-        "agree, where you disagree and why, and what (if anything) changes your mind. End with your "
-        "current best answer.",
-    ]
-    if stance is Stance.FOR:
-        parts.append("Keep arguing in favor of the proposition.")
-    elif stance is Stance.AGAINST:
-        parts.append("Keep arguing against the proposition.")
-    return "\n\n".join(parts)
-
-
-def _announce(on_progress: ProgressCallback | None, message: str) -> None:
-    """Emit a progress line if a callback is listening (surfaced for async jobs via job_status)."""
-    if on_progress is not None:
-        on_progress(message)
+def _sum_contribution_cost(contributions: list[DebateContribution]) -> Cost | None:
+    """Sum token usage across every turn of every round, or ``None`` when no turn reported any (F8a rollup)."""
+    totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    saw_any = False
+    for contribution in contributions:
+        if contribution.cost is None:
+            continue
+        saw_any = True
+        for field in totals:
+            value = getattr(contribution.cost, field)
+            if value is not None:
+                totals[field] += value
+    if not saw_any:
+        return None
+    return Cost(**{field: value or None for field, value in totals.items()})
