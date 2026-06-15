@@ -5,6 +5,38 @@ negotiates output parsing, system prompts, file context, permissions, and resume
 per-agent code to write. Adding an agent is config, not a code adapter. There are three ways in,
 roughly in order of effort.
 
+## Finding agents: the ACP registry
+
+The Agent Client Protocol maintains a **public registry of every agent and bridge that speaks ACP**:
+
+- Browse: <https://agentclientprotocol.com/get-started/registry> (also listed at <https://zed.dev/acp>)
+- Machine-readable: <https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json>
+
+Rutherford is the ACP **client**, so anything that exposes an ACP **server** over stdio can be driven by
+it — and every registry entry does. Two kinds of entry, both added the same way (the config below):
+
+- **A CLI with native ACP** — its own ACP-server subcommand or flag (e.g. `gemini --acp`, `goose acp`,
+  `qwen --acp`). Use that launch command directly.
+- **An ACP bridge / wrapper** — a small published package that fronts a CLI which has *no* native ACP by
+  spawning it and translating to ACP (e.g. `amp-acp` wraps Sourcegraph Amp, `codex-acp` wraps the Codex
+  CLI). Its launch command is the bridge (which usually requires the underlying CLI installed + authed).
+
+A bridge is just an agent whose `command` happens to be the wrapper. For example, Sourcegraph Amp (no
+native ACP) via the registry-listed `amp-acp` bridge:
+
+```toml
+[agents.amp]
+command  = ["npx", "-y", "amp-acp"]   # the registry bridge; spawns the real `amp` CLI underneath
+provider = "anthropic"
+# Bridge prerequisites live with the underlying CLI: `amp` installed + authed (amp login / AMP_API_KEY),
+# and note amp-acp needs a PAID Amp balance (free credits do not work over ACP).
+```
+
+Caveats for a community bridge (vs a vendor-native ACP mode): it is **third-party** — pin a version
+(`["npx", "-y", "amp-acp@0.8.1"]`), re-verify it after updates, and confirm it actually drives with
+`doctor` before trusting it in a panel. The bridge inherits the underlying CLI's auth, billing, and
+safety posture.
+
 ## 1. Define a new agent in config
 
 If you have an ACP-capable agent that is not in the built-in roster, declare it with an
