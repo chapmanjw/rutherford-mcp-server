@@ -16,6 +16,7 @@ own login and never calls a model provider's API.
 </p>
 
 <p align="center">
+  <a href="https://pepy.tech/projects/rutherford-mcp-server"><img src="https://static.pepy.tech/personalized-badge/rutherford-mcp-server?period=total&units=NONE&left_color=GREY&right_color=ORANGE&left_text=downloads" alt="PyPI Downloads"></a>
   <a href="https://pypi.org/project/rutherford-mcp-server/"><img src="https://img.shields.io/pypi/v/rutherford-mcp-server" alt="PyPI version"></a>
   <img src="https://img.shields.io/pypi/pyversions/rutherford-mcp-server" alt="Python 3.11+">
   <a href="https://github.com/chapmanjw/rutherford-mcp-server/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/rutherford-mcp-server" alt="MIT license"></a>
