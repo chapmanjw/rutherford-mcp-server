@@ -277,6 +277,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Produce into a fresh, non-git location.** A `write` / `propose` / `yolo` delegation whose `working_dir`
+  does not exist yet (a brand-new path to scaffold a project or write a report into, with no git repo) no
+  longer crashes with an unhandled `FileNotFoundError` from the sandbox copy. It is now a first-class
+  "write / produce things that are not in a git repo" path: the sandbox is an empty temp directory, and the
+  apply-back creates the real directory (and parents) as it writes the produced files — for `propose` nothing
+  is applied, so the path stays absent. A `working_dir` that points at a file (not a directory) is refused
+  cleanly. The existing non-git temp-copy path (an existing non-git directory) is unchanged.
+- **Sandbox filesystem faults are structured, never an uncaught raise** (found by a multi-lens review of the
+  produce change). An `OSError` while building the sandbox (mkdtemp / copytree) or applying it back (`mkdir`
+  on an unwritable produce target, disk full) is now returned as a failed `DelegationResult`, honoring the
+  delegation primitive's "every fault is a structured result, never raises" contract — previously it could
+  propagate out and abort a whole consensus/debate panel. A build failure after `mkdtemp` no longer leaks the
+  temp directory, and the non-git temp sandbox is now removed in full (the `mkdtemp` parent, not just the
+  copy) on cleanup.
 - **Write-sandbox hardening** (found by a second, deeper Codex-via-Rutherford safety review of the
   delegation / sandbox paths):
   - A sandboxed mode (`propose` / `write` / `yolo`) **with no `working_dir`** is now refused up front

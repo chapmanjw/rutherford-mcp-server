@@ -353,6 +353,11 @@ class DelegationService:
             raise
         except RutherfordError as exc:
             return _fail(req, exc.code, exc.message, details=exc.details)
+        except OSError as exc:
+            # Building the sandbox is filesystem I/O (mkdtemp / copytree / mkdir): a failure (disk full, a
+            # permission error, a vanished file mid-copy) is an operational fault, not a crash -- the delegation
+            # primitive contract is that every fault returns a structured result, never raises onto the panel.
+            return _fail(req, ErrorCode.INTERNAL, f"could not build the write sandbox for {cwd}: {exc}")
         policy = PermissionPolicy(mode=req.safety_mode, sandboxed=True)
         try:
             async with self._semaphore:
@@ -373,6 +378,10 @@ class DelegationService:
                     outcome = await asyncio.to_thread(sandbox.finish, req.safety_mode)
                 except RutherfordError as exc:
                     return _fail(req, exc.code, f"sandbox apply failed: {exc.message}", details=exc.details)
+                except OSError as exc:
+                    # Computing the diff / applying it back is filesystem I/O; an OSError here (e.g. mkdir on an
+                    # unwritable produce target, disk full) is a structured failure, never an uncaught raise.
+                    return _fail(req, ErrorCode.INTERNAL, f"sandbox apply failed for {cwd}: {exc}")
                 result.changed_files = outcome.changed_files
                 result.diff = outcome.diff or None
                 result.changes_applied = outcome.applied

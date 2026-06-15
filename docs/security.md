@@ -48,9 +48,10 @@ option, so the agent's own loop continues without the side effect rather than th
 cancelled. This is the structured ACP equivalent of the v2 per-CLI safety flags: the policy is
 enforced by Rutherford at each request, not by passing a CLI a `--read-only` flag and trusting it.
 
-The permission engine governs what the agent routes through ACP. An OS-level sandbox (worktree
-isolation) is a later layer, so the optional `verify_read_only` git check (below) still belongs above
-this for defense in depth.
+The permission engine governs what the agent routes through ACP. For a *mutating* mode it is paired with
+the **write sandbox** (below), which runs the agent in an isolated execution root rather than the user's
+tree; the optional `verify_read_only` git check (below) is the defense-in-depth backstop for the
+`read_only` path, which runs directly in `working_dir`.
 
 ---
 
@@ -84,7 +85,58 @@ Two ways to pass the gate:
 
 If neither holds, the delegation fails immediately with `WORKSPACE_NOT_TRUSTED` and no agent is
 spawned. A delegation that omits `working_dir` also fails the gate, because there is no directory to
-check.
+check. A sandboxed mode (`propose` / `write` / `yolo`) with no `working_dir` is refused outright — there
+is no tree to isolate, and the turn must never fall through to running in the server's own directory.
+
+---
+
+## The write sandbox
+
+`delegate` is the **single write path**, and it never lets an agent edit the user's tree directly. A
+mutating (`propose` / `write` / `yolo`) delegation runs in an isolated execution root built by
+`acp/sandbox.py`; only a reviewed diff is ever applied back. (The panels — `consensus`, `debate`,
+`review`, `plan` — are read-only deliberation and refuse a mutating mode at the service boundary: there
+is no coherent merge of edits from several agents into one tree.)
+
+The execution root is chosen by what `working_dir` is:
+
+- **A git repo** → an ephemeral detached worktree off `HEAD` (`git worktree add --detach`). The agent's
+  spawn cwd, the ACP `session/new` cwd, and the file/terminal confinement root are all the worktree. After
+  the turn the changed set is computed from the worktree (`git diff --cached --binary --no-renames` plus
+  the name-status). `propose` discards the worktree; `write` / `yolo` copy the changed files back
+  byte-for-byte (a copy, not `git apply`, so Windows `core.autocrlf` cannot inject `\r`) and remove the
+  deleted ones.
+- **An existing non-git directory** → a bounded temporary copy (a size guard refuses a huge tree, pointing
+  the caller at git; symlinks are skipped, never dereferenced). The agent edits the copy; the changes are
+  diffed against an open-time per-file-hash baseline (so only the agent's edits count) and applied back.
+- **A fresh path that does not exist yet** → producing into a brand-new, non-git location (scaffold a
+  project, write a report). The sandbox is an empty directory and `write` / `yolo` create the real
+  directory as they write the produced files; `propose` applies nothing, so the path stays absent. This is
+  a first-class "write / produce things that are not in a git repo" path.
+
+Guards on the apply-back (each with a test in `tests/test_sandbox.py`):
+
+- **Path containment.** A changed file is written only if `working_dir/<rel>` resolves *inside* the
+  resolved `working_dir`; a destination symlink is replaced at its own location, never written *through*
+  (so it can't redirect the write to another file). A delete resolves only the parent, removing a symlink
+  as the link itself.
+- **No silent clobber.** A git apply refuses if a file it would touch has an *uncommitted* edit vs `HEAD`
+  in the real tree (the worktree is off `HEAD`, so applying back would overwrite that local work); the
+  check runs under the repo's own `autocrlf`. The non-git apply refuses if a touched file was edited in
+  the real tree *during* the turn (a concurrent edit).
+- **Always cleaned up.** The worktree / temp copy is removed in a `finally` (and on a cancellation mid-open
+  via a shielded open), and the agent's process tree is reaped on session close.
+
+Two limitations are deliberate, given the threat model (orchestrating *cooperative* coding agents the user
+chose to run, not sandboxing adversarial code):
+
+- **Not an OS jail.** The isolation is cwd + the ACP path-escape guard. A `write` / `yolo` agent's own OS
+  process, or a terminal command it runs, can still write an absolute path outside the sandbox. Full OS
+  containment (Job Objects / ACLs) is deferred. This is strictly safer than v2, which ran agents directly
+  in the user's tree with no sandbox.
+- **A narrow apply-time TOCTOU.** A user save in the sub-millisecond window between the clobber check and
+  the copy is not detected — the same gap any check-then-write filesystem apply (`git apply` / `git stash`)
+  has. Eliminating it would require locking the whole working tree for the apply.
 
 ---
 

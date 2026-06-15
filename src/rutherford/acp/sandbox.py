@@ -16,9 +16,14 @@ Two isolation strategies, chosen by whether ``working_dir`` is a git repo:
   list). For ``propose`` the worktree is discarded and nothing is applied; for ``write`` / ``yolo`` the
   patch is applied back to the real repo (``git apply``) and *then* the worktree removed.
 * **not a git repo** -- a temporary COPY of the directory (bounded by a size guard so a huge tree is
-  refused rather than silently copied). The agent edits the copy; the changed/created files are diffed
-  against the original and, for ``write`` / ``yolo``, copied back. Over the guard, the run is refused with a
-  clear ``WORKSPACE_NOT_TRUSTED``-adjacent error telling the caller write mode needs a git working_dir.
+  refused rather than silently copied, symlinks skipped). The agent edits the copy; the changed / created /
+  deleted files are diffed against an open-time content baseline (per-file hashes, so only the agent's edits
+  count and a concurrent user edit is detected) and, for ``write`` / ``yolo``, copied / removed back. Over the
+  size guard, the run is refused with a clear error telling the caller write mode needs a git working_dir.
+* **a fresh, non-git location that does not exist yet** -- producing into a brand-new path (e.g. "scaffold a
+  project / write a report here", no git): the sandbox is an empty temp dir and the apply-back creates the
+  real directory as it writes the produced files (``propose`` applies nothing, so the path stays absent). This
+  is a first-class "write / produce things that are not in a git repo" path, not just a git fallback.
 
 The execution root is always cleaned up in a ``finally`` (worktree removed, temp copy deleted), and the
 agent's process tree is reaped by the existing session teardown. ``SandboxResult`` carries the unified diff
@@ -214,7 +219,9 @@ class Sandbox:
         if self._is_git:
             self._manager.remove_worktree(self._working_dir, self._root)
         else:
-            shutil.rmtree(self._root, ignore_errors=True)
+            # The non-git root is ``<mkdtemp>/copy``; remove the whole temp dir, not just the copy, so the
+            # ``mkdtemp`` parent does not linger as an empty directory.
+            shutil.rmtree(self._root.parent, ignore_errors=True)
 
     # --- git strategy --------------------------------------------------------
 
@@ -362,14 +369,19 @@ class SandboxManager:
         turn is handled later in :meth:`Sandbox.finish`.
         """
         resolved = Path(working_dir).resolve()
-        if self._is_git_repo(resolved):
+        if resolved.is_dir() and self._is_git_repo(resolved):
             root = self._add_worktree(resolved)
             return Sandbox(manager=self, working_dir=resolved, root=root, is_git=True)
         root = self._copy_tree(resolved)
         # Snapshot the copied tree's content hashes as the open-time baseline, so the non-git change detection
         # is agent-relative and a concurrent edit during the turn is caught at apply (the copy == the real tree
-        # right now, so this is the real tree's state at open time).
-        baseline = {path.relative_to(root).as_posix(): _sha256(path.read_bytes()) for path in _walk_files(root)}
+        # right now, so this is the real tree's state at open time). A read error mid-snapshot must not leak the
+        # freshly-built sandbox -- no Sandbox handle exists yet to clean it up -- so remove it and re-raise.
+        try:
+            baseline = {path.relative_to(root).as_posix(): _sha256(path.read_bytes()) for path in _walk_files(root)}
+        except OSError:
+            shutil.rmtree(root.parent, ignore_errors=True)  # root is <temp>/copy; drop the whole temp dir
+            raise
         return Sandbox(manager=self, working_dir=resolved, root=root, is_git=False, baseline=baseline)
 
     # --- git plumbing --------------------------------------------------------
@@ -470,27 +482,47 @@ class SandboxManager:
     # --- non-git temp-copy plumbing -----------------------------------------
 
     def _copy_tree(self, working_dir: Path) -> Path:
-        """Copy ``working_dir`` (minus the excluded dirs and any symlinks) into a temp dir, size-guarded first.
+        """Build the non-git temp sandbox: an empty root for a fresh produce target, else a copy of the tree.
 
-        Refuses a tree whose copyable content exceeds :data:`_MAX_COPY_BYTES` with a clear error -- write mode
-        on a huge non-git dir should use a git working_dir, not a slow, unreliable copy. The excluded dirs
-        (``.git`` is absent here by definition, plus ``node_modules`` / virtualenvs / caches) are skipped so
-        the copy is the source, not its regenerable artifacts. SYMLINKS are skipped entirely: copying them as
+        A ``working_dir`` that does NOT exist yet is a fresh produce target (write/produce into a brand-new,
+        non-git location): the sandbox is an empty temp dir, and the apply-back creates the real directory as
+        it writes the produced files (for ``propose`` nothing is applied, so the target stays absent). A
+        ``working_dir`` that exists but is not a directory is rejected (a file is not a workspace).
+
+        For an existing dir, its content (minus the excluded dirs and any symlinks) is copied, size-guarded
+        first: a tree whose copyable content exceeds :data:`_MAX_COPY_BYTES` is refused with a clear error --
+        write mode on a huge non-git dir should use a git working_dir, not a slow, unreliable copy. The excluded
+        dirs (``.git`` is absent here by definition, plus ``node_modules`` / virtualenvs / caches) are skipped
+        so the copy is the source, not its regenerable artifacts. SYMLINKS are skipped entirely: copying them as
         links would need an OS privilege (Windows), and dereferencing them (copytree's default) would pull the
         bytes of a file OUTSIDE the working_dir into the sandbox -- so they are simply not copied, and the real
         symlinks are left untouched by the apply-back.
         """
-        total = _tree_size(working_dir)
-        if total > _MAX_COPY_BYTES:
+        if working_dir.exists() and not working_dir.is_dir():
             raise RutherfordError(
                 ErrorCode.WORKSPACE_NOT_TRUSTED,
-                f"write mode needs a git working_dir: the non-git directory is {total // (1024 * 1024)} MiB, over the "
-                f"{_MAX_COPY_BYTES // (1024 * 1024)} MiB copy-sandbox guard. Run `git init` and commit, or point at a "
-                "smaller directory.",
+                f"working_dir {working_dir} is a file, not a directory; a write/produce delegation needs a "
+                "directory to work in (an existing one, or a fresh path to produce into).",
             )
+        if working_dir.is_dir():
+            total = _tree_size(working_dir)
+            if total > _MAX_COPY_BYTES:
+                raise RutherfordError(
+                    ErrorCode.WORKSPACE_NOT_TRUSTED,
+                    f"write mode needs a git working_dir: the non-git directory is {total // (1024 * 1024)} MiB, over "
+                    f"the {_MAX_COPY_BYTES // (1024 * 1024)} MiB copy-sandbox guard. Run `git init` and commit, or "
+                    "point at a smaller directory.",
+                )
         temp = Path(tempfile.mkdtemp(prefix="rutherford-sbx-"))
         copy = temp / "copy"
-        shutil.copytree(working_dir, copy, ignore=_copy_ignore, dirs_exist_ok=True)
+        try:
+            if not working_dir.exists():
+                copy.mkdir(parents=True)  # a fresh produce target -- empty sandbox; the real dir is made on apply
+            else:
+                shutil.copytree(working_dir, copy, ignore=_copy_ignore, dirs_exist_ok=True)
+        except OSError:
+            shutil.rmtree(temp, ignore_errors=True)  # never leak the temp dir if the build itself fails
+            raise
         return copy
 
 

@@ -717,3 +717,153 @@ def test_non_git_copy_skips_symlinks(tmp_path: Path) -> None:
     finally:
         sandbox.cleanup()
     assert (work / "link").is_symlink(), "the real symlink must be left untouched"
+
+
+# --- produce into a fresh (non-existent), non-git location -------------------
+
+
+async def test_write_mode_produces_into_a_nonexistent_dir(tmp_path: Path) -> None:
+    """A write delegation whose working_dir does NOT exist yet creates it and lands the produced file.
+
+    This is the 'write/produce things not in a git repo' case: a brand-new, non-git output location. The
+    sandbox is an empty temp dir; the apply-back creates the real directory (and parents) as it writes.
+    """
+    target = tmp_path / "fresh" / "out"  # neither component exists
+    service = _service()
+    req = await _delegate(service, prompt="WRITE=made.txt:produced here", working_dir=target, mode=SafetyMode.WRITE)
+    result = await service.delegate(req)
+    assert result.ok is True, f"produce-into-a-fresh-dir failed: {result.error}"
+    assert target.is_dir(), "the fresh produce directory was not created"
+    assert (target / "made.txt").read_text(encoding="utf-8") == "produced here"
+    assert result.changed_files == ["made.txt"]
+    assert result.changes_applied is True
+
+
+async def test_propose_into_a_nonexistent_dir_leaves_it_absent(tmp_path: Path) -> None:
+    """Propose into a non-existent dir returns the proposed change but never creates the real directory."""
+    target = tmp_path / "ghost"
+    service = _service()
+    req = await _delegate(service, prompt="WRITE=plan.txt:a proposal", working_dir=target, mode=SafetyMode.PROPOSE)
+    result = await service.delegate(req)
+    assert result.ok is True, f"propose-into-a-fresh-dir failed: {result.error}"
+    assert not target.exists(), "propose created the real directory"
+    assert result.changed_files == ["plan.txt"]
+    assert result.changes_applied is False
+
+
+async def test_write_mode_produces_alongside_existing_non_git_context(tmp_path: Path) -> None:
+    """Producing into an EXISTING non-git dir keeps its files and lands the new one (read-context + produce)."""
+    (tmp_path / "context.txt").write_text("seed notes the agent could read\n", encoding="utf-8")
+    service = _service()
+    req = await _delegate(service, prompt="WRITE=summary.md:produced", working_dir=tmp_path, mode=SafetyMode.WRITE)
+    result = await service.delegate(req)
+    assert result.ok is True, f"produce-alongside-context failed: {result.error}"
+    assert (tmp_path / "summary.md").read_text(encoding="utf-8") == "produced"
+    assert (tmp_path / "context.txt").read_text(encoding="utf-8") == "seed notes the agent could read\n"
+    assert result.changed_files == ["summary.md"]  # only the produced file is reported, not the context
+
+
+def test_containment_guard_holds_on_a_nonexistent_base(tmp_path: Path) -> None:
+    """The apply-back containment guard still refuses an escaping relpath when the base dir does not exist yet.
+
+    Producing into a fresh path means ``working_dir`` is created on apply; the containment check must still
+    reject a ``..`` climb (``Path.resolve()`` normalizes lexically even for a not-yet-created base).
+    """
+    from rutherford.acp.sandbox import Sandbox
+
+    fresh = tmp_path / "does-not-exist-yet"  # never created
+    sandbox = Sandbox(manager=SandboxManager(), working_dir=fresh.resolve(), root=tmp_path, is_git=False)
+    assert sandbox._contained_target("../escape.txt") is None  # climbs out of the fresh base -> refused
+    inside = sandbox._contained_target("nested/made.txt")
+    assert inside is not None and inside.name == "made.txt"  # a normal produced path is allowed
+
+
+def test_sandbox_open_on_a_nonexistent_dir_is_an_empty_sandbox(tmp_path: Path) -> None:
+    """``SandboxManager.open`` on a non-existent working_dir yields an empty sandbox (no copytree crash)."""
+    target = tmp_path / "nope"
+    manager = SandboxManager()
+    sandbox = manager.open(str(target))
+    try:
+        root = Path(sandbox.root)
+        assert root.is_dir() and list(root.iterdir()) == [], "a fresh produce sandbox must be an empty dir"
+        outcome = sandbox.finish(SafetyMode.WRITE)  # produced nothing -> empty result, no crash
+    finally:
+        sandbox.cleanup()
+    assert outcome.changed_files == [] and outcome.applied is False
+
+
+def test_working_dir_that_is_a_file_is_rejected(tmp_path: Path) -> None:
+    """A working_dir that points at a FILE (not a directory) is refused cleanly, not crashed on."""
+    from rutherford.domain.errors import RutherfordError
+
+    a_file = tmp_path / "a-file.txt"
+    a_file.write_text("not a workspace\n", encoding="utf-8")
+    manager = SandboxManager()
+    with pytest.raises(RutherfordError) as exc:
+        manager.open(str(a_file))
+    assert exc.value.code is ErrorCode.WORKSPACE_NOT_TRUSTED
+    assert "not a directory" in exc.value.message
+
+
+# --- sandbox I/O failures are structured, never an uncaught raise ------------
+
+
+async def test_sandbox_apply_oserror_is_a_failed_result_not_a_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OSError while applying the sandbox back is returned as a structured failure, never raised.
+
+    The delegation primitive's contract is that every operational fault is a ``DelegationResult``, not an
+    exception that would abort a whole consensus/debate panel. A disk-full / permission error mid-apply must
+    therefore surface as a failed result.
+    """
+    _git_repo(tmp_path)
+    from rutherford.acp import sandbox as sandbox_mod
+
+    def boom(self: object, mode: object) -> None:
+        raise OSError("disk full (simulated)")
+
+    monkeypatch.setattr(sandbox_mod.Sandbox, "finish", boom)
+    service = _service()
+    req = await _delegate(service, prompt="WRITE=x.txt:data", working_dir=tmp_path, mode=SafetyMode.WRITE)
+    result = await service.delegate(req)
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.INTERNAL
+    assert "apply failed" in result.error.message
+
+
+async def test_sandbox_open_oserror_is_a_failed_result_not_a_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OSError while BUILDING the sandbox is a structured failure, not a raise onto the panel."""
+    from rutherford.acp import sandbox as sandbox_mod
+
+    def boom(self: object, working_dir: str) -> None:
+        raise OSError("cannot create sandbox (simulated)")
+
+    monkeypatch.setattr(sandbox_mod.SandboxManager, "open", boom)
+    service = _service()
+    req = await _delegate(service, prompt="WRITE=x.txt:data", working_dir=tmp_path, mode=SafetyMode.WRITE)
+    result = await service.delegate(req)
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.INTERNAL
+    assert "build the write sandbox" in result.error.message
+
+
+def test_copy_tree_does_not_leak_a_temp_dir_on_a_build_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the non-git sandbox build fails after ``mkdtemp``, the temp dir is cleaned up, not leaked."""
+    import tempfile
+
+    (tmp_path / "f.txt").write_text("x\n", encoding="utf-8")
+    temp_root = Path(tempfile.gettempdir())
+    before = set(temp_root.glob("rutherford-sbx-*"))
+
+    def boom(src: object, dst: object, **kw: object) -> None:
+        raise OSError("copytree failed (simulated)")
+
+    # Patch via the module-qualified string so the sandbox module's ``shutil.copytree`` is the one replaced.
+    monkeypatch.setattr("rutherford.acp.sandbox.shutil.copytree", boom)
+    manager = SandboxManager()
+    with pytest.raises(OSError):
+        manager.open(str(tmp_path))
+    assert set(temp_root.glob("rutherford-sbx-*")) == before, "a temp sandbox dir leaked on a build failure"
