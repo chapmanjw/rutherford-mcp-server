@@ -603,6 +603,10 @@ class ConsensusRequest(BaseModel):
     #: first successful voice when unset; pass a distinct CLI so an independent, non-participant judge
     #: combines the panel instead of one of the debaters.
     judge: Target | None = None
+    #: No-self-approval hard guard (F4a, 4-A): refuse a synthesis that would be authored by a panel
+    #: participant -- for a binding verdict, name a non-participant ``judge``. Opt-in (default off, so no
+    #: behavior regression); when off, a self-authored synthesis still runs but is flagged ``self_authored``.
+    require_independent_judge: bool = False
     #: Persist this panel as a durable job (F2): a parent record plus a child record per voice, under
     #: ``<jobs_dir>/``. ``None`` follows ``default_persistence``; ``True`` / ``False`` force it.
     persist: bool | None = None
@@ -649,6 +653,11 @@ class ConsensusResult(BaseModel):
     #: The display label of the target that wrote the synthesis (a judge if one was named, else the
     #: first successful voice), so a reader can see whether the synthesizer was a panel participant.
     synthesis_by: str | None = None
+    #: No-self-approval transparency floor (F4a, 4-A): ``True`` when the synthesizer was itself a panel
+    #: participant (the default judge = the first voice's agent), so a self-authored verdict is never
+    #: silent. ``False`` when an independent (non-participant) judge wrote it. Opt into a hard refusal of
+    #: self-authorship with ``require_independent_judge``.
+    self_authored: bool = False
     skipped: list[SkippedTarget] = Field(default_factory=list)
     #: Effective model/provider diversity across the answering voices (F3). ``None`` when no voice
     #: answered (nothing to measure).
@@ -693,6 +702,12 @@ class VoiceVerdict(BaseModel):
     #: errored), ``unparseable`` (it answered but no verdict could be extracted), or ``None`` when a
     #: verdict was extracted. Lets a reader tell a mis-parse from an abstention.
     no_verdict_reason: str | None = None
+    #: No-silent-dismissal (F4a, 4-B): why this voice's PARSEABLE verdict was set aside -- a structural
+    #: reason the aggregator stamps when a real verdict lost ("minority: 2 of 5 voted 'no'; the panel
+    #: majority 'yes'"). DISTINCT from ``no_verdict_reason`` (which means the voice had NO verdict): a
+    #: dissenting voice HAS a verdict, it just did not win. ``None`` for the winning verdict(s) and for voices
+    #: with no verdict. F4b's required-dissent enriches this same field.
+    dissent: str | None = None
     text: str = ""
     #: The effective provider/model that answered this seat (F3), carried from the voice's result so a
     #: strategy reader sees per-voice identity. ``None`` when undetermined.
@@ -761,6 +776,9 @@ class DebateRequest(BaseModel):
     #: An optional target to write the closing synthesis. Defaults to the first surviving voice when
     #: unset; pass a distinct CLI for an independent, non-participant judge.
     judge: Target | None = None
+    #: No-self-approval hard guard (F4a, 4-A): refuse a closing that would be authored by a debate
+    #: participant -- name a non-participant ``judge`` for a binding verdict. Opt-in (default off).
+    require_independent_judge: bool = False
     #: Persist this debate as a durable job (F2): a parent record plus the full ``transcript.md`` artifact,
     #: under ``<jobs_dir>/``. A debate drives its turns over persistent sessions (not via ``delegate``), so
     #: there are no per-turn child records -- the transcript carries the run. ``None`` follows
@@ -804,6 +822,16 @@ class DebateContribution(BaseModel):
     role: str | None = None
     ok: bool
     text: str = ""
+    #: The seat's ROUND-1 (blind, pre-exposure) position, carried onto each LATER round's contribution so a
+    #: reader sees pre-vs-post movement (F4a, 4-C): round 1 is committed before any voice sees the others, so
+    #: a shift from this to ``text`` is real movement, not anchoring. ``None`` on a round-1 contribution (it
+    #: IS the pre-commitment) and when the seat had no usable round-1 answer. Feeds F5 convergence + F4b.
+    pre_commit: str | None = None
+    #: No-silent-dismissal (F4a, 4-B): why this seat was set aside, stamped at the prune step on the round
+    #: where a voice drops out (e.g. "set aside: no usable answer in round 2"). DISTINCT from ``error`` (a
+    #: turn fault): a pruned seat may have answered earlier rounds. ``None`` for a surviving/answering seat.
+    #: The closing names the dissent it sets aside.
+    dissent: str | None = None
     raw: str | None = None
     duration_s: float = 0.0
     error: ErrorInfo | None = None
@@ -868,6 +896,9 @@ class DebateResult(BaseModel):
     #: The display label of the target that wrote the closing synthesis (a judge if named, else the
     #: first surviving voice).
     synthesis_by: str | None = None
+    #: No-self-approval transparency (F4a, 4-A): ``True`` when the closing was written by a panel
+    #: participant (the default judge = the first surviving voice). ``False`` for an independent judge.
+    self_authored: bool = False
     skipped: list[SkippedTarget] = Field(default_factory=list)
     #: Effective model/provider diversity (F3) across the LAST USABLE round's answering voices -- the round
     #: the closing summarizes, which a budget-cut final round falls back from. ``None`` when no voice survived

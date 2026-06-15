@@ -175,6 +175,9 @@ class DebateService:
         stop_reason: str | None = None
         try:
             rounds: list[DebateRound] = []
+            # F4a (4-C): each seat's ROUND-1 (blind, pre-exposure) answer, captured once and carried onto every
+            # later round's contribution so a reader sees pre-vs-post movement without an extra sub-turn.
+            pre_commits: dict[str, str] = {}
             active = [voice for voice in voices if voice.index in sessions]
             for round_index in range(1, rounds_cap + 1):
                 if round_index > 1 and len(active) < 2:
@@ -199,16 +202,28 @@ class DebateService:
                     base_depth,
                     on_activity,
                 )
+                if round_index == 1:
+                    # Round 1 is the blind pre-commitment (no voice has seen another's answer yet).
+                    pre_commits = {c.seat_id: c.text for c in contributions if c.ok and c.text.strip()}
+                else:
+                    for contribution in contributions:  # carry the seat's blind round-1 position onto this turn
+                        contribution.pre_commit = pre_commits.get(contribution.seat_id)
                 rounds.append(DebateRound(index=round_index, contributions=contributions))
+                # F4a no-silent-dismissal (4-B): a seat that produced no usable answer this round is set aside
+                # -- stamp why on its contribution so a dropped voice is never silent. Stamped BEFORE the
+                # budget-cut break so a seat cut at the deadline (also "no usable answer") is stamped too.
+                survivors = {c.seat_id for c in contributions if c.ok and c.text.strip()}
+                for contribution in contributions:
+                    if contribution.seat_id not in survivors:
+                        contribution.dissent = f"set aside: no usable answer in round {round_index}"
                 if round_cut:  # turns were cut in-flight at the deadline -- finalize over the transcript so far
                     stop_reason = "budget"
                     break
-                survivors = {c.seat_id for c in contributions if c.ok and c.text.strip()}
                 active = [voice for voice in active if _seat_id(voice) in survivors]
 
             if stop_reason == "budget":
                 self._check_quorum(req, rounds, budget, lifecycle, base_depth, declared)
-            final, synthesis_by = await self._synthesize(req, rounds, cwd, timeout_s, base_depth)
+            final, synthesis_by, self_authored = await self._synthesize(req, rounds, cwd, timeout_s, base_depth)
             elapsed_s = round(time.monotonic() - start, 3)
             rollup = self._rollup(req, rounds, budget, stop_reason, elapsed_s) if budget is not None else None
             topology = self._topology(declared, rounds, over_cap)
@@ -248,6 +263,7 @@ class DebateService:
                 rounds=rounds,
                 final=final,
                 synthesis_by=synthesis_by,
+                self_authored=self_authored,
                 stop_reason=stop_reason if budget is not None else None,
                 rollup=rollup,
                 topology=topology,
@@ -581,29 +597,57 @@ class DebateService:
 
     async def _synthesize(
         self, req: DebateRequest, rounds: list[DebateRound], cwd: str, timeout_s: float, base_depth: int
-    ) -> tuple[str | None, str | None]:
-        """Run a closing pass over the final positions, or ``(None, None)`` when there is nothing to close.
+    ) -> tuple[str | None, str | None, bool]:
+        """Run a closing pass over the final positions, or ``(None, None, False)`` when there is nothing to close.
 
         Uses the caller-named ``judge`` when given (ideally a non-participant), else the first surviving
         voice's agent, on a fresh one-shot session one level deeper (so a Rutherford-host judge is bounded).
+        Returns ``(closing, label, self_authored)``. F4a no-self-approval (4-A): ``self_authored`` is ``True``
+        when the closing author is a debate participant -- its CLI produced a usable position in ANY round
+        (:func:`_participant_clis`), not just the final one, so a judge that argued then dropped still counts;
+        the default judge always is. ``require_independent_judge`` (per call or config) REFUSES a self-authored
+        closing with ``INVALID_INPUT``. The closing prompt requires it to NAME each set-aside dissent (4-B).
         """
         if not req.synthesize or not rounds:
-            return None, None
+            return None, None, False
         final_round = _last_usable_round(rounds)
         if final_round is None:
-            return None, None
+            return None, None, False
         closing = [c for c in final_round.contributions if c.ok and c.text.strip()]
         if not closing:
-            return None, None
+            return None, None, False
         judge = req.judge if req.judge is not None else Target(cli=closing[0].target.cli, model=closing[0].target.model)
+        # F4a no-self-approval (4-A): "participant" is ANY agent that produced a usable position in ANY round,
+        # not only one that survived to the close -- a voice that argued then dropped is still a participant,
+        # so a named judge that debated at all is self-authoring even if it is gone by the final round.
+        self_authored = judge.cli in _participant_clis(rounds)
+        if self_authored and (req.require_independent_judge or self._config.require_independent_judge):
+            raise RutherfordError(
+                ErrorCode.INVALID_INPUT,
+                f"require_independent_judge is set, but the closing would be authored by debate participant "
+                f"{judge.cli!r}; name a non-participant judge (judge=<cli>) for a binding verdict",
+            )
         if not self._descriptors.has(judge.cli):
-            return None, None
+            return None, None, False
         transcript = "\n\n".join(f"## {c.label}\n{c.text}" for c in closing)
         prompt = (
             "You are closing out a debate among several AI coding agents on the same question.\n\n"
             f"The question:\n{req.prompt}\n\nTheir final positions:\n\n{transcript}\n\n"
-            "State where they converged, lay out the remaining disagreements and the strongest case on each "
-            "side, and give your best overall answer."
+        )
+        # F4a no-silent-dismissal (4-B): the closing summarizes only the final round, so a seat that argued an
+        # earlier round then dropped would be invisible -- the judge could not NAME a dissent it never sees.
+        # Surface each set-aside seat's last usable position + why, so the instruction below is fulfillable.
+        set_aside = _set_aside_dissents(rounds, final_round)
+        if set_aside:
+            block = "\n\n".join(f"## {label} -- {reason}\n{text}" for label, reason, text in set_aside)
+            prompt += (
+                "Positions set aside before the final round (you MUST name each one and why it did not "
+                f"carry):\n\n{block}\n\n"
+            )
+        prompt += (
+            "State where they converged, lay out the remaining disagreements, and NAME each dissenting "
+            "position you set aside with a one-line reason it did not carry (F4a no-silent-dismissal). Give "
+            "the strongest case on each side, and end with your best overall answer."
         )
         descriptor = self._descriptors.get(judge.cli)
         result = await run_acp_turn(
@@ -616,8 +660,8 @@ class DebateService:
             base_depth=base_depth + 1,
         )
         if not result.ok or not result.text.strip():
-            return None, None
-        return result.text, judge.display_label
+            return None, None, False
+        return result.text, judge.display_label, self_authored
 
     def _rollup(
         self,
@@ -800,6 +844,41 @@ def _last_usable_round(rounds: list[DebateRound]) -> DebateRound | None:
         if any(c.ok and c.text.strip() for c in round_.contributions):
             return round_
     return None
+
+
+def _participant_clis(rounds: list[DebateRound]) -> set[str]:
+    """Every agent CLI that produced a usable position in ANY round (the F4a 4-A participant set).
+
+    A voice that argued then dropped is still a debate participant, so the no-self-approval guard must see it,
+    not just the final round's survivors. The default judge (always a final-round survivor) is in this set.
+    """
+    return {c.target.cli for round_ in rounds for c in round_.contributions if c.ok and c.text.strip()}
+
+
+def _set_aside_dissents(rounds: list[DebateRound], final_round: DebateRound) -> list[tuple[str, str, str]]:
+    """Each seat set aside before the final usable round, as ``(label, reason, its last usable text)`` (F4a 4-B).
+
+    The closing summarizes only ``final_round``, so a seat that argued an earlier round then dropped would be
+    invisible to the judge -- it could not NAME a dissent it never sees. This gathers each such seat's LAST
+    usable position and the reason it was set aside, so the closing prompt can carry it. A seat that never
+    produced a usable position (a pure failure) has no position to name and is omitted; a seat still answering
+    in the final round is already in the transcript and is skipped.
+    """
+    survivors = {c.seat_id for c in final_round.contributions if c.ok and c.text.strip()}
+    last_usable: dict[str, DebateContribution] = {}
+    reason: dict[str, str] = {}
+    for round_ in rounds:
+        for contribution in round_.contributions:
+            if contribution.ok and contribution.text.strip():
+                last_usable[contribution.seat_id] = contribution
+            if contribution.dissent is not None:
+                reason[contribution.seat_id] = contribution.dissent
+    out: list[tuple[str, str, str]] = []
+    for seat_id, contribution in last_usable.items():
+        if seat_id in survivors:
+            continue
+        out.append((contribution.label, reason.get(seat_id, "set aside before the final round"), contribution.text))
+    return out
 
 
 def _panel_voice(contribution: DebateContribution) -> PanelVoice:

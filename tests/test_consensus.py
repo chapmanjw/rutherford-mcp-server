@@ -169,6 +169,81 @@ async def test_consensus_synthesize_uses_named_judge() -> None:
     assert result.synthesis_by == "fake_b"
 
 
+# --- F4a no-self-approval (judge independence) -------------------------------
+
+
+async def test_consensus_synthesis_flags_self_authorship() -> None:
+    # F4a (4-A): the default judge is the first voice -- a panel participant -- so the synthesis is flagged
+    # self_authored. Naming a non-participant judge clears the flag.
+    self_judged = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_a")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(self_judged)
+    assert isinstance(result, ConsensusResult)
+    assert result.synthesis is not None and result.self_authored is True  # judged by a participant
+
+    external = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_a")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        judge=Target(cli="fake_b"),  # not one of the answering voices
+        working_dir=str(REPO_ROOT),
+    )
+    independent = await _service().consensus(external)
+    assert isinstance(independent, ConsensusResult)
+    assert independent.synthesis is not None and independent.self_authored is False
+
+
+async def test_consensus_require_independent_judge_refuses_a_participant() -> None:
+    # F4a (4-A): with require_independent_judge the default (participant) judge is REFUSED rather than
+    # silently authoring its own panel's verdict -- a clean INVALID_INPUT pointing at a non-participant judge.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_a")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        require_independent_judge=True,
+        working_dir=str(REPO_ROOT),
+    )
+    with pytest.raises(RutherfordError) as exc:
+        await _service().consensus(request)
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+    assert "require_independent_judge" in exc.value.message and "non-participant" in exc.value.message
+
+
+async def test_consensus_require_independent_judge_allows_an_external_judge() -> None:
+    # The same flag passes cleanly once a genuinely non-participant judge is named.
+    request = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_a")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        require_independent_judge=True,
+        judge=Target(cli="fake_b"),
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.synthesis is not None and result.self_authored is False
+    assert result.synthesis_by == "fake_b"
+
+
+async def test_consensus_require_independent_judge_via_config() -> None:
+    # The guard also fires from config (require_independent_judge=True) with no per-call flag -- the default
+    # participant judge is refused server-wide.
+    config = RutherfordConfig(require_independent_judge=True)
+    request = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_a")],
+        prompt="what is 17 + 25?",
+        synthesize=True,
+        working_dir=str(REPO_ROOT),
+    )
+    with pytest.raises(RutherfordError) as exc:
+        await _service(config).consensus(request)
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+
+
 # --- strategies & verdict extraction -----------------------------------------
 
 

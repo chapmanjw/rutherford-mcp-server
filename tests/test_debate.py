@@ -18,7 +18,14 @@ from rutherford.domain.enums import Effort, SafetyMode, Stance
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import DebateContribution, DebateRequest, DebateRound, Target
-from rutherford.services.debate import DebateService, _disambiguate, _Voice, _with_later_stance
+from rutherford.services.debate import (
+    DebateService,
+    _disambiguate,
+    _participant_clis,
+    _set_aside_dissents,
+    _Voice,
+    _with_later_stance,
+)
 from rutherford.services.delegation import DelegationService
 from rutherford.tools.debate import debate_tool
 
@@ -34,11 +41,13 @@ DEAD = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.e
 SLOW = AgentDescriptor(
     "slow", "Slow", _FAKE_CMD, default_model="model-s", env_overrides=(("RUTHERFORD_FAKE_SLEEP", "1.5"),)
 )
+# A fast fake with a distinct id, so a debate of two ``fake`` voices can name it as a NON-participant judge.
+JUDGE = AgentDescriptor("judge", "Judge", _FAKE_CMD, provider="beta", default_model="model-j")
 
 
 def _service(config: RutherfordConfig | None = None) -> DebateService:
     resolved = config or RutherfordConfig()
-    registry = DescriptorRegistry([FAKE, DEAD, SLOW])
+    registry = DescriptorRegistry([FAKE, DEAD, SLOW, JUDGE])
     return DebateService(registry, resolved, DelegationService(registry, resolved))
 
 
@@ -114,6 +123,163 @@ async def test_debate_handshake_failure_becomes_a_failed_contribution() -> None:
 async def test_debate_without_synthesis() -> None:
     result = await _service().debate(_two_fakes(rounds=1, synthesize=False))
     assert result.final is None
+
+
+# --- F4a no-self-approval + pre-commit + set-aside dissent --------------------
+
+
+async def test_debate_closing_flags_self_authorship() -> None:
+    # F4a (4-A): the default closing author is the first surviving voice -- a participant -- so the closing is
+    # flagged self_authored. Naming a non-participant judge clears it.
+    result = await _service().debate(_two_fakes(rounds=1))
+    assert result.final is not None and result.self_authored is True
+
+    judged = await _service().debate(_two_fakes(rounds=1, judge=Target(cli="judge")))
+    assert judged.final is not None and judged.self_authored is False
+    assert judged.synthesis_by == "judge"
+
+
+async def test_debate_require_independent_judge_refuses_a_participant() -> None:
+    # With require_independent_judge the default (participant) closing author is refused; a non-participant
+    # judge passes cleanly.
+    with pytest.raises(RutherfordError) as exc:
+        await _service().debate(_two_fakes(rounds=1, require_independent_judge=True))
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+    assert "require_independent_judge" in exc.value.message and "non-participant" in exc.value.message
+
+    ok = await _service().debate(_two_fakes(rounds=1, require_independent_judge=True, judge=Target(cli="judge")))
+    assert ok.final is not None and ok.self_authored is False
+
+
+async def test_debate_require_independent_judge_via_config() -> None:
+    # The guard fires from config as well, refusing a participant closing server-wide with no per-call flag.
+    config = RutherfordConfig(require_independent_judge=True)
+    with pytest.raises(RutherfordError) as exc:
+        await _service(config).debate(_two_fakes(rounds=1))
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+
+
+async def test_debate_carries_round_one_pre_commit_onto_later_rounds() -> None:
+    # F4a (4-C): each seat's blind round-1 answer is carried onto its later-round contributions so a reader
+    # sees pre-vs-post movement. Round 1 itself has no pre_commit (it IS the pre-commitment).
+    result = await _service().debate(_two_fakes(rounds=2))
+    assert len(result.rounds) == 2
+    assert all(c.pre_commit is None for c in result.rounds[0].contributions)  # round 1 is the blind commit
+    round_one_by_seat = {c.seat_id: c.text for c in result.rounds[0].contributions}
+    for contribution in result.rounds[1].contributions:
+        assert contribution.pre_commit == round_one_by_seat[contribution.seat_id]
+        assert contribution.pre_commit  # a non-empty captured round-1 position
+
+
+def _contribution(
+    label: str, *, seat: str, round_index: int, ok: bool, text: str, dissent: str | None = None
+) -> DebateContribution:
+    return DebateContribution(
+        label=label,
+        seat_id=seat,
+        target=Target(cli=label.lower()),
+        round_index=round_index,
+        ok=ok,
+        text=text,
+        dissent=dissent,
+    )
+
+
+def test_participant_clis_spans_every_round_not_just_the_close() -> None:
+    # F4a (4-A): a seat that argued round 1 then dropped is still a participant, so the no-self-approval set
+    # must include it -- otherwise a named judge that debated-then-dropped is wrongly treated as independent.
+    round1 = DebateRound(
+        index=1,
+        contributions=[
+            _contribution("Fake", seat="0:Fake", round_index=1, ok=True, text="A"),
+            _contribution("Dropper", seat="1:Dropper", round_index=1, ok=True, text="B"),
+        ],
+    )
+    round2 = DebateRound(
+        index=2,
+        contributions=[
+            _contribution("Fake", seat="0:Fake", round_index=2, ok=True, text="A2"),
+            _contribution(
+                "Dropper",
+                seat="1:Dropper",
+                round_index=2,
+                ok=False,
+                text="",
+                dissent="set aside: no usable answer in round 2",
+            ),
+        ],
+    )
+    assert _participant_clis([round1, round2]) == {"fake", "dropper"}  # dropper counts despite leaving round 2
+
+
+def test_set_aside_dissents_surfaces_a_dropped_seats_last_position() -> None:
+    # F4a (4-B): the closing summarizes only the final usable round, so a seat that argued earlier then dropped
+    # must be surfaced (its last usable text + why) or the "name each set-aside dissent" instruction is moot.
+    round1 = DebateRound(
+        index=1,
+        contributions=[
+            _contribution("Fake", seat="0:Fake", round_index=1, ok=True, text="keep it"),
+            _contribution("Dropper", seat="1:Dropper", round_index=1, ok=True, text="ship anyway"),
+        ],
+    )
+    round2 = DebateRound(
+        index=2,
+        contributions=[
+            _contribution("Fake", seat="0:Fake", round_index=2, ok=True, text="still keep it"),
+            _contribution(
+                "Dropper",
+                seat="1:Dropper",
+                round_index=2,
+                ok=False,
+                text="",
+                dissent="set aside: no usable answer in round 2",
+            ),
+        ],
+    )
+    final = round2  # the last usable round (Fake answered)
+    set_aside = _set_aside_dissents([round1, round2], final)
+    assert set_aside == [("Dropper", "set aside: no usable answer in round 2", "ship anyway")]  # its round-1 text
+    # a seat still answering the final round is already in the transcript, never re-surfaced as "set aside"
+    assert all(label != "Fake" for label, _, _ in set_aside)
+
+
+def test_set_aside_dissents_omits_a_pure_failure_with_no_position() -> None:
+    # A seat that never produced a usable position has nothing to NAME -- it is omitted (its failure is its own
+    # record), so the closing block only ever carries real dissenting positions.
+    round1 = DebateRound(
+        index=1,
+        contributions=[
+            _contribution("Fake", seat="0:Fake", round_index=1, ok=True, text="answer"),
+            _contribution(
+                "Dead",
+                seat="1:Dead",
+                round_index=1,
+                ok=False,
+                text="",
+                dissent="set aside: no usable answer in round 1",
+            ),
+        ],
+    )
+    assert _set_aside_dissents([round1], round1) == []  # the dead seat has no position to surface
+
+
+async def test_debate_set_aside_voice_is_stamped_with_dissent() -> None:
+    # F4a (4-B): a seat that produced no usable answer in a round is dropped -- its contribution carries a
+    # structural set-aside reason, never a silent disappearance. The dead voice fails round 1 and is stamped.
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="fake"), Target(cli="dead")],
+        prompt="what is 17 + 25?",
+        rounds=2,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().debate(request)
+    dead = next(c for c in result.rounds[0].contributions if c.target.cli == "dead")
+    assert dead.ok is False and dead.dissent == "set aside: no usable answer in round 1"
+    # the surviving voices argued on and were never set aside
+    survivors = [c for c in result.rounds[0].contributions if c.target.cli == "fake"]
+    assert survivors and all(c.dissent is None for c in survivors)
+    # round 2 ran only the two survivors (the dead seat is gone)
+    assert {c.target.cli for c in result.rounds[1].contributions} == {"fake"}
 
 
 @pytest.mark.parametrize("mode", [SafetyMode.PROPOSE, SafetyMode.WRITE, SafetyMode.YOLO])
@@ -202,6 +368,8 @@ async def test_debate_budget_cuts_a_round_and_finalizes() -> None:
     slow = by_cli["slow"]
     assert slow.ok is False and slow.error is not None and slow.error.code is ErrorCode.BUDGET_EXHAUSTED
     assert slow.text == "" and slow.partial == "partial-so-far"  # partial kept as a trace, never the text
+    # F4a (4-B): a seat cut at the deadline produced no usable answer, so it is set aside, not silent.
+    assert slow.dissent == "set aside: no usable answer in round 1"
     assert result.rollup is not None
     assert result.rollup.stop_reason == "budget" and result.rollup.cut == 1 and result.rollup.usable == 1
 

@@ -136,6 +136,45 @@ def test_all_voices_defensive_split() -> None:
     assert aggregate(Strategy.ALL_VOICES, [_voice("yes")]) == ("split", None)
 
 
+# --- F4a no-silent-dismissal (dissent stamping) ------------------------------
+
+
+def test_stamp_dissent_marks_losing_verdicts_only() -> None:
+    from rutherford.services.consensus import _stamp_dissent
+
+    verdicts = [_voice("yes"), _voice("yes"), _voice("no"), _voice(None, ok=False)]
+    _stamp_dissent(verdicts, "majority", "yes")
+    assert verdicts[0].dissent is None and verdicts[1].dissent is None  # the winners are not "dissent"
+    # the losing-but-parseable verdict carries a structural reason, distinct from no_verdict_reason
+    assert verdicts[2].dissent == "minority: 1 of 3 voted 'no'; the panel majority 'yes'"
+    assert verdicts[2].no_verdict_reason is None  # it HAD a verdict; it just lost
+    # a failed voice has no verdict -> no dissent (no_verdict_reason carries its 'failed' instead)
+    assert verdicts[3].dissent is None and verdicts[3].no_verdict_reason == "failed"
+
+
+def test_stamp_dissent_noop_without_a_decision() -> None:
+    from rutherford.services.consensus import _stamp_dissent
+
+    verdicts = [_voice("a"), _voice("b")]  # a split -> no winner to dissent from
+    _stamp_dissent(verdicts, "split", None)
+    assert all(v.dissent is None for v in verdicts)
+
+
+def test_stamp_dissent_is_honest_when_weight_overrides_head_count() -> None:
+    from rutherford.services.consensus import _stamp_dissent
+
+    # One heavy 'yes' outweighs two light 'no's: the HEAD count favors 'no' (2 of 3), but the panel decides
+    # 'yes' on weight. The dissent must report each loser's OWN head count honestly, never the weighted total,
+    # so a reader sees a weighted decision overrode a numeric majority rather than it being hidden.
+    verdicts = [_voice("yes", weight=3.0), _voice("no", weight=1.0), _voice("no", weight=1.0)]
+    outcome, decision = aggregate(Strategy.WEIGHTED, verdicts)
+    assert (outcome, decision) == ("majority", "yes")
+    _stamp_dissent(verdicts, outcome, decision)
+    assert verdicts[0].dissent is None  # the weight-winner is not a dissent
+    assert verdicts[1].dissent == "minority: 2 of 3 voted 'no'; the panel majority 'yes'"
+    assert verdicts[2].dissent == verdicts[1].dissent  # both 'no' voters carry the same honest head count
+
+
 # --- stance ------------------------------------------------------------------
 
 

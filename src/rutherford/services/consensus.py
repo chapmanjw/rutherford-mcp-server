@@ -19,6 +19,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
@@ -209,12 +210,13 @@ class ConsensusService:
             answer = strategy_result.decision or strategy_result.outcome
             result: ConsensusResult | StrategyResult = strategy_result
         else:
-            synthesis, synthesis_by = await self._maybe_synthesize(req, voices, base_depth)
+            synthesis, synthesis_by, self_authored = await self._maybe_synthesize(req, voices, base_depth)
             answer = synthesis or "(no synthesis -- see the linked voice records)"
             result = ConsensusResult(
                 voices=voices,
                 synthesis=synthesis,
                 synthesis_by=synthesis_by,
+                self_authored=self_authored,
                 skipped=skipped,
                 diversity=self._diversity(voices),
             )
@@ -756,6 +758,7 @@ class ConsensusService:
                 )
             )
         outcome, decision = aggregate(req.strategy, verdicts, min_quorum=self._config.min_quorum)
+        _stamp_dissent(verdicts, outcome, decision)
         return StrategyResult(
             strategy=req.strategy,
             outcome=outcome,
@@ -779,34 +782,49 @@ class ConsensusService:
 
     async def _maybe_synthesize(
         self, req: ConsensusRequest, voices: list[DelegationResult], base_depth: int
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, bool]:
         """Resolve the tri-state ``synthesize`` and run a combining pass when it is on (``all-voices`` only).
 
         ``None`` means the caller omitted it -- the one case the configured ``synthesize_default`` fills;
-        an explicit ``False`` always wins over a ``synthesize_default=true``.
+        an explicit ``False`` always wins over a ``synthesize_default=true``. Returns ``(synthesis, label,
+        self_authored)``.
         """
         effective = req.synthesize if req.synthesize is not None else self._config.synthesize_default
         if not effective or not voices:
-            return None, None
+            return None, None, False
         return await self._synthesize(req, voices, base_depth)
 
     async def _synthesize(
         self, req: ConsensusRequest, voices: list[DelegationResult], base_depth: int
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, bool]:
         """Delegate a combining pass to the nominated judge, else the first successful voice.
 
         Mirrors the debate ``_synthesize`` pattern: a fresh one-shot ACP turn on a read-only session.
-        Returns ``(synthesis, synthesizer_label)``, or ``(None, None)`` when no synthesis was produced
-        -- no successful voice, an unknown judge, or the synthesis run itself failed -- so ``synthesis_by``
-        never names an author for a synthesis that does not exist.
+        Returns ``(synthesis, synthesizer_label, self_authored)``, or ``(None, None, False)`` when no
+        synthesis was produced -- no successful voice, an unknown judge, or the synthesis run itself failed --
+        so ``synthesis_by`` never names an author for a synthesis that does not exist.
+
+        F4a no-self-approval (4-A): ``self_authored`` is ``True`` when the resolved judge is a panel
+        participant (its CLI is one of the answering voices'); the default judge (the first voice) always is.
+        When ``require_independent_judge`` is set (per call or config), a self-authored synthesis is REFUSED
+        with ``INVALID_INPUT`` rather than silently authored -- name a non-participant ``judge``.
         """
         ok_voices = [voice for voice in voices if voice.ok and voice.text.strip()]
         if not ok_voices:
-            return None, None
+            return None, None, False
         first = ok_voices[0].target
         judge = req.judge if req.judge is not None else Target(cli=first.cli, model=first.model)
+        # The judge is a participant iff its CLI is one of the answering voices' -- the agent is the unit of
+        # independence (a same-CLI judge is "the defendant authoring the verdict" even on a different model).
+        self_authored = judge.cli in {voice.target.cli for voice in ok_voices}
+        if self_authored and (req.require_independent_judge or self._config.require_independent_judge):
+            raise RutherfordError(
+                ErrorCode.INVALID_INPUT,
+                f"require_independent_judge is set, but the synthesis would be authored by panel participant "
+                f"{judge.cli!r}; name a non-participant judge (judge=<cli>) for a binding verdict",
+            )
         if not self._descriptors.has(judge.cli):
-            return None, None
+            return None, None, False
         transcript = "\n\n".join(
             f"## {voice.target.cli}" + (f" ({voice.target.model})" if voice.target.model else "") + f"\n{voice.text}"
             for voice in ok_voices
@@ -815,8 +833,9 @@ class ConsensusService:
             "You are synthesizing answers several AI coding agents gave to the same question.\n\n"
             f"Original question:\n{req.prompt}\n\n"
             f"Answers:\n\n{transcript}\n\n"
-            "Write one synthesized answer: state where they agree, flag where they disagree, and give "
-            "your best combined recommendation."
+            "Write one synthesized answer: state where they agree, and where they disagree NAME each "
+            "dissenting position you set aside and give a one-line reason it did not carry (F4a "
+            "no-silent-dismissal). End with your best combined recommendation."
         )
         cwd = req.working_dir or str(Path.cwd())
         descriptor = self._descriptors.get(judge.cli)
@@ -833,8 +852,30 @@ class ConsensusService:
             base_depth=base_depth + 1,
         )
         if not result.ok or not result.text.strip():
-            return None, None
-        return result.text, judge.display_label
+            return None, None, False
+        return result.text, judge.display_label, self_authored
+
+
+def _stamp_dissent(verdicts: list[VoiceVerdict], outcome: str, decision: str | None) -> None:
+    """F4a no-silent-dismissal (4-B): stamp a structural reason on each PARSEABLE verdict that LOST.
+
+    A voice with a real verdict that is not the panel's ``decision`` was set aside -- record why, so a
+    losing-but-valid position is never silently dropped. ``no_verdict_reason`` stays distinct (it marks a
+    voice that had NO verdict: failed / unparseable); ``dissent`` marks a verdict that lost. Only stamped when
+    a decision was reached -- a split / tied / no_majority / no_quorum outcome has no winner to dissent from.
+    The count is the head count of that verdict among the eligible (parseable) voices, so a weighted decision
+    that overrode the head count reads honestly ("2 of 5 voted 'no'; the panel majority 'yes'").
+    """
+    if decision is None:
+        return
+    eligible = [v.verdict for v in verdicts if v.verdict is not None]
+    tally = Counter(eligible)
+    for verdict in verdicts:
+        if verdict.verdict is not None and verdict.verdict != decision:
+            verdict.dissent = (
+                f"minority: {tally[verdict.verdict]} of {len(eligible)} voted {verdict.verdict!r}; "
+                f"the panel {outcome} {decision!r}"
+            )
 
 
 def _fail_voice(target: Target, req: ConsensusRequest, code: ErrorCode, message: str) -> DelegationResult:
