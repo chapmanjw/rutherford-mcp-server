@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-06-15
+
+### Added
+
+- **`doctor` and `setup` recognize a missing npm ACP adapter shim and offer to install it.** A few agents
+  launch a SEPARATE npm adapter that fronts an underlying CLI -- `codex` -> `codex-acp`, `claude_code` ->
+  `claude-agent-acp`, `pi` -> `pi-acp`. When that CLI is installed but the adapter shim is not, `doctor` no
+  longer reports a bare `not_installed`: it adds an `install_hint` with the exact `npm i -g <package>` command.
+  `setup` lists every such gap under `adapters.installable`, and `setup install_adapters=true` runs the
+  install for each (an explicit, opt-in machine change; off by default). The install argv is built only from a
+  curated package constant, never caller input. Covers codex / claude_code / pi today; the mechanism is
+  generic (an `AgentDescriptor` declares its `underlying_cli` + `adapter_package`).
+
+### Fixed
+
+- Restored the PyPI downloads badge as the first badge in the README badge row.
+
 ## [3.0.0] - 2026-06-15
 
 A ground-up, ACP-native rewrite. Rutherford is now the [Agent Client Protocol](https://agentclientprotocol.com)
