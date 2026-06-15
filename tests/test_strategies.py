@@ -182,15 +182,9 @@ def test_stamp_dissent_is_honest_when_weight_overrides_head_count() -> None:
 # --- F3 correlation-aware vote-math (opt-in lineage discount) ----------------
 
 
-def _lv(verdict: str, provider: str | None, *, weight: float = 1.0) -> VoiceVerdict:
-    return VoiceVerdict(
-        label="v",
-        cli="fake",
-        weight=weight,
-        ok=True,
-        verdict=verdict,
-        provenance=Provenance(provider=provider) if provider is not None else None,
-    )
+def _lv(verdict: str, provider: str | None, *, weight: float = 1.0, model: str | None = None) -> VoiceVerdict:
+    prov = Provenance(provider=provider, model=model) if (provider is not None or model is not None) else None
+    return VoiceVerdict(label="v", cli="fake", weight=weight, ok=True, verdict=verdict, provenance=prov)
 
 
 def test_lineage_discounts_collapse_a_shared_vendor_keep_others_full() -> None:
@@ -198,6 +192,19 @@ def test_lineage_discounts_collapse_a_shared_vendor_keep_others_full() -> None:
     factors = lineage_discounts(voices)
     assert factors[id(voices[0])] == 0.5 and factors[id(voices[1])] == 0.5  # two-voice alpha lineage halved
     assert factors[id(voices[2])] == 1.0  # the lone beta keeps full weight
+
+
+def test_lineage_discounts_split_model_lines_within_one_vendor() -> None:
+    # F3 family key in the vote-math: two voices of the SAME model line (claude-opus, different generations)
+    # are one effective vote; a different line of the same vendor (claude-sonnet) is independent.
+    voices = [
+        _lv("yes", "anthropic", model="claude-opus-4-8"),
+        _lv("yes", "anthropic", model="claude-opus-4-7"),
+        _lv("no", "anthropic", model="claude-sonnet-4"),
+    ]
+    factors = lineage_discounts(voices)
+    assert factors[id(voices[0])] == 0.5 and factors[id(voices[1])] == 0.5  # the two opus voices share a lineage
+    assert factors[id(voices[2])] == 1.0  # sonnet is its own lineage, not collapsed with opus
 
 
 def test_lineage_discounts_treat_unknown_lineages_as_independent() -> None:
@@ -385,12 +392,77 @@ def test_diversity_unknown_excluded() -> None:
     assert report.low_diversity is False
 
 
-def test_effective_lineages_is_the_vendor_proxy() -> None:
-    # item 5 (5-A/5-B): effective_lineages = distinct vendor count now, as a NAMED headline concept that
-    # the vote-math stretch can later rekey to model-family without changing the field.
-    provs = [Provenance(provider="anthropic", model="opus"), Provenance(provider="anthropic", model="haiku")]
+def test_effective_lineages_is_the_model_family_key_decollapses_one_vendor() -> None:
+    # F3 family key (5-D): two Claude LINES of one vendor read as TWO effective lineages (opus != haiku),
+    # even though the vendor count is 1 -- the de-collapse the vendor proxy could not do.
+    provs = [
+        Provenance(provider="anthropic", model="claude-opus-4-8"),
+        Provenance(provider="anthropic", model="claude-haiku-4-5"),
+    ]
     report = effective_diversity(provs, min_distinct=2)
-    assert report.effective_lineages == report.distinct_providers == 1
+    assert report.distinct_providers == 1 and report.effective_lineages == 2
+
+
+def test_effective_lineages_collapses_two_generations_of_one_line() -> None:
+    # Two generations of the SAME line (opus-4-8 and opus-4-7) are ONE family -> one effective lineage, even
+    # though the model strings differ -- the "one model line in N costumes" correlation the raw-model axis misses.
+    provs = [
+        Provenance(provider="anthropic", model="claude-opus-4-8"),
+        Provenance(provider="anthropic", model="claude-opus-4-7"),
+    ]
+    report = effective_diversity(provs, min_distinct=2)
+    assert report.distinct_models == 2 and report.effective_lineages == 1
+
+
+def test_model_family_matches_on_word_boundaries_not_raw_substrings() -> None:
+    # 'octopus-v2' must NOT match the 'opus' family token (a raw-substring bug); it falls back to its vendor,
+    # distinct from a REAL claude-opus voice -> 2 lineages. A substring match would merge them into one phantom.
+    report = effective_diversity(
+        [Provenance(provider="acme", model="octopus-v2"), Provenance(provider="anthropic", model="claude-opus-4-8")]
+    )
+    assert report.effective_lineages == 2  # {acme, claude-opus}, not a merged {claude-opus}
+
+
+def test_model_family_allows_a_version_suffix_but_not_word_glue() -> None:
+    # 'gemma3:12b' (a real local id) IS the gemma family -- a glued version digit is allowed -- while
+    # 'gemmastone' is NOT (a glued letter is word-glue). The two gemma backends are one lineage.
+    gemma = effective_diversity(
+        [Provenance(provider="ollama", model="gemma3:12b"), Provenance(provider="lmstudio", model="gemma3:27b")]
+    )
+    assert gemma.effective_lineages == 1  # both gemma family across two local backends
+    glue = effective_diversity(
+        [Provenance(provider="acme", model="gemmastone"), Provenance(provider="beta", model="x")]
+    )
+    assert glue.effective_lineages == 2  # gemmastone is NOT gemma -> vendor acme, distinct from beta
+
+
+def test_model_family_digit_ending_token_does_not_swallow_a_longer_version() -> None:
+    # A digit-ending family token (gpt-5) must NOT match a longer version (gpt-50) -- that would bucket a
+    # distinct future line into an older family. gpt-50 falls back to vendor, distinct from a real gpt-5.
+    report = effective_diversity(
+        [Provenance(provider="openai", model="gpt-50-ultra"), Provenance(provider="openai", model="gpt-5.2")]
+    )
+    assert report.effective_lineages == 2  # gpt-50 (vendor openai) is NOT the gpt-5 family
+
+
+def test_effective_lineages_merges_one_model_line_across_vendors() -> None:
+    # The SAME model line served by two vendors (gpt-4 on openai + gpt-4 on azure) is ONE correlated lineage,
+    # so effective_lineages can be BELOW distinct_providers -- the family key is vendor-independent by design.
+    report = effective_diversity(
+        [Provenance(provider="openai", model="gpt-4-turbo"), Provenance(provider="azure", model="gpt-4-turbo")]
+    )
+    assert report.distinct_providers == 2 and report.effective_lineages == 1
+
+
+def test_effective_lineages_unlisted_model_falls_back_to_vendor() -> None:
+    # An unlisted model is NOT prefix-guessed (5-A over-reporting trap): it falls back to the VENDOR, so two
+    # unlisted models of one vendor are one lineage and two distinct vendors are two.
+    one_vendor = effective_diversity(
+        [Provenance(provider="acme", model="mystery-1"), Provenance(provider="acme", model="mystery-2")]
+    )
+    assert one_vendor.effective_lineages == 1  # both fall back to the 'acme' vendor
+    two_vendors = effective_diversity([Provenance(provider="acme", model="x"), Provenance(provider="beta", model="y")])
+    assert two_vendors.effective_lineages == 2
 
 
 def test_diversity_headline_reads_as_one_sentence() -> None:

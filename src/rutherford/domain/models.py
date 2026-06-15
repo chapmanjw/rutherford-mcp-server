@@ -157,12 +157,15 @@ class DiversityReport(BaseModel):
     answered_voices: int
     distinct_models: int
     distinct_providers: int
-    #: The number of EFFECTIVE LINEAGES behind the answers (F3, item 5): how many genuinely independent
-    #: sources the panel actually spanned. Keyed on the vendor proxy now (so it equals the distinct-provider
-    #: count), but a NAMED field rather than a presentation alias of ``distinct_providers`` -- the vote-math
-    #: stretch can swap the lineage key from vendor to model-family without changing this headline contract.
-    #: A conservative trust signal: "1 effective lineage" is a real warning; a higher count is only as
-    #: trustworthy as the provenance inference (unresolved voices land in ``unknown``, not a lineage).
+    #: The number of EFFECTIVE LINEAGES behind the answers (F3): how many genuinely independent sources the
+    #: panel actually spanned, keyed on the base MODEL FAMILY (a curated heuristic) and falling back to the
+    #: vendor for an unlisted model -- so claude-opus and claude-sonnet read as two lineages, not one
+    #: "anthropic" (5-D de-collapse). The family is vendor-independent (the same model line served through two
+    #: vendors is ONE correlated lineage), so this is NOT guaranteed ``>= distinct_providers``. A SEPARATE axis
+    #: from ``low_diversity`` (which keeps the raw-model + vendor axes), so a same-vendor panel can read "2
+    #: effective lineages" yet still flag low diversity. A conservative trust signal: "1 effective lineage" is
+    #: a real warning; a higher count is only as good as the provenance inference (unresolved voices land in
+    #: ``unknown``, not a lineage) and the family table's coverage.
     effective_lineages: int
     unknown: int
     low_diversity: bool
@@ -617,10 +620,10 @@ class ConsensusRequest(BaseModel):
     #: candidate is stamped with its standing on the ``dissent`` field so a minority position is first-class,
     #: not buried in the matrix. Opt-in (default off); composes with ``require_dissent`` in config.
     require_dissent: bool = False
-    #: Discount correlated votes by vendor lineage when aggregating (F3 vote-math stretch, opt-in): N voices
-    #: of one lineage count as one effective vote, so a panel of "one model in N CLI costumes" cannot
-    #: over-count under ``majority`` / ``plurality`` / ``weighted``. Off by default (it changes outcomes for
-    #: correlated panels); composes with ``discount_correlated_votes`` in config.
+    #: Discount correlated votes by model-family lineage (vendor fallback) when aggregating (F3 vote-math
+    #: stretch, opt-in): N voices of one lineage count as one effective vote, so a panel of "one model in N CLI
+    #: costumes" cannot over-count under ``majority`` / ``plurality`` / ``weighted``. Off by default (it changes
+    #: outcomes for correlated panels); composes with ``discount_correlated_votes`` in config.
     discount_correlated: bool = False
     #: Per-voice resume handles, parallel to ``targets`` (item 9 panel continuation): when set, each voice
     #: resumes its prior ACP session (``session/load``) so the panel continues a kept consensus job instead of
@@ -742,7 +745,7 @@ class VoiceVerdict(BaseModel):
     #: strategy and for a voice that failed round 1 (no answer to rank). Set from the :class:`RankReport`.
     rank: int | None = None
     #: The correlation discount applied to this voice when ``discount_correlated`` was on (F3 vote-math):
-    #: ``1 / (voices sharing its vendor lineage)``, so a reader sees a correlated vote was down-weighted --
+    #: ``1 / (voices sharing its model-family lineage)``, so a reader sees a correlated vote was down-weighted --
     #: ``0.5`` means it shared its lineage with one other voice. ``None`` when the discount was not applied.
     lineage_weight: float | None = None
 
@@ -819,7 +822,7 @@ class StrategyResult(BaseModel):
     #: The RANK strategy's leaderboard / pairwise matrix / concordance (F4b). ``None`` for every other
     #: strategy.
     rank: RankReport | None = None
-    #: Whether the aggregation discounted correlated votes by vendor lineage (F3 vote-math, opt-in): when
+    #: Whether the aggregation discounted correlated votes by model-family lineage (F3 vote-math, opt-in): when
     #: ``True``, voices sharing a lineage were down-weighted (each voice's :attr:`VoiceVerdict.lineage_weight`
     #: shows by how much), so a panel of "one model in N costumes" did not over-count. ``False`` by default.
     correlation_discounted: bool = False

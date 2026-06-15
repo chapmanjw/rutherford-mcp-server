@@ -260,6 +260,7 @@ async def test_consensus_resume_aligns_each_handle_to_its_own_seat(tmp_path: Pat
         resume_session_ids=["handle-for-fake", "handle-for-fake-a"],
     )
     result = await app.consensus.consensus(request)
+    assert isinstance(result, ConsensusResult)
     by_cli = {voice.target.cli: voice for voice in result.voices}
     assert "session=handle-for-fake" in by_cli["fake"].text  # fake loaded its own (position-0) handle
     assert "session=handle-for-fake-a" in by_cli["fake_a"].text  # fake_a loaded its own (position-1) handle

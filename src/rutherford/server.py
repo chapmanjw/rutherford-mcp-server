@@ -294,9 +294,9 @@ async def consensus(
     (`StrategyResult`) instead of every voice. `rank` is a two-round protocol (F4b): every voice answers, then
     ranks the OTHER answers anonymized and self-excluded, aggregated by Borda mean-rank into a `rank`
     leaderboard with a pairwise agreement matrix and concordance; `require_dissent` surfaces each non-winning
-    position on its `dissent`. `discount_correlated=true` (F3 vote-math, opt-in) down-weights correlated
-    votes by vendor lineage so a panel of "one model in N CLI costumes" counts as one effective vote under
-    `majority` / `plurality` / `weighted` (each voice's `lineage_weight` shows the discount). Optional
+    position on its `dissent`. `discount_correlated=true` (F3 vote-math, opt-in) down-weights correlated votes
+    by model-family lineage (vendor fallback) so a panel of "one model in N CLI costumes" counts as one
+    effective vote under `majority` / `plurality` / `weighted` (each voice's `lineage_weight` shows it). Optional
     `stances` (parallel to `targets`) steer each voice and cannot combine with the auto-expanded panel.
     `synthesize` (defaults to `synthesize_default`, off
     out of the box) adds a server-side combined answer (`all-voices` only); `judge` names the seat that

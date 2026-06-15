@@ -113,8 +113,9 @@ def aggregate(
     when one was reached, else ``None``. ``all-voices`` never reaches here.
 
     ``correlation_discount`` (F3 vote-math stretch, opt-in) scales each voting voice by ``1 /
-    lineage-multiplicity`` -- the vendor lineage proxy (5-A) -- so N voices of one lineage ("one model in
-    N CLI costumes") count as ONE effective vote, not N. It applies to the counting/weighting strategies
+    lineage-multiplicity`` -- the model-family lineage (5-A, vendor fallback) -- so N voices of one lineage
+    ("one model in N CLI costumes") count as ONE effective vote, not N. It applies to the counting/weighting
+    strategies
     (``majority`` / ``plurality`` / ``weighted``); ``unanimous`` (agreement, not weight) and
     ``parity-pair`` (a proposer-vs-counterweight check) are unaffected. Off by default -- the discount
     changes outcomes for correlated panels, so it is opt-in (no behavior regression).
@@ -159,20 +160,23 @@ def aggregate(
 def lineage_discounts(voices: list[VoiceVerdict]) -> dict[int, float]:
     """Per-voice correlation discount factors keyed by ``id(voice)`` (F3 vote-math): ``1 / lineage size``.
 
-    Groups the ANSWERING voices (ok + a parseable verdict) by their vendor lineage (``provenance.provider``,
-    the same proxy F3's diversity uses); each gets ``1 / (voices sharing that lineage)``, so a lineage of
-    three correlated voices contributes one effective vote. A voice whose lineage cannot be resolved is its
-    OWN lineage (factor ``1.0``) -- two unknowns are NOT assumed correlated, keeping the discount
-    conservative. Non-answering voices are absent (a caller reads ``1.0`` for them via ``.get``). Pure.
+    Groups the ANSWERING voices (ok + a parseable verdict) by their model-family lineage (``_lineage_key``:
+    the base model family, falling back to the vendor for an unlisted model) -- the same key F3's diversity
+    uses; each gets ``1 / (voices sharing that lineage)``, so a lineage of three correlated voices contributes
+    one effective vote. A voice whose lineage cannot be resolved is its OWN lineage (factor ``1.0``) -- two
+    unknowns are NOT assumed correlated, keeping the discount conservative. Non-answering voices are absent (a
+    caller reads ``1.0`` for them via ``.get``). Pure.
     """
     parseable = [voice for voice in voices if voice.ok and voice.verdict is not None]
-    # Typed group keys keep the two namespaces disjoint: a resolved vendor is ``("provider", key)``, an
-    # unresolved voice is ``("unknown", index)`` -- so a real provider can NEVER collide with the unknown
-    # marker (a string sentinel could, if a provider were literally named like it).
+    # Group by the effective LINEAGE (base model family, else vendor) -- the same key F3's effective_lineages
+    # uses -- so two voices of one model line ("claude-opus" in two CLI costumes) are one effective vote, and
+    # claude-opus vs claude-sonnet are NOT collapsed. Typed group keys keep the namespaces disjoint: a
+    # resolved lineage is ``("lineage", key)``, an unresolved voice is ``("unknown", index)`` -- so a real
+    # lineage can NEVER collide with the unknown marker.
     groups: dict[tuple[str, str | int], list[VoiceVerdict]] = defaultdict(list)
     for index, voice in enumerate(parseable):
-        key = _provider_key(voice.provenance)
-        groups[("provider", key) if key is not None else ("unknown", index)].append(voice)
+        key = _lineage_key(voice.provenance)
+        groups[("lineage", key) if key is not None else ("unknown", index)].append(voice)
     out: dict[int, float] = {}
     for members in groups.values():
         factor = 1.0 / len(members)
@@ -442,6 +446,7 @@ def effective_diversity(provenances: Sequence[Provenance | None], *, min_distinc
     """
     models: set[str] = set()
     providers: set[str] = set()
+    lineages: set[str] = set()
     unknown = 0
     known_providers = 0
     for prov in provenances:
@@ -454,6 +459,9 @@ def effective_diversity(provenances: Sequence[Provenance | None], *, min_distinc
         if provider_key is not None:
             known_providers += 1
             providers.add(provider_key)
+        lineage_key = _lineage_key(prov)
+        if lineage_key is not None:
+            lineages.add(lineage_key)
     known_models = len(provenances) - unknown
     low_diversity = (known_models >= 2 and len(models) < min_distinct) or (
         known_providers >= 2 and len(providers) < min_distinct
@@ -462,9 +470,11 @@ def effective_diversity(provenances: Sequence[Provenance | None], *, min_distinc
         answered_voices=len(provenances),
         distinct_models=len(models),
         distinct_providers=len(providers),
-        # Effective lineages (item 5): the vendor proxy now -- a NAMED concept the vote-math stretch can later
-        # rekey to model-family without changing this field's meaning.
-        effective_lineages=len(providers),
+        # Effective lineages (item 5 / vote-math stretch): the base-model-FAMILY count, refining the vendor
+        # proxy so claude-opus and claude-sonnet read as two lineages, not one "anthropic" (5-D). The family is
+        # vendor-independent (the same line across two hosting vendors is one correlated lineage), and an
+        # unlisted model falls back to the vendor. A SEPARATE axis from ``low_diversity`` (model + vendor axes).
+        effective_lineages=len(lineages),
         unknown=unknown,
         low_diversity=low_diversity,
         models=sorted(models),
@@ -484,3 +494,61 @@ def _provider_key(prov: Provenance | None) -> str | None:
     if prov is None or not prov.provider:
         return None
     return prov.provider.strip().lower()
+
+
+#: Curated base-model-family table (F3 lineage key, 5-A/5-D): the first table entry whose token appears in a
+#: normalized model id gives the family. Matched on LETTER boundaries (the token may not be glued to a letter
+#: on either side), not raw substring -- so an unrelated id never false-matches (``octopus-v2`` is NOT
+#: ``claude-opus``; ``gemmastone`` is NOT ``gemma``) while a version suffix is still allowed (``gemma3:12b`` IS
+#: ``gemma``, ``gpt-5.2`` IS ``gpt-5``). Only the model LINES worth splitting are listed -- Claude
+#: opus/sonnet/haiku, the GPT generations, the Gemini lines, and Gemma -- so "claude-opus + claude-sonnet"
+#: reads as two lineages, not one "anthropic" (the 5-D de-collapse). An UNLISTED model falls back to its
+#: VENDOR (a generic prefix guess would re-introduce over-reporting, 5-A). A labeled heuristic, not a proof of
+#: independence -- coarse where a line is unlisted (e.g. ``gpt-4o`` is glued to a letter and falls to vendor).
+_MODEL_FAMILIES: tuple[tuple[str, str], ...] = (
+    ("opus", "claude-opus"),
+    ("sonnet", "claude-sonnet"),
+    ("haiku", "claude-haiku"),
+    ("gpt-5", "gpt-5"),
+    ("gpt-4", "gpt-4"),
+    ("gemini-2.5", "gemini-2.5"),  # before the looser "gemini-2" so 2.5 is its own family
+    ("gemini-2", "gemini-2"),
+    ("gemini-1.5", "gemini-1.5"),
+    ("gemma", "gemma"),
+)
+
+
+def _model_family(model: str | None) -> str | None:
+    """The base model family of a model id from the curated table, or ``None`` when unlisted (5-A heuristic).
+
+    A family token never glues to a LETTER on the left. On the RIGHT the boundary depends on the token: a
+    LETTER-ending token (``gemma``, ``opus``) may take a version digit (``gemma3:12b`` -> ``gemma``) but not a
+    letter (``gemmastone`` does not match); a DIGIT-ending token (``gpt-5``, ``gemini-2``) may not take any
+    further alphanumeric, so a longer version is NOT swallowed into an older family (``gpt-50`` / ``gemini-25``
+    do NOT match ``gpt-5`` / ``gemini-2``). ``octopus`` and ``gpt-4o`` (letter-glued) fall back to the vendor.
+    """
+    if not model:
+        return None
+    normalized = model.strip().lower()
+    for needle, family in _MODEL_FAMILIES:
+        # A digit-ending token must not be followed by more alphanumerics (gpt-5 must not eat gpt-50); a
+        # letter-ending token may take a version digit (gemma -> gemma3) but not a letter (not gemmastone).
+        right = r"(?![a-z0-9])" if needle[-1].isdigit() else r"(?![a-z])"
+        if re.search(rf"(?<![a-z]){re.escape(needle)}{right}", normalized):
+            return family
+    return None
+
+
+def _lineage_key(prov: Provenance | None) -> str | None:
+    """The effective-LINEAGE key (F3): the base model family when recognized, else the vendor proxy.
+
+    Refines the coarse vendor key so distinct model lines (claude-opus vs claude-sonnet) count as distinct
+    lineages -- the 5-D de-collapse -- while an UNLISTED model conservatively falls back to the vendor (never
+    a prefix guess). The family is VENDOR-INDEPENDENT by design: the SAME model line served through two
+    vendors (a Claude on Anthropic and on Bedrock, a GPT on OpenAI and on Azure) is genuinely correlated, so
+    it is one lineage -- which is why ``effective_lineages`` is NOT guaranteed ``>= distinct_providers``. A
+    labeled heuristic; ``None`` when neither family nor vendor resolves, so an unknown-lineage voice is
+    excluded rather than assumed same or different.
+    """
+    family = _model_family(prov.model if prov is not None else None)
+    return family if family is not None else _provider_key(prov)
