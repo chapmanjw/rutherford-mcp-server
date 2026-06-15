@@ -36,7 +36,15 @@ from typing import Any
 
 from acp import PROTOCOL_VERSION, RequestError, run_agent
 from acp.helpers import update_agent_message_text, update_agent_thought_text
-from acp.schema import InitializeResponse, ModelInfo, NewSessionResponse, PromptResponse, SessionModelState
+from acp.schema import (
+    AgentCapabilities,
+    InitializeResponse,
+    LoadSessionResponse,
+    ModelInfo,
+    NewSessionResponse,
+    PromptResponse,
+    SessionModelState,
+)
 
 
 def _block_text(block: Any) -> str:
@@ -158,6 +166,9 @@ class FakeAgent:
 
     def __init__(self) -> None:
         self._client: Any = None
+        #: The session id a ``session/load`` resumed, so a ``WHOAMI`` prompt can prove a turn ran on a RESUMED
+        #: session (vs a fresh ``session/new``). ``None`` until a load happens.
+        self._loaded_session: str | None = None
 
     def on_connect(self, conn: Any) -> None:
         self._client = conn
@@ -165,13 +176,27 @@ class FakeAgent:
     async def initialize(
         self, protocol_version: int, client_capabilities: Any = None, client_info: Any = None, **kwargs: Any
     ) -> InitializeResponse:
-        return InitializeResponse(protocol_version=PROTOCOL_VERSION)
+        # Advertise the loadSession capability so the resume (session/load) path is exercisable. A test that
+        # needs an agent which CANNOT resume sets RUTHERFORD_FAKE_NO_LOADSESSION=1 (then a resume -> RESUME_FAILED).
+        supports_load = os.environ.get("RUTHERFORD_FAKE_NO_LOADSESSION") != "1"
+        return InitializeResponse(
+            protocol_version=PROTOCOL_VERSION,
+            agent_capabilities=AgentCapabilities(load_session=supports_load),
+        )
 
     async def new_session(
         self, cwd: str, additional_directories: Any = None, mcp_servers: Any = None, **kwargs: Any
     ) -> NewSessionResponse:
         models = _advertised_models()
         return NewSessionResponse(session_id="fake-session-1", models=models)
+
+    async def load_session(
+        self, cwd: str, session_id: str, additional_directories: Any = None, mcp_servers: Any = None, **kwargs: Any
+    ) -> LoadSessionResponse:
+        # Resume: the agent reloads the named conversation. session/load keeps the requested id (no new one is
+        # minted), so the client runs the next prompt under ``session_id``. Recorded so WHOAMI can confirm it.
+        self._loaded_session = session_id
+        return LoadSessionResponse(models=_advertised_models())
 
     async def set_session_model(self, model_id: str, session_id: str, **kwargs: Any) -> None:
         # Accepting any advertised id is enough for the client's best-effort set_model call to succeed (e.g. an
@@ -190,6 +215,14 @@ class FakeAgent:
         if "REFUSE" in text:
             return PromptResponse(stop_reason="refusal")
         if "EMPTY" in text:
+            return PromptResponse(stop_reason="end_turn")
+        if "WHOAMI" in text:
+            # Report the session this turn runs under and whether it was RESUMED (session/load) -- lets a test
+            # prove a follow-up delegate with session_id actually continued the prior session, not a fresh one.
+            resumed = "yes" if self._loaded_session == session_id else "no"
+            await self._client.session_update(
+                session_id, update_agent_message_text(f"session={session_id} resumed={resumed}")
+            )
             return PromptResponse(stop_reason="end_turn")
         env_answer = _env_answer(text)
         if env_answer is not None:

@@ -43,6 +43,55 @@ async def test_run_turn_refusal() -> None:
     assert result.error.reexecution_safety is ReexecutionSafety.DUPLICATE_COST
 
 
+# --- session resume (ACP session/load) ---------------------------------------
+
+
+async def test_run_turn_resumes_a_session_via_load() -> None:
+    """A resume drives ACP ``session/load`` instead of ``session/new``: the turn runs under the REQUESTED id
+    (not the fake's fixed ``fake-session-1`` from new_session), and the agent confirms it reloaded it."""
+    result = await run_acp_turn(
+        FAKE, "WHOAMI", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, resume_session_id="resume-me-123"
+    )
+    assert result.ok is True
+    assert result.session_id == "resume-me-123"  # the loaded id, not new_session's "fake-session-1"
+    assert "resumed=yes" in result.text
+
+
+async def test_run_turn_without_resume_is_a_fresh_session() -> None:
+    """The default path (no resume) creates a fresh session/new, so the agent reports it was NOT resumed."""
+    result = await run_acp_turn(FAKE, "WHOAMI", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert result.ok is True
+    assert result.session_id == "fake-session-1"
+    assert "resumed=no" in result.text
+
+
+async def test_run_turn_resume_unsupported_agent_is_resume_failed() -> None:
+    """An agent that does not advertise the loadSession capability cannot resume: a clean RESUME_FAILED."""
+    noload = AgentDescriptor("noload", "NoLoad", FAKE.command, env_overrides=(("RUTHERFORD_FAKE_NO_LOADSESSION", "1"),))
+    result = await run_acp_turn(
+        noload, "WHOAMI", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, resume_session_id="nope"
+    )
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.RESUME_FAILED
+    assert result.error.reexecution_safety is ReexecutionSafety.SAFE  # pre-prompt, no side effect
+
+
+async def test_delegate_threads_session_id_into_a_resume() -> None:
+    """The delegate flow wires ``DelegationRequest.session_id`` through to the ACP resume path."""
+    service = DelegationService(DescriptorRegistry([FAKE]), RutherfordConfig())
+    result = await service.delegate(
+        DelegationRequest(
+            target=Target(cli="fake"),
+            prompt="WHOAMI",
+            working_dir=str(REPO_ROOT),
+            session_id="carryover-9",
+            timeout_s=60.0,
+        )
+    )
+    assert result.ok is True
+    assert result.session_id == "carryover-9" and "resumed=yes" in result.text
+
+
 async def test_run_turn_empty_answer() -> None:
     result = await _turn("EMPTY answer please")
     assert result.ok is False and result.error is not None

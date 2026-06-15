@@ -8,6 +8,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`delegate` can resume a prior agent session** via a `session_id` parameter (v2 parity). Pass the
+  `session_id` from an earlier delegate result and the agent reloads that conversation over ACP
+  (`session/load`) instead of opening a fresh one (`session/new`), so a follow-up turn continues where the
+  last left off. It is gated on the agent advertising the ACP `loadSession` capability at `initialize`; a
+  resume against an agent that does not persist its own sessions fails cleanly with `RESUME_FAILED` rather
+  than silently starting fresh (wiring the previously-unreachable error code). The resume restores the
+  *conversation*, not the filesystem — a `write`/`yolo` resume still runs in a fresh isolated sandbox. The
+  `DelegationRequest.session_id` field existed but was inert; it is now threaded tool → service →
+  `run_acp_turn` → `ACPSession`.
 - Local-model support for **opencode** on both Ollama and LM Studio (`[agents.<id>] base="opencode"
   backend="ollama"|"lmstudio" model=...`). opencode is configured entirely through one inline-JSON
   environment variable (`OPENCODE_CONFIG_CONTENT`) that declares an `@ai-sdk/openai-compatible` provider

@@ -148,6 +148,7 @@ async def delegate(
     fallback: list[Any] | None = None,
     allow_model_fallback: bool = True,
     persist: bool | None = None,
+    session_id: str | None = None,
     mode: str = "sync",
 ) -> str:
     """Delegate a task to one ACP agent and return its normalized result.
@@ -166,8 +167,11 @@ async def delegate(
     `allow_model_fallback` (default true) first retries the same agent on its configured fallback model on a
     model-unavailable failure, where it has one. `persist` keeps this run as a durable job under
     `<jobs_dir>/<run_id>/` (`state.toon` + answer / diff artifacts); `None` follows `default_persistence`
-    (`ephemeral` out of the box), `true` / `false` force it. `mode="async"` runs the turn as a background job
-    and returns a `job_id` (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
+    (`ephemeral` out of the box), `true` / `false` force it. `session_id` resumes a prior agent session: pass
+    the `session_id` from an earlier delegate result and the agent reloads that conversation (ACP
+    `session/load`) instead of starting fresh, so a follow-up turn continues it; agents that do not persist
+    their own sessions fail `RESUME_FAILED`. `mode="async"` runs the turn as a background job and returns a
+    `job_id` (poll with `job_status` / `job_result`); `mode="sync"` awaits it.
     """
     return await _guarded(
         delegate_tool(
@@ -185,6 +189,7 @@ async def delegate(
             fallback=fallback,
             allow_model_fallback=allow_model_fallback,
             persist=persist,
+            session_id=session_id,
             mode=mode,
         )
     )

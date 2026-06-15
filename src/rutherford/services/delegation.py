@@ -309,6 +309,7 @@ class DelegationService:
                 effort=self.resolve_effort(req.target.cli, req.effort),
                 base_depth=base_depth,
                 parent_run_id=req.parent_run_id,
+                resume_session_id=req.session_id,  # resume a prior agent session over ACP, where supported
             )
         # Check the fingerprint whether or not the turn SUCCEEDED: a read-only agent that mutated the tree and
         # then failed (or returned empty) still broke the read-only promise, and the side effect is the signal
@@ -372,6 +373,7 @@ class DelegationService:
                     base_depth=base_depth,
                     parent_run_id=req.parent_run_id,
                     sandbox_root=sandbox.root,
+                    resume_session_id=req.session_id,  # resume a prior agent session (conversation, not the tree)
                 )
             if result.ok:
                 try:

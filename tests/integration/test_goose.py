@@ -259,6 +259,39 @@ async def test_goose_debate_persistent_sessions() -> None:
     assert any(contribution.ok for round_ in result.rounds for contribution in round_.contributions)
 
 
+async def test_goose_session_resume_recalls_prior_context() -> None:
+    """A second delegate that passes the first result's ``session_id`` resumes the SAME goose conversation over
+    ACP ``session/load``: goose recalls a codeword set in the first turn -- the live proof of session resume.
+
+    Each delegate spawns a fresh goose process, so call 2 recalling the codeword means goose genuinely reloaded
+    the prior session from its own persistence, driven by Rutherford's resume (not a fresh session).
+    """
+    service = DelegationService(default_registry(), RutherfordConfig())
+    cwd = str(Path.cwd())
+    established = await service.delegate(
+        DelegationRequest(
+            target=Target(cli="goose"),
+            prompt="Remember this codeword for later: BANANA-7. Reply with just: OK",
+            working_dir=cwd,
+            timeout_s=120.0,
+        )
+    )
+    assert established.ok is True, f"establishing the session failed: {established.error}"
+    assert established.session_id is not None
+    resumed = await service.delegate(
+        DelegationRequest(
+            target=Target(cli="goose"),
+            prompt="What was the codeword I told you to remember? Reply with just the codeword.",
+            working_dir=cwd,
+            timeout_s=120.0,
+            session_id=established.session_id,
+        )
+    )
+    assert resumed.ok is True, f"resuming the session failed: {resumed.error}"
+    assert resumed.session_id == established.session_id  # the SAME session, resumed -- not a fresh one
+    assert "BANANA-7" in resumed.text, f"the resumed session did not recall the codeword: {resumed.text!r}"
+
+
 # --- F8a: time budget + effort against real agents ---------------------------
 
 #: A prompt that makes a real agent think for a while, so a tight panel deadline reliably catches a voice

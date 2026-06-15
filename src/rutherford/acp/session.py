@@ -28,6 +28,8 @@ from acp.schema import (
     EmbeddedResourceContentBlock,
     ImageContentBlock,
     Implementation,
+    InitializeResponse,
+    LoadSessionResponse,
     NewSessionResponse,
     PromptResponse,
     ResourceContentBlock,
@@ -99,9 +101,16 @@ class ACPSession:
         base_depth: int = 0,
         parent_run_id: str | None = None,
         sandbox_root: str | None = None,
+        resume_session_id: str | None = None,
     ) -> None:
         self._descriptor = descriptor
         self._policy = policy
+        # Resume a prior agent session over ACP (``session/load``) instead of creating a fresh one
+        # (``session/new``): the opaque id from an earlier turn's result, round-tripped back so the agent
+        # reloads that conversation. ``None`` is the default fresh-session path. Gated at open() on the agent
+        # advertising the ``loadSession`` capability; a resume against an agent that cannot reload its own
+        # sessions is a clean ``RESUME_FAILED`` rather than a silent fresh session.
+        self._resume_session_id = resume_session_id
         # N1 (item 3): how deep this run sits in a Rutherford-driving-Rutherford chain, and the panel parent
         # to correlate a voice back to. Layered onto the agent's environment at open() so a nested host reads
         # them back (the recursion guard) and an aggregate cap can reason across layers (count-first lineage).
@@ -229,10 +238,29 @@ class ACPSession:
         self._conn = conn
         self._pid = process.pid
         try:
-            await asyncio.wait_for(
+            init = await asyncio.wait_for(
                 conn.initialize(protocol_version=PROTOCOL_VERSION, client_info=_CLIENT_INFO),
                 timeout=self._descriptor.handshake_timeout_s,
             )
+        except Exception as exc:
+            await self.close()
+            raise ACPHandshakeError(
+                ErrorCode.ACP_HANDSHAKE_FAILED,
+                f"ACP handshake with {self._descriptor.id} failed: {exc}",
+                ReexecutionSafety.SAFE,
+            ) from exc
+        # Resume a prior session (session/load) when asked, else create a fresh one (session/new). The resume
+        # path is gated on the agent's advertised loadSession capability and fails RESUME_FAILED if unsupported.
+        session: NewSessionResponse | LoadSessionResponse
+        if self._resume_session_id is not None:
+            session = await self._resume(conn, init)
+        else:
+            session = await self._new_session(conn)
+        await self._select_model(conn, session)
+
+    async def _new_session(self, conn: ClientSideConnection) -> NewSessionResponse:
+        """Create a fresh session (``session/new``); a failure is an ``ACP_HANDSHAKE_FAILED`` handshake fault."""
+        try:
             session = await asyncio.wait_for(
                 conn.new_session(cwd=self._cwd, mcp_servers=[]),
                 timeout=self._descriptor.handshake_timeout_s,
@@ -245,9 +273,45 @@ class ACPSession:
                 ReexecutionSafety.SAFE,
             ) from exc
         self._session_id = session.session_id
-        await self._select_model(conn, session)
+        return session
 
-    async def _select_model(self, conn: ClientSideConnection, session: NewSessionResponse) -> None:
+    async def _resume(self, conn: ClientSideConnection, init: InitializeResponse) -> LoadSessionResponse:
+        """Resume the prior session via ACP ``session/load`` instead of ``session/new``.
+
+        Gated on the agent advertising the ``loadSession`` capability at initialize: an agent that does not
+        persist and reload its own sessions cannot resume, so a resume against it is a clean ``RESUME_FAILED``
+        rather than a silent fresh session. ``session/load`` does not mint a new id -- the loaded session keeps
+        the requested one. SAFE re-execution: the resume is pre-prompt, with no side effect or cost.
+        """
+        resume_id = self._resume_session_id
+        assert resume_id is not None  # guarded by the caller (only taken when a resume id is set)
+        caps = init.agent_capabilities
+        if caps is None or not caps.load_session:
+            await self.close()
+            raise ACPHandshakeError(
+                ErrorCode.RESUME_FAILED,
+                f"{self._descriptor.id} cannot resume a session: it does not advertise the ACP loadSession "
+                "capability (it does not persist sessions for reload)",
+                ReexecutionSafety.SAFE,
+            )
+        try:
+            session = await asyncio.wait_for(
+                conn.load_session(cwd=self._cwd, session_id=resume_id, mcp_servers=[]),
+                timeout=self._descriptor.handshake_timeout_s,
+            )
+        except Exception as exc:
+            await self.close()
+            raise ACPHandshakeError(
+                ErrorCode.RESUME_FAILED,
+                f"resuming session {resume_id!r} on {self._descriptor.id} failed: {exc}",
+                ReexecutionSafety.SAFE,
+            ) from exc
+        self._session_id = resume_id
+        return session
+
+    async def _select_model(
+        self, conn: ClientSideConnection, session: NewSessionResponse | LoadSessionResponse
+    ) -> None:
         """Best-effort ``session/set_model`` to the resolved model, so a chosen model (and a model-id-encoded
         effort tier for codex/cursor) actually takes effect over ACP. Never fatal.
 
@@ -397,6 +461,7 @@ async def run_acp_turn(
     base_depth: int = 0,
     parent_run_id: str | None = None,
     sandbox_root: str | None = None,
+    resume_session_id: str | None = None,
 ) -> DelegationResult:
     """Open a one-shot session, run a single prompt turn, and return the normalized result.
 
@@ -404,9 +469,11 @@ async def run_acp_turn(
     apply over ACP (per-agent env / args / a model-id rewrite); it is echoed on the result as ``effort`` and
     ``effort_applied`` (F8a, 2-L). ``base_depth`` / ``parent_run_id`` are the N1 lineage signal layered onto
     the agent's environment so a Rutherford-driving-Rutherford chain is bounded. ``sandbox_root`` confines the
-    agent's file/terminal callbacks to an isolated worktree / copy for a mutating run. Never raises for an
-    operational failure; a handshake/spawn failure becomes a failed :class:`DelegationResult`
-    (re-execution-safe), still carrying the requested effort.
+    agent's file/terminal callbacks to an isolated worktree / copy for a mutating run. ``resume_session_id``
+    resumes a prior agent session (ACP ``session/load``) instead of opening a fresh one, where the agent
+    supports it -- otherwise the turn fails ``RESUME_FAILED``. Never raises for an operational failure; a
+    handshake / spawn / resume failure becomes a failed :class:`DelegationResult` (re-execution-safe), still
+    carrying the requested effort.
     """
     start = time.monotonic()
     session = ACPSession(
@@ -418,6 +485,7 @@ async def run_acp_turn(
         base_depth=base_depth,
         parent_run_id=parent_run_id,
         sandbox_root=sandbox_root,
+        resume_session_id=resume_session_id,
     )
     try:
         async with session:
@@ -516,8 +584,8 @@ def _resolve_env(descriptor: AgentDescriptor) -> dict[str, str]:
     return env
 
 
-def _advertises_model(session: NewSessionResponse, model_id: str) -> bool:
-    """Whether ``new_session`` advertised ``model_id`` among its selectable models (so set_model is safe)."""
+def _advertises_model(session: NewSessionResponse | LoadSessionResponse, model_id: str) -> bool:
+    """Whether the session advertised ``model_id`` among its selectable models (so set_model is safe)."""
     state = session.models
     if state is None or state.available_models is None:
         return False
