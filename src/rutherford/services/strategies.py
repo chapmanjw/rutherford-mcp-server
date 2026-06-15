@@ -98,13 +98,26 @@ def _normalize(token: str) -> str:
     return token.strip().lower()
 
 
-def aggregate(strategy: Strategy, voices: list[VoiceVerdict], *, min_quorum: int = 1) -> tuple[str, str | None]:
+def aggregate(
+    strategy: Strategy,
+    voices: list[VoiceVerdict],
+    *,
+    min_quorum: int = 1,
+    correlation_discount: bool = False,
+) -> tuple[str, str | None]:
     """Aggregate verdicts into ``(outcome, decision)`` for ``strategy``.
 
     ``voices`` is the whole panel (including failed/unparseable voices); those stay in the denominator
     so an outcome cannot be certified off a minority of survivors. ``min_quorum`` is the floor on
     parseable voices below which the outcome is ``no_quorum``. ``decision`` is the winning verdict token
     when one was reached, else ``None``. ``all-voices`` never reaches here.
+
+    ``correlation_discount`` (F3 vote-math stretch, opt-in) scales each voting voice by ``1 /
+    lineage-multiplicity`` -- the vendor lineage proxy (5-A) -- so N voices of one lineage ("one model in
+    N CLI costumes") count as ONE effective vote, not N. It applies to the counting/weighting strategies
+    (``majority`` / ``plurality`` / ``weighted``); ``unanimous`` (agreement, not weight) and
+    ``parity-pair`` (a proposer-vs-counterweight check) are unaffected. Off by default -- the discount
+    changes outcomes for correlated panels, so it is opt-in (no behavior regression).
 
     Outcomes: ``unanimous`` | ``majority`` | ``no_majority`` | ``plurality`` | ``tied`` | ``split`` |
     ``agree`` | ``escalate`` | ``no_quorum``.
@@ -113,21 +126,59 @@ def aggregate(strategy: Strategy, voices: list[VoiceVerdict], *, min_quorum: int
     eligible = len(voices)
     if len(parseable) < min_quorum:
         return ("no_quorum", None)
+    discounts = lineage_discounts(voices) if correlation_discount else None
+
+    def factor(voice: VoiceVerdict) -> float:
+        return discounts.get(id(voice), 1.0) if discounts is not None else 1.0
+
     if strategy is Strategy.UNANIMOUS:
         return _unanimous(parseable, eligible)
     if strategy is Strategy.MAJORITY:
-        return _strict_majority(Counter(str(voice.verdict) for voice in parseable), float(eligible))
-    if strategy is Strategy.PLURALITY:
-        return _plurality(Counter(str(voice.verdict) for voice in parseable))
-    if strategy is Strategy.WEIGHTED:
         sums: dict[str, float] = defaultdict(float)
         for voice in parseable:
-            sums[str(voice.verdict)] += voice.weight
-        total_weight = sum(voice.weight for voice in voices)  # failed voices keep their weight in the denominator
-        return _strict_majority(sums, total_weight)
+            sums[str(voice.verdict)] += factor(voice)
+        return _strict_majority(sums, sum(factor(voice) for voice in voices))
+    if strategy is Strategy.PLURALITY:
+        scores: dict[str, float] = defaultdict(float)
+        for voice in parseable:
+            scores[str(voice.verdict)] += factor(voice)
+        return _plurality(scores)
+    if strategy is Strategy.WEIGHTED:
+        weighted: dict[str, float] = defaultdict(float)
+        for voice in parseable:
+            weighted[str(voice.verdict)] += voice.weight * factor(voice)
+        # Failed voices keep their full weight in the denominator (the discount applies only to a lineage's
+        # ANSWERING voices), so an outcome still cannot be certified off a minority of survivors.
+        total_weight = sum(voice.weight * factor(voice) for voice in voices)
+        return _strict_majority(weighted, total_weight)
     if strategy is Strategy.PARITY_PAIR:
         return _parity_pair(voices)
     return ("split", None)  # defensive; ALL_VOICES does not aggregate
+
+
+def lineage_discounts(voices: list[VoiceVerdict]) -> dict[int, float]:
+    """Per-voice correlation discount factors keyed by ``id(voice)`` (F3 vote-math): ``1 / lineage size``.
+
+    Groups the ANSWERING voices (ok + a parseable verdict) by their vendor lineage (``provenance.provider``,
+    the same proxy F3's diversity uses); each gets ``1 / (voices sharing that lineage)``, so a lineage of
+    three correlated voices contributes one effective vote. A voice whose lineage cannot be resolved is its
+    OWN lineage (factor ``1.0``) -- two unknowns are NOT assumed correlated, keeping the discount
+    conservative. Non-answering voices are absent (a caller reads ``1.0`` for them via ``.get``). Pure.
+    """
+    parseable = [voice for voice in voices if voice.ok and voice.verdict is not None]
+    # Typed group keys keep the two namespaces disjoint: a resolved vendor is ``("provider", key)``, an
+    # unresolved voice is ``("unknown", index)`` -- so a real provider can NEVER collide with the unknown
+    # marker (a string sentinel could, if a provider were literally named like it).
+    groups: dict[tuple[str, str | int], list[VoiceVerdict]] = defaultdict(list)
+    for index, voice in enumerate(parseable):
+        key = _provider_key(voice.provenance)
+        groups[("provider", key) if key is not None else ("unknown", index)].append(voice)
+    out: dict[int, float] = {}
+    for members in groups.values():
+        factor = 1.0 / len(members)
+        for voice in members:
+            out[id(voice)] = factor
+    return out
 
 
 def _unanimous(parseable: list[VoiceVerdict], eligible: int) -> tuple[str, str | None]:

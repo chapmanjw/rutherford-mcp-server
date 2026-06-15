@@ -617,6 +617,11 @@ class ConsensusRequest(BaseModel):
     #: candidate is stamped with its standing on the ``dissent`` field so a minority position is first-class,
     #: not buried in the matrix. Opt-in (default off); composes with ``require_dissent`` in config.
     require_dissent: bool = False
+    #: Discount correlated votes by vendor lineage when aggregating (F3 vote-math stretch, opt-in): N voices
+    #: of one lineage count as one effective vote, so a panel of "one model in N CLI costumes" cannot
+    #: over-count under ``majority`` / ``plurality`` / ``weighted``. Off by default (it changes outcomes for
+    #: correlated panels); composes with ``discount_correlated_votes`` in config.
+    discount_correlated: bool = False
     #: Persist this panel as a durable job (F2): a parent record plus a child record per voice, under
     #: ``<jobs_dir>/``. ``None`` follows ``default_persistence``; ``True`` / ``False`` force it.
     persist: bool | None = None
@@ -728,6 +733,10 @@ class VoiceVerdict(BaseModel):
     #: This answer's 1-based standing in the RANK leaderboard (F4b), 1 = best. ``None`` for every other
     #: strategy and for a voice that failed round 1 (no answer to rank). Set from the :class:`RankReport`.
     rank: int | None = None
+    #: The correlation discount applied to this voice when ``discount_correlated`` was on (F3 vote-math):
+    #: ``1 / (voices sharing its vendor lineage)``, so a reader sees a correlated vote was down-weighted --
+    #: ``0.5`` means it shared its lineage with one other voice. ``None`` when the discount was not applied.
+    lineage_weight: float | None = None
 
 
 class RankEntry(BaseModel):
@@ -802,6 +811,10 @@ class StrategyResult(BaseModel):
     #: The RANK strategy's leaderboard / pairwise matrix / concordance (F4b). ``None`` for every other
     #: strategy.
     rank: RankReport | None = None
+    #: Whether the aggregation discounted correlated votes by vendor lineage (F3 vote-math, opt-in): when
+    #: ``True``, voices sharing a lineage were down-weighted (each voice's :attr:`VoiceVerdict.lineage_weight`
+    #: shows by how much), so a panel of "one model in N costumes" did not over-count. ``False`` by default.
+    correlation_discounted: bool = False
     #: Advisory, non-fatal notices for the caller (e.g. a suggestion to keep this panel as a job).
     notice: str | None = None
     #: The directory this panel was persisted to when kept as a job (parent + a child record per voice).

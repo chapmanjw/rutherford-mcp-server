@@ -139,6 +139,10 @@ class RutherfordConfig(BaseModel):
     #: F5 (11-C): the aggregation strategy used to read a convergence-tracked debate's per-round decision.
     #: Default ``majority``; ``unanimous`` makes the convergence test the strictest.
     debate_convergence_strategy: Strategy = Strategy.MAJORITY
+    #: F3 vote-math stretch (opt-in): workspace-wide default for discounting correlated votes by vendor
+    #: lineage in a consensus aggregation; the per-call ``discount_correlated`` is the usual opt-in. Off by
+    #: default -- the discount changes outcomes for correlated panels, so it is never on out of the box.
+    discount_correlated_votes: bool = False
     #: Minimum number of parseable voices (ok, with an extracted verdict) an aggregating consensus
     #: strategy needs before it will return a decision; below it the outcome is ``no_quorum``. Guards
     #: against certifying an outcome off one surviving voice when the rest failed.

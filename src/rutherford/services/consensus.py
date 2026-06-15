@@ -65,6 +65,7 @@ from .strategies import (
     effective_diversity,
     extract_ranking,
     extract_verdict,
+    lineage_discounts,
     rank_panel,
     ranking_instruction,
     verdict_instruction,
@@ -804,7 +805,18 @@ class ConsensusService:
                     provenance=voice.provenance,
                 )
             )
-        outcome, decision = aggregate(req.strategy, verdicts, min_quorum=self._config.min_quorum)
+        discount = req.discount_correlated or self._config.discount_correlated_votes
+        if discount:
+            # F3 vote-math (opt-in): stamp each ANSWERING voice's lineage discount so the down-weighting is
+            # auditable, not silent, then aggregate over the discounted weights. A failed / unparseable voice
+            # has no lineage and is left ``None`` (it carries no vote to discount).
+            factors = lineage_discounts(verdicts)
+            for verdict in verdicts:
+                if id(verdict) in factors:
+                    verdict.lineage_weight = factors[id(verdict)]
+        outcome, decision = aggregate(
+            req.strategy, verdicts, min_quorum=self._config.min_quorum, correlation_discount=discount
+        )
         _stamp_dissent(verdicts, outcome, decision)
         return StrategyResult(
             strategy=req.strategy,
@@ -813,6 +825,7 @@ class ConsensusService:
             voices=verdicts,
             skipped=skipped,
             diversity=self._diversity(voices),
+            correlation_discounted=discount,
         )
 
     async def _rank(

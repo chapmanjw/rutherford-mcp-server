@@ -13,6 +13,7 @@ from rutherford.services.strategies import (
     effective_diversity,
     extract_ranking,
     extract_verdict,
+    lineage_discounts,
     rank_panel,
     ranking_instruction,
     verdict_instruction,
@@ -176,6 +177,66 @@ def test_stamp_dissent_is_honest_when_weight_overrides_head_count() -> None:
     assert verdicts[0].dissent is None  # the weight-winner is not a dissent
     assert verdicts[1].dissent == "minority: 2 of 3 voted 'no'; the panel majority 'yes'"
     assert verdicts[2].dissent == verdicts[1].dissent  # both 'no' voters carry the same honest head count
+
+
+# --- F3 correlation-aware vote-math (opt-in lineage discount) ----------------
+
+
+def _lv(verdict: str, provider: str | None, *, weight: float = 1.0) -> VoiceVerdict:
+    return VoiceVerdict(
+        label="v",
+        cli="fake",
+        weight=weight,
+        ok=True,
+        verdict=verdict,
+        provenance=Provenance(provider=provider) if provider is not None else None,
+    )
+
+
+def test_lineage_discounts_collapse_a_shared_vendor_keep_others_full() -> None:
+    voices = [_lv("yes", "alpha"), _lv("yes", "alpha"), _lv("no", "beta")]
+    factors = lineage_discounts(voices)
+    assert factors[id(voices[0])] == 0.5 and factors[id(voices[1])] == 0.5  # two-voice alpha lineage halved
+    assert factors[id(voices[2])] == 1.0  # the lone beta keeps full weight
+
+
+def test_lineage_discounts_treat_unknown_lineages_as_independent() -> None:
+    voices = [_lv("yes", None), _lv("yes", None)]  # two UNRESOLVED-vendor voices
+    factors = lineage_discounts(voices)
+    assert factors[id(voices[0])] == 1.0 and factors[id(voices[1])] == 1.0  # NOT assumed correlated
+
+
+def test_lineage_discounts_unknown_marker_cannot_collide_with_a_real_provider() -> None:
+    # A provider literally named like the internal unknown-marker must NOT collapse with an unresolved voice.
+    # Index 0 is the unresolved voice; the second voice's provider mimics a string sentinel for index 0.
+    voices = [_lv("no", None), _lv("yes", "\x00unknown-0")]
+    factors = lineage_discounts(voices)
+    assert factors[id(voices[0])] == 1.0 and factors[id(voices[1])] == 1.0  # each its OWN lineage, never merged
+
+
+def test_aggregate_discount_collapses_a_lineages_over_count() -> None:
+    voices = [_lv("yes", "alpha"), _lv("yes", "alpha"), _lv("no", "beta")]
+    assert aggregate(Strategy.MAJORITY, voices) == ("majority", "yes")  # off: 2 yes outvote 1 no
+    # on: the two alpha votes are one effective vote (1.0) -> ties the independent beta no (1.0) -> no_majority
+    assert aggregate(Strategy.MAJORITY, voices, correlation_discount=True) == ("no_majority", None)
+
+
+def test_aggregate_discount_does_not_collapse_independent_lineages() -> None:
+    voices = [_lv("yes", None), _lv("yes", None), _lv("no", "beta")]  # two distinct (unknown) lineages agree
+    assert aggregate(Strategy.MAJORITY, voices, correlation_discount=True) == ("majority", "yes")
+
+
+def test_aggregate_discount_applies_to_weighted() -> None:
+    voices = [_lv("yes", "alpha", weight=2.0), _lv("yes", "alpha", weight=2.0), _lv("no", "beta", weight=3.0)]
+    assert aggregate(Strategy.WEIGHTED, voices) == ("majority", "yes")  # off: weight 4 yes vs 3 no
+    # on: alpha halved -> yes weight 2.0 vs no weight 3.0 -> the independent heavy 'no' now carries
+    assert aggregate(Strategy.WEIGHTED, voices, correlation_discount=True) == ("majority", "no")
+
+
+def test_aggregate_discount_off_is_byte_for_byte_the_old_behavior() -> None:
+    voices = [_lv("yes", "alpha"), _lv("yes", "alpha"), _lv("no", "beta")]
+    assert aggregate(Strategy.MAJORITY, voices) == aggregate(Strategy.MAJORITY, voices, correlation_discount=False)
+    assert aggregate(Strategy.PLURALITY, voices) == aggregate(Strategy.PLURALITY, voices, correlation_discount=False)
 
 
 # --- RANK: ballot extraction (F4b) -------------------------------------------

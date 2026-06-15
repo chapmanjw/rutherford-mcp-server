@@ -260,6 +260,7 @@ async def consensus(
     judge: Any | None = None,
     require_independent_judge: bool = False,
     require_dissent: bool = False,
+    discount_correlated: bool = False,
     stances: list[str] | None = None,
     expand_all: bool = False,
     working_dir: str | None = None,
@@ -290,8 +291,11 @@ async def consensus(
     (`StrategyResult`) instead of every voice. `rank` is a two-round protocol (F4b): every voice answers, then
     ranks the OTHER answers anonymized and self-excluded, aggregated by Borda mean-rank into a `rank`
     leaderboard with a pairwise agreement matrix and concordance; `require_dissent` surfaces each non-winning
-    position on its `dissent`. Optional `stances` (parallel to `targets`) steer each voice
-    and cannot combine with the auto-expanded panel. `synthesize` (defaults to `synthesize_default`, off
+    position on its `dissent`. `discount_correlated=true` (F3 vote-math, opt-in) down-weights correlated
+    votes by vendor lineage so a panel of "one model in N CLI costumes" counts as one effective vote under
+    `majority` / `plurality` / `weighted` (each voice's `lineage_weight` shows the discount). Optional
+    `stances` (parallel to `targets`) steer each voice and cannot combine with the auto-expanded panel.
+    `synthesize` (defaults to `synthesize_default`, off
     out of the box) adds a server-side combined answer (`all-voices` only); `judge` names the seat that
     writes it. `timeout_s` applies to every voice; one failing voice is a failed result, never an aborted
     panel. Consensus is read-only deliberation: a `safety_mode` beyond `read_only` (`propose` / `write` /
@@ -320,6 +324,7 @@ async def consensus(
             judge=judge,
             require_independent_judge=require_independent_judge,
             require_dissent=require_dissent,
+            discount_correlated=discount_correlated,
             stances=stances,
             expand_all=expand_all,
             working_dir=working_dir,

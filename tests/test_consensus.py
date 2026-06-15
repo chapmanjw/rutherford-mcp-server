@@ -47,8 +47,37 @@ SLOW = AgentDescriptor(
 )
 
 
+# Voices with a FIXED vendor lineage AND a fixed verdict (via env), so a panel can hold two correlated
+# 'alpha' yes-votes against one independent 'beta' no-vote -- the case the F3 vote-math discount targets.
+ALPHA_YES = AgentDescriptor(
+    "alpha_yes", "Alpha Yes", _FAKE_CMD, provider="alpha", env_overrides=(("RUTHERFORD_FAKE_VERDICT", "yes"),)
+)
+ALPHA_YES2 = AgentDescriptor(
+    "alpha_yes2", "Alpha Yes 2", _FAKE_CMD, provider="alpha", env_overrides=(("RUTHERFORD_FAKE_VERDICT", "yes"),)
+)
+BETA_NO = AgentDescriptor(
+    "beta_no", "Beta No", _FAKE_CMD, provider="beta", env_overrides=(("RUTHERFORD_FAKE_VERDICT", "no"),)
+)
+
+
 def _registry(extra: list[AgentDescriptor] | None = None) -> DescriptorRegistry:
     return DescriptorRegistry([FAKE, FAKE_A, FAKE_B, *(extra or [])])
+
+
+def _discount_service() -> ConsensusService:
+    config = RutherfordConfig()
+    registry = DescriptorRegistry([ALPHA_YES, ALPHA_YES2, BETA_NO])
+    return ConsensusService(DelegationService(registry, config), registry, config)
+
+
+def _correlated_panel(**kwargs: Any) -> ConsensusRequest:
+    return ConsensusRequest(
+        targets=[Target(cli="alpha_yes"), Target(cli="alpha_yes2"), Target(cli="beta_no")],
+        prompt="Decide.",
+        strategy=Strategy.MAJORITY,
+        working_dir=str(REPO_ROOT),
+        **kwargs,
+    )
 
 
 def _service(config: RutherfordConfig | None = None, extra: list[AgentDescriptor] | None = None) -> ConsensusService:
@@ -500,6 +529,37 @@ async def test_rank_tool_and_server_wiring(monkeypatch: Any) -> None:
         prompt="what is 17 + 25?", targets=["fake", "fake_a", "fake_b"], strategy="rank", working_dir=str(REPO_ROOT)
     )
     assert "leaderboard" in wrapped
+
+
+# --- F3 correlation-aware vote-math (opt-in lineage discount) ----------------
+
+
+async def test_consensus_discount_correlated_collapses_a_vendor_lineage() -> None:
+    # Two 'alpha' voices vote yes, one 'beta' votes no. With the discount, the alpha pair is ONE effective
+    # vote -> it ties the independent beta no -> no_majority, and each correlated voice is stamped 0.5.
+    result = await _discount_service().consensus(_correlated_panel(discount_correlated=True))
+    assert isinstance(result, StrategyResult)
+    assert result.correlation_discounted is True and result.outcome == "no_majority" and result.decision is None
+    by_cli = {voice.cli: voice for voice in result.voices}
+    assert by_cli["alpha_yes"].lineage_weight == 0.5 and by_cli["alpha_yes2"].lineage_weight == 0.5
+    assert by_cli["beta_no"].lineage_weight == 1.0  # the lone vendor keeps full weight
+
+
+async def test_consensus_without_discount_lets_the_lineage_over_count() -> None:
+    # The same panel WITHOUT the discount: the two correlated alpha votes over-count and carry the majority.
+    result = await _discount_service().consensus(_correlated_panel())
+    assert isinstance(result, StrategyResult)
+    assert result.correlation_discounted is False and result.outcome == "majority" and result.decision == "yes"
+    assert all(voice.lineage_weight is None for voice in result.voices)  # not stamped when off
+
+
+async def test_consensus_discount_correlated_via_config() -> None:
+    config = RutherfordConfig(discount_correlated_votes=True)
+    registry = DescriptorRegistry([ALPHA_YES, ALPHA_YES2, BETA_NO])
+    service = ConsensusService(DelegationService(registry, config), registry, config)
+    result = await service.consensus(_correlated_panel())  # no per-call flag; config default fires
+    assert isinstance(result, StrategyResult)
+    assert result.correlation_discounted is True and result.outcome == "no_majority"
 
 
 # --- failed-voice edges ------------------------------------------------------
