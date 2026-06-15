@@ -295,14 +295,22 @@ def test_sandbox_worktree_is_created_and_cleaned_up(tmp_path: Path) -> None:
     root = Path(sandbox.root)
     assert root.is_dir(), "the worktree root was not created"
     assert (root / "README.md").read_text(encoding="utf-8") == "seed\n", "the worktree did not start from HEAD"
+    # Match the worktree path in either its as-is or OS-canonical form, with either slash. A CI runner's TEMP
+    # can be an 8.3 SHORT path (``C:\Users\RUNNER~1\...``) while ``git worktree list`` prints the LONG form
+    # (``C:\Users\runneradmin\...``); ``resolve()`` (computed while the dir still exists) expands the short form.
+    root_forms = {str(root), str(root.resolve())}
+
+    def _listed(stdout: str) -> bool:
+        return any(form in stdout or form in stdout.replace("/", "\\") for form in root_forms)
+
     # git knows about the worktree while it is live.
     listed = subprocess.run(["git", "worktree", "list"], cwd=tmp_path, capture_output=True, text=True, check=True)
-    assert str(root) in listed.stdout.replace("/", "\\") or str(root) in listed.stdout
+    assert _listed(listed.stdout), f"git worktree list did not show the sandbox worktree {root}:\n{listed.stdout}"
     sandbox.cleanup()
     assert not root.exists(), "the worktree dir survived cleanup"
     # The repo no longer lists the removed worktree.
     after = subprocess.run(["git", "worktree", "list"], cwd=tmp_path, capture_output=True, text=True, check=True)
-    assert str(root) not in after.stdout, "git still lists the removed worktree"
+    assert not _listed(after.stdout), "git still lists the removed worktree"
 
 
 def test_sandbox_finish_with_no_change_is_empty(tmp_path: Path) -> None:
