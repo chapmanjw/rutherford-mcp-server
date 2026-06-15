@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -18,13 +19,16 @@ from rutherford.domain.enums import Effort, SafetyMode, Stance, Strategy
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import ConsensusRequest, ConsensusResult, StrategyResult, Target
+from rutherford.io.serialize import decode
 from rutherford.services.consensus import ConsensusService, _Candidate
 from rutherford.services.delegation import DelegationService
+from rutherford.services.jobs import JobRecord, JobStore
 from rutherford.tools.common import as_target, ensure_known_targets, parse_stances, parse_strategy
 from rutherford.tools.consensus import consensus_tool
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
+_DrainJob = Callable[[JobStore, str], Awaitable[JobRecord]]
 FAKE = AgentDescriptor("fake", "Fake", _FAKE_CMD)
 # Two more fakes with distinct provider + default model, so a panel of them spans real diversity.
 FAKE_A = AgentDescriptor("fake_a", "Fake A", _FAKE_CMD, provider="alpha", default_model="model-a")
@@ -723,7 +727,7 @@ async def test_consensus_tool_expand_all_via_all_sentinel() -> None:
     assert out.count('text: "42"') == 3  # fanned out to all three registered fakes
 
 
-async def test_consensus_tool_async_runs_same_aggregating_path(monkeypatch: Any) -> None:
+async def test_consensus_tool_async_runs_same_aggregating_path(monkeypatch: Any, drain_async_job: _DrainJob) -> None:
     monkeypatch.setattr(server, "_APP", _app())
     submit = await server.consensus(
         prompt=_prompt("VERDICT: yes"),
@@ -732,6 +736,7 @@ async def test_consensus_tool_async_runs_same_aggregating_path(monkeypatch: Any)
         mode="async",
     )
     assert "job_id" in submit
+    await drain_async_job(server.get_app().jobs, decode(submit)["job_id"])  # let the job finish (clean teardown)
 
 
 # --- time budget + harvest (F8a) ---------------------------------------------

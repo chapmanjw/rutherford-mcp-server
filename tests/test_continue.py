@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,11 @@ from rutherford.domain.models import (
     Target,
 )
 from rutherford.io.ledger import read_record
+from rutherford.io.serialize import decode
+from rutherford.services.jobs import JobRecord, JobStore
 from rutherford.tools.continue_job import _panel_continuation_request, _reinjection_prompt, continue_job_tool
+
+_DrainJob = Callable[[JobStore, str], Awaitable[JobRecord]]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
@@ -324,7 +329,7 @@ def test_panel_continuation_request_replays_the_persisted_panel() -> None:
     assert request.targets[1].parity is True and request.targets[1].stance is Stance.AGAINST
 
 
-async def test_continue_a_consensus_panel_async_returns_a_job_id(tmp_path: Path) -> None:
+async def test_continue_a_consensus_panel_async_returns_a_job_id(tmp_path: Path, drain_async_job: _DrainJob) -> None:
     app = _panel_app(tmp_path)
     parent = await app.consensus.consensus(
         ConsensusRequest(
@@ -339,6 +344,7 @@ async def test_continue_a_consensus_panel_async_returns_a_job_id(tmp_path: Path)
         app, job_id=Path(parent.run_dir).name, prompt="WHOAMI", working_dir=str(REPO_ROOT), mode="async"
     )
     assert "job_id" in out
+    await drain_async_job(app.jobs, decode(out)["job_id"])  # let the fire-and-forget job finish (clean teardown)
 
 
 async def test_continue_unknown_job_is_not_found(tmp_path: Path) -> None:
@@ -394,8 +400,9 @@ async def test_continue_corrupt_record_is_invalid_input(tmp_path: Path) -> None:
     assert exc.value.code is ErrorCode.INVALID_INPUT and "corrupt" in exc.value.message
 
 
-async def test_continue_async_returns_a_job_id(tmp_path: Path) -> None:
+async def test_continue_async_returns_a_job_id(tmp_path: Path, drain_async_job: _DrainJob) -> None:
     app = _app(tmp_path)
     _write_parent(app)
     out = await continue_job_tool(app, job_id="parent01", prompt="WHOAMI", working_dir=str(REPO_ROOT), mode="async")
     assert "job_id" in out
+    await drain_async_job(app.jobs, decode(out)["job_id"])  # let the fire-and-forget job finish (clean teardown)
