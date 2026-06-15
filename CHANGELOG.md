@@ -313,6 +313,14 @@ All notable changes to this project are documented in this file. The format is b
       outside the workspace can't pull external bytes into the sandbox; the real symlink is left untouched.
     - Delete-back resolves only a path's **parent** (not the final component), so deleting a workspace symlink
       removes the link itself rather than following it (or being wrongly skipped).
+    - Apply-back **never writes through a destination symlink** (a fourth review pass): if the destination is a
+      symlink it is replaced at its own in-tree location rather than followed, so a symlink can't redirect a
+      write to another file the conflict checks never examined; a real directory at the destination is skipped.
+  - Two limitations are deliberate and documented (in `acp/sandbox.py`), given the cooperative-agent threat
+    model: the sandbox is cwd + path-guard isolation, **not an OS jail** (a write/yolo agent's own process or a
+    terminal command can still write an absolute path outside it; OS containment is deferred); and the
+    check-then-apply path has a **narrow inherent TOCTOU** (a user save in the sub-millisecond window between
+    the clobber check and the copy is not caught — the same gap `git apply` / `git stash` have).
   - Known, accepted limitation (unchanged, and documented in `acp/sandbox.py` + the security docs): the
     sandbox confines a *cooperative* agent's ACP `fs`/terminal activity by cwd + the path-escape guard; it is
     NOT an OS jail. A write/yolo agent's own process (or a terminal command it runs) can still write an

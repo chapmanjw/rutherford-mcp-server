@@ -669,6 +669,32 @@ def test_non_git_apply_refuses_a_concurrent_edit(tmp_path: Path) -> None:
     assert (tmp_path / "shared.txt").read_text(encoding="utf-8") == "user concurrent edit\n"
 
 
+def test_copy_apply_does_not_follow_an_in_tree_destination_symlink(tmp_path: Path) -> None:
+    """Apply-back never writes THROUGH a destination symlink: it replaces the link, leaving the target intact.
+
+    If the real tree has a symlink ``link -> target.txt`` and the agent's change lands at ``link``, copying the
+    sandbox file straight over ``link`` would follow it and clobber ``target.txt`` (a file the conflict checks
+    never examined). The link must be removed and the agent's file written at the link's own location.
+    """
+    from rutherford.acp.sandbox import Sandbox
+
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "target.txt").write_text("the real target, must survive\n", encoding="utf-8")
+    try:
+        (work / "link").symlink_to(work / "target.txt")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not creatable on this platform / without the privilege")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "link").write_text("agent content\n", encoding="utf-8")  # the agent's file lands at "link"
+    sandbox = Sandbox(manager=SandboxManager(), working_dir=work.resolve(), root=root, is_git=True)
+    sandbox._copy_apply(["link"])
+    assert (work / "link").read_text(encoding="utf-8") == "agent content\n"  # written at the link location
+    assert not (work / "link").is_symlink(), "the symlink should have been replaced, not followed"
+    assert (work / "target.txt").read_text(encoding="utf-8") == "the real target, must survive\n"
+
+
 def test_non_git_copy_skips_symlinks(tmp_path: Path) -> None:
     """The non-git copy skips symlinks: outside bytes are never dereferenced into the sandbox, and the real
     symlink is left untouched by the apply-back."""

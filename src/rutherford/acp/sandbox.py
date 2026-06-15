@@ -24,6 +24,19 @@ The execution root is always cleaned up in a ``finally`` (worktree removed, temp
 agent's process tree is reaped by the existing session teardown. ``SandboxResult`` carries the unified diff
 and the changed-file list back to the delegation service, which stamps them onto the
 :class:`~rutherford.domain.models.DelegationResult`.
+
+Two limitations are deliberate, given the threat model (orchestrating COOPERATIVE coding agents the user
+chose to run on their own machine, not sandboxing adversarial code):
+
+* **Not an OS jail.** The isolation is cwd + the ACP file/terminal path-escape guard. A write/yolo agent's
+  own OS process, or a terminal command it runs, can still write an absolute path outside the sandbox. Full
+  OS containment (Windows Job Objects / ACLs) is deferred. This is strictly safer than v2, which ran agents
+  directly in the user's tree with no sandbox at all.
+* **A narrow apply-time TOCTOU.** The clobber / concurrent-edit checks run, then the changed files are copied
+  back. A user save to one of those files in the sub-millisecond window between the check and the copy is not
+  detected. Eliminating it would need to lock the whole working tree for the apply; the window is tiny and a
+  user actively editing files the agent is mid-write on is outside the cooperative model, so it is accepted
+  (the same inherent gap any check-then-write filesystem apply has, ``git apply`` / ``git stash`` included).
 """
 
 from __future__ import annotations
@@ -311,11 +324,22 @@ class Sandbox:
         return "\n".join(diff_parts), sorted(changed), sorted(deleted)
 
     def _copy_apply(self, changed: list[str]) -> None:
-        """Copy each changed/created file from the temp copy back into the real ``working_dir`` (contained)."""
+        """Copy each changed/created file from the sandbox back into the real ``working_dir`` (contained).
+
+        Never FOLLOWS a destination symlink: if the destination is itself a symlink, the link is removed and the
+        agent's file is written at the link's own (in-tree) location, so a symlink cannot redirect the write to
+        another file (in or out of the tree) that the conflict checks never examined. A destination that is a
+        real directory is skipped rather than copied into.
+        """
         for rel in changed:
             dst = self._contained_target(rel)
             if dst is None:
-                continue  # would escape the working_dir via a symlink -- refused
+                continue  # resolves outside the working_dir via a symlink -- refused
+            if dst.is_symlink():
+                dst.unlink()  # replace the link with the agent's file; do not write THROUGH it
+            elif dst.is_dir():
+                _log.warning("sandbox apply-back skipped %s: a real directory exists at the destination", rel)
+                continue
             src = self._root / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
