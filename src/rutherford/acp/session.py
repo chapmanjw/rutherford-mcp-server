@@ -254,27 +254,38 @@ class ACPSession:
             ) from exc
         self._conn = conn
         self._pid = process.pid
+        # A cancellation ANYWHERE in the handshake (initialize / new_session / load / set_model) is a
+        # BaseException, so the per-stage ``except Exception`` guards below do NOT catch it. Without this outer
+        # guard the just-spawned agent would be left registered on the exit stack but never torn down -- a
+        # leaked process tree, since ``run_acp_turn`` enters the session with ``async with`` and Python skips
+        # ``__aexit__`` when ``__aenter__`` (this ``open``) raises. Tear the agent down on a cancel, then
+        # re-raise so the cancellation still propagates (the per-stage handlers already close on an Exception).
         try:
-            init = await asyncio.wait_for(
-                conn.initialize(protocol_version=PROTOCOL_VERSION, client_info=_CLIENT_INFO),
-                timeout=self._handshake_timeout,
-            )
-        except Exception as exc:
+            try:
+                init = await asyncio.wait_for(
+                    conn.initialize(protocol_version=PROTOCOL_VERSION, client_info=_CLIENT_INFO),
+                    timeout=self._handshake_timeout,
+                )
+            except Exception as exc:
+                await self.close()
+                raise ACPHandshakeError(
+                    ErrorCode.ACP_HANDSHAKE_FAILED,
+                    f"ACP handshake with {self._descriptor.id} failed: {exc}",
+                    ReexecutionSafety.SAFE,
+                ) from exc
+            # Resume a prior session (session/load) when asked, else create a fresh one (session/new). The
+            # resume path is gated on the agent's advertised loadSession capability and fails RESUME_FAILED if
+            # unsupported.
+            session: NewSessionResponse | LoadSessionResponse
+            if self._resume_session_id is not None:
+                session = await self._resume(conn, init)
+            else:
+                session = await self._new_session(conn)
+            self._available_models = _models_of(session)
+            await self._select_model(conn, session)
+        except asyncio.CancelledError:
             await self.close()
-            raise ACPHandshakeError(
-                ErrorCode.ACP_HANDSHAKE_FAILED,
-                f"ACP handshake with {self._descriptor.id} failed: {exc}",
-                ReexecutionSafety.SAFE,
-            ) from exc
-        # Resume a prior session (session/load) when asked, else create a fresh one (session/new). The resume
-        # path is gated on the agent's advertised loadSession capability and fails RESUME_FAILED if unsupported.
-        session: NewSessionResponse | LoadSessionResponse
-        if self._resume_session_id is not None:
-            session = await self._resume(conn, init)
-        else:
-            session = await self._new_session(conn)
-        self._available_models = _models_of(session)
-        await self._select_model(conn, session)
+            raise
 
     async def _new_session(self, conn: ClientSideConnection) -> NewSessionResponse:
         """Create a fresh session (``session/new``); a failure is an ``ACP_HANDSHAKE_FAILED`` handshake fault."""
@@ -460,7 +471,12 @@ class ACPSession:
         with contextlib.suppress(Exception):
             await self._client.shutdown_terminals()
         try:
-            await self._stack.aclose()
+            # Suppressed so the documented "a teardown failure never propagates" contract actually holds: a
+            # transport teardown error (e.g. a half-open async generator) must not propagate -- it would mask a
+            # cancellation in flight when open()'s cancel handler calls close() before re-raising, and corrupt
+            # the exception an ``async with session`` body was already unwinding. The reap still runs regardless.
+            with contextlib.suppress(Exception):
+                await self._stack.aclose()
         finally:
             if descendants:
                 await asyncio.to_thread(reap, descendants)
