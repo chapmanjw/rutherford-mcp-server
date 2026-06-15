@@ -15,6 +15,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,13 +24,22 @@ from ..acp.descriptors import DescriptorRegistry
 from ..acp.permission import PermissionPolicy
 from ..acp.session import ACPHandshakeError, ACPSession, run_acp_turn
 from ..config.schema import RutherfordConfig
-from ..domain.enums import EFFORT_ORDER, ActivityEventKind, Effort, SafetyMode, Stance, runs_sandboxed
+from ..domain.enums import (
+    EFFORT_ORDER,
+    ActivityEventKind,
+    Effort,
+    SafetyMode,
+    Stance,
+    TerminationReason,
+    runs_sandboxed,
+)
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import (
     ActivityEvent,
     Cost,
     DebateContribution,
+    DebateOutcome,
     DebateRequest,
     DebateResult,
     DebateRound,
@@ -38,15 +48,17 @@ from ..domain.models import (
     ErrorInfo,
     PanelInputs,
     PanelTarget,
+    ProgressLedger,
     RunRollup,
     Target,
     Topology,
+    VoiceVerdict,
 )
 from ..io.ledger import RunLedger
 from ..runtime.depth import ensure_within_aggregate_cap
 from .delegation import ActivityCallback, DelegationService, PanelLifecycle, emit_activity
 from .persistence import PanelVoice, write_panel_record
-from .strategies import effective_diversity
+from .strategies import aggregate, effective_diversity, extract_verdict, verdict_instruction
 
 _log = logging.getLogger("rutherford.services.debate")
 
@@ -178,17 +190,22 @@ class DebateService:
             # F4a (4-C): each seat's ROUND-1 (blind, pre-exposure) answer, captured once and carried onto every
             # later round's contribution so a reader sees pre-vs-post movement without an extra sub-turn.
             pre_commits: dict[str, str] = {}
+            # F5 (11-D/11-E): the termination-grammar arm this debate stops on (UNRESOLVED until an earlier
+            # arm fires) and the running convergence ledger (the prior round's, for the stall counter).
+            termination = TerminationReason.UNRESOLVED
+            prior_ledger: ProgressLedger | None = None
             active = [voice for voice in voices if voice.index in sessions]
             for round_index in range(1, rounds_cap + 1):
                 if round_index > 1 and len(active) < 2:
+                    termination = TerminationReason.QUORUM_LOST
                     break  # a debate needs at least two voices to keep arguing
                 remaining: float | None = None
                 if enforce and budget is not None:
                     remaining = budget - (time.monotonic() - start)
                     if remaining <= 0:  # the budget is spent at this boundary -- do not start another round
                         stop_reason = "budget"
+                        termination = TerminationReason.BUDGET
                         break
-                previous = rounds[-1] if rounds else None
                 contributions, round_cut = await self._run_round(
                     req,
                     voices,
@@ -196,7 +213,7 @@ class DebateService:
                     sessions,
                     open_errors,
                     round_index,
-                    previous,
+                    rounds,  # F5 (11-B): the full history so far, so carry-forward can re-send every round
                     timeout_s,
                     remaining,
                     base_depth,
@@ -208,7 +225,8 @@ class DebateService:
                 else:
                     for contribution in contributions:  # carry the seat's blind round-1 position onto this turn
                         contribution.pre_commit = pre_commits.get(contribution.seat_id)
-                rounds.append(DebateRound(index=round_index, contributions=contributions))
+                this_round = DebateRound(index=round_index, contributions=contributions)
+                rounds.append(this_round)
                 # F4a no-silent-dismissal (4-B): a seat that produced no usable answer this round is set aside
                 # -- stamp why on its contribution so a dropped voice is never silent. Stamped BEFORE the
                 # budget-cut break so a seat cut at the deadline (also "no usable answer") is stamped too.
@@ -218,7 +236,20 @@ class DebateService:
                         contribution.dissent = f"set aside: no usable answer in round {round_index}"
                 if round_cut:  # turns were cut in-flight at the deadline -- finalize over the transcript so far
                     stop_reason = "budget"
+                    termination = TerminationReason.BUDGET
                     break
+                # F5 (11-C): read this round's convergence and stop early on agreement (converged) or a frozen
+                # decision (stalled). Deterministic (verdict aggregation), so no extra subprocess and replayable.
+                if req.track_convergence:
+                    ledger = self._convergence_ledger(this_round, prior_ledger)
+                    this_round.ledger = ledger
+                    prior_ledger = ledger
+                    if ledger.converged:
+                        termination = TerminationReason.CONVERGED
+                        break
+                    if ledger.stall_count >= self._config.debate_stall_tolerance:
+                        termination = TerminationReason.STALLED
+                        break
                 active = [voice for voice in active if _seat_id(voice) in survivors]
 
             if stop_reason == "budget":
@@ -258,6 +289,13 @@ class DebateService:
                     message=finished_message,
                 )
             )
+            outcome = DebateOutcome(
+                termination=termination,
+                rounds_run=len(rounds),
+                converged=termination is TerminationReason.CONVERGED,
+                decision=prior_ledger.decision if prior_ledger is not None else None,
+                stall_count=prior_ledger.stall_count if prior_ledger is not None else 0,
+            )
             return DebateResult(
                 prompt=req.prompt,
                 rounds=rounds,
@@ -268,6 +306,7 @@ class DebateService:
                 rollup=rollup,
                 topology=topology,
                 diversity=diversity,
+                outcome=outcome,
                 run_dir=run_dir,
             )
         finally:
@@ -447,7 +486,7 @@ class DebateService:
         sessions: dict[int, ACPSession],
         open_errors: dict[int, str],
         round_index: int,
-        previous: DebateRound | None,
+        history: list[DebateRound],
         timeout_s: float,
         remaining_budget: float | None,
         base_depth: int,
@@ -465,7 +504,7 @@ class DebateService:
         """
 
         async def _turn(voice: _Voice) -> DebateContribution:
-            prompt = self._round_prompt(req, voice, previous)
+            prompt = self._round_prompt(req, voice, history)
             async with self._delegation.semaphore:
                 emit_activity(
                     on_activity,
@@ -572,20 +611,23 @@ class DebateService:
             raise exc
         return task.result()
 
-    def _round_prompt(self, req: DebateRequest, voice: _Voice, previous: DebateRound | None) -> str:
-        """Round 1 is the full question; later rounds send only the others' latest positions (a delta).
+    def _round_prompt(self, req: DebateRequest, voice: _Voice, history: list[DebateRound]) -> str:
+        """The prompt for one voice this round: the opening question, then either a delta or the full transcript.
 
-        The persistent session remembers this voice's own prior answer, so the delta does not re-send it --
-        the whole point of holding the session across rounds. A steered voice's FOR/AGAINST stance is
-        re-embedded EVERY round, not just round 1 (v2 parity): without the reminder a multi-round debate
-        drifts toward the center as each voice accommodates the others, so the assigned side has to be
-        restated each round to hold the adversarial framing the stance is for.
+        Round 1 is the full question. By default a later round sends only the PREVIOUS round's other-voice
+        positions (a delta): the persistent session remembers this voice's own prior answer, so the delta does
+        not re-send it -- the whole point of holding the session across rounds. With ``carry_forward`` (F5,
+        11-B) a later round instead re-sends the FULL prior transcript verbatim, for a weaker session memory.
+        A steered voice's FOR/AGAINST stance is re-embedded EVERY round (v2 parity); a convergence-tracked
+        debate (F5, 11-C) appends a one-word verdict ask so the round's position can be aggregated.
         """
-        if previous is None:
-            return _with_stance(req.prompt, voice.stance)
+        if not history:
+            return self._with_verdict_ask(req, _with_stance(req.prompt, voice.stance))
+        if req.carry_forward:
+            return self._with_verdict_ask(req, _with_later_stance(self._carry_forward_prompt(history), voice.stance))
         others = [
             (contribution.label, contribution.text)
-            for contribution in previous.contributions
+            for contribution in history[-1].contributions
             if contribution.seat_id != _seat_id(voice) and contribution.ok and contribution.text.strip()
         ]
         block = "\n\n".join(f"## {label}\n{text}" for label, text in others) or "(no other positions)"
@@ -593,7 +635,74 @@ class DebateService:
             "This is the next round of our debate. Here are the other participants' latest positions:\n\n"
             f"{block}\n\nCritique them and revise or defend your own answer. End with your current best answer."
         )
-        return _with_later_stance(prompt, voice.stance)
+        return self._with_verdict_ask(req, _with_later_stance(prompt, voice.stance))
+
+    def _carry_forward_prompt(self, history: list[DebateRound]) -> str:
+        """Render the FULL prior transcript (every round, every answering voice) for a carry-forward round (11-B)."""
+        blocks: list[str] = []
+        for round_ in history:
+            answers = "\n\n".join(f"### {c.label}\n{c.text}" for c in round_.contributions if c.ok and c.text.strip())
+            if answers:
+                blocks.append(f"## Round {round_.index}\n\n{answers}")
+        transcript = "\n\n".join(blocks) or "(no prior positions)"
+        return (
+            "This is the next round of our debate. Here is the FULL transcript so far:\n\n"
+            f"{transcript}\n\nCritique the other participants' positions and revise or defend your own answer. "
+            "End with your current best answer."
+        )
+
+    def _with_verdict_ask(self, req: DebateRequest, prompt: str) -> str:
+        """Append a one-word verdict instruction when convergence is tracked, so the round can be aggregated (11-C)."""
+        if not req.track_convergence:
+            return prompt
+        return f"{prompt}\n\n{verdict_instruction(None)}"
+
+    def _convergence_ledger(self, round_: DebateRound, prior: ProgressLedger | None) -> ProgressLedger:
+        """This round's convergence snapshot (F5, 11-C): aggregate the verdicts and update the stall counter.
+
+        Each answering voice's one-word verdict is extracted and aggregated under ``debate_convergence_strategy``.
+        ``converged`` is a unanimous outcome (genuine agreement). The stall counter rises while a non-converged
+        decision holds UNCHANGED across rounds and resets when it moves (or when there is no decision to hold),
+        so ``stalled`` means the panel froze short of agreement. Pure -- no subprocess -- so it is replayable.
+        """
+        verdicts: list[VoiceVerdict] = []
+        for c in round_.contributions:
+            if not (c.ok and c.text.strip()):
+                continue
+            verdict = extract_verdict(c.text, None)
+            verdicts.append(
+                VoiceVerdict(
+                    label=c.label,
+                    cli=c.target.cli,
+                    ok=True,
+                    verdict=verdict,
+                    no_verdict_reason=None if verdict is not None else "unparseable",
+                )
+            )
+        outcome, decision = aggregate(
+            self._config.debate_convergence_strategy, verdicts, min_quorum=self._config.min_quorum
+        )
+        parseable = [v.verdict for v in verdicts if v.verdict is not None]
+        tally = Counter(parseable)
+        prior_decision = prior.decision if prior is not None else None
+        # Convergence is genuine AGREEMENT -- every answering voice gave the SAME verdict -- measured directly,
+        # NOT off the aggregate ``outcome`` (a MAJORITY-strategy panel returns "majority" even when unanimous).
+        converged = (
+            len(parseable) >= self._config.min_quorum
+            and len(parseable) == len(verdicts)  # every answering voice produced a verdict
+            and len(set(parseable)) == 1
+        )
+        held = decision is not None and decision == prior_decision
+        stall_count = (prior.stall_count if prior is not None else 0) + 1 if held and not converged else 0
+        return ProgressLedger(
+            round_index=round_.index,
+            outcome=outcome,
+            decision=decision,
+            tally={str(key): count for key, count in tally.items()},
+            changed=decision != prior_decision,
+            stall_count=stall_count,
+            converged=converged,
+        )
 
     async def _synthesize(
         self, req: DebateRequest, rounds: list[DebateRound], cwd: str, timeout_s: float, base_depth: int

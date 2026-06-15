@@ -350,6 +350,8 @@ async def debate(
     rounds: int = 2,
     judge: Any | None = None,
     require_independent_judge: bool = False,
+    carry_forward: bool = False,
+    track_convergence: bool = False,
     working_dir: str | None = None,
     safety_mode: str | None = None,
     synthesize: bool = True,
@@ -371,6 +373,11 @@ async def debate(
     session across all `rounds`: round one is each voice's
     independent answer, and each later round shows a voice the others' latest positions and asks it to
     revise -- the agent remembers its own prior reasoning in-session, so only the delta is sent.
+    `carry_forward=true` instead re-sends the FULL prior transcript verbatim each round (for a weaker session
+    memory; bounded by `time_budget_s`). `track_convergence=true` asks each voice for a one-word verdict each
+    round and stops early when the panel CONVERGES (a unanimous verdict) or STALLS (the decision holds for the
+    configured tolerance); the `outcome` field reports the termination reason (converged / stalled /
+    unresolved / budget / quorum_lost) and the final decision.
     `synthesize=true` (default) adds a closing summary; `judge` names a target to write it. A debate is
     read-only deliberation: a `safety_mode` beyond `read_only` (`propose` / `write` / `yolo`) is refused --
     the voices run on persistent sessions in the working directory with no per-turn sandbox -- so route write /
@@ -395,6 +402,8 @@ async def debate(
             rounds=rounds,
             judge=judge,
             require_independent_judge=require_independent_judge,
+            carry_forward=carry_forward,
+            track_convergence=track_convergence,
             working_dir=working_dir,
             safety_mode=safety_mode,
             synthesize=synthesize,

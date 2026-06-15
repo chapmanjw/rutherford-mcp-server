@@ -161,6 +161,26 @@ class Effort(StrEnum):
 EFFORT_ORDER: tuple[Effort, ...] = (Effort.LOW, Effort.MEDIUM, Effort.HIGH, Effort.XHIGH)
 
 
+class TerminationReason(StrEnum):
+    """Why a debate stopped (F5, 11-D/11-E): the arms of the termination grammar.
+
+    A debate always stops for exactly one reason. ``budget`` and ``quorum_lost`` apply to any debate;
+    ``converged`` and ``stalled`` only fire when convergence is tracked; ``unresolved`` is the default --
+    the round budget ran out without an earlier arm firing.
+    """
+
+    #: The panel reached agreement -- a unanimous verdict across the answering voices (tracked debates).
+    CONVERGED = "converged"
+    #: Positions stopped moving: the decision held unchanged for the stall tolerance, short of agreement.
+    STALLED = "stalled"
+    #: The round budget ran out without converging or stalling (the default terminal).
+    UNRESOLVED = "unresolved"
+    #: A wall-clock time budget finalized the debate at a round boundary (F8a).
+    BUDGET = "budget"
+    #: Fewer than two voices remained to keep arguing, so the debate could not continue.
+    QUORUM_LOST = "quorum_lost"
+
+
 class ReexecutionSafety(StrEnum):
     """Whether a failed ACP turn may be silently re-issued (transport / model / cross-agent fallback).
 

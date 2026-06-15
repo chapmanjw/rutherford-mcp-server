@@ -27,6 +27,7 @@ from .enums import (
     SafetyMode,
     Stance,
     Strategy,
+    TerminationReason,
 )
 from .error_codes import ErrorCode
 
@@ -866,6 +867,16 @@ class DebateRequest(BaseModel):
     #: (today equivalent to ``harvest``; the deliberate come-back rides the item-9 primitive). ``None``
     #: follows the configured ``default_on_budget`` (``harvest`` out of the box).
     on_budget: OnBudget | None = None
+    #: F5 (11-B): each later round re-sends the FULL prior transcript verbatim (every round, every voice)
+    #: instead of only the previous round's positions. Off by default -- the delta + the persistent session
+    #: is the cheaper default; carry-forward trades tokens for an explicit history (useful where session
+    #: memory is weak), bounded by ``time_budget_s``.
+    carry_forward: bool = False
+    #: F5 (11-C): track convergence -- ask each voice for a one-word verdict each round, aggregate it, and
+    #: stop early when the panel CONVERGES (a unanimous verdict) or STALLS (the decision holds unchanged for
+    #: the configured tolerance). Off by default (a debate is free-form argument); on, it adds the termination
+    #: grammar and a populated ``outcome``.
+    track_convergence: bool = False
 
 
 class DebateContribution(BaseModel):
@@ -941,11 +952,50 @@ class DebateContribution(BaseModel):
     run_dir: str | None = None
 
 
+class ProgressLedger(BaseModel):
+    """One round's convergence snapshot (F5, 11-C): the aggregated verdict and how stable it is.
+
+    Recorded on a round only when the debate tracks convergence. ``decision`` is the round's aggregated
+    verdict (the convergence strategy over each voice's extracted verdict), ``outcome`` the aggregate
+    category (``unanimous`` / ``majority`` / ...), ``tally`` the per-verdict head count, ``changed`` whether
+    the decision moved from the prior round, ``stall_count`` how many consecutive rounds the (non-converged)
+    decision has held, and ``converged`` whether the panel reached agreement this round. Deterministic and
+    pure -- no extra subprocess -- so it is replayable.
+    """
+
+    round_index: int
+    outcome: str
+    decision: str | None = None
+    tally: dict[str, int] = Field(default_factory=dict)
+    changed: bool = False
+    stall_count: int = 0
+    converged: bool = False
+
+
+class DebateOutcome(BaseModel):
+    """Why a debate terminated and what it concluded (F5, 11-D): metadata atop the transcript + closing.
+
+    Not a new result shape -- a debate is still a transcript and an optional closing; this rides on
+    :class:`DebateResult` as the termination-grammar verdict. ``termination`` is the arm that stopped it,
+    ``rounds_run`` how many rounds were actually held, ``converged`` whether the panel agreed, ``decision``
+    the final aggregated verdict when convergence was tracked (else ``None``), and ``stall_count`` the
+    trailing run of unchanged rounds.
+    """
+
+    termination: TerminationReason
+    rounds_run: int
+    converged: bool = False
+    decision: str | None = None
+    stall_count: int = 0
+
+
 class DebateRound(BaseModel):
     """Every participating voice's contribution for one round of a debate, in panel order."""
 
     index: int
     contributions: list[DebateContribution] = Field(default_factory=list)
+    #: The round's convergence snapshot (F5, 11-C), set when the debate tracks convergence; ``None`` otherwise.
+    ledger: ProgressLedger | None = None
 
 
 class DebateResult(BaseModel):
@@ -983,6 +1033,9 @@ class DebateResult(BaseModel):
     rollup: RunRollup | None = None
     #: Process/agent fan-out observed for this debate (N1, item 3). ``None`` when not measured.
     topology: Topology | None = None
+    #: Why the debate terminated and what it concluded (F5, 11-D): the termination-grammar arm, rounds run,
+    #: and -- when convergence was tracked -- whether the panel converged and on what. Always set.
+    outcome: DebateOutcome | None = None
 
 
 # --- Jobs --------------------------------------------------------------------

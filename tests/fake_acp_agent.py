@@ -145,6 +145,17 @@ def _run_command(text: str) -> str | None:
     return line.strip() or None
 
 
+def _verdict_env() -> str | None:
+    """A fixed ``VERDICT: <token>`` answer from ``RUTHERFORD_FAKE_VERDICT``, or ``None`` when unset.
+
+    Lets a test register a voice that always votes a chosen way by descriptor env, so a convergence-tracked
+    debate (F5) can mix a steady ``yes`` voter and a steady ``no`` voter without per-voice prompts -- the
+    panel sends one shared question, but each agent's own env decides its stable verdict.
+    """
+    value = os.environ.get("RUTHERFORD_FAKE_VERDICT")
+    return f"VERDICT: {value}" if value else None
+
+
 def _ranking_reply(text: str) -> str | None:
     """A deterministic ``RANK:`` ballot when the prompt is a RANK ranking round, else ``None``.
 
@@ -272,7 +283,7 @@ class FakeAgent:
             await asyncio.sleep(sleep_for)
         answer = _planted_answer(text)
         if answer is None:
-            answer = "42" if "17 + 25" in text else f"ECHO:{text[:40]}"
+            answer = _verdict_env() or ("42" if "17 + 25" in text else f"ECHO:{text[:40]}")
         await self._client.session_update(session_id, update_agent_thought_text("thinking"))
         await self._client.session_update(session_id, update_agent_message_text(answer))
         return PromptResponse(stop_reason="end_turn")

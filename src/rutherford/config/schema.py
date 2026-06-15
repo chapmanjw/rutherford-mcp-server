@@ -17,7 +17,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from ..domain.enums import Effort, SafetyMode
+from ..domain.enums import Effort, SafetyMode, Strategy
 from ..domain.models import OnBudget
 
 _log = logging.getLogger(__name__)
@@ -133,6 +133,12 @@ class RutherfordConfig(BaseModel):
     enforce_agent_cap: bool = False
     #: Maximum number of rounds a single debate call may run (each round is a full panel pass).
     max_debate_rounds: int = Field(default=4, ge=1, le=10)
+    #: F5 (11-C): how many consecutive rounds a convergence-tracked debate's decision may hold UNCHANGED
+    #: (short of agreement) before it is declared STALLED and stopped early. Default 2.
+    debate_stall_tolerance: int = Field(default=2, ge=1)
+    #: F5 (11-C): the aggregation strategy used to read a convergence-tracked debate's per-round decision.
+    #: Default ``majority``; ``unanimous`` makes the convergence test the strictest.
+    debate_convergence_strategy: Strategy = Strategy.MAJORITY
     #: Minimum number of parseable voices (ok, with an extracted verdict) an aggregating consensus
     #: strategy needs before it will return a decision; below it the outcome is ``no_quorum``. Guards
     #: against certifying an outcome off one surviving voice when the rest failed.

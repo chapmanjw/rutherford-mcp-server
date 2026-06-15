@@ -14,7 +14,7 @@ from rutherford import server
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import AppContext, build_app_context
-from rutherford.domain.enums import Effort, SafetyMode, Stance
+from rutherford.domain.enums import Effort, SafetyMode, Stance, TerminationReason
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import DebateContribution, DebateRequest, DebateRound, Target
@@ -43,11 +43,21 @@ SLOW = AgentDescriptor(
 )
 # A fast fake with a distinct id, so a debate of two ``fake`` voices can name it as a NON-participant judge.
 JUDGE = AgentDescriptor("judge", "Judge", _FAKE_CMD, provider="beta", default_model="model-j")
+# Voices that always vote a fixed way (via env), so a convergence-tracked debate (F5) can hold a stable
+# disagreement -- a steady 'yes' bloc against a steady 'no' -- without per-voice prompts.
+YES_VOTER = AgentDescriptor("yesvoter", "Yes", _FAKE_CMD, env_overrides=(("RUTHERFORD_FAKE_VERDICT", "yes"),))
+NO_VOTER = AgentDescriptor("novoter", "No", _FAKE_CMD, env_overrides=(("RUTHERFORD_FAKE_VERDICT", "no"),))
 
 
 def _service(config: RutherfordConfig | None = None) -> DebateService:
     resolved = config or RutherfordConfig()
     registry = DescriptorRegistry([FAKE, DEAD, SLOW, JUDGE])
+    return DebateService(registry, resolved, DelegationService(registry, resolved))
+
+
+def _converge_service(config: RutherfordConfig | None = None) -> DebateService:
+    resolved = config or RutherfordConfig()
+    registry = DescriptorRegistry([FAKE, YES_VOTER, NO_VOTER])
     return DebateService(registry, resolved, DelegationService(registry, resolved))
 
 
@@ -311,7 +321,7 @@ def test_stance_is_re_embedded_every_round_not_just_round_one() -> None:
     voice = _Voice(index=0, target=Target(cli="fake"), label="Pro", stance=Stance.FOR)
     req = _two_fakes(rounds=3)
 
-    opening = service._round_prompt(req, voice, None)
+    opening = service._round_prompt(req, voice, [])
     assert "Argue in favor of the proposition." in opening  # round 1 opens with the stance
 
     other = DebateContribution(
@@ -323,7 +333,7 @@ def test_stance_is_re_embedded_every_round_not_just_round_one() -> None:
         ok=True,
         text="No, the opposite is true.",
     )
-    later = service._round_prompt(req, voice, DebateRound(index=1, contributions=[other]))
+    later = service._round_prompt(req, voice, [DebateRound(index=1, contributions=[other])])
     assert "Keep arguing in favor of the proposition." in later  # the stance is restated each round
     assert "No, the opposite is true." in later  # the other voice's latest position rides the delta
 
@@ -332,7 +342,7 @@ def test_unsteered_later_round_prompt_has_no_stance_reminder() -> None:
     service = _service()
     voice = _Voice(index=0, target=Target(cli="fake"), label="Neutral", stance=None)
     other = DebateContribution(label="Other", target=Target(cli="fake"), round_index=1, ok=True, text="point")
-    later = service._round_prompt(_two_fakes(rounds=2), voice, DebateRound(index=1, contributions=[other]))
+    later = service._round_prompt(_two_fakes(rounds=2), voice, [DebateRound(index=1, contributions=[other])])
     assert "Keep arguing" not in later
 
 
@@ -450,3 +460,166 @@ async def test_debate_cut_turn_with_no_stream_has_no_partial() -> None:
     with pytest.raises(RutherfordError) as exc:
         await _service(config).debate(request)
     assert exc.value.code is ErrorCode.BUDGET_EXHAUSTED
+
+
+# --- F5: carry-forward + convergence/stall + DebateOutcome -------------------
+
+
+def _ledger_round(index: int, *texts: str) -> DebateRound:
+    contributions = [
+        DebateContribution(
+            label=f"v{i}", seat_id=f"{i}:v{i}", target=Target(cli="fake"), round_index=index, ok=True, text=text
+        )
+        for i, text in enumerate(texts)
+    ]
+    return DebateRound(index=index, contributions=contributions)
+
+
+def _round_with(index: int, label: str, text: str) -> DebateRound:
+    other = DebateContribution(
+        label=label, seat_id=f"1:{label}", target=Target(cli="fake"), round_index=index, ok=True, text=text
+    )
+    return DebateRound(index=index, contributions=[other])
+
+
+def test_carry_forward_sends_the_full_transcript_not_just_the_delta() -> None:
+    # F5 (11-B): a carry-forward round re-sends EVERY prior round verbatim, not only the previous one.
+    service = _service()
+    voice = _Voice(index=0, target=Target(cli="fake"), label="A", stance=None)
+    req = _two_fakes(rounds=3, carry_forward=True)
+    prompt = service._round_prompt(
+        req, voice, [_round_with(1, "B", "round-one-pos"), _round_with(2, "B", "round-two-pos")]
+    )
+    assert "FULL transcript" in prompt
+    assert "round-one-pos" in prompt and "round-two-pos" in prompt  # BOTH prior rounds
+    assert "Round 1" in prompt and "Round 2" in prompt
+
+
+def test_default_delta_sends_only_the_previous_round() -> None:
+    # Default (no carry-forward): only the latest round's positions ride the delta -- the session memory holds
+    # the rest. This is the contrast that makes carry-forward a real, separate mode.
+    service = _service()
+    voice = _Voice(index=0, target=Target(cli="fake"), label="A", stance=None)
+    req = _two_fakes(rounds=3)
+    prompt = service._round_prompt(
+        req, voice, [_round_with(1, "B", "round-one-pos"), _round_with(2, "B", "round-two-pos")]
+    )
+    assert "round-two-pos" in prompt and "round-one-pos" not in prompt  # only the previous round
+
+
+def test_convergence_ledger_unanimous_is_converged() -> None:
+    ledger = _service()._convergence_ledger(_ledger_round(1, "VERDICT: yes", "VERDICT: yes"), None)
+    assert ledger.converged is True and ledger.decision == "yes" and ledger.tally == {"yes": 2}
+
+
+def test_convergence_ledger_stable_majority_stalls_not_converges() -> None:
+    # A stable MAJORITY that is not unanimous is NOT convergence -- the stall counter rises while it holds.
+    service = _service()
+    first = service._convergence_ledger(_ledger_round(2, "VERDICT: yes", "VERDICT: yes", "VERDICT: no"), None)
+    assert first.converged is False and first.decision == "yes" and first.stall_count == 0  # just established
+    second = service._convergence_ledger(_ledger_round(3, "VERDICT: yes", "VERDICT: yes", "VERDICT: no"), first)
+    assert second.stall_count == 1 and second.changed is False  # the decision held one round
+    third = service._convergence_ledger(_ledger_round(4, "VERDICT: yes", "VERDICT: yes", "VERDICT: no"), second)
+    assert third.stall_count == 2
+
+
+def test_convergence_ledger_decision_change_resets_the_stall() -> None:
+    service = _service()
+    first = service._convergence_ledger(_ledger_round(1, "VERDICT: yes", "VERDICT: yes", "VERDICT: no"), None)
+    moved = service._convergence_ledger(_ledger_round(2, "VERDICT: no", "VERDICT: no", "VERDICT: yes"), first)
+    assert moved.decision == "no" and moved.changed is True and moved.stall_count == 0
+
+
+def test_convergence_ledger_no_verdicts_has_no_decision() -> None:
+    ledger = _service()._convergence_ledger(_ledger_round(1, "just prose", "more prose"), None)
+    assert ledger.decision is None and ledger.converged is False and ledger.stall_count == 0
+
+
+def test_convergence_ledger_a_no_verdict_round_resets_the_stall() -> None:
+    # A held decision that then becomes unreadable (no verdicts) resets the stall -- a vanished decision is
+    # not a "held" one, so the panel is no longer frozen on it.
+    service = _service()
+    first = service._convergence_ledger(_ledger_round(1, "VERDICT: yes", "VERDICT: yes", "VERDICT: no"), None)
+    held = service._convergence_ledger(_ledger_round(2, "VERDICT: yes", "VERDICT: yes", "VERDICT: no"), first)
+    assert held.stall_count == 1
+    blank = service._convergence_ledger(_ledger_round(3, "prose", "prose", "prose"), held)
+    assert blank.decision is None and blank.stall_count == 0
+
+
+def test_debate_outcome_and_ledger_serialize_onto_the_wire() -> None:
+    # F5 metadata rides the TOON wire: to_plain (model_dump json, exclude_none) keeps the enum + the tally dict.
+    from rutherford.domain.models import DebateOutcome, ProgressLedger
+    from rutherford.io.serialize import to_plain
+
+    outcome = to_plain(
+        DebateOutcome(termination=TerminationReason.STALLED, rounds_run=3, decision="yes", stall_count=2)
+    )
+    assert outcome["termination"] == "stalled" and outcome["rounds_run"] == 3 and outcome["decision"] == "yes"
+    ledger = ProgressLedger(round_index=2, outcome="majority", decision="yes", tally={"yes": 2, "no": 1}, stall_count=1)
+    assert to_plain(ledger)["tally"] == {"yes": 2, "no": 1}  # the per-verdict tally dict round-trips
+
+
+async def test_debate_converges_on_a_unanimous_verdict() -> None:
+    # Both voices vote 'yes' in round 1 -> unanimity -> the debate stops CONVERGED without running all rounds.
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="fake")],
+        prompt="Decide.\nSAY=VERDICT: yes",
+        rounds=4,
+        working_dir=str(REPO_ROOT),
+        track_convergence=True,
+    )
+    result = await _service().debate(request)
+    assert result.outcome is not None
+    assert result.outcome.termination is TerminationReason.CONVERGED and result.outcome.converged is True
+    assert result.outcome.decision == "yes" and result.outcome.rounds_run == 1  # converged at round 1
+    assert result.rounds[0].ledger is not None and result.rounds[0].ledger.converged is True
+
+
+async def test_debate_without_convergence_tracking_is_unresolved() -> None:
+    # No tracking: the debate runs its full round budget and terminates UNRESOLVED, with no per-round ledger.
+    result = await _service().debate(_two_fakes(rounds=2))
+    assert result.outcome is not None and result.outcome.termination is TerminationReason.UNRESOLVED
+    assert result.outcome.rounds_run == 2 and result.outcome.converged is False
+    assert all(round_.ledger is None for round_ in result.rounds)
+
+
+async def test_debate_stalls_on_a_frozen_disagreement() -> None:
+    # A steady 2-yes / 1-no split never reaches unanimity but the majority holds: the debate stops STALLED
+    # once the decision is unchanged for the stall tolerance, instead of burning every round.
+    config = RutherfordConfig(debate_stall_tolerance=1)
+    request = DebateRequest(
+        targets=[Target(cli="yesvoter"), Target(cli="novoter"), Target(cli="yesvoter")],
+        prompt="Decide.",
+        rounds=4,
+        working_dir=str(REPO_ROOT),
+        track_convergence=True,
+    )
+    result = await _converge_service(config).debate(request)
+    assert result.outcome is not None and result.outcome.termination is TerminationReason.STALLED
+    assert result.outcome.decision == "yes" and result.outcome.converged is False
+    # tolerance=1: round 1 establishes the decision (stall 0), round 2 holds it (stall 1 >= 1) -> stop at 2.
+    assert result.outcome.rounds_run == 2
+
+
+async def test_debate_quorum_lost_is_recorded_in_the_outcome() -> None:
+    # A debate that drops below two voices terminates QUORUM_LOST (recorded on the outcome, not just a silent stop).
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="dead")],
+        prompt="what is 17 + 25?",
+        rounds=3,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service().debate(request)
+    assert result.outcome is not None and result.outcome.termination is TerminationReason.QUORUM_LOST
+
+
+async def test_debate_budget_termination_is_recorded_in_the_outcome() -> None:
+    request = DebateRequest(
+        targets=[Target(cli="fake"), Target(cli="slow")],
+        prompt="what is 17 + 25?",
+        rounds=3,
+        working_dir=str(REPO_ROOT),
+        time_budget_s=1.2,
+    )
+    result = await _service().debate(request)
+    assert result.outcome is not None and result.outcome.termination is TerminationReason.BUDGET
