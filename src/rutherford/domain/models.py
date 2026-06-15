@@ -437,6 +437,11 @@ class DelegationRequest(BaseModel):
     #: When set, this delegation is a voice of a persisted panel: its run record is written as a child
     #: of this parent run id (consensus/debate set it on each voice). ``None`` for a top-level run.
     parent_run_id: str | None = None
+    #: When set, this delegation CONTINUES a prior persisted run (item 9): its leaf record records the link
+    #: (``RunRecord.continued_from``) so the continuation chain is traceable. Distinct from ``parent_run_id``
+    #: (a panel voice's parent); a continuation is a fresh top-level run that builds on an earlier one's
+    #: context. ``None`` for a non-continuation run.
+    continues_run_id: str | None = None
     #: Per-call confirmation that a write/yolo delegation may mutate ``working_dir`` even when
     #: it is not on the configured trusted-workspace allowlist.
     trust_workspace: bool = False
@@ -1064,6 +1069,13 @@ class RunRecord(BaseModel):
     duration_s: float = 0.0
     #: A parent run's id when this record is a child of a panel (consensus/debate); ``None`` at top level.
     parent_run_id: str | None = None
+    #: The agent session id this run produced, so a later continuation can resume the exact conversation
+    #: (item 9, ACP ``session/load``). ``None`` when the adapter minted no resumable session.
+    session_id: str | None = None
+    #: The run id this record CONTINUES (item 9, 9-B): a continuation links forward to the run it built on,
+    #: forming a traceable chain without mutating the parent. Distinct from ``parent_run_id`` (a panel
+    #: voice's parent). ``None`` for a run that did not continue another.
+    continued_from: str | None = None
     #: For a panel record (``kind`` consensus/debate), the run ids of the child voice records so a reader
     #: can reassemble the panel from its parts: one child per voice in panel order for a consensus, and
     #: one child per turn in round-major order (round 1's voices, then round 2's, ...) for a debate. Empty

@@ -23,6 +23,7 @@ keeps no business logic -- it serializes and writes, nothing more.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 from ..domain.models import RunRecord
@@ -46,6 +47,19 @@ def read_record(run_dir: Path) -> RunRecord:
     """
     text = (run_dir / RECORD_FILENAME).read_text(encoding="utf-8")
     return RunRecord.model_validate(json.loads(text))
+
+
+def read_answer(run_dir: Path) -> str:
+    """The answer text a run produced, from ``<run_dir>/artifacts/answer.md`` (for continuation re-injection).
+
+    Returns ``""`` when the artifact is missing or empty -- a continuation degrades to re-injecting only the
+    original prompt rather than failing. Raises ``OSError`` only on an unreadable (not absent) file.
+    """
+    answer_path = run_dir / "artifacts" / "answer.md"
+    if not answer_path.exists():
+        return ""
+    text = answer_path.read_text(encoding="utf-8").strip()
+    return "" if text == "(no answer)" else text
 
 
 class RunLedger:
@@ -92,3 +106,18 @@ class RunLedger:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content if content.strip() else "(empty)", encoding="utf-8")
         return run_dir
+
+    def remove(self, run_id: str) -> None:
+        """Delete a run's directory (best-effort). The ledger owns the jobs tree, so deletion lives here too.
+
+        Used to drop a throwaway record -- e.g. a continuation's failed-resume probe that was superseded by
+        the re-injection fallback (item 9), so the continuation chain keeps only the real child. A ``run_id``
+        is a single directory name; a missing directory is a silent no-op. A ``run_id`` that is not a plain
+        single component (``""`` / ``.`` / ``..`` / a separator) is refused -- a delete must never be able to
+        reach the root itself or its parent, even if a caller passed a malformed id.
+        """
+        if run_id in ("", ".", "..") or Path(run_id).name != run_id:
+            return
+        target = self._root / run_id
+        if target.name == run_id and target.parent == self._root:
+            shutil.rmtree(target, ignore_errors=True)

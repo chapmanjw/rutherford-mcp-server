@@ -566,6 +566,10 @@ class DelegationService:
             finished_at=self._clock(),
             duration_s=result.duration_s,
             parent_run_id=req.parent_run_id,
+            # item 9: the session this run produced (for a later continuation to resume) and the run this one
+            # continues (the forward link), so the continuation chain is reconstructable from the records.
+            session_id=result.session_id,
+            continued_from=req.continues_run_id,
             cli=req.target.cli,
             requested_model=req.target.model,  # pre-fallback; result.target.model is the resolved one
             model=result.target.model,

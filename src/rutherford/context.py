@@ -63,6 +63,9 @@ class AppContext:
     jobs: JobStore
     roles: RoleStore
     panels: PanelCache
+    #: The durable run ledger (F2): the reader/writer of ``<jobs_dir>/<run_id>/``. Held here so a tool can
+    #: read a persisted parent record (``continue_job``, item 9), not only write through the services.
+    ledger: RunLedger
     #: One-time-per-session guard for the first-run setup hint, so the advisory nudges once rather than on
     #: every call (:meth:`persistence_notice`).
     setup_hint_emitted: bool = False
@@ -147,6 +150,7 @@ def build_app_context(
         jobs=jobs,
         roles=roles,
         panels=panels,
+        ledger=ledger,
     )
 
 

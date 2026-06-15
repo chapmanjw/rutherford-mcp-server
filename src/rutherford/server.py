@@ -33,6 +33,7 @@ from .runtime.logging import configure_logging
 from .services.delegation import ActivityCallback
 from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
+from .tools.continue_job import continue_job_tool
 from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
 from .tools.discover import discover_tool
@@ -196,6 +197,53 @@ async def delegate(
             persist=persist,
             session_id=session_id,
             external_tracking=external_tracking,
+            mode=mode,
+        )
+    )
+
+
+@mcp.tool
+async def continue_job(
+    job_id: str,
+    prompt: str,
+    model: str | None = None,
+    working_dir: str | None = None,
+    files: list[str] | None = None,
+    safety_mode: str | None = None,
+    timeout_s: float | None = None,
+    trust_workspace: bool = False,
+    role: str | None = None,
+    effort: str | None = None,
+    persist: bool = True,
+    mode: str = "sync",
+) -> str:
+    """Continue a completed durable job with a new direction, building on its accumulated context.
+
+    `job_id` is the id of a kept run under `<jobs_dir>/` (the `run_dir` name a persisted result carries). The
+    parent's record supplies the agent, model, working dir, role, and files the continuation inherits unless
+    you override them here. When the parent recorded a resumable ACP session it is resumed (`session/load`) so
+    the agent keeps its prior reasoning; an adapter that cannot resume falls back to re-injecting the parent's
+    prompt + answer as fresh context, and the result's `notice` says which path ran. The continuation is a
+    fresh run linked to the parent (`continued_from`) -- the parent is never mutated. The trust gate is
+    re-applied fresh and defaults to `read_only`: the parent's write mode is NOT inherited, since the new
+    direction may change intent. `persist` (default true) keeps the continuation as its own durable child job.
+    v1 continues a single `delegate` job; continuing a consensus / debate panel is not yet supported.
+    `mode="async"` runs it as a background job and returns a `job_id`.
+    """
+    return await _guarded(
+        continue_job_tool(
+            get_app(),
+            job_id=job_id,
+            prompt=prompt,
+            model=model,
+            working_dir=working_dir,
+            files=files,
+            safety_mode=safety_mode,
+            timeout_s=timeout_s,
+            trust_workspace=trust_workspace,
+            role=role,
+            effort=effort,
+            persist=persist,
             mode=mode,
         )
     )

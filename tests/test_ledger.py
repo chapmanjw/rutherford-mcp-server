@@ -71,6 +71,21 @@ def test_root_property_exposes_the_jobs_dir(tmp_path: Path) -> None:
     assert ledger.root == tmp_path / "jobs"
 
 
+def test_remove_drops_a_child_but_refuses_to_escape(tmp_path: Path) -> None:
+    # remove deletes one run's own directory (the failed-resume probe cleanup, item 9); a malformed id that
+    # could reach the root or its parent (``..`` / a separator) is a no-op, so a delete can never escape.
+    ledger = RunLedger(tmp_path / "jobs")
+    run_dir = ledger.write(_record(), answer="x")
+    assert run_dir.exists()
+    ledger.remove("abc123")
+    assert not run_dir.exists()  # the child was removed
+    sentinel = tmp_path / "sentinel"  # a sibling of the jobs root: a ``..`` escape must NOT touch it
+    sentinel.mkdir()
+    for bad in ("..", ".", "", "../sentinel", "a/b"):
+        ledger.remove(bad)
+    assert sentinel.exists() and (tmp_path / "jobs").exists()  # nothing outside a direct child was deleted
+
+
 def test_state_record_round_trips_clean_inputs(tmp_path: Path) -> None:
     # The replay-complete inputs round-trip through the reader: argv (the launch command), prompt, model, cwd.
     # env is absent. This is what continuation recomposes a run from.
