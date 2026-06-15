@@ -41,6 +41,27 @@ class AgentDescriptor:
     #: path is a clean no-op for it (it is NOT invented). Set per agent in config (``[agents.<id>]
     #: fallback_model``) for an agent whose plan can decline a named model and fall back to a known-good one.
     fallback_model: str | None = None
+    #: For an agent whose launch ``command`` is a SEPARATE npm-installed ACP adapter shim that fronts an
+    #: underlying CLI (codex -> codex-acp, claude_code -> claude-agent-acp, pi -> pi-acp), the binary of that
+    #: underlying CLI -- ``"codex"`` / ``"claude"`` / ``"pi"``. When the adapter shim (``command[0]``) is not
+    #: on PATH but this CLI is, the adapter is merely un-installed (not the whole agent), so ``doctor`` can say
+    #: so and offer to install it instead of a bare ``not_installed``. ``None`` for an agent that IS its own
+    #: ACP server (goose, gemini, ...) -- there is no separate shim to set up.
+    underlying_cli: str | None = None
+    #: The npm package that provides the adapter shim, installed with ``npm i -g <adapter_package>`` -- e.g.
+    #: ``"@agentclientprotocol/codex-acp"``. Set together with :attr:`underlying_cli`; ``None`` otherwise. The
+    #: value is a curated constant (never user input), so building the install argv from it cannot inject.
+    adapter_package: str | None = None
+
+    @property
+    def is_wrapped_adapter(self) -> bool:
+        """Whether this agent's launch command is a separate npm adapter shim fronting an underlying CLI.
+
+        True when both :attr:`underlying_cli` and :attr:`adapter_package` are set -- the case where the adapter
+        can be missing while the underlying CLI is present, so ``doctor`` reports an installable gap rather than
+        a flat ``not_installed`` and ``setup`` can install it.
+        """
+        return self.underlying_cli is not None and self.adapter_package is not None
 
 
 class DescriptorRegistry:
@@ -117,14 +138,28 @@ HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("junie", "Junie", ("junie", "--acp=true")),
     AgentDescriptor("kimi", "Kimi Code", ("kimi", "acp"), provider="moonshot"),
     AgentDescriptor("openhands", "OpenHands", ("openhands", "acp"), handshake_timeout_s=90.0),
-    AgentDescriptor("codex", "Codex", ("codex-acp",), provider="openai"),
-    AgentDescriptor("claude_code", "Claude Code", ("claude-agent-acp",), provider="anthropic"),
+    AgentDescriptor(
+        "codex",
+        "Codex",
+        ("codex-acp",),
+        provider="openai",
+        underlying_cli="codex",
+        adapter_package="@agentclientprotocol/codex-acp",
+    ),
+    AgentDescriptor(
+        "claude_code",
+        "Claude Code",
+        ("claude-agent-acp",),
+        provider="anthropic",
+        underlying_cli="claude",
+        adapter_package="@agentclientprotocol/claude-agent-acp",
+    ),
     AgentDescriptor("copilot", "GitHub Copilot", ("copilot", "--acp")),
     AgentDescriptor("qwen", "Qwen Code", ("qwen", "--acp"), provider="alibaba"),
     AgentDescriptor("droid", "Factory Droid", ("droid", "exec", "--output-format", "acp")),
     AgentDescriptor("cursor", "Cursor", ("cursor-agent", "acp")),
     AgentDescriptor("kiro", "Kiro", ("kiro-cli", "acp")),
-    AgentDescriptor("pi", "Pi", ("pi-acp",)),
+    AgentDescriptor("pi", "Pi", ("pi-acp",), underlying_cli="pi", adapter_package="pi-acp"),
     AgentDescriptor("hermes", "Hermes", ("hermes", "acp"), provider="nous"),
     AgentDescriptor("gemini", "Gemini CLI", ("gemini", "--acp"), provider="google"),
     AgentDescriptor("qoder", "Qoder", ("qodercli", "--acp"), provider="qoder"),

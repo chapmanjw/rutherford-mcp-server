@@ -173,7 +173,7 @@ read-only.
 | `doctor` | Probe each agent with a real read-only ACP round trip and report conformance. |
 | `discover` | Detect installed ACP agents from the community registry and propose reviewable config blocks. |
 | `list_roles` | List the role personas you can pass as `role="<id>"`. |
-| `setup` | Show where config lives and scaffold a starter `config.toml`; the first-run helper. |
+| `setup` | Show where config lives, scaffold a starter `config.toml`, and install missing npm ACP adapter shims; the first-run helper. |
 | `reload_panels` | Reload the named multi-agent panel definitions from config without restarting the server. |
 | `list_jobs` | List the background jobs being tracked (every status), newest first. |
 | `activity` | Show only the jobs in flight right now, each with a live elapsed time. |

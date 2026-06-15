@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from ..domain.enums import SafetyMode
 from ..domain.error_codes import ErrorCode
 from ..domain.models import DelegationResult
+from .adapters import install_hint as adapter_install_hint
 from .descriptors import AgentDescriptor
 from .permission import PermissionPolicy
 from .session import ACPHandshakeError, ACPSession, run_acp_turn
@@ -40,6 +41,9 @@ class ConformanceReport(BaseModel):
     answered: bool
     detail: str
     duration_s: float
+    #: When ``status`` is ``not_installed`` but the agent's underlying CLI IS present (its npm ACP adapter
+    #: shim is the only missing piece), the one-line ``npm i -g`` instruction to set it up; ``None`` otherwise.
+    install_hint: str | None = None
 
 
 def classify(agent_id: str, result: DelegationResult) -> ConformanceReport:
@@ -91,7 +95,14 @@ async def _probe_in(descriptor: AgentDescriptor, cwd: str, timeout_s: float) -> 
     result = await run_acp_turn(
         descriptor, _PROBE_PROMPT, policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd=cwd, timeout_s=timeout_s
     )
-    return classify(descriptor.id, result)
+    report = classify(descriptor.id, result)
+    # A not_installed for a wrapped-adapter agent whose underlying CLI IS present is really just a missing npm
+    # shim -- surface the exact install command instead of a flat "not installed" the user can't act on.
+    if report.status == "not_installed":
+        hint = adapter_install_hint(descriptor)
+        if hint is not None:
+            return report.model_copy(update={"install_hint": hint, "detail": f"{report.detail} ({hint})"})
+    return report
 
 
 async def probe_agent(
@@ -130,6 +141,9 @@ class ConnectionReport(BaseModel):
     models: list[str]
     detail: str
     duration_s: float
+    #: As on :class:`ConformanceReport`: the ``npm i -g`` instruction when a ``not_installed`` agent's
+    #: underlying CLI is present and only its ACP adapter shim is missing; ``None`` otherwise.
+    install_hint: str | None = None
 
 
 async def probe_connection(
@@ -203,6 +217,7 @@ def _connect_failure(
     descriptor: AgentDescriptor, status: str, installed: bool, detail: str, start: float
 ) -> ConnectionReport:
     """A non-reachable :class:`ConnectionReport` (the agent did not open a session)."""
+    hint = adapter_install_hint(descriptor) if status == "not_installed" else None
     return ConnectionReport(
         agent_id=descriptor.id,
         status=status,
@@ -210,6 +225,7 @@ def _connect_failure(
         connected=False,
         session_id=None,
         models=[],
-        detail=detail,
+        detail=f"{detail} ({hint})" if hint is not None else detail,
         duration_s=round(time.monotonic() - start, 3),
+        install_hint=hint,
     )

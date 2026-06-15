@@ -19,6 +19,12 @@ unexecutable command all surface as `ACP_SPAWN_FAILED`, which `doctor` classifie
 
 - Install the agent (or its ACP shim — `codex` needs `codex-acp`, `claude_code` needs
   `claude-agent-acp`, `pi` needs `pi-acp`, all `npm i -g`).
+- **The CLI is installed but the adapter shim is not.** `codex` / `claude_code` / `pi` launch a *separate*
+  npm adapter that fronts the underlying CLI (`codex` / `claude` / `pi`). If you have the CLI but the shim
+  is missing, `doctor` does not just say `not_installed` — it adds an `install_hint` with the exact
+  `npm i -g <package>`. Run that, or let Rutherford do it: **`setup install_adapters=true`** detects every
+  such gap (CLI present, shim absent) and runs the install for you. `setup` (no flag) lists them under
+  `adapters.installable` without installing.
 - If it is installed but not on the server's PATH, add its directory to PATH before starting the
   Rutherford process.
 - On Windows, confirm the resolved command is a real `.exe` or a recognized npm shim. `prepare_argv`

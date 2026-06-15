@@ -10,9 +10,11 @@ currently-registered agents) lets the caller see what they already have before t
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
+from ..acp.adapters import install_adapter, installable_adapters
 from ..config.loader import default_global_config_path
 from ..config.schema import RutherfordConfig
 from ..context import AppContext, tool_success
@@ -102,6 +104,7 @@ async def setup_tool(
     scope: str = "project",
     write: bool = False,
     trust_workspace: bool = False,
+    install_adapters: bool = False,
 ) -> str:
     """Show where config lives and scaffold a starter ``config.toml``; with ``write`` create it (never clobber).
 
@@ -110,6 +113,11 @@ async def setup_tool(
     current cwd to ``trusted_workspaces``. With ``write=False`` (default) the proposed ``content`` and
     ``path`` are returned without touching disk; with ``write=True`` the parent dirs are created and the
     file is written -- but an existing file is left untouched and reported (``written=false``).
+
+    The ``adapters`` block always reports which agents have their underlying CLI installed but are missing
+    their npm ACP adapter shim (codex/claude_code/pi -- what ``doctor`` flags as ``not_installed`` with an
+    install hint). With ``install_adapters=true`` it actually runs ``npm i -g <package>`` for each of those
+    (an explicit, opt-in machine mutation; off by default) and reports the per-agent result.
     """
     if scope not in SCOPES:
         options = ", ".join(SCOPES)
@@ -144,4 +152,30 @@ async def setup_tool(
     }
     if note is not None:
         result["note"] = note
+    result["adapters"] = await _adapters_section(app, install=install_adapters)
     return tool_success(result)
+
+
+async def _adapters_section(app: AppContext, *, install: bool) -> dict[str, Any]:
+    """Report (and optionally install) the npm ACP adapter shims an installed CLI is still missing.
+
+    ``installable`` is every agent whose underlying CLI is on PATH but whose ACP adapter shim is not -- a
+    one-command fix. With ``install`` true, runs ``npm i -g <package>`` for each (off-thread, sequentially so
+    concurrent global installs do not contend on npm's lock) and reports the per-agent outcome under
+    ``installed``. A clean machine (every adapter present, or none installable) returns an empty ``installable``.
+    """
+    missing = installable_adapters(app.descriptors)
+    section: dict[str, Any] = {
+        "installable": [
+            {"agent": d.id, "package": d.adapter_package, "command": f"npm i -g {d.adapter_package}"} for d in missing
+        ]
+    }
+    if install and missing:
+        installed = []
+        for descriptor in missing:  # sequential: parallel `npm i -g` calls contend on the global install lock
+            outcome = await asyncio.to_thread(install_adapter, descriptor)
+            installed.append(
+                {"agent": outcome.agent_id, "package": outcome.package, "ok": outcome.ok, "detail": outcome.detail}
+            )
+        section["installed"] = installed
+    return section

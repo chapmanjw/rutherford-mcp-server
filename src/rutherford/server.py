@@ -526,7 +526,9 @@ async def reload_panels() -> str:
 
 
 @mcp.tool
-async def setup(scope: str = "project", write: bool = False, trust_workspace: bool = False) -> str:
+async def setup(
+    scope: str = "project", write: bool = False, trust_workspace: bool = False, install_adapters: bool = False
+) -> str:
     """Show where config lives and scaffold a starter `config.toml`; the first-run helper.
 
     `scope` is `project` (`<cwd>/.rutherford/config.toml`) or `global` (the platform config dir's
@@ -535,8 +537,17 @@ async def setup(scope: str = "project", write: bool = False, trust_workspace: bo
     create the file -- it never overwrites an existing one (`already_exists=true`, `written=false`).
     `trust_workspace=true` adds the current directory to `trusted_workspaces` so write/yolo delegations are
     permitted there.
+
+    The `adapters` block reports agents whose underlying CLI is installed but whose npm ACP adapter shim is
+    not (codex needs `codex-acp`, claude_code needs `claude-agent-acp`, pi needs `pi-acp` -- what `doctor`
+    flags as `not_installed` with an install hint). Pass `install_adapters=true` to run `npm i -g <package>`
+    for each of those automatically (an explicit, opt-in machine change; off by default).
     """
-    return await _guarded(setup_tool(get_app(), scope=scope, write=write, trust_workspace=trust_workspace))
+    return await _guarded(
+        setup_tool(
+            get_app(), scope=scope, write=write, trust_workspace=trust_workspace, install_adapters=install_adapters
+        )
+    )
 
 
 @mcp.tool
@@ -567,6 +578,11 @@ async def doctor(agent: str | None = None, timeout_s: float = 60.0, connect_only
     handshake_failed / not_installed plus each agent's advertised models -- it shows whether Rutherford can
     talk to and configure an agent even when a model call would fail for a reason outside ACP (an auth /
     entitlement / quota issue, e.g. Grok without a SuperGrok subscription).
+
+    When an agent (codex / claude_code / pi) launches a separate npm ACP adapter shim and that shim is not
+    installed but its underlying CLI is (you have `codex`/`claude`/`pi`), the report adds an `install_hint`
+    with the exact `npm i -g <package>` command instead of a flat not_installed -- run that, or
+    `setup install_adapters=true`, to set the adapter up.
     """
     return await _guarded(doctor_tool(get_app(), agent=agent, timeout_s=timeout_s, connect_only=connect_only))
 
