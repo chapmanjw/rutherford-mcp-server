@@ -180,7 +180,7 @@ scope), `safety_mode`, `timeout_s`, `role`, and `mode` (`sync` or `async`). `del
 
 ## The agent roster
 
-Rutherford ships **16 built-in agents** with curated launch commands and quirks (the Windows npm-shim
+Rutherford ships **18 built-in agents** with curated launch commands and quirks (the Windows npm-shim
 resolution, per-agent handshake budgets, a fixed provider) that a bare `acp.json` cannot express, so
 they work with zero config:
 
@@ -202,13 +202,19 @@ they work with zero config:
 | `kiro` | Kiro | `kiro-cli acp` | Kiro login / `KIRO_API_KEY` |
 | `pi` | Pi | `pi-acp` | Pi login |
 | `hermes` | Hermes | `hermes acp` | Nous endpoint |
+| `gemini` | Gemini CLI | `gemini --acp` | Google / Gemini CLI login |
+| `qoder` | Qoder | `qodercli --acp` | Qoder login |
 
 `codex` and `claude_code` launch through the official Zed adapters (`codex-acp` and
 `claude-agent-acp`, npm `@agentclientprotocol/*`), which front the Codex and Claude Code CLIs as ACP
 servers and reuse the existing CLI login — no API key. `cline` drives over ACP only with Cline's own
 service auth (a ChatGPT-subscription or OpenRouter provider set in the desktop app does not reach the
-headless `--acp` path). `hermes` depends on the configured Nous model and its latency can be high. Not
-every agent drives cleanly on every machine — run `doctor` to see which actually answer here.
+headless `--acp` path). `hermes` depends on the configured Nous model and its latency can be high.
+`gemini` is Google's official Gemini CLI (the `--acp` mode works as of CLI 0.46.0). `qoder`'s `--acp`
+flag is real but hidden from `--help`, and Qoder's installer drops `qodercli` at `~/.qoder/bin/` rather
+than on PATH — add that directory to PATH, point `[agents.qoder] command` at the full path, or let
+`discover` find it. Not every agent drives cleanly on every machine — run `doctor` to see which actually
+answer here.
 
 **Config-driven agents.** Under ACP an agent is just how to launch it plus a few quirks, so the roster
 is config-driven. An `[agents.<id>]` section overrides a built-in's command / env / provider / model,

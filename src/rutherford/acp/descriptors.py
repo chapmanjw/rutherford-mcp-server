@@ -95,6 +95,14 @@ class DescriptorRegistry:
 #: desktop app is NOT reached by the headless ``--acp`` path (it returns an empty turn). (``kilo`` is not
 #: here: handshake works on OpenRouter, but the turn never completes headless; ``kimi``'s only ACP auth is
 #: an interactive terminal device-code login. Receipts 12/13.)
+#:
+#: ``gemini`` is Google's official Gemini CLI (``gemini --acp``); live-verified driving over ACP on
+#: 2026-06-14 (status=ok, ~2.2s), which supersedes the earlier "headless ACP known-issue" finding (fixed by
+#: Gemini CLI 0.46.0). ``qoder`` is Qoder AI's ``qodercli`` (``qodercli --acp``; the ``--acp`` flag is hidden
+#: from ``--help`` but real -- like ``cursor``'s ``acp``), live-verified driving on 2026-06-14 (status=ok,
+#: ~2.9s). Qoder AI's own installer drops the binary at ``~/.qoder/bin/qodercli/`` (NOT on PATH), so on a
+#: machine where ``qodercli`` is not PATH-resolvable, point the launch command at the full path via
+#: ``[agents.qoder] command = [...]`` -- or let ``discover`` find it.
 HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("goose", "Goose", ("goose", "acp")),
     AgentDescriptor("opencode", "OpenCode", ("opencode", "acp")),
@@ -112,6 +120,8 @@ HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("kiro", "Kiro", ("kiro-cli", "acp")),
     AgentDescriptor("pi", "Pi", ("pi-acp",)),
     AgentDescriptor("hermes", "Hermes", ("hermes", "acp"), provider="nous"),
+    AgentDescriptor("gemini", "Gemini CLI", ("gemini", "--acp"), provider="google"),
+    AgentDescriptor("qoder", "Qoder", ("qodercli", "--acp"), provider="qoder"),
 )
 
 

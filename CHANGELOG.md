@@ -8,6 +8,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Two more built-in agents (18 total): `gemini` and `qoder`.** `gemini` is Google's official Gemini CLI
+  (`gemini --acp`, provider `google`) — live-verified driving over ACP (status=ok, ~2.2s), which supersedes
+  the earlier "headless ACP known-issue" note (fixed by Gemini CLI 0.46.0); it adds a Google/Gemini voice to
+  the crew. `qoder` is Qoder AI's `qodercli` (`qodercli --acp`; the `--acp` flag is real but hidden from
+  `--help`, like Cursor's `acp`) — live-verified (status=ok, ~2.9s). Qoder AI's installer drops the binary at
+  `~/.qoder/bin/qodercli/` rather than on PATH, so on such a machine point `[agents.qoder] command` at the
+  full path (or add the dir to PATH).
 - **`delegate` can resume a prior agent session** via a `session_id` parameter (v2 parity). Pass the
   `session_id` from an earlier delegate result and the agent reloads that conversation over ACP
   (`session/load`) instead of opening a fresh one (`session/new`), so a follow-up turn continues where the
