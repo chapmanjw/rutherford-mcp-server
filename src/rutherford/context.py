@@ -19,7 +19,7 @@ from typing import Any
 from .acp.cooldown import CooldownTracker
 from .acp.descriptors import DescriptorRegistry
 from .acp.roster import build_registry
-from .config.loader import load_config
+from .config.loader import has_project_config, load_config
 from .config.panels import PanelCache, load_panels
 from .config.schema import RutherfordConfig
 from .domain.error_codes import ErrorCode
@@ -63,10 +63,44 @@ class AppContext:
     jobs: JobStore
     roles: RoleStore
     panels: PanelCache
+    #: One-time-per-session guard for the first-run setup hint, so the advisory nudges once rather than on
+    #: every call (:meth:`persistence_notice`).
+    setup_hint_emitted: bool = False
 
     def new_correlation_id(self) -> str:
         """Mint a short correlation id for a tool call."""
         return uuid.uuid4().hex[:12]
+
+    def persistence_notice(self, *, persisted: bool, complex_run: bool, external_tracking: bool) -> str | None:
+        """Advisory F2 notice for a tool result, or ``None`` when there is none.
+
+        Up to two non-fatal hints, joined: a one-time (per session) first-run hint when this workspace has no
+        Rutherford config dir, and a suggestion to keep a complex (multi-voice / write) run as a durable job
+        when persistence is off by default and the run was not persisted. ``external_tracking`` suppresses the
+        suggestion (an orchestrator already tracks the run). stdio cannot prompt, so the notice rides the
+        result's ``notice`` field for the calling agent to relay. A single string (not a list) so the TOON
+        payload stays decodable.
+        """
+        notices: list[str] = []
+        # Key the first-run hint off a recognized config FILE, not the ``.rutherford`` dir. The dir is created
+        # by a persisted run's ledger (``.rutherford/jobs/``) even with no config, so a dir check would wrongly
+        # suppress the hint; conversely ``has_project_config`` honors EVERY project config name
+        # (``rutherford.toml`` / ``.rutherford.toml`` / ``.rutherford/config.toml``), so a workspace configured
+        # via any of them never gets a false "no config" hint.
+        if not self.setup_hint_emitted and not has_project_config(Path.cwd()):
+            notices.append(
+                "No Rutherford config in this workspace yet: runs are ephemeral by default (nothing is kept "
+                "on disk). To keep runs as durable jobs under .rutherford/jobs/, set the default for this "
+                "workspace (setup scope=project write=true, then default_persistence=job in the file) or pass "
+                "persist=true per call."
+            )
+            self.setup_hint_emitted = True
+        if complex_run and not persisted and not external_tracking and self.config.default_persistence == "ephemeral":
+            notices.append(
+                "This run spans multiple voices or writes. Pass persist=true to keep it as a durable job for "
+                "tracking, reference, or to continue later."
+            )
+        return "\n\n".join(notices) if notices else None
 
 
 def build_app_context(

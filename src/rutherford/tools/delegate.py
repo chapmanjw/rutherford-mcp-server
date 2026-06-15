@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..context import AppContext, tool_success
+from ..domain.enums import is_mutating
 from ..domain.models import DelegationRequest, Target
 from ..services.delegation import ActivityCallback
 from .common import (
@@ -38,6 +39,7 @@ async def delegate_tool(
     allow_model_fallback: bool = True,
     persist: bool | None = None,
     session_id: str | None = None,
+    external_tracking: bool = False,
     mode: str = "sync",
 ) -> str:
     """Validate the request, drive one ACP turn (with fallback), and return the TOON-encoded result envelope.
@@ -95,6 +97,13 @@ async def delegate_tool(
         # A standalone delegation emits one voice_started/voice_finished pair (N1, item 3): on the async path
         # the job buffers them for the ``activity`` poll table; on the sync path there is no sink (None).
         result = await app.delegation.delegate(request, correlation_id="voice:0", on_activity=on_activity)
+        # Advisory F2 nudge (suppressed by external_tracking): a mutating or fallback delegation is worth
+        # keeping as a durable job, plus the one-time first-run setup hint.
+        result.notice = app.persistence_notice(
+            persisted=result.run_dir is not None,
+            complex_run=is_mutating(request.safety_mode) or bool(request.fallback),
+            external_tracking=external_tracking,
+        )
         return tool_success(result)
 
     if run_async:

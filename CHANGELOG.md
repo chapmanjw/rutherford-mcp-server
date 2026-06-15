@@ -283,8 +283,27 @@ All notable changes to this project are documented in this file. The format is b
   `goose` × ollama/lmstudio, `qwen` × ollama/lmstudio, `claude_code` × ollama (Ollama's
   Anthropic-compatible endpoint; LM Studio is OpenAI-only). The model must support tool-calling. See
   `docs/local-models.md`.
+- **`python -m rutherford init` first-run CLI** (v2 parity). Scaffolds a starter `config.toml` from the
+  effective defaults — `<cwd>/.rutherford/config.toml` by default, or the platform global path with
+  `--global` — prints the registered agents, and never clobbers an existing config (edit it, or remove it
+  and re-run). `--yes` skips the y/N confirmation. It reuses the same scaffold the `setup` MCP tool writes;
+  as the bootstrap command it scaffolds from defaults (and warns) rather than refusing when an existing,
+  possibly unrelated config — a broken project `config.toml` must not block `init --global` — fails to load.
+- **Advisory persistence notices** on `delegate` / `consensus` / `debate` results (v2 parity). A non-fatal
+  `notice` rides the result envelope (absent from the wire when empty) to nudge a caller toward durable jobs:
+  a one-time-per-session first-run hint when the workspace has no `config.toml`, and a suggestion to pass
+  `persist=true` for a complex (multi-voice / write) run that was not persisted under the default-ephemeral
+  policy. A new `external_tracking=true` parameter on the three tools silences the suggestion when an
+  orchestrator already tracks the run.
 
 ### Fixed
+
+- **`doctor` no longer false-flags a cold local model.** A local-model agent (provider `ollama` / `lmstudio`,
+  or a configured backend whose env points at a `localhost` / `127.0.0.1` endpoint — matched
+  case-insensitively) now gets a generous probe-timeout floor (180s) over the per-call `timeout_s`, because a
+  cold local model loads from disk on its first prompt and the 60s cloud default reliably reported a healthy
+  model as broken. The floor only raises a too-short budget; a larger explicit `timeout_s` and a cloud
+  agent's default are untouched.
 
 - **Produce into a fresh, non-git location.** A `write` / `propose` / `yolo` delegation whose `working_dir`
   does not exist yet (a brand-new path to scaffold a project or write a report into, with no git repo) no

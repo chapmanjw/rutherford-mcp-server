@@ -34,6 +34,16 @@ PROJECT_CONFIG_NAMES = ("rutherford.toml", ".rutherford.toml", ".rutherford/conf
 PROJECT_ACP_JSON = ".rutherford/acp.json"
 
 
+def has_project_config(cwd: Path) -> bool:
+    """Whether ``cwd`` holds a project-local Rutherford config under any of the recognized names.
+
+    The single source of truth for "is this workspace configured" -- it honors every name in
+    :data:`PROJECT_CONFIG_NAMES` (``rutherford.toml`` / ``.rutherford.toml`` / ``.rutherford/config.toml``),
+    not just the ``setup``-written one, so a caller that keys UI off it stays correct if the set grows.
+    """
+    return any((cwd / name).exists() for name in PROJECT_CONFIG_NAMES)
+
+
 def default_global_config_path(env: Mapping[str, str] | None = None) -> Path:
     """Return the platform-appropriate global config path.
 

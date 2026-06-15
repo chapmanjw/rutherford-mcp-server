@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from rutherford.config.loader import deep_merge, default_global_config_path, load_config
+from rutherford.config.loader import deep_merge, default_global_config_path, has_project_config, load_config
 from rutherford.config.schema import AgentConfig, RutherfordConfig
 from rutherford.domain.enums import Effort, SafetyMode
 from rutherford.domain.errors import ConfigError
@@ -37,6 +37,21 @@ def test_load_project_override(tmp_path: Path) -> None:
     assert config.default_model_for("goose") == "gpt"
     assert config.timeout_for("goose") == 9.0
     assert config.timeout_for("missing") is None
+
+
+@pytest.mark.parametrize("name", ["rutherford.toml", ".rutherford.toml", ".rutherford/config.toml"])
+def test_has_project_config_honors_every_name(name: str, tmp_path: Path) -> None:
+    assert has_project_config(tmp_path) is False  # nothing yet
+    cfg = tmp_path / name
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('default_safety_mode = "read_only"\n', encoding="utf-8")
+    assert has_project_config(tmp_path) is True
+
+
+def test_has_project_config_ignores_a_bare_rutherford_dir(tmp_path: Path) -> None:
+    # A persisted run's ledger creates .rutherford/jobs/ but no config file -- that is NOT a configured workspace.
+    (tmp_path / ".rutherford" / "jobs").mkdir(parents=True)
+    assert has_project_config(tmp_path) is False
 
 
 def test_load_explicit_and_missing(tmp_path: Path) -> None:

@@ -47,6 +47,7 @@ async def consensus_tool(
     time_budget_s: float | None = None,
     on_budget: str | None = None,
     persist: bool | None = None,
+    external_tracking: bool = False,
     mode: str = "sync",
     on_activity: ActivityCallback | None = None,
 ) -> str:
@@ -129,6 +130,11 @@ async def consensus_tool(
         # the sync path uses ``on_activity`` (the MCP progress push), supplied by server.py. Exactly one is
         # ever set -- a sync call has no job buffer, an async call has no live caller to push to.
         result = await app.consensus.consensus(request, on_activity=job_activity or on_activity)
+        # Advisory F2 nudge (suppressed by external_tracking): a consensus panel is a multi-voice run worth
+        # keeping as a durable job, plus the one-time first-run setup hint.
+        result.notice = app.persistence_notice(
+            persisted=result.run_dir is not None, complex_run=True, external_tracking=external_tracking
+        )
         return tool_success(result)
 
     if run_async:

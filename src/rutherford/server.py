@@ -16,12 +16,14 @@ import contextlib
 import logging
 import sys
 from collections.abc import Awaitable
+from pathlib import Path
 from typing import Any
 
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
-from .config.loader import load_config
+from .config.loader import default_global_config_path, load_config
+from .config.schema import RutherfordConfig
 from .context import AppContext, build_app_context, error_payload_from, tool_error
 from .domain.enums import ActivityEventKind
 from .domain.error_codes import ErrorCode
@@ -149,6 +151,7 @@ async def delegate(
     allow_model_fallback: bool = True,
     persist: bool | None = None,
     session_id: str | None = None,
+    external_tracking: bool = False,
     mode: str = "sync",
 ) -> str:
     """Delegate a task to one ACP agent and return its normalized result.
@@ -190,6 +193,7 @@ async def delegate(
             allow_model_fallback=allow_model_fallback,
             persist=persist,
             session_id=session_id,
+            external_tracking=external_tracking,
             mode=mode,
         )
     )
@@ -216,6 +220,7 @@ async def consensus(
     time_budget_s: float | None = None,
     on_budget: str | None = None,
     persist: bool | None = None,
+    external_tracking: bool = False,
     mode: str = "sync",
     ctx: Context | None = None,
 ) -> str:
@@ -270,6 +275,7 @@ async def consensus(
             time_budget_s=time_budget_s,
             on_budget=on_budget,
             persist=persist,
+            external_tracking=external_tracking,
             mode=mode,
             # N1 (item 3): on a sync call, push live progress as voices finish (gated on the client's
             # progressToken; silent otherwise). An async job polls ``activity`` instead, so no pusher.
@@ -295,6 +301,7 @@ async def debate(
     time_budget_s: float | None = None,
     on_budget: str | None = None,
     persist: bool | None = None,
+    external_tracking: bool = False,
     mode: str = "sync",
     ctx: Context | None = None,
 ) -> str:
@@ -338,6 +345,7 @@ async def debate(
             time_budget_s=time_budget_s,
             on_budget=on_budget,
             persist=persist,
+            external_tracking=external_tracking,
             mode=mode,
             on_activity=make_progress_pusher(ctx) if ctx is not None else None,
         )
@@ -518,13 +526,55 @@ async def cancel_job(job_id: str) -> str:
     return await _guarded(cancel_job_tool(get_app(), job_id=job_id))
 
 
+def _init(args: list[str]) -> None:
+    """First-run setup CLI (``python -m rutherford init [--global] [--yes]``).
+
+    Scaffolds a starter ``config.toml`` at the effective defaults -- ``<cwd>/.rutherford/config.toml`` by
+    default, or the platform global config path with ``--global`` -- and shows the registered agents. It NEVER
+    clobbers an existing file (edit it, or remove it and re-run); ``--yes`` skips the confirmation prompt. The
+    config scaffolding is the same the ``setup`` MCP tool writes. Afterwards, run the ``doctor`` tool from an
+    MCP client to see which agents are installed and actually answer over ACP (the trustworthy health signal,
+    which a static scaffold cannot give). Auto-detect is disabled here so the command is fast and deterministic.
+    """
+    scope = "global" if "--global" in args else "project"
+    assume_yes = "--yes" in args or "-y" in args
+    # ``init`` is the bootstrap command, so it must not refuse to scaffold just because an EXISTING config is
+    # malformed -- in particular a broken project ``config.toml`` must never block ``init --global`` (a
+    # different scope). Try the effective config for the roster snapshot + defaults; on a load error fall back
+    # to the built-in defaults and warn, rather than exiting. Auto-detect is off so the command stays fast.
+    try:
+        config = load_config().model_copy(update={"auto_detect_local_models": False})
+    except ConfigError as exc:
+        print(f"rutherford: ignoring an invalid existing config ({exc}); scaffolding from defaults", file=sys.stderr)
+        config = RutherfordConfig(auto_detect_local_models=False)
+    app = build_app_context(config=config)
+    path = default_global_config_path() if scope == "global" else Path.cwd() / ".rutherford" / "config.toml"
+    agents = app.descriptors.ids()
+    print(f"rutherford: {len(agents)} built-in agent(s): {', '.join(agents)}")
+    print(f"config target ({scope}): {path}")
+    if path.exists():
+        print("a config already exists there; it will not be overwritten -- edit it, or remove it and re-run.")
+        return
+    if not assume_yes and input("\nwrite a starter config.toml there? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("aborted; nothing written.")
+        return
+    asyncio.run(setup_tool(app, scope=scope, write=True))
+    print(f"wrote {path}")
+    print("next: run the `doctor` tool from your MCP client to see which agents answer over ACP.")
+
+
 def main() -> None:
-    """Console entry point: start the stdio MCP server. ``--smoke`` builds the app and exits, no server loop.
+    """Console entry point: start the stdio MCP server. ``--smoke`` builds the app and exits, no server loop;
+    ``init`` scaffolds a starter config and exits.
 
     The smoke path is the entrypoint health check (``just smoke``): it loads config and builds the full app
     context -- exercising config validation and registry build -- then prints a line and returns instead of
     blocking on ``mcp.run``. It disables live local-backend probing so the check is fast and deterministic.
     """
+    argv = sys.argv[1:]
+    if argv and argv[0] == "init":
+        _init(argv[1:])
+        return
     smoke = "--smoke" in sys.argv
     try:
         global _APP

@@ -125,13 +125,20 @@ If `rutherford-mcp-server` is not on the client's PATH, use an absolute path, or
 with the interpreter from the environment where you installed it. More clients and WSL:
 [docs/mcp-client-integration.md](docs/mcp-client-integration.md).
 
-**3. Scaffold a config (optional).** Rutherford works with zero config, but `setup` shows where config
-lives and writes a starter file:
+**3. Scaffold a config (optional).** Rutherford works with zero config. To write a starter file, either
+run the one-shot CLI from your terminal:
+
+```sh
+rutherford-mcp-server init          # or: python -m rutherford init  [--global] [--yes]
+```
+
+or, once it is registered with a client, ask for the `setup` tool:
 
 > Run Rutherford's setup and write a project config.
 
-It resolves the config path, returns a commented starter `config.toml` at the effective defaults, and
-(with `write=true`) creates it without ever clobbering an existing file.
+Both resolve the config path, write a commented starter `config.toml` at the effective defaults, and never
+clobber an existing file. `init` targets `<cwd>/.rutherford/config.toml` (or the global path with
+`--global`); `setup` returns the path and content to the client and writes with `write=true`.
 
 **4. Run `doctor` first.** Multi-agent auth and PATH is the most common thing that goes wrong, so
 confirm the crew actually drives before your first real task:

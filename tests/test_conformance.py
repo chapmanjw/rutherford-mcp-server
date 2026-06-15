@@ -19,12 +19,20 @@ from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import DelegationResult, ErrorInfo, Target
 from rutherford.io.serialize import decode
-from rutherford.tools.capabilities import doctor_tool
+from rutherford.tools import capabilities as capabilities_module
+from rutherford.tools.capabilities import _LOCAL_PROBE_TIMEOUT_S, _probe_timeout, doctor_tool
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FAKE = AgentDescriptor("fake", "Fake", (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py")))
 DEAD = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.exit(0)"))
 BAD = AgentDescriptor("bad", "Bad", ("this-binary-does-not-exist-xyz123",))
+OLLAMA = AgentDescriptor("local", "Local", ("local-acp",), provider="ollama")
+LOCALHOST = AgentDescriptor(
+    "host", "Host", ("host-acp",), env_overrides=(("OPENAI_BASE_URL", "http://localhost:1234"),)
+)
+LOCALHOST_UPPER = AgentDescriptor(
+    "hostu", "HostU", ("hostu-acp",), env_overrides=(("OPENAI_BASE_URL", "http://LOCALHOST:1234/v1"),)
+)
 
 
 def _result(ok: bool, code: ErrorCode | None = None) -> DelegationResult:
@@ -73,3 +81,35 @@ async def test_doctor_unknown_agent() -> None:
     app = build_app_context(config=RutherfordConfig(), descriptors=DescriptorRegistry([FAKE]))
     with pytest.raises(RutherfordError):
         await doctor_tool(app, agent="nope")
+
+
+def test_probe_timeout_floors_local_models() -> None:
+    # A cloud agent keeps the call default; a local-runtime provider gets the cold-start floor.
+    assert _probe_timeout(FAKE, 60.0) == 60.0
+    assert _probe_timeout(OLLAMA, 60.0) == _LOCAL_PROBE_TIMEOUT_S
+    # A configured backend agent pointing at a localhost endpoint is local too, even with no provider set.
+    assert _probe_timeout(LOCALHOST, 60.0) == _LOCAL_PROBE_TIMEOUT_S
+    # URL hosts are case-insensitive: an uppercase LOCALHOST is still local.
+    assert _probe_timeout(LOCALHOST_UPPER, 60.0) == _LOCAL_PROBE_TIMEOUT_S
+
+
+def test_probe_timeout_is_a_floor_not_an_override() -> None:
+    # An explicit budget larger than the floor still wins -- the floor only RAISES a too-short default.
+    assert _probe_timeout(OLLAMA, _LOCAL_PROBE_TIMEOUT_S + 120.0) == _LOCAL_PROBE_TIMEOUT_S + 120.0
+    assert _probe_timeout(FAKE, 600.0) == 600.0
+
+
+async def test_doctor_budgets_a_cold_local_model(monkeypatch: Any) -> None:
+    # The doctor tool must hand a local-model agent the generous floor, not the 60s cloud default that
+    # false-flags a cold model loading on its first prompt. Capture the timeout each probe actually receives.
+    seen: dict[str, float] = {}
+
+    async def _fake_probe(descriptor: AgentDescriptor, *, timeout_s: float = 60.0) -> Any:
+        seen[descriptor.id] = timeout_s
+        return classify(descriptor.id, _result(True))
+
+    monkeypatch.setattr(capabilities_module, "probe_agent", _fake_probe)
+    app = build_app_context(config=RutherfordConfig(), descriptors=DescriptorRegistry([FAKE, OLLAMA]))
+    await doctor_tool(app, timeout_s=60.0)
+    assert seen["fake"] == 60.0
+    assert seen["local"] == _LOCAL_PROBE_TIMEOUT_S

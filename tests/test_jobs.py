@@ -108,9 +108,14 @@ async def test_async_delegation_envelope_matches_sync_shape() -> None:
     assert record.status is JobStatus.SUCCEEDED
     assert record.result is not None
     asynced = decode(record.result)
-    # Drop the only run-to-run-volatile field; everything else must match exactly.
-    sync.pop("duration_s", None)
-    asynced.pop("duration_s", None)
+    # Drop the run-to-run-volatile fields; everything else must match exactly. ``duration_s`` is timing;
+    # ``observed_peak_agents`` is the N1 psutil-observed process-peak floor, which varies with whatever
+    # subprocesses happen to be alive (so it diverges between the two calls under a concurrent full suite);
+    # ``notice`` is the advisory channel, and the one-time first-run setup hint fires on the FIRST call only
+    # (it is per-AppContext state), so the reused app emits it on the sync call but not the async one.
+    for volatile in ("duration_s", "observed_peak_agents", "notice"):
+        sync.pop(volatile, None)
+        asynced.pop(volatile, None)
     assert asynced == sync
     assert "42" in record.result
 

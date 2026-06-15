@@ -40,6 +40,7 @@ async def debate_tool(
     time_budget_s: float | None = None,
     on_budget: str | None = None,
     persist: bool | None = None,
+    external_tracking: bool = False,
     mode: str = "sync",
     on_activity: ActivityCallback | None = None,
 ) -> str:
@@ -91,6 +92,11 @@ async def debate_tool(
         # N1 (item 3): the async path hands the debate the JOB's activity sink; the sync path uses
         # ``on_activity`` (the MCP progress push). Exactly one is ever set.
         result = await app.debate.debate(request, on_activity=job_activity or on_activity)
+        # Advisory F2 nudge (suppressed by external_tracking): a debate is a multi-voice run worth keeping as a
+        # durable job, plus the one-time first-run setup hint.
+        result.notice = app.persistence_notice(
+            persisted=result.run_dir is not None, complex_run=True, external_tracking=external_tracking
+        )
         return tool_success(result)
 
     if run_async:

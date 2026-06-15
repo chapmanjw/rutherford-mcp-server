@@ -6,6 +6,22 @@ the hood. Everything defaults to read-only; the write-mode recipe calls out the 
 
 Find the recipe that matches your problem and start there. You do not need to read top to bottom.
 
+## The minimal call
+
+Every tool below takes a small set of required arguments and sensible defaults for the rest — you never
+need to send a fully-populated payload. The bare minimum for each:
+
+| tool | required arguments | example |
+| --- | --- | --- |
+| `delegate` | `cli`, `prompt` | `{ "cli": "codex", "prompt": "explain src/auth/session.py" }` |
+| `consensus` | `prompt` (omit `targets`, or pass `"all"`, to fan out to every agent) | `{ "prompt": "where is the deadlock in queue.py?" }` |
+| `debate` | `prompt`, `targets` (at least two) | `{ "prompt": "UUIDv7 or ULID?", "targets": ["codex", "claude_code"] }` |
+| `doctor` | none | `{}` |
+
+`debate` is the one tool that needs an explicit `targets` (a debate has no meaningful single-agent form), so
+send the two arguments above rather than an empty object. Everything else — safety mode, models, effort,
+persistence, timeouts — has a default; add an argument only to override it.
+
 ## See who is on the crew
 
 > Which coding agents can Rutherford reach right now? Then run doctor and tell me which actually drive.
