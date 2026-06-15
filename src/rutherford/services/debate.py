@@ -266,12 +266,12 @@ class DebateService:
         child records -- ``transcript.md`` inlines every turn and the parent record carries the run. The
         parent's status derives from the turns (succeeded when any voice ever answered); :class:`PanelInputs`
         captures the resolved roster (each seat + its latest resume handle), the round count, whether a closing
-        synthesis ran, and any judge so the debate replays from ``state.toon``. Runs off-thread (file I/O).
+        synthesis ran, and any judge so the debate replays from ``state.json``. Runs off-thread (file I/O).
         """
         assert self._ledger is not None  # guarded by the caller (persist + ledger present)
         contributions = [c for round_ in rounds for c in round_.contributions]
         clis = sorted({c.target.cli for c in contributions})
-        # Each seat's latest resume handle across the rounds, recorded in the parent state.toon (F8a, 2-I).
+        # Each seat's latest resume handle across the rounds, recorded in the parent state.json (F8a, 2-I).
         seat_sessions: dict[str, str] = {c.seat_id: c.session_id for c in contributions if c.session_id is not None}
         panel_inputs = PanelInputs(
             targets=[

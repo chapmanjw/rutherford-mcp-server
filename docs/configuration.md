@@ -94,7 +94,7 @@ order the fields appear in `config/schema.py`.
 > is enforced; `write` / `propose` / `yolo` run in an isolated git-worktree sandbox and `verify_read_only`
 > checks a `read_only` run did not mutate its git tree), `default_timeout_s`, `default_effort`,
 > `default_time_budget_s`, `default_on_budget` (time budget / effort), `default_persistence` / `jobs_dir`
-> (F2 durable on-disk jobs — a `persist=true` `delegate` / `consensus` / `debate` writes a `state.toon`
+> (F2 durable on-disk jobs — a `persist=true` `delegate` / `consensus` / `debate` writes a `state.json`
 > record plus Markdown artifacts under `jobs_dir`; the in-memory `JobStore` is the separate async-job
 > runtime), `max_targets`, `max_depth` (the recursion guard, `MAX_DEPTH_EXCEEDED`), `max_concurrency` (the
 > fan-out semaphore), `max_agents_advisory` / `enforce_agent_cap` (the aggregate-agent cap — flags

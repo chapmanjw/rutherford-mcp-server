@@ -240,7 +240,7 @@ class DelegationService:
             if recovered is not None:
                 # The winning alternate persisted its OWN leaf record inside its recursive ``delegate`` call
                 # (it ran through this same path), and the failed primary is not persisted -- matching v2: a
-                # cross-target fallback's leaf ``state.toon`` records the run that answered, not the whole chain.
+                # cross-target fallback's leaf ``state.json`` records the run that answered, not the whole chain.
                 recovered.delegation_call_count = attempts
                 emit_activity(on_activity, _voice_finished_event(recovered, req.role, base_depth, correlation_id))
                 return recovered
@@ -551,7 +551,7 @@ class DelegationService:
         the corpus is post-launch outcomes (success and runtime failure), not pre-flight refusals. The record
         pins the resolved launch ``argv`` (carried up on the result), the requested-vs-resolved model, the
         prompt/role/files/cwd, and the outcome (changed files + the sandbox diff for a write run), so the run
-        recomposes from ``state.toon`` alone. ``env`` is NEVER persisted (it can hold secrets). A filesystem
+        recomposes from ``state.json`` alone. ``env`` is NEVER persisted (it can hold secrets). A filesystem
         failure is swallowed -- a run that already produced an answer must never fail because its record could
         not be written -- leaving the result without ``run_dir``. ``req.parent_run_id`` links a voice's record
         to its panel parent.

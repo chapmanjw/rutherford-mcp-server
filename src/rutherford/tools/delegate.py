@@ -60,7 +60,7 @@ async def delegate_tool(
     default) lets a model-unavailable failure retry the SAME agent on its configured ``fallback_model`` first,
     where it has one (most ACP agents do not -- a clean no-op).
 
-    ``persist`` keeps this run as a durable job under ``<jobs_dir>/<run_id>/`` (F2: ``state.toon`` plus the
+    ``persist`` keeps this run as a durable job under ``<jobs_dir>/<run_id>/`` (F2: ``state.json`` plus the
     answer / diff artifacts), so it survives the process. ``None`` follows the configured
     ``default_persistence`` (``ephemeral`` out of the box -- nothing on disk unless asked); ``True`` / ``False``
     force it for this one call. The persisted result carries its ``run_dir``.

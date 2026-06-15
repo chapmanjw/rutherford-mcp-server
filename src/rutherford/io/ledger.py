@@ -2,12 +2,18 @@
 # Copyright (c) 2026 John Chapman
 """The durable run ledger (F2): persist a run as a job on disk.
 
-A run a caller opts to keep (Model A) is written under ``<root>/<run_id>/`` as ``state.toon`` -- the
-structured :class:`~rutherford.domain.models.RunRecord`, TOON-encoded through the one serialization
-seam (:mod:`rutherford.io.serialize`) -- plus Markdown ``artifacts/`` (the answer a human reads, a diff
-for a write run, and for a panel one ``voices/voice-N.md`` per voice plus a debate ``transcript.md``).
-This writer is the only place that touches the jobs directory; the services hand it a finished record and
-the answer text.
+A run a caller opts to keep (Model A) is written under ``<root>/<run_id>/`` as ``state.json`` -- the
+structured :class:`~rutherford.domain.models.RunRecord` as JSON -- plus Markdown ``artifacts/`` (the answer a
+human reads, a diff for a write run, and for a panel one ``voices/voice-N.md`` per voice plus a debate
+``transcript.md``). This writer is the only place that touches the jobs directory; the services hand it a
+finished record and the answer text.
+
+The record is JSON, NOT the TOON used on the MCP tool wire: ``state.json`` is internal -- only Rutherford's
+own reader (job continuation / on-demand analysis) ever loads it back, and no LLM consumes it -- so it uses a
+format that round-trips reliably rather than one optimized for an LLM's token budget. (TOON is reserved for
+the tool payloads an MCP client actually reads; see :mod:`rutherford.io.serialize`.) Reading is
+:func:`read_record`; the round trip is lossless, so a real argv with colon-bearing elements
+(``gemma3:12b``, a Windows path) is read back exactly.
 
 Persistence is best-effort by contract: a write failure must never fail the delegation that produced the
 answer, so the caller wraps :meth:`RunLedger.write` and degrades to an unpersisted result. The writer
@@ -16,14 +22,34 @@ keeps no business logic -- it serializes and writes, nothing more.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from ..domain.models import RunRecord
-from .serialize import encode
+from .serialize import to_plain
+
+#: The filename of the structured record under a run's directory.
+RECORD_FILENAME = "state.json"
+
+
+def record_to_json(record: RunRecord) -> str:
+    """Serialize a :class:`RunRecord` to the on-disk JSON text (pretty, UTF-8, ``None`` fields dropped)."""
+    return json.dumps(to_plain(record), indent=2, ensure_ascii=False)
+
+
+def read_record(run_dir: Path) -> RunRecord:
+    """Load and validate the :class:`RunRecord` from ``<run_dir>/state.json`` (the reader side of the ledger).
+
+    The inverse of :meth:`RunLedger.write`'s record. Raises ``OSError`` if the file is missing/unreadable and
+    a pydantic ``ValidationError`` / ``json.JSONDecodeError`` if the content is malformed -- the caller (job
+    continuation) decides how to surface a corrupt or absent record.
+    """
+    text = (run_dir / RECORD_FILENAME).read_text(encoding="utf-8")
+    return RunRecord.model_validate(json.loads(text))
 
 
 class RunLedger:
-    """Writes :class:`RunRecord` jobs under a root directory as ``state.toon`` + Markdown artifacts."""
+    """Writes :class:`RunRecord` jobs under a root directory as ``state.json`` + Markdown artifacts."""
 
     def __init__(self, root: Path) -> None:
         #: The jobs root, e.g. ``<workspace>/.rutherford/jobs``. Created lazily on the first write.
@@ -44,7 +70,7 @@ class RunLedger:
     ) -> Path:
         """Persist ``record`` and its artifacts under ``<root>/<run_id>/``; return the run directory.
 
-        ``state.toon`` holds the structured record; ``artifacts/answer.md`` holds the answer the run
+        ``state.json`` holds the structured record; ``artifacts/answer.md`` holds the answer the run
         produced (or a placeholder when empty, so the file always exists); ``artifacts/diff.md`` holds
         ``diff`` as a fenced block when a write run captured one; ``extra_artifacts`` maps additional
         filenames to Markdown content under ``artifacts/`` (e.g. a panel's ``voices/voice-1.md`` or a
@@ -57,7 +83,7 @@ class RunLedger:
         run_dir = self._root / record.run_id
         artifacts = run_dir / "artifacts"
         artifacts.mkdir(parents=True, exist_ok=True)
-        (run_dir / "state.toon").write_text(encode(record), encoding="utf-8")
+        (run_dir / RECORD_FILENAME).write_text(record_to_json(record), encoding="utf-8")
         (artifacts / "answer.md").write_text(answer if answer.strip() else "(no answer)", encoding="utf-8")
         if diff is not None and diff.strip():
             (artifacts / "diff.md").write_text(f"```diff\n{diff}\n```\n", encoding="utf-8")

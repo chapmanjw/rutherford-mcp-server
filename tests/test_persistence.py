@@ -2,12 +2,11 @@
 # Copyright (c) 2026 John Chapman
 """Tests for durable run persistence (F2) over ACP: leaf delegate records and panel parent/child records.
 
-Drives the real in-process fake ACP agent (a subprocess), so the persisted ``state.toon`` carries the
-actual resolved launch ``argv`` and a real answer. The fake agent's launch argv has colon-bearing elements
-(``sys.executable`` plus a path), which python-toon 0.1.x cannot round-trip inside an inline array, so a
-real run's record is asserted by reading ``state.toon`` as text (the human/LLM-readable form, which carries
-everything verbatim) -- the clean-record decode round-trip lives in ``test_ledger``. ``env`` is verified to
-be ABSENT from every persisted record.
+Drives the real in-process fake ACP agent (a subprocess), so the persisted record carries the actual
+resolved launch ``argv`` and a real answer. The record is JSON (``state.json``) -- an internal form no LLM
+consumes -- so a real run's record, including the fake agent's colon-bearing launch argv (``sys.executable``
+plus a path), round-trips losslessly and is asserted by reading it back with ``read_record``. ``env`` is
+verified to be ABSENT from every persisted record.
 """
 
 from __future__ import annotations
@@ -18,9 +17,9 @@ from pathlib import Path
 
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.schema import RutherfordConfig
-from rutherford.domain.enums import SafetyMode
+from rutherford.domain.enums import JobStatus, SafetyMode
 from rutherford.domain.models import ConsensusRequest, DebateRequest, DelegationRequest, Target
-from rutherford.io.ledger import RunLedger
+from rutherford.io.ledger import RECORD_FILENAME, RunLedger, read_record
 from rutherford.services.consensus import ConsensusService
 from rutherford.services.debate import DebateService
 from rutherford.services.delegation import DelegationService
@@ -35,12 +34,12 @@ DEAD = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.e
 
 
 def _has_env_field(state: str) -> bool:
-    """Whether ``state.toon`` carries an ``env`` FIELD (not the letters 'env' inside a venv path/value).
+    """Whether the persisted JSON record carries an ``env`` KEY (not the letters 'env' inside a path value).
 
-    A TOON field is ``<key>:`` or ``<key>[...]:`` at the start of a line, so this checks for a real ``env``
-    key rather than a substring -- a launch argv legitimately contains ``.venv\\Scripts\\python.exe``.
+    A launch argv legitimately contains ``.venv\\Scripts\\python.exe``, so check for the JSON object key
+    ``"env":`` rather than the bare substring ``env``.
     """
-    return any(line.startswith(("env:", "env[")) for line in state.splitlines())
+    return '"env":' in state
 
 
 def _registry(extra: list[AgentDescriptor] | None = None) -> DescriptorRegistry:
@@ -90,18 +89,14 @@ async def test_persist_true_writes_state_and_answer(tmp_path: Path) -> None:
     assert result.run_dir is not None
     run_dir = Path(result.run_dir)
     assert (run_dir / "artifacts" / "answer.md").read_text(encoding="utf-8").strip() == result.text
-    state = (run_dir / "state.toon").read_text(encoding="utf-8")
-    assert "kind: delegate" in state
-    assert "cli: fake" in state
-    assert "ok: true" in state
-    assert "schema_version: 1" in state
-    # The replay-complete inputs are in the record: the prompt, the cwd, and the resolved launch argv (the
-    # fake agent's command, carried verbatim into state.toon).
-    assert "prompt: what is 17 + 25?" in state
-    assert "fake_acp_agent.py" in state  # the pinned launch argv survives the write
-    # env is NEVER persisted -- the record has no env field at all (it can carry secrets). Check the field
-    # key, not the substring (a venv path legitimately contains the letters "env").
-    assert not _has_env_field(state)
+    record = read_record(run_dir)  # the record round-trips through the reader continuation will use
+    assert record.kind == "delegate" and record.cli == "fake" and record.ok is True
+    assert record.schema_version == 1
+    # The replay-complete inputs are in the record: the prompt and the resolved launch argv carried verbatim.
+    assert record.prompt == "what is 17 + 25?"
+    assert any("fake_acp_agent.py" in arg for arg in record.argv)  # the pinned launch argv survives the write
+    # env is NEVER persisted -- the record has no env field at all (it can carry secrets).
+    assert not _has_env_field((run_dir / RECORD_FILENAME).read_text(encoding="utf-8"))
 
 
 async def test_persist_false_writes_nothing(tmp_path: Path) -> None:
@@ -119,7 +114,7 @@ async def test_default_persistence_job_persists_by_default(tmp_path: Path) -> No
         DelegationRequest(target=Target(cli="fake"), prompt="hi", working_dir=str(REPO_ROOT)),  # no explicit persist
     )
     assert result.run_dir is not None
-    assert (Path(result.run_dir) / "state.toon").is_file()
+    assert (Path(result.run_dir) / RECORD_FILENAME).is_file()
 
 
 async def test_explicit_persist_false_overrides_default_job(tmp_path: Path) -> None:
@@ -138,9 +133,8 @@ async def test_failed_run_is_persisted_with_failed_status(tmp_path: Path) -> Non
     )
     assert result.ok is False
     assert result.run_dir is not None
-    state = (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
-    assert "status: failed" in state
-    assert "ok: false" in state
+    record = read_record(Path(result.run_dir))
+    assert record.status == JobStatus.FAILED and record.ok is False
 
 
 def _git(path: Path, *args: str) -> str:
@@ -183,9 +177,9 @@ async def test_persisted_write_mode_writes_diff_artifact(tmp_path: Path) -> None
     diff_md = (run_dir / "artifacts" / "diff.md").read_text(encoding="utf-8")
     assert "```diff" in diff_md
     assert "created.txt" in diff_md  # the created (untracked) file is in the diff
-    state = (run_dir / "state.toon").read_text(encoding="utf-8")
-    assert "created.txt" in state  # changed_files recorded
-    assert "safety_mode: write" in state
+    record = read_record(run_dir)
+    assert any("created.txt" in f for f in record.changed_files)  # changed_files recorded
+    assert record.safety_mode == SafetyMode.WRITE
 
 
 async def test_unknown_target_refusal_is_not_persisted(tmp_path: Path) -> None:
@@ -227,26 +221,25 @@ async def test_persisted_consensus_writes_parent_and_children(tmp_path: Path) ->
     result = await _consensus(tmp_path).consensus(request)
     assert result.run_dir is not None
     parent_dir = Path(result.run_dir)
-    parent_state = (parent_dir / "state.toon").read_text(encoding="utf-8")
-    assert "kind: consensus" in parent_state
+    parent = read_record(parent_dir)
+    assert parent.kind == "consensus"
     # The parent links two child voice records by run id.
     jobs_root = tmp_path / "jobs"
     child_dirs = [d for d in jobs_root.iterdir() if d.is_dir() and d != parent_dir]
     assert len(child_dirs) == 2, f"expected 2 child records, found {len(child_dirs)}"
     for child in child_dirs:
-        child_state = (child / "state.toon").read_text(encoding="utf-8")
-        assert "kind: delegate" in child_state
-        assert f"parent_run_id: {parent_dir.name}" in child_state
-        assert not _has_env_field(child_state)
+        child_record = read_record(child)
+        assert child_record.kind == "delegate"
+        assert child_record.parent_run_id == parent_dir.name
+        assert not _has_env_field((child / RECORD_FILENAME).read_text(encoding="utf-8"))
     # Per-voice artifacts under the parent, with the real answers.
     voice1 = (parent_dir / "artifacts" / "voices" / "voice-1.md").read_text(encoding="utf-8")
     voice2 = (parent_dir / "artifacts" / "voices" / "voice-2.md").read_text(encoding="utf-8")
     assert "42" in voice1 and "42" in voice2
     # The parent's answer.md exists (a placeholder when no synthesis ran).
     assert (parent_dir / "artifacts" / "answer.md").is_file()
-    # The parent rolls up: it lists both child run ids and names both clis.
-    for child in child_dirs:
-        assert child.name in parent_state
+    # The parent rolls up: it links both child run ids.
+    assert {child.name for child in child_dirs} == set(parent.child_run_ids)
 
 
 async def test_persisted_consensus_rolls_up_status_and_skipped(tmp_path: Path) -> None:
@@ -265,9 +258,9 @@ async def test_persisted_consensus_rolls_up_status_and_skipped(tmp_path: Path) -
     )
     result = await service.consensus(request)
     assert result.run_dir is not None
-    parent_state = (Path(result.run_dir) / "state.toon").read_text(encoding="utf-8")
+    parent = read_record(Path(result.run_dir))
     # One voice answered, so the panel parent is succeeded even though one child failed.
-    assert "status: succeeded" in parent_state
+    assert parent.status == JobStatus.SUCCEEDED
 
 
 async def test_consensus_persist_false_writes_nothing(tmp_path: Path) -> None:
@@ -296,10 +289,10 @@ async def test_persisted_debate_writes_parent_and_transcript(tmp_path: Path) -> 
     result = await _debate(tmp_path).debate(request)
     assert result.run_dir is not None
     parent_dir = Path(result.run_dir)
-    parent_state = (parent_dir / "state.toon").read_text(encoding="utf-8")
-    assert "kind: debate" in parent_state
-    assert "rounds: 2" in parent_state  # the PanelInputs records the round count
-    assert not _has_env_field(parent_state)
+    parent = read_record(parent_dir)
+    assert parent.kind == "debate"
+    assert parent.panel is not None and parent.panel.rounds == 2  # the PanelInputs records the round count
+    assert not _has_env_field((parent_dir / RECORD_FILENAME).read_text(encoding="utf-8"))
     # A debate drives turns over persistent sessions (not via delegate), so the parent carries the run via
     # the full transcript -- every turn is inlined, with the real answers.
     transcript = (parent_dir / "artifacts" / "transcript.md").read_text(encoding="utf-8")
@@ -352,11 +345,11 @@ def test_write_panel_record_rolls_up_status_cost_and_changed_files(tmp_path: Pat
         finished_at=1005.0,
     )
     assert run_dir is not None
-    state = (Path(run_dir) / "state.toon").read_text(encoding="utf-8")
-    assert "status: succeeded" in state  # one voice answered
-    assert "child1" in state and "child2" in state  # both child run ids linked
+    record = read_record(Path(run_dir))
+    assert record.status == JobStatus.SUCCEEDED  # one voice answered
+    assert record.child_run_ids == ["child1", "child2"]  # both child run ids linked
     # The changed-file union is de-duplicated in first-seen order.
-    assert "a.py" in state and "b.py" in state
+    assert "a.py" in record.changed_files and "b.py" in record.changed_files
     assert (Path(run_dir) / "artifacts" / "answer.md").read_text(encoding="utf-8") == "the synthesis"
 
 
@@ -375,9 +368,9 @@ def test_write_panel_record_all_failed_is_failed(tmp_path: Path) -> None:
         finished_at=1001.0,
     )
     assert run_dir is not None
-    state = (Path(run_dir) / "state.toon").read_text(encoding="utf-8")
-    assert "status: failed" in state
-    assert "ok: false" in state  # ok tracks the derived status, not the RunRecord default
+    record = read_record(Path(run_dir))
+    assert record.status == JobStatus.FAILED
+    assert record.ok is False  # ok tracks the derived status, not the RunRecord default
 
 
 def test_write_panel_record_degrades_on_bad_jobs_dir(tmp_path: Path) -> None:

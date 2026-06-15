@@ -205,7 +205,7 @@ class ConsensusService:
         if req.strategy is not Strategy.ALL_VOICES:
             strategy_result = self._aggregate(req, targets, voices, skipped)
             # The parent record's headline answer for a strategy panel is the decision (or, absent one, the
-            # outcome category) so a reader opening state.toon sees the panel's verdict, not "(no synthesis)".
+            # outcome category) so a reader opening state.json sees the panel's verdict, not "(no synthesis)".
             answer = strategy_result.decision or strategy_result.outcome
             result: ConsensusResult | StrategyResult = strategy_result
         else:

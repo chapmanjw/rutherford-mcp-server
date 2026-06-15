@@ -2,7 +2,7 @@
 # Copyright (c) 2026 John Chapman
 """Panel-level run persistence (F2): write the parent record that links a panel's child voices.
 
-A persisted consensus/debate is one parent job directory whose ``state.toon`` is a :class:`RunRecord`
+A persisted consensus/debate is one parent job directory whose ``state.json`` is a :class:`RunRecord`
 of ``kind`` ``consensus`` / ``debate`` carrying ``child_run_ids`` -- the run ids of the per-voice child
 records (each a normal leaf delegate record persisted under its own dir with ``parent_run_id`` set). The
 parent's ``artifacts/answer.md`` holds the synthesis, a consensus adds one ``artifacts/voices/voice-N.md``

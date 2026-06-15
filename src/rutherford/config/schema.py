@@ -194,7 +194,7 @@ class RutherfordConfig(BaseModel):
     #: Whether a run is persisted to disk as a durable job by default (F2, Model A: durability is
     #: opt-in). ``ephemeral`` (the default) leaves nothing on disk unless a call passes
     #: ``persist=true``; ``job`` persists every run unless a call passes ``persist=false``. A persisted
-    #: run is written under :attr:`jobs_dir` as ``<run_id>/state.toon`` (TOON) plus Markdown artifacts.
+    #: run is written under :attr:`jobs_dir` as ``<run_id>/state.json`` (JSON) plus Markdown artifacts.
     default_persistence: Literal["ephemeral", "job"] = "ephemeral"
     #: Where durable jobs are written. ``None`` (the default) means ``<cwd>/.rutherford/jobs`` -- the
     #: workspace the server runs in -- so jobs live with the project, not the user's home. Set an

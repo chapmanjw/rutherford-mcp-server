@@ -509,7 +509,7 @@ class DelegationResult(BaseModel):
     #: sums this into :attr:`Topology.realized_delegations`, so a fallback's extra agents are counted. Scope
     #: note: this is the chain aggregate on the RETURNED result (what the panel rolls up); a cross-target
     #: fallback's alternates each persist their OWN leaf record (their own count) and the failed primary is
-    #: not persisted, so a standalone ``persist=True`` cross-target fallback's leaf ``state.toon`` records the
+    #: not persisted, so a standalone ``persist=True`` cross-target fallback's leaf ``state.json`` records the
     #: winning run rather than the whole chain -- the chain total is on this returned field. A best-effort
     #: count (3-B-limit): a voice cut mid-fallback contributes a floor of 1 (its cancelled task is opaque).
     delegation_call_count: int = 1
@@ -781,7 +781,7 @@ class DebateContribution(BaseModel):
     error: ErrorInfo | None = None
     fallback_from: str | None = None
     #: This turn's resume session handle, carried from the voice's result so the debate parent's roster can
-    #: record each seat's handle in ``state.toon`` for a later continuation (F8a, 2-I). ``None`` when the
+    #: record each seat's handle in ``state.json`` for a later continuation (F8a, 2-I). ``None`` when the
     #: CLI established no resumable session.
     session_id: str | None = None
     #: stdout this turn streamed before a time-budget deadline cut it (F8a, 2-F: capture always). A debate
@@ -793,7 +793,7 @@ class DebateContribution(BaseModel):
     #: ``None`` when undetermined.
     provenance: Provenance | None = None
     #: The cost this turn reported, carried from the voice's result, so a persisted debate's parent can
-    #: roll up panel cost into ``state.toon`` (decision 1-D). ``None`` when the CLI reported none.
+    #: roll up panel cost into ``state.json`` (decision 1-D). ``None`` when the CLI reported none.
     cost: Cost | None = None
     #: The effort tier this turn actually applied (F8a, 2-L), carried from the voice's result. ``None``
     #: when the adapter has no effort knob or no effort was requested.
@@ -888,7 +888,7 @@ class PanelTarget(BaseModel):
     cli: str
     model: str | None = None
     stance: Stance | None = None
-    #: The seat's resume session handle, recorded in the parent ``state.toon`` so a later continuation can
+    #: The seat's resume session handle, recorded in the parent ``state.json`` so a later continuation can
     #: resume it (F8a, 2-I) -- in particular a voice cut at the time budget, which has no child record of its
     #: own (its handle is recovered from the harvested partial). ``None`` when the seat established no session.
     session_id: str | None = None
@@ -896,7 +896,7 @@ class PanelTarget(BaseModel):
 
 class PanelInputs(BaseModel):
     """The resolved orchestration config of a persisted consensus/debate, captured on the panel PARENT
-    record so the panel -- not just each voice -- can be replayed or continued from ``state.toon`` alone
+    record so the panel -- not just each voice -- can be replayed or continued from ``state.json`` alone
     (decision 1-D for the panel parent). Leaf child records capture each voice's per-invocation argv/model;
     these are the panel-level semantics that live on no child: the seat roster, the consensus aggregation
     ``strategy``, whether a ``synthesize`` pass was requested, a debate's ``rounds``, and any ``judge``.
@@ -912,7 +912,7 @@ class PanelInputs(BaseModel):
 class RunRecord(BaseModel):
     """A durable, replay-complete record of one run, persisted as a job (F2).
 
-    Written to ``<jobs_dir>/<run_id>/state.toon`` when a call opts into persistence -- Model A:
+    Written to ``<jobs_dir>/<run_id>/state.json`` when a call opts into persistence -- Model A:
     durability is opt-in, an ephemeral run leaves nothing on disk, so the corpus is the runs you
     chose to keep. Distinct from the in-memory, mutable, TTL-evicted :class:`Job`: a ``RunRecord``
     is an immutable audit/replay entry. ``schema_version`` is pinned from day one so records written

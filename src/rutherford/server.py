@@ -171,7 +171,7 @@ async def delegate(
     skipped and `fallback_chain` records the path. A write/yolo delegation never falls back.
     `allow_model_fallback` (default true) first retries the same agent on its configured fallback model on a
     model-unavailable failure, where it has one. `persist` keeps this run as a durable job under
-    `<jobs_dir>/<run_id>/` (`state.toon` + answer / diff artifacts); `None` follows `default_persistence`
+    `<jobs_dir>/<run_id>/` (`state.json` + answer / diff artifacts); `None` follows `default_persistence`
     (`ephemeral` out of the box), `true` / `false` force it. `session_id` resumes a prior agent session: pass
     the `session_id` from an earlier delegate result and the agent reloads that conversation (ACP
     `session/load`) instead of starting fresh, so a follow-up turn continues it; agents that do not persist
@@ -250,7 +250,7 @@ async def consensus(
     `timeout_s`): at the deadline answered voices are kept, in-flight ones cut, and the panel aggregates over
     the harvest if `min_quorum` usable remain (`stop_reason="budget"`, with a `rollup`); below `min_quorum`
     is `BUDGET_EXHAUSTED`. `on_budget` is harvest | continue | resume (default `default_on_budget`). `persist`
-    keeps the panel as a durable job (F2): a parent `state.toon` linking a child record per voice, plus
+    keeps the panel as a durable job (F2): a parent `state.json` linking a child record per voice, plus
     `voices/voice-N.md` artifacts; `None` follows `default_persistence`, `true` / `false` force it.
     `mode="async"` runs the panel as a background job and returns a `job_id` (poll with `job_status` /
     `job_result`); `mode="sync"` awaits it.
@@ -324,7 +324,7 @@ async def debate(
     wall-clock deadline for the WHOLE debate enforced at round boundaries: a round still in flight at the
     deadline is cut and the transcript so far is finalized (`stop_reason="budget"`, with a `rollup`);
     `on_budget` is harvest | continue | resume (default `default_on_budget`; `continue` runs every round to
-    completion). `persist` keeps the debate as a durable job (F2): a parent `state.toon` plus the full
+    completion). `persist` keeps the debate as a durable job (F2): a parent `state.json` plus the full
     `transcript.md`; `None` follows `default_persistence`, `true` / `false` force it. `mode="async"` runs the
     debate as a background job and returns a `job_id` (poll with `job_status` / `job_result`); `mode="sync"`
     awaits it.

@@ -58,7 +58,7 @@ async def debate_tool(
     enforced at round boundaries: a round still in flight at the deadline is cut, the transcript so far is
     finalized (``stop_reason="budget"``), and ``on_budget`` (harvest|continue|resume, default
     ``default_on_budget``) chooses the behavior -- ``continue`` runs every round to completion. ``persist``
-    keeps the debate as a durable job (F2): a parent ``state.toon`` plus the full ``transcript.md``; ``None``
+    keeps the debate as a durable job (F2): a parent ``state.json`` plus the full ``transcript.md``; ``None``
     follows ``default_persistence``, ``True`` / ``False`` force it.
     """
     if panel is not None:

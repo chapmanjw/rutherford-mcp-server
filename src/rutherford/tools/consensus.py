@@ -73,7 +73,7 @@ async def consensus_tool(
     job and returns a ``job_id``; ``mode="sync"`` (the default) awaits it. Validation always runs on the
     request path, so a bad panel fails there rather than inside a job. A named ``role`` has its persona
     prepended to the prompt every voice receives; ``UNKNOWN_ROLE`` if the id is not a known role. ``persist``
-    keeps the panel as a durable job (F2): a parent ``state.toon`` linking a child record per voice, plus
+    keeps the panel as a durable job (F2): a parent ``state.json`` linking a child record per voice, plus
     ``voices/voice-N.md`` artifacts; ``None`` follows ``default_persistence``, ``True`` / ``False`` force it.
     """
     parsed: list[Target]

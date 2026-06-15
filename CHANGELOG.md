@@ -74,8 +74,9 @@ All notable changes to this project are documented in this file. The format is b
   `default_persistence` — `ephemeral` out of the box, so nothing is written unless asked), and the
   previously-inert `default_persistence` / `jobs_dir` config is now wired. A persisted run is written under
   `<jobs_dir>/<run_id>/` (`jobs_dir` defaults to `<cwd>/.rutherford/jobs`):
-  - `state.toon` — a versioned, replay-complete `RunRecord` (TOON-encoded through the `io/serialize` seam):
-    the resolved launch `argv`, requested-vs-resolved model, provenance, safety mode, requested/applied
+  - `state.json` — a versioned, replay-complete `RunRecord` as JSON (an internal record only Rutherford's
+    own reader consumes, so it round-trips losslessly rather than using the token-optimized TOON of the
+    tool wire): the resolved launch `argv`, requested-vs-resolved model, provenance, safety mode, requested/applied
     effort, topology, `cwd`, prompt, role, files, ok / error code, changed files, cost, stop reason, and a
     rollup. The child process `env` is **never** persisted (it can carry secrets); replay recomposes it.
   - `artifacts/answer.md` (the answer / synthesis) and, for a write run, `artifacts/diff.md` (the sandbox
@@ -440,6 +441,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **The durable-job record is now JSON (`state.json`), not TOON (`state.toon`), and the ledger gained a
+  reader.** TOON is a *wire* optimization — it cuts the tokens an MCP client spends reading a tool result —
+  but the F2 record is purely internal: only Rutherford's own reader (job continuation / on-demand analysis)
+  ever loads it back, and no LLM consumes it, so it has no business paying TOON's round-trip fragility for a
+  token saving nobody collects. Persisting it as JSON makes it round-trip losslessly — including a real argv
+  with colon-bearing elements (`gemma3:12b`, a Windows path) that the python-toon 0.1.x decoder could not
+  read back — which removes the standing codec limitation and the `strict` xfail that tracked it, and
+  unblocks the reader side of F2. New `io.ledger.read_record(run_dir)` is that reader (the missing inverse of
+  the writer). Tool results on the MCP wire are unchanged — still TOON. (The Markdown artifacts —
+  `answer.md`, `diff.md`, `transcript.md`, `voices/voice-N.md` — are unchanged too.)
 - The `setup` starter `config.toml` now scaffolds the F2 durability knobs (`default_persistence`, a commented
   `jobs_dir`) and `synthesize_default` at their effective defaults, and points at the sibling `panels.toon`
   for named multi-agent panels (with a note to call `reload_panels` after editing it) — closing the v2-setup
