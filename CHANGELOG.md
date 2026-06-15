@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-06-15
+
+A ground-up, ACP-native rewrite. Rutherford is now the [Agent Client Protocol](https://agentclientprotocol.com)
+*client* and every coding agent is an ACP *server* it spawns and drives through a real
+`initialize` / `session/new` / `session/prompt` exchange, so the protocol negotiates output, system prompts,
+file context, permissions, and resume, and there is no per-agent output parser to maintain. The persistent
+session is the foundation a debate runs on (one session per voice across rounds, sending only the delta).
+
+**Breaking.** The entire v2 subprocess-adapter architecture is gone: no `ProcessRunner`, no
+`build_invocation` / `parse_output`, no `adapters/` package, no hand-written code adapter per CLI. Adding an
+agent is now a config-driven `AgentDescriptor` (`[agents.<id>]`) or a built-in descriptor, never an adapter
+(see `docs/adding-an-agent.md`). The built-in roster is 19 ACP-native agents; a few v2 CLIs without a working
+headless ACP mode are not carried over and can be added back via `discover` or config once their ACP support
+lands. A `write` / `yolo` / `propose` delegation now runs inside an isolated git-worktree (or copy) sandbox
+with only a reviewed diff applied back; `consensus` and `debate` are read-only deliberation and refuse a
+mutating mode at the service boundary.
+
 ### Added
 
 - **`grok` built-in agent (19 total) + a handshake-only connection check.** `grok` is xAI's Grok CLI
@@ -89,10 +106,7 @@ All notable changes to this project are documented in this file. The format is b
     transcript carries the run rather than per-turn child records).
   - `io/ledger.py` (`RunLedger`) is the one writer of the jobs directory; persistence is best-effort — a write
     failure logs and degrades to an unpersisted result, never failing a run that already produced an answer.
-  - Known limitation (carried from v2): python-toon 0.1.x cannot round-trip an inline array whose elements are
-    quoted (a colon-bearing `argv` element such as a Windows path or `gemma3:12b`), so a record with such an
-    `argv` is content-complete on disk but not yet machine-re-readable via `decode`. The clean-input fields
-    (prompt, model, cwd, a colon-free `argv`) round-trip; an `xfail` tracks the codec fix.
+    `io.ledger.read_record` / `iter_records` are the reader side (job continuation and the `analyze` report).
 - The write/propose sandbox substrate, so Rutherford can safely delegate file-writing work to an agent over
   ACP. A mutating delegation (`write` / `propose` / `yolo`) with a `working_dir` no longer runs the agent in
   the user's tree — it runs in an isolated execution root and only a reviewed diff is ever applied back.
@@ -303,7 +317,7 @@ All notable changes to this project are documented in this file. The format is b
   ChatGPT and Claude Code logins, correcting the earlier research note that flagged them as possibly
   API-key-only), plus `copilot` (`copilot --acp`), `qwen` (`qwen --acp`), `droid`
   (`droid exec --output-format acp`), `cursor` (`cursor-agent acp`), `kiro` (`kiro-cli acp`), `pi`
-  (the `pi-acp` wrapper) and `hermes` (`hermes acp`), each probed and driven live. Roster: 16 descriptors.
+  (the `pi-acp` wrapper) and `hermes` (`hermes acp`), each probed and driven live.
   (`hermes` is registered but kept out of the bounded integration test — the Nous endpoint latency is too
   variable to assert against; check it live with `doctor`.)
 - Config-driven agents. Under ACP an agent is just how to launch it plus a few quirks (no per-CLI parser),
@@ -333,6 +347,37 @@ All notable changes to this project are documented in this file. The format is b
   `persist=true` for a complex (multi-voice / write) run that was not persisted under the default-ephemeral
   policy. A new `external_tracking=true` parameter on the three tools silences the suggestion when an
   orchestrator already tracks the run.
+- **`RANK`: a two-round preference-voting consensus strategy (F4b).** `strategy=rank` runs an answer round,
+  then a second round where each voice ranks the others' answers — anonymized, self-excluded, and per-voter
+  shuffled so a voice cannot favor its own or anchor on an order. The result is a `RankReport`: a Borda
+  leaderboard, a pairwise Spearman-correlation matrix, and a concordance score, plus a required dissent from
+  the top pick. For questions with no single right answer (which of these designs is best?) where a yes/no
+  tally does not fit.
+- **Anti-anchoring integrity guards on consensus and debate (F4a).** A synthesis/closing authored by a panel
+  participant is flagged `self_authored`, and `require_independent_judge` refuses one (so a voice cannot grade
+  its own panel); a losing-but-valid verdict or a set-aside debate position carries a structured `dissent`
+  reason rather than vanishing; and a debate's round-1 answer is captured as a blind `pre_commit` before any
+  voice sees another's, so pre-vs-post movement is visible and convergence is measured against a real prior.
+- **F3 lineage trust signals.** A consensus result carries an `effective_lineages` headline — how many
+  genuinely independent model lineages produced the answers, keyed on the base model family (so `claude-opus`
+  and `claude-sonnet` read as two lineages, not one "anthropic"), with a `LOW DIVERSITY` flag — so a panel
+  that is one model in several CLI costumes is visible rather than passing as N independent opinions. An
+  opt-in, off-by-default correlation-aware vote-math (`discount_correlated`) down-weights votes that share a
+  lineage so the panel does not over-count; an across-panel `analyze` report surfaces which lineages tend to
+  agree (observational only — it never reshapes a live vote).
+- **`continue_job`: resume or build on a completed durable job.** Point `continue_job` at a kept job id with a
+  new prompt and it resumes the agent's ACP session (`session/load`) where supported, else re-injects the
+  prior prompt + answer; works for a `delegate`, `consensus`, or `debate` job (a panel rebuilds its roster and
+  strategy from the persisted `PanelInputs` and resumes each seat). The continuation is a fresh child run
+  linked via `continued_from`, and it re-derives its own safety gate defaulting to `read_only` — never
+  inheriting the parent's mode or the workspace write-default.
+- **Stateful debate (F5).** A debate can carry the full transcript forward each round (`carry_forward`) rather
+  than only the previous round, and track convergence: a per-round progress ledger plus a termination grammar
+  yields a `DebateOutcome` with a `TerminationReason` (`converged` / `stalled` / `unresolved` / `budget` /
+  `quorum_lost`), so a `DebateResult` can say whether the panel actually agreed or just ran out of rounds.
+- **`analyze`: an offline report over the kept run corpus.** A read-only tool (`analyze report=historical_agreement`)
+  that scans the consensus panels you chose to persist and reports how often two model lineages reached the
+  same verdict when they co-voted — a signal for your roster choice, never a vote discount.
 
 ### Fixed
 
@@ -441,22 +486,72 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
-- **The durable-job record is now JSON (`state.json`), not TOON (`state.toon`), and the ledger gained a
-  reader.** TOON is a *wire* optimization — it cuts the tokens an MCP client spends reading a tool result —
-  but the F2 record is purely internal: only Rutherford's own reader (job continuation / on-demand analysis)
-  ever loads it back, and no LLM consumes it, so it has no business paying TOON's round-trip fragility for a
-  token saving nobody collects. Persisting it as JSON makes it round-trip losslessly — including a real argv
-  with colon-bearing elements (`gemma3:12b`, a Windows path) that the python-toon 0.1.x decoder could not
-  read back — which removes the standing codec limitation and the `strict` xfail that tracked it, and
-  unblocks the reader side of F2. New `io.ledger.read_record(run_dir)` is that reader (the missing inverse of
-  the writer). Tool results on the MCP wire are unchanged — still TOON. (The Markdown artifacts —
-  `answer.md`, `diff.md`, `transcript.md`, `voices/voice-N.md` — are unchanged too.)
+- **TOON is reserved for the MCP wire; internal records and panel files are not TOON.** TOON cuts the tokens
+  an MCP client spends reading a tool *result*, but the F2 record is purely internal — only Rutherford's own
+  reader (job continuation / the `analyze` report) loads it back, no LLM consumes it — so it is persisted as
+  JSON (`state.json`), which round-trips losslessly including a real `argv` with colon-bearing elements
+  (`gemma3:12b`, a Windows path). Tool results on the wire stay TOON; the Markdown artifacts (`answer.md`,
+  `diff.md`, `transcript.md`, `voices/voice-N.md`) are plain Markdown.
 - The `setup` starter `config.toml` now scaffolds the F2 durability knobs (`default_persistence`, a commented
   `jobs_dir`) and `synthesize_default` at their effective defaults, and points at the sibling `panels.toon`
   for named multi-agent panels (with a note to call `reload_panels` after editing it) — closing the v2-setup
   parity gap where the scaffold only emitted the safety/timeout/roster basics.
 - Config: `AdapterConfig` → `AgentConfig` (gains `command`/`env`/`provider`/`handshake_timeout_s`),
   `adapters` → `agents`, `enabled_adapters` → `enabled_agents`.
+
+### Removed
+
+- **The entire v2 subprocess-adapter machinery.** `ProcessRunner` / `AsyncProcessRunner`, the `adapters/`
+  package and every hand-written per-CLI code adapter, `build_invocation` / `parse_output` and the golden
+  parse tests, and the shared output-parsing toolkit are all gone — ACP negotiates output, prompts, file
+  context, permissions, and resume, so there is no per-agent parser to maintain. An agent is now a config
+  `[agents.<id>]` block or a built-in `AgentDescriptor`.
+- **The v2 config surface** noted under Changed above is a breaking rename (`AdapterConfig`/`adapters`/
+  `enabled_adapters` → `AgentConfig`/`agents`/`enabled_agents`); a v2 `rutherford.toml` must be updated.
+- **A few v2 CLIs are not in the 19-agent built-in roster** — those without a working headless ACP server
+  mode (e.g. Kilo Code's headless turn hangs). Any dropped CLI can be added back through `[agents.<id>]`
+  config or proposed by `discover` once it ships a drivable ACP mode.
+
+## [2.0.0] - 2026-06-13
+
+Purely additive: the supported roster grows from 13 to 22 CLIs and there are no breaking changes
+(strict SemVer would make this 1.8.0; 2.0.0 marks the roster milestone). Each new adapter was verified
+live end to end before release. (This release is on the v2 line; the 3.0.0 ACP rewrite supersedes its
+adapter architecture, but the entry is kept for history.)
+
+### Added
+
+- Nine new CLI adapters: Amp, Cline, Continue, Hermes Agent, Junie, Kilo Code, Kimi Code, OpenHands, and
+  pi. Each is a hand-written code adapter reusing the shared parsing toolkit, with golden parse tests,
+  unit tests, a shared-contract pass, and an opt-in live integration entry (`RUTHERFORD_IT_<CLI>`).
+  - Genuine read-only sandboxes, verified live to leave a file untouched: Continue (`--readonly`), pi
+    (`--tools read,grep,find,ls`), and Cline (`--plan --auto-approve false` — plan mode alone still applies
+    an edit).
+  - Best-effort read-only, the Antigravity case: Amp, Hermes, Junie, Kilo, Kimi, and OpenHands are
+    autonomous agents that auto-run their tools with no per-call deny flag, so `read_only` cannot be
+    guaranteed (verified live that each applies an edit in read_only mode). Each sets
+    `write_uses_bypass`, documents the caveat, and relies on the optional `verify_read_only` git guard as
+    the post-hoc backstop.
+  - Reasoning-effort knobs where the CLI exposes one: Cline and pi map effort to `--thinking` (through
+    `xhigh`); Junie maps it to `--effort`.
+- `scripts/update-clis.ps1` and `scripts/update-clis.sh`: update each installed supported CLI via its
+  native updater (or the npm / uv command that owns it) and report a before→after version table. A CLI
+  with no safe non-interactive updater is reported version-only with a manual hint; nothing is ever
+  force-updated blindly.
+- `docs/cli-maintenance.md`: a per-CLI status, known-issues, and re-verify playbook for keeping the
+  version-sensitive integrations working as the third-party CLIs evolve.
+
+### Changed
+
+- Windows launch: `prepare_argv` now prefers an npm shim's sibling `.ps1` (run via `powershell -File`)
+  over `cmd.exe /c`. `cmd.exe` truncates an argv element at its first newline, so a multi-line role
+  preamble lost everything after line one, and it does not forward a programmatic stdin pipe to some node
+  shims; the `.ps1` preserves both. The sibling is resolved by the resolved shim's full path (same
+  directory), never by bare name, so a same-named `.ps1` elsewhere on `PATH` is never substituted. This
+  also fixes the latent multi-line truncation for the existing npm-shim adapters.
+- The README, `docs/adding-a-cli.md`, and `docs/integration-testing.md` now list the nine new adapters,
+  carry a repository or project link for every supported CLI, and record the confirmed CLI versions for
+  this release.
 
 ## [1.7.0] - 2026-06-13
 

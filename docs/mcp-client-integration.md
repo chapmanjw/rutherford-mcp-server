@@ -18,9 +18,10 @@ macOS, and Linux. Python 3.11+ is required.
 claude mcp add rutherford -- rutherford-mcp-server
 ```
 
-In a session, the Rutherford tools become available: `delegate`, `consensus`, `debate`,
-`capabilities`, `doctor`, `list_roles`, `setup`, `list_jobs`, `activity`, `job_status`, `job_result`,
-and `cancel_job`.
+In a session, the Rutherford tools become available: `delegate`, `consensus`, `debate`, `review`,
+`plan`, `continue_job`, `analyze`, `capabilities`, `doctor`, `discover`, `list_roles`, `setup`,
+`reload_panels`, `list_jobs`, `activity`, `job_status`, `job_result`, and `cancel_job` (see the
+README tools table for what each does).
 
 ## Claude Desktop
 

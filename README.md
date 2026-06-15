@@ -56,7 +56,7 @@ agent's own account.
         +--> goose acp
         +--> codex-acp                 (the Zed adapter fronting Codex)
         +--> claude-agent-acp          (the Zed adapter fronting Claude Code)
-        +--> ... 13 more built-in agents, all config-driven
+        +--> ... 16 more built-in agents, all config-driven
 ```
 
 A voice that fails to spawn, handshake, or answer comes back as one failed result in a structured
@@ -164,10 +164,16 @@ read-only.
 | `delegate` | Hand one task to one ACP agent; get one normalized result back. |
 | `consensus` | Ask the same prompt of several agents in parallel; return every voice. |
 | `debate` | Have several agents argue across rounds (persistent sessions) and return the full transcript. |
+| `review` | Review a diff or a working dir's changes across one or more agents — a code-review-shaped consensus. |
+| `plan` | Produce an implementation plan for a task without making changes (read-only by construction). |
+| `continue_job` | Resume or build on a completed durable job (delegate / consensus / debate) with a new prompt. |
+| `analyze` | Run an offline report over the kept run corpus (e.g. `historical_agreement` cross-lineage agreement). |
 | `capabilities` | List the registered agents (id, display name, launch command, provider) — the cheap snapshot. |
 | `doctor` | Probe each agent with a real read-only ACP round trip and report conformance. |
+| `discover` | Detect installed ACP agents from the community registry and propose reviewable config blocks. |
 | `list_roles` | List the role personas you can pass as `role="<id>"`. |
 | `setup` | Show where config lives and scaffold a starter `config.toml`; the first-run helper. |
+| `reload_panels` | Reload the named multi-agent panel definitions from config without restarting the server. |
 | `list_jobs` | List the background jobs being tracked (every status), newest first. |
 | `activity` | Show only the jobs in flight right now, each with a live elapsed time. |
 | `job_status` | Report one background job's status and timings. |

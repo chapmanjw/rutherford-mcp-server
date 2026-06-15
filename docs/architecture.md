@@ -1,10 +1,12 @@
 # Architecture
 
 Rutherford is a stdio MCP server that orchestrates other agentic coding agents over the
-[Agent Client Protocol (ACP)](https://agentclientprotocol.com). Its three orchestration operations are
-**delegate** (hand one task to one agent), **consensus** (hand the same task to several agents in
-parallel), and **debate** (have several agents argue across rounds on persistent sessions). It never
-calls a model provider API directly and never reimplements an agent's own features.
+[Agent Client Protocol (ACP)](https://agentclientprotocol.com). Its three core orchestration operations
+are **delegate** (hand one task to one agent), **consensus** (hand the same task to several agents in
+parallel), and **debate** (have several agents argue across rounds on persistent sessions); **review**
+and **plan** are read-only deliberation panels on top, and **analyze** / **continue_job** / **discover**
+round out the surface (see the README tools table). It never calls a model provider API directly and
+never reimplements an agent's own features.
 
 The defining fact: Rutherford is the ACP *client* and each coding agent is an ACP *agent*. It spawns
 the agent as an ACP server over stdio and drives a real `initialize` / `new_session` / `prompt`
@@ -29,6 +31,9 @@ services           src/rutherford/services/
                    delegation.py  -- single agent, one ACP turn, the safety gate
                    consensus.py   -- fan the prompt out to N agents in parallel
                    debate.py      -- N agents, persistent sessions, multi-round
+                   strategies.py  -- verdict extraction + the tally/RANK aggregation + F3 lineage
+                   persistence.py -- the durable panel parent RunRecord (F2)
+                   analysis.py    -- the cross-run historical-agreement report
                    jobs.py        -- in-memory background-job store
                    roles.py       -- role persona loader and store
         |
@@ -39,14 +44,21 @@ ACP runtime        src/rutherford/acp/
                    journal.py     -- EventJournal (event-sourced turn record)
                    client.py      -- the ACP client callbacks (permission, fs, terminal)
                    permission.py  -- PermissionPolicy (safety mode -> ACP decisions)
+                   sandbox.py     -- the write/propose worktree (or copy) execution root
+                   effort.py      -- map a reasoning-effort tier to each agent's native knob
+                   cooldown.py    -- per-agent failure cooldown / bench tracker
+                   failures.py    -- ACP failure classification (re-execution safety)
                    launch.py      -- cross-platform launch resolution (Windows npm shims)
                    teardown.py    -- reap an agent's orphaned descendant process tree
                    conformance.py -- the doctor probe (does an agent really drive?)
+                   registry.py    -- the community ACP agent registry (for discover)
+                   discovery.py   -- detect installed registry agents, propose config
                    local_detect.py-- zero-config Ollama / LM Studio detection
         |
 domain + config    src/rutherford/domain/   models, enums, errors, error_codes
-                   src/rutherford/config/   schema, loader, acp_json
-                   src/rutherford/io/       serialize.py (TOON seam)
+                   src/rutherford/config/   schema, loader, acp_json, panels, locations
+                   src/rutherford/io/       serialize.py (TOON seam), ledger.py (F2 reader/writer), jsontext.py
+                   src/rutherford/runtime/  logging, recursion-depth / lineage env (depth.py)
 ```
 
 Dependencies point inward. The domain layer imports nothing from any other layer. The ACP runtime
@@ -69,6 +81,7 @@ hand-written subprocess adapter:
 | `provider` | the fixed model vendor when known, else `None` for bring-your-own-model |
 | `env_passthrough` | which inherited env vars to pass through; `None` passes the full environment |
 | `default_model` | the model used when a call names none; `None` means the agent's own default |
+| `fallback_model` | the model to retry with when the requested one is unavailable; `None` (every built-in) means no fallback |
 | `handshake_timeout_s` | seconds allotted for `initialize` + `new_session` before it is judged failed |
 | `env_overrides` | env vars to set for the subprocess (e.g. a local-runtime provider env) |
 
@@ -152,8 +165,11 @@ is the permission authority at the moment of each tool call:
   picks the agent's `allow_*` option for a mutating mode (preferring the one-shot `_once` form) or a
   `reject_*` option otherwise, declining the tool call rather than cancelling the whole turn.
 
-This governs what the agent routes through ACP. An OS-level sandbox (worktree isolation) is a later
-layer, so the optional `verify_read_only` git check still belongs above this for defense in depth.
+This governs what the agent routes through ACP. For a mutating mode (`write` / `propose` / `yolo`) the
+permission engine is paired with the write sandbox (`acp/sandbox.py` — an ephemeral git-worktree, or a
+bounded temp copy for a non-git tree, that the agent's edits and brokered terminal are confined to, with
+only a reviewed diff applied back; see [security.md](security.md)). On the `read_only` path the optional
+`verify_read_only` git check is the defense-in-depth backstop for a best-effort-only agent.
 
 ---
 

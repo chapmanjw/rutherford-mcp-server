@@ -90,8 +90,8 @@ closed mapping; an unknown id fails with `UNKNOWN_TARGET` and lists the known id
 
 - Run `capabilities` to see every registered agent id. The built-in ids are `goose`, `opencode`,
   `vibe`, `cline`, `junie`, `kimi`, `openhands`, `codex`, `claude_code`, `copilot`, `qwen`, `droid`,
-  `cursor`, `kiro`, `pi`, `hermes`, plus any you added in config and any auto-detected local model
-  (`ollama-<model>` / `lmstudio-<model>`). The id is case-sensitive.
+  `cursor`, `kiro`, `pi`, `hermes`, `gemini`, `qoder`, `grok`, plus any you added in config and any
+  auto-detected local model (`ollama-<model>` / `lmstudio-<model>`). The id is case-sensitive.
 
 ### `TOO_MANY_TARGETS` — panel fan-out exceeds the cap
 
