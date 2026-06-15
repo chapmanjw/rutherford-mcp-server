@@ -237,15 +237,21 @@ class ConsensusService:
                 topology,
             )
 
+        ok_count = sum(1 for voice in voices if voice.ok)
+        # Surface the F3 effective-lineages headline on the transparency stream (item 5, 5-C): a reader sees
+        # "3/5 ok -- 2 effective lineages; LOW DIVERSITY" live, not just buried in the result's diversity block.
+        finished_message = f"consensus panel finished: {ok_count}/{len(voices)} ok"
+        if result.diversity is not None:
+            finished_message += f" -- {result.diversity.headline}"
         lifecycle.mark_closed(
             ActivityEvent(
                 kind=ActivityEventKind.PANEL_FINISHED,
                 tool="consensus",
                 depth=base_depth,
                 declared=declared,
-                done=sum(1 for voice in voices if voice.ok),
+                done=ok_count,
                 observed_agents=topology.observed_peak_agents,
-                message=f"consensus panel finished: {sum(1 for v in voices if v.ok)}/{len(voices)} ok",
+                message=finished_message,
             )
         )
         return result
@@ -760,8 +766,13 @@ class ConsensusService:
         )
 
     def _diversity(self, voices: list[DelegationResult]) -> DiversityReport | None:
-        """Effective model/provider diversity across the voices that answered, or ``None`` if none did."""
-        answered = [voice.provenance for voice in voices if voice.ok]
+        """Effective model/provider diversity across the voices that ANSWERED (ok with non-empty text), or None.
+
+        An ``ok`` voice with empty text contributed no opinion, so it is excluded from the lineage count --
+        the same answered-voice predicate the budget harvest, synthesis, and the debate diversity use, so the
+        ``answered_voices`` headline is consistent across paths and an empty success never inflates a lineage.
+        """
+        answered = [voice.provenance for voice in voices if voice.ok and voice.text.strip()]
         if not answered:
             return None
         return effective_diversity(answered, min_distinct=self._config.min_distinct)

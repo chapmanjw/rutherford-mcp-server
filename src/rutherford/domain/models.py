@@ -156,10 +156,38 @@ class DiversityReport(BaseModel):
     answered_voices: int
     distinct_models: int
     distinct_providers: int
+    #: The number of EFFECTIVE LINEAGES behind the answers (F3, item 5): how many genuinely independent
+    #: sources the panel actually spanned. Keyed on the vendor proxy now (so it equals the distinct-provider
+    #: count), but a NAMED field rather than a presentation alias of ``distinct_providers`` -- the vote-math
+    #: stretch can swap the lineage key from vendor to model-family without changing this headline contract.
+    #: A conservative trust signal: "1 effective lineage" is a real warning; a higher count is only as
+    #: trustworthy as the provenance inference (unresolved voices land in ``unknown``, not a lineage).
+    effective_lineages: int
     unknown: int
     low_diversity: bool
     models: list[str] = Field(default_factory=list)
     providers: list[str] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def headline(self) -> str:
+        """A one-sentence TRUST summary, serialized onto the result so it rides the wire, not just the fields.
+
+        A diversity statement, NOT an agreement or transport claim -- it reports how many independent lineages
+        produced the answers, so a reader can weigh the panel's outcome against its real independence (item 5,
+        5-C). Reads as a sentence: ``"2 effective lineage(s) among 5 answering voice(s)"`` -- with
+        ``"; LOW DIVERSITY"`` appended when the model OR vendor count collapsed below the floor, and an
+        ``"N unresolved"`` note when some voices' provenance could not be inferred (those count toward no
+        lineage, keeping the lineage count conservative). The ``effective_lineages`` count and the
+        ``low_diversity`` flag are separate signals on separate axes: a low count is the conservative lineage
+        signal, while the flag also watches the model axis -- so ``"0 effective lineage(s); LOW DIVERSITY"``
+        is honest (e.g. two same-model voices whose vendor was unresolved: no measurable lineage, yet the
+        model axis still caught the duplication).
+        """
+        text = f"{self.effective_lineages} effective lineage(s) among {self.answered_voices} answering voice(s)"
+        if self.unknown:
+            text += f", {self.unknown} unresolved"
+        return f"{text}; LOW DIVERSITY" if self.low_diversity else text
 
 
 class RunRollup(BaseModel):
@@ -841,8 +869,9 @@ class DebateResult(BaseModel):
     #: first surviving voice).
     synthesis_by: str | None = None
     skipped: list[SkippedTarget] = Field(default_factory=list)
-    #: Effective model/provider diversity across the final round's answering voices (F3). ``None``
-    #: when no voice survived to the final round.
+    #: Effective model/provider diversity (F3) across the LAST USABLE round's answering voices -- the round
+    #: the closing summarizes, which a budget-cut final round falls back from. ``None`` when no voice survived
+    #: to a usable round.
     diversity: DiversityReport | None = None
     #: Advisory, non-fatal notices for the caller (e.g. a suggestion to keep this debate as a job).
     notice: str | None = None

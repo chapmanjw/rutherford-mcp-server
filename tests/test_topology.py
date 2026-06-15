@@ -218,6 +218,32 @@ async def test_consensus_emits_per_voice_activity() -> None:
         assert event.correlation_id is not None
 
 
+async def test_consensus_panel_finished_carries_effective_lineages() -> None:
+    """item 5 (5-C): the F3 trust headline rides the transparency stream, not just the result's diversity block."""
+    events: list[ActivityEvent] = []
+    request = ConsensusRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_b")], prompt="what is 17 + 25?", working_dir=str(REPO_ROOT)
+    )
+    await _consensus().consensus(request, on_activity=events.append)
+    finished = next(e for e in events if e.kind is ActivityEventKind.PANEL_FINISHED)
+    assert finished.message is not None and "2 effective lineage(s)" in finished.message
+
+
+async def test_debate_computes_and_surfaces_diversity() -> None:
+    """item 5: a debate now carries a diversity report (was always None) and surfaces the headline live."""
+    events: list[ActivityEvent] = []
+    request = DebateRequest(
+        targets=[Target(cli="fake_a"), Target(cli="fake_b")],
+        prompt="what is 17 + 25?",
+        rounds=2,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _debate().debate(request, on_activity=events.append)
+    assert result.diversity is not None and result.diversity.effective_lineages == 2
+    finished = next(e for e in events if e.kind is ActivityEventKind.PANEL_FINISHED)
+    assert finished.message is not None and "effective lineage(s)" in finished.message
+
+
 def test_activity_snapshot_in_flight_columns() -> None:
     """The per-voice activity projection collapses a voice's events to its current row with the 3-H columns."""
     from rutherford.tools.jobs import _latest_voice_states

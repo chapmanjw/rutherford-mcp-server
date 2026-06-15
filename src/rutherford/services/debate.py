@@ -34,6 +34,7 @@ from ..domain.models import (
     DebateResult,
     DebateRound,
     DelegationResult,
+    DiversityReport,
     ErrorInfo,
     PanelInputs,
     PanelTarget,
@@ -45,6 +46,7 @@ from ..io.ledger import RunLedger
 from ..runtime.depth import ensure_within_aggregate_cap
 from .delegation import ActivityCallback, DelegationService, PanelLifecycle, emit_activity
 from .persistence import PanelVoice, write_panel_record
+from .strategies import effective_diversity
 
 _log = logging.getLogger("rutherford.services.debate")
 
@@ -212,6 +214,7 @@ class DebateService:
             topology = self._topology(declared, rounds, over_cap)
             usable_round = _last_usable_round(rounds)
             usable = sum(1 for c in usable_round.contributions if c.ok and c.text.strip()) if usable_round else 0
+            diversity = self._diversity(usable_round)
             run_dir: str | None = None
             if persist and self._ledger is not None:
                 run_dir = await asyncio.to_thread(
@@ -225,6 +228,10 @@ class DebateService:
                     rollup,
                     topology,
                 )
+            # Surface the F3 effective-lineages headline on the transparency stream (item 5, 5-C).
+            finished_message = f"debate panel finished: {len(rounds)} round(s)"
+            if diversity is not None:
+                finished_message += f" -- {diversity.headline}"
             lifecycle.mark_closed(
                 ActivityEvent(
                     kind=ActivityEventKind.PANEL_FINISHED,
@@ -233,7 +240,7 @@ class DebateService:
                     declared=declared,
                     done=usable,
                     observed_agents=topology.observed_peak_agents,
-                    message=f"debate panel finished: {len(rounds)} round(s)",
+                    message=finished_message,
                 )
             )
             return DebateResult(
@@ -244,6 +251,7 @@ class DebateService:
                 stop_reason=stop_reason if budget is not None else None,
                 rollup=rollup,
                 topology=topology,
+                diversity=diversity,
                 run_dir=run_dir,
             )
         finally:
@@ -307,6 +315,21 @@ class DebateService:
             topology=topology,
             extra_artifacts={"transcript.md": _render_transcript(req.prompt, rounds)},
         )
+
+    def _diversity(self, usable_round: DebateRound | None) -> DiversityReport | None:
+        """Effective model/provider diversity (F3, item 5) across the LAST USABLE round's answering voices.
+
+        A debate's trust signal is whose distinct lineages reached the final exchange, so it is measured over
+        the last round that produced answers (the same round the closing summarizes), not every turn ever run.
+        ``None`` when no voice survived to a usable round, mirroring the consensus report's "nothing answered,
+        nothing to measure" contract.
+        """
+        if usable_round is None:
+            return None
+        answered = [c.provenance for c in usable_round.contributions if c.ok and c.text.strip()]
+        if not answered:
+            return None
+        return effective_diversity(answered, min_distinct=self._config.min_distinct)
 
     def _topology(self, declared: int, rounds: list[DebateRound], over_cap: bool) -> Topology:
         """The debate's observed process/agent fan-out (N1, item 3), summed across every turn of every round.

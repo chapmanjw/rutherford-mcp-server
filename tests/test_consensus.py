@@ -127,6 +127,9 @@ async def test_consensus_diversity_high_across_distinct_models() -> None:
     assert isinstance(result, ConsensusResult)
     assert result.diversity is not None and result.diversity.low_diversity is False
     assert result.diversity.distinct_models == 2 and result.diversity.distinct_providers == 2
+    # item 5: the named effective-lineages headline (vendor proxy now) is carried on the result.
+    assert result.diversity.effective_lineages == 2
+    assert result.diversity.headline == "2 effective lineage(s) among 2 answering voice(s)"
 
 
 # --- synthesis ---------------------------------------------------------------

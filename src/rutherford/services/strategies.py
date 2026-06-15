@@ -228,6 +228,9 @@ def effective_diversity(provenances: Sequence[Provenance | None], *, min_distinc
         answered_voices=len(provenances),
         distinct_models=len(models),
         distinct_providers=len(providers),
+        # Effective lineages (item 5): the vendor proxy now -- a NAMED concept the vote-math stretch can later
+        # rekey to model-family without changing this field's meaning.
+        effective_lineages=len(providers),
         unknown=unknown,
         low_diversity=low_diversity,
         models=sorted(models),

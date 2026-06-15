@@ -178,3 +178,66 @@ def test_diversity_unknown_excluded() -> None:
     assert report.unknown == 1 and report.distinct_models == 1
     # only one resolved model -> not flagged (an all-unknown or single-known panel is unmeasured)
     assert report.low_diversity is False
+
+
+def test_effective_lineages_is_the_vendor_proxy() -> None:
+    # item 5 (5-A/5-B): effective_lineages = distinct vendor count now, as a NAMED headline concept that
+    # the vote-math stretch can later rekey to model-family without changing the field.
+    provs = [Provenance(provider="anthropic", model="opus"), Provenance(provider="anthropic", model="haiku")]
+    report = effective_diversity(provs, min_distinct=2)
+    assert report.effective_lineages == report.distinct_providers == 1
+
+
+def test_diversity_headline_reads_as_one_sentence() -> None:
+    # item 5 (5-C): a one-sentence trust summary -- effective lineages, low-diversity flag, unresolved note.
+    # `headline` is a computed field (no parens), so it serializes onto the result wire, not just the methods.
+    same = effective_diversity([Provenance(provider="openai", model="x"), Provenance(provider="openai", model="x")])
+    assert same.headline == "1 effective lineage(s) among 2 answering voice(s); LOW DIVERSITY"
+    diverse = effective_diversity(
+        [Provenance(provider="openai", model="a"), Provenance(provider="anthropic", model="b")]
+    )
+    assert diverse.headline == "2 effective lineage(s) among 2 answering voice(s)"
+    with_unknown = effective_diversity([Provenance(provider="openai", model="a"), None])
+    assert "1 unresolved" in with_unknown.headline and "LOW DIVERSITY" not in with_unknown.headline
+
+
+def test_diversity_headline_all_unknown_is_unmeasured_not_low() -> None:
+    # 5-D conservative limit: all-unknown provenance -> 0 effective lineages, NOT a false LOW DIVERSITY flag.
+    report = effective_diversity([None, None])
+    assert report.effective_lineages == 0 and report.low_diversity is False
+    assert report.headline == "0 effective lineage(s) among 2 answering voice(s), 2 unresolved"
+
+
+def test_diversity_headline_single_voice_is_unmeasured() -> None:
+    # A single resolved voice is unmeasured (no LOW DIVERSITY flag) -- the documented single-known-panel limit.
+    report = effective_diversity([Provenance(provider="openai", model="a")])
+    assert report.low_diversity is False
+    assert report.headline == "1 effective lineage(s) among 1 answering voice(s)"
+
+
+def test_diversity_headline_low_and_unresolved_together() -> None:
+    # Both clauses co-occur and in order (unresolved note, THEN the low-diversity flag): two same-vendor
+    # voices flag low diversity while a third voice's provenance is unresolved.
+    report = effective_diversity(
+        [Provenance(provider="openai", model="x"), Provenance(provider="openai", model="x"), None]
+    )
+    assert report.low_diversity is True and report.unknown == 1 and report.effective_lineages == 1
+    assert report.headline == "1 effective lineage(s) among 3 answering voice(s), 1 unresolved; LOW DIVERSITY"
+
+
+def test_diversity_zero_lineages_can_still_flag_on_the_model_axis() -> None:
+    # The two signals are on separate axes: same model id with an UNRESOLVED vendor -> 0 measurable lineages
+    # (the lineage/provider axis is unmeasured) yet the MODEL axis still catches the duplication. Honest, per
+    # the headline docstring. `unknown` tracks the MODEL axis, so it is 0 here (the model resolved).
+    report = effective_diversity([Provenance(model="dup"), Provenance(model="dup")])
+    assert report.effective_lineages == 0 and report.low_diversity is True and report.unknown == 0
+    assert report.headline == "0 effective lineage(s) among 2 answering voice(s); LOW DIVERSITY"
+
+
+def test_diversity_headline_serializes_onto_the_result_wire() -> None:
+    # Codex finding: a method is dropped by model_dump; a computed field is on the wire. Prove the sentence
+    # is in the serialized payload (what an MCP client reads), not only callable in Python.
+    from rutherford.io.serialize import to_plain
+
+    report = effective_diversity([Provenance(provider="openai", model="x"), Provenance(provider="openai", model="x")])
+    assert to_plain(report)["headline"] == "1 effective lineage(s) among 2 answering voice(s); LOW DIVERSITY"
