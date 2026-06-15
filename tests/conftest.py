@@ -20,8 +20,10 @@ import pytest
 @pytest.fixture(autouse=True)
 def _no_live_local_backends(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Refuse local-backend HTTP probes so the suite never touches a real Ollama / LM Studio."""
-    if request.module.__name__.rsplit(".", 1)[-1] == "test_local_detect":
-        yield  # this module mocks urlopen itself to test detection
+    # test_local_detect mocks urlopen itself; test_registry / test_discover fetch a local file:// registry
+    # fixture (no network, no local backend), so they opt out of the blanket urlopen refusal too.
+    if request.module.__name__.rsplit(".", 1)[-1] in ("test_local_detect", "test_registry", "test_discover"):
+        yield
         return
 
     def _refuse(*_args: object, **_kwargs: object) -> object:

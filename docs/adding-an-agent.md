@@ -12,6 +12,15 @@ The Agent Client Protocol maintains a **public registry of every agent and bridg
 - Browse: <https://agentclientprotocol.com/get-started/registry> (also listed at <https://zed.dev/acp>)
 - Machine-readable: <https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json>
 
+Rutherford can **discover registry agents you already have**: run `discover` (the MCP tool) or
+`python -m rutherford discover` from a terminal. It fetches the registry, finds which listed agents are
+installed on this machine (scanning PATH plus `~/.local/bin`, `~/.cargo/bin`, and `~/.<vendor>/bin` — it
+even finds a custom-path install like Qoder's `~/.qoder/bin/qodercli/`), probes each with a real read-only
+ACP round trip, and prints a ready-to-paste `[agents.<id>]` block for the ones that drive. It is
+detect-only — it never downloads or runs `npx`. Add `--write` (CLI) or `write=true` (tool) to append the
+proposal to your config (never overwriting an existing section). For an agent `discover` cannot place (a
+download-only entry, or one you want to wire by hand), add it manually as below.
+
 Rutherford is the ACP **client**, so anything that exposes an ACP **server** over stdio can be driven by
 it — and every registry entry does. Two kinds of entry, both added the same way (the config below):
 

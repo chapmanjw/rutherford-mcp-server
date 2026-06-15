@@ -8,6 +8,24 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`discover`: registry-driven detection of installed ACP agents (a new tool + `python -m rutherford
+  discover` CLI).** Fetches the community [ACP agent registry](https://agentclientprotocol.com/get-started/registry)
+  (cached at `~/.rutherford/acp-registry.json` for offline reuse; the CDN needs a real User-Agent), detects
+  which registry agents are ALREADY installed on this machine, probes the ones it finds with a real
+  read-only ACP round trip, and proposes a reviewable `[agents.<id>]` config block for every new agent that
+  drives. Detection is **detect-only**: it scans PATH plus curated install dirs (`~/.local/bin`,
+  `~/.cargo/bin`, and every `~/.<vendor>/bin`, one subdir deep — which is how it finds a custom-path install
+  like Qoder at `~/.qoder/bin/qodercli/`) and **never downloads or runs `npx`**. A registry id that aliases a
+  built-in (e.g. `codex-acp` → `codex`, `mistral-vibe` → `vibe`) is recognized as already-in-roster, so it is
+  never proposed as a duplicate. `write=true` (CLI `--write`) appends the proposal to the project config the
+  loader actually reads (`--global` for the global one), creating the file if needed and never overwriting an
+  existing section; `probe=false` (`--no-probe`) returns the raw detection without spawning anything. Safety
+  posture (hardened over an adversarial review): probing only ever spawns a resolved agent binary, never a
+  shell/interpreter — a structural family classifier refuses `powershell`/`python`/`node`/`R` and their
+  versioned, `-dbg`/`-preview`, `.cmd`-shim, and `pythonw`-variant forms, so a tampered registry cannot get
+  code-bearing args executed; the written config is TOML-injection-safe (a registry id is only kept if it is a
+  safe bare key, comment text and command args are fully escaped, and a write into a malformed config is
+  refused rather than risked). Use it to adopt any ACP agent or bridge Rutherford does not ship as a built-in.
 - **Two more built-in agents (18 total): `gemini` and `qoder`.** `gemini` is Google's official Gemini CLI
   (`gemini --acp`, provider `google`) — live-verified driving over ACP (status=ok, ~2.2s), which supersedes
   the earlier "headless ACP known-issue" note (fixed by Gemini CLI 0.46.0); it adds a Google/Gemini voice to

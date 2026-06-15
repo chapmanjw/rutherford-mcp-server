@@ -35,6 +35,7 @@ from .tools.capabilities import capabilities_tool, doctor_tool
 from .tools.consensus import consensus_tool
 from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
+from .tools.discover import discover_tool
 from .tools.jobs import activity_tool, cancel_job_tool, job_result_tool, job_status_tool, list_jobs_tool
 from .tools.panels import reload_panels_tool
 from .tools.plan import plan_tool
@@ -51,7 +52,8 @@ mcp: FastMCP = FastMCP(
         "yolo are explicit opt-in behind a trusted workspace. Long tasks can run as background jobs "
         "(mode=async), enumerated with `list_jobs`, polled with `job_status` / `job_result`, and cancelled "
         "with `cancel_job`; `activity` is the focused snapshot of just the jobs in flight right now. First "
-        "time here? `setup` shows where config lives and scaffolds a starter config.toml."
+        "time here? `setup` shows where config lives and scaffolds a starter config.toml, and `discover` "
+        "finds ACP agents you already have installed (via the community registry) and proposes config for them."
     ),
 )
 
@@ -463,6 +465,23 @@ async def setup(scope: str = "project", write: bool = False, trust_workspace: bo
 
 
 @mcp.tool
+async def discover(refresh: bool = False, probe: bool = True, write: bool = False, scope: str = "project") -> str:
+    """Find installed ACP agents via the community registry and propose `[agents.<id>]` config for them.
+
+    The registry-driven companion to `setup`/`doctor`. It fetches the ACP agent registry (cached under
+    `~/.rutherford/acp-registry.json` for offline use), detects which registry agents are ALREADY installed
+    here -- scanning PATH plus curated install dirs (`~/.local/bin`, `~/.cargo/bin`, `~/.<vendor>/bin`),
+    never downloading or running `npx` -- and (with `probe=true`, the default) drives each found agent with a
+    real read-only ACP round trip so the proposal only includes ones that actually answer. Returns the
+    discovered agents and a proposed `[agents.<id>]` config block for the new drivers. `write=true` appends
+    that block to the config for `scope` (`project` -> `<cwd>/.rutherford/config.toml`, `global` -> the
+    platform path), creating the file if needed and never overwriting an existing section. `refresh`
+    re-fetches the registry. Use this to adopt an ACP agent (or bridge) Rutherford does not ship as a built-in.
+    """
+    return await _guarded(discover_tool(get_app(), refresh=refresh, probe=probe, write=write, scope=scope))
+
+
+@mcp.tool
 async def doctor(agent: str | None = None, timeout_s: float = 60.0) -> str:
     """Probe each agent (or one named `agent`) with a real read-only ACP round trip and report conformance.
 
@@ -563,9 +582,33 @@ def _init(args: list[str]) -> None:
     print("next: run the `doctor` tool from your MCP client to see which agents answer over ACP.")
 
 
+def _discover(args: list[str]) -> None:
+    """Registry-driven discovery CLI (``python -m rutherford discover [--global] [--write] [--no-probe] [--refresh]``).
+
+    Fetches the ACP registry, detects installed agents (PATH + curated install dirs; never downloads),
+    probes the ones found (unless ``--no-probe``), and prints the discovered agents plus a proposed
+    ``[agents.<id>]`` config block for the new drivers. ``--write`` appends that block to the project config
+    (``--global`` for the global one), never clobbering an existing section. The same logic the ``discover``
+    MCP tool runs, surfaced for the terminal so a user can adopt agents before wiring up an MCP client.
+    """
+    scope = "global" if "--global" in args else "project"
+    write = "--write" in args
+    probe = "--no-probe" not in args
+    refresh = "--refresh" in args
+    try:
+        config = load_config().model_copy(update={"auto_detect_local_models": False})
+    except ConfigError as exc:
+        print(f"rutherford: ignoring an invalid existing config ({exc}); discovering with defaults", file=sys.stderr)
+        config = RutherfordConfig(auto_detect_local_models=False)
+    app = build_app_context(config=config)
+    print("rutherford: fetching the ACP registry and probing installed agents (this can take a moment)...")
+    out = asyncio.run(discover_tool(app, refresh=refresh, probe=probe, write=write, scope=scope))
+    print(out)
+
+
 def main() -> None:
     """Console entry point: start the stdio MCP server. ``--smoke`` builds the app and exits, no server loop;
-    ``init`` scaffolds a starter config and exits.
+    ``init`` scaffolds a starter config and exits; ``discover`` finds installed ACP agents and exits.
 
     The smoke path is the entrypoint health check (``just smoke``): it loads config and builds the full app
     context -- exercising config validation and registry build -- then prints a line and returns instead of
@@ -574,6 +617,9 @@ def main() -> None:
     argv = sys.argv[1:]
     if argv and argv[0] == "init":
         _init(argv[1:])
+        return
+    if argv and argv[0] == "discover":
+        _discover(argv[1:])
         return
     smoke = "--smoke" in sys.argv
     try:
