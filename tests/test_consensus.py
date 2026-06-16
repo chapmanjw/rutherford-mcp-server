@@ -113,6 +113,48 @@ async def test_consensus_collects_every_voice() -> None:
     assert all(voice.ok and "42" in voice.text for voice in result.voices)
 
 
+async def test_consensus_applies_per_seat_effort_to_each_voice() -> None:
+    # A panel can pin DIFFERENT efforts per seat: the claude_code-id fake advertises an effort config option,
+    # so each voice's own tier (high vs xhigh) is set on its own session and echoed back -- proof per-seat
+    # effort flows independently to each voice, not one uniform call-level tier.
+    claude = AgentDescriptor(
+        "claude_code",
+        "Claude",
+        _FAKE_CMD,
+        env_overrides=(("RUTHERFORD_FAKE_EFFORT_OPTION", "effort:low,medium,high,xhigh,max"),),
+    )
+    request = ConsensusRequest(
+        targets=[Target(cli="claude_code", effort=Effort.HIGH), Target(cli="claude_code", effort=Effort.XHIGH)],
+        prompt="EFFORT?",
+        working_dir=str(REPO_ROOT),
+    )
+    result = await _service(extra=[claude]).consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.voices[0].effort_applied is Effort.HIGH and "effort=high" in result.voices[0].text
+    assert result.voices[1].effort_applied is Effort.XHIGH and "effort=xhigh" in result.voices[1].text
+
+
+async def test_consensus_budgeted_path_applies_config_option_effort() -> None:
+    # The budgeted fan-out builds the ACPSession directly (not via delegate), so it is the OTHER route into the
+    # config-option effort path. A generous time budget routes through it WITHOUT cutting the voice, proving the
+    # tier is set and reported on the budgeted branch too -- not just the un-budgeted delegate path.
+    claude = AgentDescriptor(
+        "claude_code",
+        "Claude",
+        _FAKE_CMD,
+        env_overrides=(("RUTHERFORD_FAKE_EFFORT_OPTION", "effort:low,medium,high,xhigh,max"),),
+    )
+    request = ConsensusRequest(
+        targets=[Target(cli="claude_code", effort=Effort.XHIGH)],
+        prompt="EFFORT?",
+        working_dir=str(REPO_ROOT),
+        time_budget_s=30.0,  # generous: routes through _fan_out_budgeted but never cuts the instant fake
+    )
+    result = await _service(extra=[claude]).consensus(request)
+    assert isinstance(result, ConsensusResult)
+    assert result.voices[0].effort_applied is Effort.XHIGH and "effort=xhigh" in result.voices[0].text
+
+
 async def test_consensus_requires_a_target() -> None:
     with pytest.raises(RutherfordError) as exc:
         await _service().consensus(ConsensusRequest(targets=[], prompt="x"))

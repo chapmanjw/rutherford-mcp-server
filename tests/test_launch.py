@@ -95,3 +95,28 @@ def test_npm_shim_missing_target_falls_back(tmp_path: Path, monkeypatch: Any) ->
     (tmp_path / "tool4.ps1").write_text("# ps", encoding="utf-8")
     monkeypatch.setattr("rutherford.acp.launch.shutil.which", lambda name: str(cmd))
     assert prepare_argv(("tool4",))[0] == "powershell.exe"
+
+
+@_NT_ONLY
+def test_extensionless_npm_bin_resolves_via_cmd_sibling(tmp_path: Path, monkeypatch: Any) -> None:
+    # shutil.which returns the EXTENSIONLESS npm bin (a Unix shell script Windows cannot exec, WinError 193);
+    # prepare_argv must resolve it via the .cmd sibling shim to the real bundled .exe (codex-acp / claude case).
+    exe = tmp_path / "node_modules" / "pkg" / "bin" / "tool5.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("x", encoding="utf-8")
+    bare = tmp_path / "tool5"  # the extensionless shell-script bin npm also installs
+    bare.write_text("#!/bin/sh\n", encoding="utf-8")
+    cmd = tmp_path / "tool5.cmd"
+    cmd.write_text('@echo off\n"%dp0%\\node_modules\\pkg\\bin\\tool5.exe" %*\n', encoding="utf-8")
+    monkeypatch.setattr("rutherford.acp.launch.shutil.which", lambda name: str(bare))
+    assert prepare_argv(("tool5", "acp")) == [str(exe), "acp"]
+
+
+@_NT_ONLY
+def test_extensionless_bin_without_sibling_is_returned_unchanged(tmp_path: Path, monkeypatch: Any) -> None:
+    # No .cmd/.ps1 sibling to resolve through: prepare_argv returns the command unchanged, so the spawn fails
+    # naturally as ACP_SPAWN_FAILED rather than this function inventing a launch path.
+    bare = tmp_path / "tool6"
+    bare.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr("rutherford.acp.launch.shutil.which", lambda name: str(bare))
+    assert prepare_argv(("tool6", "acp")) == [str(bare), "acp"]

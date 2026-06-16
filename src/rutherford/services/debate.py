@@ -482,7 +482,8 @@ class DebateService:
                 policy=policy,
                 cwd=cwd,
                 model=voice.target.model,
-                effort=req.effort,
+                # F8a: a per-seat effort pins THIS voice's tier across every round; else the call-level effort.
+                effort=_seat_effort(voice.target, req.effort),
                 base_depth=base_depth,
                 # item 9 continuation: resume this seat's prior debate session where one was recorded, so the
                 # agent recalls the earlier argument; a seat that cannot reload fails open (RESUME_FAILED) and
@@ -816,7 +817,9 @@ class DebateService:
         all_contributions = [c for round_ in rounds for c in round_.contributions]
         applied = [c.effort_applied for c in all_contributions if c.effort_applied is not None]
         effort_applied = max(applied, key=EFFORT_ORDER.index) if applied else None
-        requested = [self._resolve_effort(c.target.cli, req.effort) for c in all_contributions]
+        # effort_requested is the highest tier across the SEATS (each seat's effort, else the call effort, else
+        # config); read from req.targets, since a contribution's resolved target is a bare pair with no effort.
+        requested = [self._resolve_effort(t.cli, _seat_effort(t, req.effort)) for t in req.targets]
         present = [tier for tier in requested if tier is not None]
         effort_requested = max(present, key=EFFORT_ORDER.index) if present else None
         return RunRollup(
@@ -911,6 +914,14 @@ def _with_later_stance(prompt: str, stance: Stance | None) -> str:
     if stance is Stance.AGAINST:
         return f"{prompt}\n\nKeep arguing against the proposition."
     return prompt
+
+
+def _seat_effort(target: Target, call_effort: Effort | None) -> Effort | None:
+    """A debate seat's effort before config: the seat's own ``effort`` wins, else the call-level effort (F8a).
+
+    The per-seat / call precedence; the config / global default half stays in :meth:`DebateService._resolve_effort`.
+    """
+    return target.effort if target.effort is not None else call_effort
 
 
 def _to_contribution(voice: _Voice, round_index: int, result: DelegationResult) -> DebateContribution:

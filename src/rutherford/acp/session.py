@@ -42,7 +42,7 @@ from ..domain.models import Cost, DelegationResult, ErrorInfo, Provenance, Targe
 from ..runtime.depth import child_env
 from .client import RutherfordACPClient
 from .descriptors import AgentDescriptor
-from .effort import effort_overrides
+from .effort import EFFORT_CONFIG_OPTION_IDS, clamp_to_supported, effort_overrides
 from .journal import EventJournal, journal_event_from_message
 from .launch import prepare_argv
 from .permission import PermissionPolicy
@@ -137,6 +137,10 @@ class ACPSession:
         resolved_model = model or descriptor.default_model
         self._effort = effort
         self._override = effort_overrides(descriptor, effort, model=resolved_model)
+        #: The tier this session actually applied. Seeded from the launch-time override (cline/kiro/junie/
+        #: cursor/codex-with-model know it statically); the config-option path (claude_code, codex-no-model)
+        #: updates it at open once the agent's advertised effort options are known. ``None`` for a no-op.
+        self._effort_applied = self._override.applied
         self._target = Target(cli=descriptor.id, model=self._override.model or resolved_model)
         # F2 replay-completeness: the LOGICAL launch argv (the agent's ACP-server command plus any
         # effort-override extra args), pinned here so a persisted run records what it was issued with. Kept
@@ -159,11 +163,19 @@ class ACPSession:
         #: see what the agent offered -- the "configure" signal of a handshake-only connection check. ``[]``
         #: when the agent advertises no selectable models (it runs on its own default).
         self._available_models: list[str] = []
+        #: The session config options the agent advertised at open (``session.configOptions``), captured so
+        #: the config-option effort path can find an advertised ``effort`` / ``reasoning_effort`` option and
+        #: clamp the requested tier to its values. ``[]`` when the agent advertises none.
+        self._config_options: list[object] = []
 
     @property
     def effort_applied(self) -> Effort | None:
-        """The effort tier this session actually applied (clamped), or ``None`` for a no-op (F8a, 2-L)."""
-        return self._override.applied
+        """The effort tier this session actually applied (clamped), or ``None`` for a no-op (F8a, 2-L).
+
+        For a launch-time channel this is known before open; for the config-option channel (claude_code,
+        codex-no-model) it is set during :meth:`open` once the agent's advertised effort options are read.
+        """
+        return self._effort_applied
 
     @property
     def observed_peak_agents(self) -> int | None:
@@ -282,7 +294,9 @@ class ACPSession:
             else:
                 session = await self._new_session(conn)
             self._available_models = _models_of(session)
+            self._config_options = list(session.config_options or [])
             await self._select_model(conn, session)
+            await self._select_effort(conn)
         except asyncio.CancelledError:
             await self.close()
             raise
@@ -359,6 +373,33 @@ class ACPSession:
                 conn.set_session_model(model_id=model, session_id=self._session_id),
                 timeout=self._handshake_timeout,
             )
+
+    async def _select_effort(self, conn: ClientSideConnection) -> None:
+        """Best-effort ``session/set_config_option`` for an agent that carries effort via a config option.
+
+        The config-option effort channel (F8a): when the override routed this agent here
+        (``via_config_option`` -- claude_code's ``effort`` option, codex's ``reasoning_effort`` option), find
+        the advertised option among ``session.configOptions`` and set it to the requested tier, clamped to the
+        option's own advertised values (so ``max`` on a codex option topping out at ``xhigh`` becomes
+        ``xhigh``). ``effort_applied`` is updated to the tier actually set. Never fatal: like model selection,
+        effort is an enhancement, not a handshake requirement, so any failure (or an agent that turns out to
+        advertise no such option) leaves the turn on the agent's default tier -- a reported no-op, not a crash.
+        """
+        if self._effort is None or not self._override.via_config_option or self._session_id is None:
+            return
+        found = _effort_config_option(self._config_options)
+        if found is None:
+            return  # the agent advertised no effort option after all -- honest no-op (effort_applied stays None)
+        config_id, supported = found
+        applied = clamp_to_supported(self._effort, supported)
+        if applied is None:
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                conn.set_config_option(config_id=config_id, value=applied.value, session_id=self._session_id),
+                timeout=self._handshake_timeout,
+            )
+            self._effort_applied = applied
 
     async def prompt(self, text: str, *, timeout_s: float) -> DelegationResult:
         """Run one prompt turn on the live session and return its normalized result.
@@ -445,7 +486,7 @@ class ACPSession:
         pins the logical launch for an F2 replay.
         """
         result.effort = self._effort
-        result.effort_applied = self._override.applied
+        result.effort_applied = self._effort_applied
         result.observed_peak_agents = self._observed_peak_agents
         result.argv = list(self._launch_argv)
         return result
@@ -632,3 +673,32 @@ def _models_of(session: NewSessionResponse | LoadSessionResponse) -> list[str]:
     if state is None or state.available_models is None:
         return []
     return [info.model_id for info in state.available_models]
+
+
+def _effort_config_option(options: list[object]) -> tuple[str, list[Effort]] | None:
+    """The advertised reasoning-effort config option as ``(config_id, supported_tiers)``, or ``None``.
+
+    Matched by id against :data:`~rutherford.acp.effort.EFFORT_CONFIG_OPTION_IDS` (codex's
+    ``reasoning_effort``, claude_code's ``effort``), so a new agent advertising one of those ids is covered
+    without a code change. A boolean option (no ``options`` list, e.g. codex's ``fast-mode``) is skipped.
+    ``supported_tiers`` are the option's select values parsed to :class:`Effort` -- each value is an id
+    (``low`` / ``medium`` / ... and sometimes ``default`` / ``off``), and only the ones naming a real tier are
+    kept, so ``default`` does not masquerade as one. A grouped option list (entries without a flat ``value``)
+    yields no tiers rather than raising.
+    """
+    for option in options:
+        config_id = getattr(option, "id", None)
+        values = getattr(option, "options", None)
+        if config_id not in EFFORT_CONFIG_OPTION_IDS or values is None:
+            continue
+        supported: list[Effort] = []
+        for entry in values:
+            raw = getattr(entry, "value", None)
+            if not isinstance(raw, str):
+                continue
+            try:
+                supported.append(Effort(raw))
+            except ValueError:
+                continue  # "default" / "off" and other non-tier option values are not effort tiers
+        return str(config_id), supported
+    return None

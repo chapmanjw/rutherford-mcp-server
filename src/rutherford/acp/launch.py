@@ -7,8 +7,10 @@
 JSON-RPC stdin the ACP transport needs (cmd drops it; PowerShell's ``$input | & exe`` pipeline mangles it
 into objects). So for an npm shim this resolves the shim to its REAL target -- the bundled ``.exe`` or the
 ``node <entry>.js`` it wraps -- and launches that directly with clean stdio. A non-npm shim falls back to
-the ``.ps1`` sibling via PowerShell, then ``cmd /c``. A ``.exe`` is run directly. An unresolved command is
-returned unchanged so the spawn fails naturally as ``ACP_SPAWN_FAILED`` ("not installed").
+the ``.ps1`` sibling via PowerShell, then ``cmd /c``. A ``.exe`` is run directly. When ``shutil.which``
+resolves to the EXTENSIONLESS npm bin (a Unix shell script Windows cannot exec), its ``.cmd`` / ``.ps1``
+sibling is resolved instead. An unresolved command is returned unchanged so the spawn fails naturally as
+``ACP_SPAWN_FAILED`` ("not installed").
 """
 
 from __future__ import annotations
@@ -44,6 +46,20 @@ def prepare_argv(argv: tuple[str, ...]) -> list[str]:
             if sibling.exists():
                 return [*_POWERSHELL, str(sibling), *rest]
             return ["cmd.exe", "/c", str(path), *rest]
+        if suffix == "":
+            # ``shutil.which`` returned the EXTENSIONLESS npm bin -- a Unix shell script Windows cannot exec
+            # (``CreateProcess`` -> WinError 193). It shadows the ``.cmd`` / ``.ps1`` siblings npm also installs
+            # (PATHEXT resolution can land on the bare name first). Resolve via a sibling shim, which IS a real
+            # npm shim wrapping ``[node, entry.js]`` / a bundled ``.exe`` -- so codex-acp / claude-agent-acp
+            # launch with clean JSON-RPC stdio instead of failing as "not installed".
+            for sibling_suffix in (".cmd", ".ps1"):
+                sibling = path.with_name(path.name + sibling_suffix)
+                if sibling.exists():
+                    target = _resolve_npm_shim(sibling)
+                    if target is not None:
+                        return [*target, *rest]
+                    if sibling_suffix == ".ps1":
+                        return [*_POWERSHELL, str(sibling), *rest]
     return [resolved, *rest]
 
 

@@ -44,7 +44,10 @@ from acp.schema import (
     ModelInfo,
     NewSessionResponse,
     PromptResponse,
+    SessionConfigOptionSelect,
+    SessionConfigSelectOption,
     SessionModelState,
+    SetSessionConfigOptionResponse,
 )
 
 
@@ -189,6 +192,29 @@ def _advertised_models() -> SessionModelState | None:
     return SessionModelState(available_models=infos, current_model_id=ids[0])
 
 
+def _advertised_config_options() -> list[SessionConfigOptionSelect] | None:
+    """A reasoning-effort select config option from ``RUTHERFORD_FAKE_EFFORT_OPTION``, else ``None``.
+
+    Drives the config-option effort path (F8a) without a real CLI: a test opts in by setting the env to
+    ``<id>:<v1,v2,...>`` (e.g. ``reasoning_effort:low,medium,high,xhigh`` for codex, ``effort:low,medium,high,
+    xhigh,max`` for claude_code). Off by default so the existing tests, which expect no ``set_config_option``
+    call, are unchanged. The first value is the advertised current value.
+    """
+    raw = os.environ.get("RUTHERFORD_FAKE_EFFORT_OPTION")
+    if not raw:
+        return None
+    option_id, _, values_raw = raw.partition(":")
+    values = [item.strip() for item in values_raw.split(",") if item.strip()]
+    if not option_id or not values:
+        return None
+    options = [SessionConfigSelectOption(name=value, value=value) for value in values]
+    return [
+        SessionConfigOptionSelect(
+            id=option_id.strip(), name="Effort", type="select", current_value=values[0], options=options
+        )
+    ]
+
+
 class FakeAgent:
     """A deterministic ACP agent driven entirely by the prompt text."""
 
@@ -197,6 +223,9 @@ class FakeAgent:
         #: The session id a ``session/load`` resumed, so a ``WHOAMI`` prompt can prove a turn ran on a RESUMED
         #: session (vs a fresh ``session/new``). ``None`` until a load happens.
         self._loaded_session: str | None = None
+        #: The effort tier a ``session/set_config_option`` set, so an ``EFFORT?`` prompt can prove Rutherford's
+        #: config-option effort path reached the agent and with which (clamped) value. ``None`` until set.
+        self._effort_set: str | None = None
 
     def on_connect(self, conn: Any) -> None:
         self._client = conn
@@ -216,7 +245,9 @@ class FakeAgent:
         self, cwd: str, additional_directories: Any = None, mcp_servers: Any = None, **kwargs: Any
     ) -> NewSessionResponse:
         models = _advertised_models()
-        return NewSessionResponse(session_id="fake-session-1", models=models)
+        return NewSessionResponse(
+            session_id="fake-session-1", models=models, config_options=_advertised_config_options()
+        )
 
     async def load_session(
         self, cwd: str, session_id: str, additional_directories: Any = None, mcp_servers: Any = None, **kwargs: Any
@@ -231,6 +262,21 @@ class FakeAgent:
         # effort-rewritten 'gpt-5.2[high]'); the client suppresses any error, so an unknown id is safe too.
         return None
 
+    async def set_config_option(
+        self, config_id: str, session_id: str, value: str | bool, **kwargs: Any
+    ) -> SetSessionConfigOptionResponse:
+        # Record the effort tier the config-option path set, so an EFFORT? prompt can echo it back -- proof the
+        # tier reached the agent (after Rutherford's clamp to the advertised values).
+        if isinstance(value, str):
+            self._effort_set = value
+        # The response REQUIRES the full set of options with their updated current values (a real agent echoes
+        # them back), so reflect the new current_value on the matching option rather than returning an empty set.
+        options = _advertised_config_options() or []
+        for option in options:
+            if option.id == config_id and isinstance(value, str):
+                option.current_value = value
+        return SetSessionConfigOptionResponse(config_options=options)
+
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         return None
 
@@ -243,6 +289,13 @@ class FakeAgent:
         if "REFUSE" in text:
             return PromptResponse(stop_reason="refusal")
         if "EMPTY" in text:
+            return PromptResponse(stop_reason="end_turn")
+        if "EFFORT?" in text:
+            # Report the effort tier set via session/set_config_option (or '(unset)'), so a test can prove the
+            # config-option effort path reached the agent with the clamped tier.
+            await self._client.session_update(
+                session_id, update_agent_message_text(f"effort={self._effort_set or '(unset)'}")
+            )
             return PromptResponse(stop_reason="end_turn")
         if "WHOAMI" in text:
             # Report the session this turn runs under and whether it was RESUMED (session/load) -- lets a test

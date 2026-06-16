@@ -6,6 +6,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [3.0.2] - 2026-06-15
+
+### Added
+
+- **Reasoning effort now works in panel configs for `codex`, `claude_code`, and `kiro`, and can be pinned per
+  seat.** A panel seat (and a `Target`) takes an `effort` tier, so one voice can run at `xhigh` while another
+  runs at `high`; a per-seat tier overrides the call-level `effort`, which overrides the per-agent / global
+  config default. A new `max` tier joins the scale (`claude_code` and `kiro` reach it; `codex` and `cursor`
+  clamp it to `xhigh`).
+- **Effort is delivered over ACP through each agent's real, self-described knob.** `codex` and `claude_code`
+  expose effort as an ACP *config option* (`reasoning_effort` / `effort`), so Rutherford reads the agent's
+  advertised option at session open, clamps the requested tier to the values it actually offers, and sets it
+  via `session/set_config_option` -- covering `claude_code` (previously a silent no-op) and a `codex` seat
+  with no pinned model. `kiro` takes the `--effort` launch flag; `codex` with a pinned model keeps encoding
+  the tier in the model id (`model[effort]`). An agent that advertises no effort knob is an honest no-op
+  (`effort_applied` stays null), never a false claim.
+
+### Fixed
+
+- **Windows: an agent whose npm launcher resolved to its extensionless bin failed to start** (`WinError 193`
+  -- e.g. `codex-acp` / `claude-agent-acp` when `shutil.which` returned the Unix shell-script bin that shadows
+  the `.cmd` / `.ps1` siblings on `PATHEXT` resolution). `prepare_argv` now resolves the sibling shim, so the
+  agent launches with clean JSON-RPC stdio instead of reporting `not_installed`.
+
 ## [3.0.1] - 2026-06-15
 
 ### Added

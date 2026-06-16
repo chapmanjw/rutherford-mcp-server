@@ -2,24 +2,31 @@
 # Copyright (c) 2026 John Chapman
 """Reasoning-effort tiers mapped to a per-call ACP override (F8a, decision 2-L).
 
-ACP has no protocol field for reasoning effort, so a tier becomes per-agent launch args, env, or a model-id
-rewrite -- the only places an effort knob can live over ACP. :func:`effort_overrides` is the one mapping
-table: it returns the extra args / env / rewritten model an :class:`~rutherford.acp.session.ACPSession`
-layers onto the descriptor for a single turn, plus the ``applied`` tier (clamped to what the agent supports)
-and a human ``note`` for the result. An agent with no effort knob is a reported no-op (``applied=None``), not
-a silent drop.
+ACP delivers a reasoning-effort tier one of four ways, and each wired agent uses its own real, verifiable
+knob -- so a budget that did nothing is never reported as if it did. :func:`effort_overrides` is the one
+mapping table for the *launch-time* channels (args / env / a model-id rewrite); the *session config-option*
+channel is resolved later, at session open, by :class:`~rutherford.acp.session.ACPSession` from what the
+agent actually advertises (the ``via_config_option`` flag below routes an agent there). An agent with no
+effort knob is a reported no-op (``applied=None``), not a silent drop.
 
-Only the agents whose knob is verifiable are wired, and each through its real ACP mechanism -- so a budget
-that did nothing is never reported as if it did:
+Launch-time channels (this table):
 
-* ``codex`` (``codex-acp``) -- effort rides the ACP **model id** as ``model[effort]`` (bracket syntax the
-  adapter parses; vocabulary includes ``xhigh``). Needs a concrete model to rewrite; a no-op when none.
-* ``cursor`` (``cursor-agent``) -- effort rides the model id as a ``model-<tier>`` suffix (clamps ``xhigh``
-  to ``high``). Needs a concrete model to rewrite; a no-op when none.
-* ``cline`` (``cline --acp``) -- the global ``--thinking <tier>`` launch flag, valid alongside ``--acp`` and
-  honored for every tier including ``xhigh``.
-* ``junie`` (``junie --acp=true``) -- the ``JUNIE_EFFORT`` env var sets the default effort for new sessions;
-  best-effort because the docs do not explicitly confirm it applies in ACP mode (see the note).
+* ``cline`` (``cline --acp``) -- the global ``--thinking <tier>`` launch flag, every tier.
+* ``kiro`` (``kiro-cli acp``) -- the ``--effort <tier>`` launch flag, vocabulary ``low..xhigh`` plus ``max``
+  (so no clamp: it covers every Rutherford tier).
+* ``junie`` (``junie --acp=true``) -- the ``JUNIE_EFFORT`` env var (best-effort; ACP-mode application
+  unconfirmed -- see the note).
+* ``cursor`` (``cursor-agent``) -- effort rides the model id as a ``model-<tier>`` suffix (clamps to
+  ``high``). Needs a concrete model; a no-op when none.
+* ``codex`` (``codex-acp``) WITH a concrete model -- effort rides the ACP **model id** as ``model[effort]``
+  (the bracket syntax codex-acp advertises and parses; tops out at ``xhigh``), so one ``set_model`` selects
+  both the model and the tier.
+
+Session config-option channel (``via_config_option=True``; applied at open, not here):
+
+* ``claude_code`` (``claude-agent-acp``) -- the ACP ``effort`` config option (values ``low..max``).
+* ``codex`` WITHOUT a model -- the ACP ``reasoning_effort`` config option (values ``low..xhigh``), so a
+  codex seat that pins no model still gets its tier on codex's default model.
 
 Every other agent (including ``pi``, whose ``--thinking`` is an in-session RPC selector with no launch knob)
 is an honest no-op.
@@ -54,6 +61,13 @@ class EffortOverride:
     model: str | None = None
     applied: Effort | None = None
     note: str = ""
+    #: Route this agent's effort through the ACP **config-option** channel resolved at session open
+    #: (claude_code's ``effort`` option, codex's ``reasoning_effort`` option) rather than a launch-time
+    #: arg/env/model. When ``True``, the launch-time fields are empty and ``applied`` is ``None`` here --
+    #: the session discovers the agent's advertised effort option, clamps the requested tier to its values,
+    #: sets it, and reports the actually-applied tier. A no-op (``applied`` stays ``None``) if the agent
+    #: advertises no such option after all.
+    via_config_option: bool = False
 
     @property
     def env_dict(self) -> dict[str, str]:
@@ -91,21 +105,49 @@ def effort_overrides(descriptor: AgentDescriptor, effort: Effort | None, *, mode
 
 
 def _codex(model: str | None, effort: Effort) -> EffortOverride:
-    """Codex: encode effort in the ACP model id as ``model[effort]`` (the ``codex-acp`` adapter parses it).
+    """Codex: encode effort in the ACP model id as ``model[effort]`` when a model is pinned, else the
+    ``reasoning_effort`` config option.
 
-    The adapter advertises ``base[effort]`` model ids and validates the effort against the model, so the tier
-    must ride a concrete model. With no model resolved there is nothing to rewrite, so this reports a no-op
-    rather than guessing a base model.
+    codex-acp advertises ``base[effort]`` model ids (live-confirmed: ``gpt-5.5[low|medium|high|xhigh]``), so
+    with a concrete model one ``set_model`` selects both the model and the tier. With NO model the bare id is
+    not advertised (so ``set_model`` would be skipped); codex-acp also exposes a ``reasoning_effort`` config
+    option, so this routes the no-model case there instead of dropping the tier (the old behavior). Codex tops
+    out at ``xhigh``, so ``max`` clamps down -- reported on the model-id note; the config-option path clamps to
+    the option's advertised values at open.
     """
-    applied = _clamp(effort, _CODEX_CEILING)
     if not model:
         return EffortOverride(
-            note=f"effort '{effort.value}' needs a model for codex's 'model[effort]' id; none resolved, ignored"
+            via_config_option=True,
+            note=f"reasoning effort '{effort.value}' via codex's 'reasoning_effort' config option (no model pinned)",
         )
+    applied = _clamp(effort, _CODEX_CEILING)
     note = f"reasoning effort via the codex model id '[{applied.value}]'"
-    if applied is not effort:  # unreachable today (xhigh is the ceiling) but kept honest if the ceiling drops
-        note += f" (clamped from {effort.value})"  # pragma: no cover
+    if applied is not effort:
+        note += f" (clamped from {effort.value})"
     return EffortOverride(model=_codex_model(model, applied), applied=applied, note=note)
+
+
+def _claude_code(model: str | None, effort: Effort) -> EffortOverride:
+    """Claude Code: the ACP ``effort`` config option (resolved at session open).
+
+    claude-agent-acp advertises an ``effort`` config option whose values are the current model's supported
+    levels (live-confirmed ``default/low/medium/high/xhigh/max``), settable over ACP via ``set_config_option``
+    -- not a launch flag and not the model id. So this just routes to the config-option channel; the session
+    discovers the option, clamps the requested tier to the model's advertised levels, and applies it.
+    """
+    return EffortOverride(
+        via_config_option=True,
+        note=f"reasoning effort '{effort.value}' via claude_code's 'effort' config option",
+    )
+
+
+def _kiro(model: str | None, effort: Effort) -> EffortOverride:
+    """Kiro: the ``kiro-cli acp --effort <tier>`` launch flag (live-confirmed ``low..xhigh`` plus ``max``).
+
+    Kiro's vocabulary covers every Rutherford tier, so no clamp applies -- the requested tier rides the launch
+    argv directly, like cline's ``--thinking``.
+    """
+    return EffortOverride(extra_args=("--effort", effort.value), applied=effort, note=f"--effort {effort.value}")
 
 
 def _cursor(model: str | None, effort: Effort) -> EffortOverride:
@@ -178,7 +220,32 @@ _Builder = Callable[[str | None, Effort], EffortOverride]
 #: The per-agent effort builders, keyed by agent id. An id absent here has no effort knob (a reported no-op).
 _BUILDERS: dict[str, _Builder] = {
     "codex": _codex,
+    "claude_code": _claude_code,
     "cursor": _cursor,
     "cline": _cline,
     "junie": _junie,
+    "kiro": _kiro,
 }
+
+#: Config-option ids an agent uses to advertise its reasoning-effort tier over ACP. The session's
+#: config-option effort path matches an advertised option by one of these ids (codex uses
+#: ``reasoning_effort``, claude_code uses ``effort``), so a new agent that advertises one of them is covered
+#: without a code change. Kept here, next to the builders, so the two halves of the effort wiring stay together.
+EFFORT_CONFIG_OPTION_IDS: frozenset[str] = frozenset({"effort", "reasoning_effort"})
+
+
+def clamp_to_supported(effort: Effort, supported: list[Effort]) -> Effort | None:
+    """Clamp ``effort`` to the nearest tier at-or-below it within ``supported`` (the config-option path).
+
+    ``supported`` is the agent's advertised effort options parsed to :class:`Effort` (order-agnostic). The
+    requested tier wins if offered; otherwise the highest supported tier below it (so ``max`` on a codex
+    option topping out at ``xhigh`` becomes ``xhigh``); if the request is below every supported tier, the
+    lowest supported one. ``None`` only when nothing is supported (the caller then leaves effort a no-op).
+    """
+    if not supported:
+        return None
+    if effort in supported:
+        return effort
+    ordered = sorted(supported, key=EFFORT_ORDER.index)
+    below = [tier for tier in ordered if EFFORT_ORDER.index(tier) < EFFORT_ORDER.index(effort)]
+    return below[-1] if below else ordered[0]

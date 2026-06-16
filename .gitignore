@@ -20,6 +20,7 @@ venv/
 .coverage.*
 coverage.xml
 htmlcov/
+*,cover
 
 # Local research receipts (kept out of commits)
 .research/

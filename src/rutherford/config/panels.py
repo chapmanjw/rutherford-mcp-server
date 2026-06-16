@@ -27,7 +27,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..domain.enums import Stance, Strategy
+from ..domain.enums import Effort, Stance, Strategy
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import Target
@@ -39,7 +39,7 @@ PANELS_FILENAME = "panels.toon"
 
 #: The keys a panel record and a panel target may carry. Anything else is a validation error.
 _PANEL_KEYS = frozenset({"description", "strategy", "targets"})
-_TARGET_KEYS = frozenset({"cli", "model", "role", "label", "weight", "parity", "stance"})
+_TARGET_KEYS = frozenset({"cli", "model", "role", "label", "weight", "parity", "stance", "effort"})
 
 
 class PanelTarget(BaseModel):
@@ -63,6 +63,10 @@ class PanelTarget(BaseModel):
     weight: float | None = Field(default=None, ge=0)
     parity: bool | None = None
     stance: Stance | None = None
+    #: Per-seat reasoning-effort tier (F8a): pins THIS voice's tier (e.g. a codex seat at ``xhigh`` next to a
+    #: claude seat at ``high``), overriding the call-level ``effort``. ``None`` falls back to the call's
+    #: effort, then config. Maps onto :class:`~rutherford.domain.models.Target.effort`.
+    effort: Effort | None = None
 
 
 class Panel(BaseModel):
@@ -90,6 +94,7 @@ class Panel(BaseModel):
                 weight=target.weight,
                 parity=target.parity,
                 stance=target.stance,
+                effort=target.effort,
             )
             for target in self.targets
         ]
@@ -293,6 +298,11 @@ def _parse_target(
     if stance is not None and stance not in {member.value for member in Stance}:
         options = ", ".join(member.value for member in Stance)
         problems.append({**here, "error": f"unknown stance {stance!r}; choose one of: {options}"})
+
+    effort = raw.get("effort")
+    if effort is not None and effort not in {member.value for member in Effort}:
+        options = ", ".join(member.value for member in Effort)
+        problems.append({**here, "error": f"unknown effort {effort!r}; choose one of: {options}"})
 
     weight = raw.get("weight")
     if weight is not None and not isinstance(weight, (int, float)):

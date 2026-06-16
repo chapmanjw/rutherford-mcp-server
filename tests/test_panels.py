@@ -21,7 +21,7 @@ from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.config.panels import Panel, PanelCache, PanelStore, PanelTarget, load_panels
 from rutherford.config.schema import RutherfordConfig
 from rutherford.context import AppContext, build_app_context
-from rutherford.domain.enums import Stance, Strategy
+from rutherford.domain.enums import Effort, Stance, Strategy
 from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.errors import RutherfordError
 from rutherford.domain.models import Target
@@ -80,6 +80,36 @@ def test_loads_a_panel_with_its_targets_and_strategy(tmp_path: Path) -> None:
     assert [t.cli for t in targets] == ["fake", "fake_a"]
     assert targets[1].stance is Stance.AGAINST
     assert targets[1].effective_weight == 2.0
+
+
+def test_loads_per_seat_effort_onto_the_target(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_panels(
+        home,
+        {
+            "crew": {
+                "targets": [
+                    {"cli": "fake", "effort": "xhigh"},
+                    {"cli": "fake_a", "effort": "high"},
+                    {"cli": "fake_b"},  # no per-seat effort -> None (inherits the call/config)
+                ]
+            }
+        },
+    )
+    store = load_panels(KNOWN, env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    targets = store.get("crew").to_targets()
+    assert targets[0].effort is Effort.XHIGH
+    assert targets[1].effort is Effort.HIGH
+    assert targets[2].effort is None
+
+
+def test_unknown_effort_is_panel_invalid(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_panels(home, {"crew": {"targets": [{"cli": "fake", "effort": "turbo"}]}})
+    with pytest.raises(RutherfordError) as exc:
+        load_panels(KNOWN, env={"USERPROFILE": str(home)}, cwd=str(tmp_path / "proj"))
+    assert exc.value.code is ErrorCode.PANEL_INVALID
+    assert "unknown effort" in str(exc.value)
 
 
 def test_project_scope_overrides_user_scope_by_name(tmp_path: Path) -> None:

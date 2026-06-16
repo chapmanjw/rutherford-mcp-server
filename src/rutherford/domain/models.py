@@ -71,6 +71,10 @@ class Target(BaseModel):
     weight: float | None = Field(default=None, ge=0)
     parity: bool | None = None
     stance: Stance | None = None
+    #: Per-seat reasoning-effort tier (F8a). Overrides the call-level ``effort`` for just this seat, so a
+    #: panel can pin one voice to ``xhigh`` and another to ``high``. ``None`` falls back to the call's
+    #: ``effort``, then the per-agent / global config default. A no-op for an agent with no effort knob.
+    effort: Effort | None = None
 
     @property
     def display_label(self) -> str:

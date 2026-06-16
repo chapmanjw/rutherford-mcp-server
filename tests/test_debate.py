@@ -432,6 +432,31 @@ async def test_debate_on_budget_continue_runs_every_round() -> None:
     assert result.rollup is not None and result.rollup.stop_reason == "ok" and result.rollup.cut == 0
 
 
+async def test_debate_applies_per_seat_effort_to_each_voice() -> None:
+    # A debate panel can pin DIFFERENT efforts per seat: each voice's own tier rides its own persistent session
+    # (set via the claude_code-id fake's effort config option) and is echoed back -- proof per-seat effort
+    # flows independently to each debate voice, not one uniform call-level tier.
+    claude = AgentDescriptor(
+        "claude_code",
+        "Claude",
+        _FAKE_CMD,
+        env_overrides=(("RUTHERFORD_FAKE_EFFORT_OPTION", "effort:low,medium,high,xhigh,max"),),
+    )
+    registry = DescriptorRegistry([claude])
+    service = DebateService(registry, RutherfordConfig(), DelegationService(registry, RutherfordConfig()))
+    request = DebateRequest(
+        targets=[Target(cli="claude_code", effort=Effort.HIGH), Target(cli="claude_code", effort=Effort.XHIGH)],
+        prompt="EFFORT?",
+        rounds=1,
+        working_dir=str(REPO_ROOT),
+    )
+    result = await service.debate(request)
+    contributions = result.rounds[0].contributions
+    assert all(c.ok for c in contributions)
+    assert {c.effort_applied for c in contributions} == {Effort.HIGH, Effort.XHIGH}
+    assert {c.text.strip() for c in contributions} == {"effort=high", "effort=xhigh"}
+
+
 async def test_debate_budget_rollup_records_effort_requested() -> None:
     request = DebateRequest(
         targets=[Target(cli="fake"), Target(cli="slow")],

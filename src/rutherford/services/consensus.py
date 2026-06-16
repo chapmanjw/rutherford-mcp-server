@@ -31,7 +31,7 @@ from ..acp.descriptors import DescriptorRegistry
 from ..acp.permission import PermissionPolicy
 from ..acp.session import ACPHandshakeError, ACPSession, run_acp_turn
 from ..config.schema import RutherfordConfig
-from ..domain.enums import EFFORT_ORDER, ActivityEventKind, SafetyMode, Stance, Strategy, runs_sandboxed
+from ..domain.enums import EFFORT_ORDER, ActivityEventKind, Effort, SafetyMode, Stance, Strategy, runs_sandboxed
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import (
@@ -233,7 +233,7 @@ class ConsensusService:
                     f"min_quorum ({self._config.min_quorum})",
                 )
 
-        rollup = self._rollup(req, voices, cut, budget, stop_reason, elapsed_s) if budget is not None else None
+        rollup = self._rollup(req, targets, voices, cut, budget, stop_reason, elapsed_s) if budget is not None else None
         topology = self._topology(declared, voices, over_cap)
 
         effective_synthesize = req.synthesize if req.synthesize is not None else self._config.synthesize_default
@@ -458,7 +458,8 @@ class ConsensusService:
             role=target.role or req.role,
             safety_mode=req.safety_mode,
             timeout_s=req.timeout_s,
-            effort=req.effort,  # the panel's producer-effort cap flows to every voice (F8a)
+            # F8a: a per-seat effort pins THIS voice's tier; else the call-level effort flows to every voice.
+            effort=_seat_effort(target, req.effort),
             # item 9 panel continuation: resume this seat's prior session where one was recorded.
             session_id=_resume_id(req, index),
             # When the panel persists, each voice is a child record under the parent (F2); when it does not,
@@ -488,7 +489,9 @@ class ConsensusService:
                 policy=policy,
                 cwd=cwd,
                 model=target.model,
-                effort=req.effort,
+                # F8a: resolve per-seat effort (else call, else config default) for the direct-session path,
+                # so the budgeted path honors a per-seat tier AND a configured default like the delegate path.
+                effort=self._delegation.resolve_effort(target.cli, _seat_effort(target, req.effort)),
                 base_depth=base_depth,
                 resume_session_id=_resume_id(req, index),  # item 9: resume this seat under a budget too
             )
@@ -656,7 +659,7 @@ class ConsensusService:
         voice with the cut recorded -- it stays in the panel and the denominator, never silently dropped.
         """
         partial = session.partial_text.strip() if session is not None else ""
-        effort = self._delegation.resolve_effort(target.cli, req.effort)
+        effort = self._delegation.resolve_effort(target.cli, _seat_effort(target, req.effort))
         applied = session.effort_applied if session is not None else None
         # N1 (item 3): a cut voice still spun up a subprocess, so it counts 1 toward realized fan-out and
         # carries the peak the session's sampler observed before the cut (a floor) into the panel topology.
@@ -696,6 +699,7 @@ class ConsensusService:
     def _rollup(
         self,
         req: ConsensusRequest,
+        targets: list[Target],
         voices: list[DelegationResult],
         cut: set[int],
         budget: float | None,
@@ -717,7 +721,9 @@ class ConsensusService:
         usable = sum(1 for voice in voices if voice.ok and voice.text.strip())
         applied = [voice.effort_applied for voice in voices if voice.effort_applied is not None]
         effort_applied = max(applied, key=EFFORT_ORDER.index) if applied else None
-        requested_tiers = [self._delegation.resolve_effort(voice.target.cli, req.effort) for voice in voices]
+        # effort_requested is the highest tier across the SEATS (each seat's effort, else the call effort, else
+        # config), so a per-seat tier is reflected -- the resolved voice.target is a bare pair with no effort.
+        requested_tiers = [self._delegation.resolve_effort(t.cli, _seat_effort(t, req.effort)) for t in targets]
         present = [tier for tier in requested_tiers if tier is not None]
         effort_requested = max(present, key=EFFORT_ORDER.index) if present else None
         return RunRollup(
@@ -1271,6 +1277,16 @@ def _stance_for(target: Target, stances: list[Stance] | None, index: int) -> Sta
     if target.stance is not None:
         return target.stance
     return stances[index] if stances else None
+
+
+def _seat_effort(target: Target, call_effort: Effort | None) -> Effort | None:
+    """The effort a seat runs at before config: the seat's own ``effort`` wins, else the call-level effort.
+
+    The per-seat / call precedence half of the F8a resolution (the config / global default half stays in
+    :meth:`DelegationService.resolve_effort`), so a panel seat can pin its own tier while a bare seat inherits
+    the call's.
+    """
+    return target.effort if target.effort is not None else call_effort
 
 
 def _resume_id(req: ConsensusRequest, index: int) -> str | None:

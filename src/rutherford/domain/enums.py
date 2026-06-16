@@ -146,19 +146,24 @@ class Strategy(StrEnum):
 class Effort(StrEnum):
     """The universal reasoning-effort tier a caller can ask a CLI to spend (F8a, decision 2-L).
 
-    Maps per adapter to that CLI's native knob (``map_effort``), clamped to the nearest tier the CLI
-    supports and reported as ``effort_applied``. Ordered least to most. The ``-fast`` serving-latency
-    variants are deliberately excluded -- they are orthogonal to thinking depth, not an effort tier.
+    Maps per adapter to that CLI's native knob, clamped to the nearest tier the CLI supports and
+    reported as ``effort_applied``. Ordered least to most. The ``-fast`` serving-latency variants are
+    deliberately excluded -- they are orthogonal to thinking depth, not an effort tier.
+
+    ``max`` is the top tier: claude_code (``effort`` config option) and kiro (``--effort``) advertise it
+    live; codex (``reasoning_effort`` tops out at ``xhigh``) and cursor (``-high`` suffix) clamp ``max``
+    down to their own ceiling, reported honestly as ``effort_applied``.
     """
 
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
     XHIGH = "xhigh"
+    MAX = "max"
 
 
-#: The canonical effort order, least to most, for clamp-to-nearest in ``map_effort``.
-EFFORT_ORDER: tuple[Effort, ...] = (Effort.LOW, Effort.MEDIUM, Effort.HIGH, Effort.XHIGH)
+#: The canonical effort order, least to most, for clamp-to-nearest.
+EFFORT_ORDER: tuple[Effort, ...] = (Effort.LOW, Effort.MEDIUM, Effort.HIGH, Effort.XHIGH, Effort.MAX)
 
 
 class TerminationReason(StrEnum):
