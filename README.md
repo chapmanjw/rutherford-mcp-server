@@ -4,7 +4,7 @@
   <img src="https://raw.githubusercontent.com/chapmanjw/rutherford-mcp-server/main/docs/images/logo.png" width="180" alt="Rutherford logo">
 </p>
 
-<h1 align="center">Rutherford</h1>
+<h1 align="center">Rutherford — MCP Server &nbsp;|&nbsp; <a href="https://github.com/chapmanjw/rutherford-claude-plugin">Claude Plugin</a></h1>
 
 <p align="center"><b>Give your AI coding agent a crew.</b></p>
 
@@ -17,6 +17,7 @@ own login and never calls a model provider's API.
 
 <p align="center">
   <a href="https://pepy.tech/projects/rutherford-mcp-server"><img src="https://static.pepy.tech/personalized-badge/rutherford-mcp-server?period=total&units=NONE&left_color=GREY&right_color=ORANGE&left_text=downloads" alt="PyPI Downloads"></a>
+  <a href="https://github.com/chapmanjw/rutherford-mcp-server"><img src="https://badgen.net/github/stars/chapmanjw/rutherford-mcp-server" alt="GitHub stars"></a>
   <a href="https://pypi.org/project/rutherford-mcp-server/"><img src="https://img.shields.io/pypi/v/rutherford-mcp-server" alt="PyPI version"></a>
   <img src="https://img.shields.io/pypi/pyversions/rutherford-mcp-server" alt="Python 3.11+">
   <a href="https://github.com/chapmanjw/rutherford-mcp-server/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/rutherford-mcp-server" alt="MIT license"></a>
@@ -34,6 +35,13 @@ own login and never calls a model provider's API.
 ```sh
 uv tool install rutherford-mcp-server
 ```
+
+> **Using Claude Code?** The [Rutherford Claude Plugin](https://github.com/chapmanjw/rutherford-claude-plugin)
+> wraps this server with one-step setup: it auto-registers the server (no manual `mcp add`) and adds
+> skills, an orchestrator agent, and slash commands for setup, panels, consensus, debate, and review.
+> Install it with `/plugin marketplace add chapmanjw/rutherford-claude-plugin` then
+> `/plugin install rutherford@rutherford-claude`. Either path is fully supported — reach for the plugin
+> for a batteries-included Claude Code experience, or wire up this server directly for any MCP client.
 
 ## What Rutherford is
 
@@ -313,3 +321,13 @@ installed and authenticated.
 ## License
 
 MIT (c) John Chapman. See [LICENSE](LICENSE).
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=chapmanjw%2Frutherford-mcp-server&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=chapmanjw/rutherford-mcp-server&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=chapmanjw/rutherford-mcp-server&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=chapmanjw/rutherford-mcp-server&type=date&legend=top-left" />
+ </picture>
+</a>
