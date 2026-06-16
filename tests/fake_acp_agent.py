@@ -44,6 +44,7 @@ from acp.schema import (
     ModelInfo,
     NewSessionResponse,
     PromptResponse,
+    SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
     SessionModelState,
@@ -192,7 +193,7 @@ def _advertised_models() -> SessionModelState | None:
     return SessionModelState(available_models=infos, current_model_id=ids[0])
 
 
-def _advertised_config_options() -> list[SessionConfigOptionSelect] | None:
+def _advertised_config_options() -> list[SessionConfigOptionSelect | SessionConfigOptionBoolean] | None:
     """A reasoning-effort select config option from ``RUTHERFORD_FAKE_EFFORT_OPTION``, else ``None``.
 
     Drives the config-option effort path (F8a) without a real CLI: a test opts in by setting the env to
@@ -208,11 +209,12 @@ def _advertised_config_options() -> list[SessionConfigOptionSelect] | None:
     if not option_id or not values:
         return None
     options = [SessionConfigSelectOption(name=value, value=value) for value in values]
-    return [
+    advertised: list[SessionConfigOptionSelect | SessionConfigOptionBoolean] = [
         SessionConfigOptionSelect(
             id=option_id.strip(), name="Effort", type="select", current_value=values[0], options=options
         )
     ]
+    return advertised
 
 
 class FakeAgent:
@@ -273,7 +275,7 @@ class FakeAgent:
         # them back), so reflect the new current_value on the matching option rather than returning an empty set.
         options = _advertised_config_options() or []
         for option in options:
-            if option.id == config_id and isinstance(value, str):
+            if isinstance(option, SessionConfigOptionSelect) and option.id == config_id and isinstance(value, str):
                 option.current_value = value
         return SetSessionConfigOptionResponse(config_options=options)
 
