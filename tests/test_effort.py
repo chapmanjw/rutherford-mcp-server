@@ -11,6 +11,7 @@ import pytest
 
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.acp.effort import EffortOverride, clamp_to_supported, effort_overrides
+from rutherford.acp.roster import build_registry
 from rutherford.config.schema import AgentConfig, RutherfordConfig
 from rutherford.domain.enums import Effort
 from rutherford.domain.models import DelegationRequest, Target
@@ -124,6 +125,87 @@ def test_unknown_agent_is_a_reported_noop() -> None:
 def test_none_effort_is_a_clean_noop() -> None:
     override = effort_overrides(_descriptor("codex"), None, model="gpt-5.2")
     assert override == EffortOverride() and override.applied is None and override.note == ""
+
+
+# --- base= clones inherit the base adapter's effort knob (lineage-then-id dispatch) -----------------------
+
+
+def _clone(agent_id: str, base: str) -> AgentDescriptor:
+    """A config clone of a built-in, built through the REAL roster so ``effort_base`` is stamped."""
+    config = RutherfordConfig(auto_detect_local_models=False, agents={agent_id: AgentConfig(base=base)})
+    return build_registry(config).get(agent_id)
+
+
+def test_base_clone_of_codex_with_a_model_inherits_the_model_id_bracket() -> None:
+    # The whole bug in one test: before the lineage fix this was the not-supported no-op; now the clone runs
+    # the real _codex builder and encodes the tier in the model id, exactly like base codex.
+    override = effort_overrides(_clone("my-codex", "codex"), Effort.HIGH, model="gpt-5.2")
+    assert override.model == "gpt-5.2[high]" and override.applied is Effort.HIGH
+
+
+def test_base_clone_of_codex_with_no_model_routes_to_the_config_option() -> None:
+    override = effort_overrides(_clone("my-codex", "codex"), Effort.HIGH, model=None)
+    assert override.via_config_option and override.model is None and override.applied is None
+
+
+def test_base_clone_of_claude_code_routes_to_the_config_option() -> None:
+    override = effort_overrides(_clone("claude-sonnet", "claude_code"), Effort.XHIGH, model="opus")
+    assert override.via_config_option and override.applied is None and override.model is None
+
+
+def test_base_clone_of_cline_inherits_the_thinking_flag() -> None:
+    override = effort_overrides(_clone("my-cline", "cline"), Effort.HIGH, model=None)
+    assert override.extra_args == ("--thinking", "high") and override.applied is Effort.HIGH
+
+
+def test_base_clone_of_kiro_inherits_the_effort_flag() -> None:
+    override = effort_overrides(_clone("my-kiro", "kiro"), Effort.HIGH, model=None)
+    assert override.extra_args == ("--effort", "high") and override.applied is Effort.HIGH
+
+
+def test_base_clone_of_junie_inherits_the_junie_effort_env() -> None:
+    override = effort_overrides(_clone("my-junie", "junie"), Effort.MEDIUM, model=None)
+    assert ("JUNIE_EFFORT", "medium") in override.extra_env and override.applied is Effort.MEDIUM
+
+
+def test_base_clone_of_cursor_with_a_model_inherits_the_suffix_and_clamp() -> None:
+    override = effort_overrides(_clone("my-cursor", "cursor"), Effort.MAX, model="gpt-5.2")
+    assert override.model == "gpt-5.2-high" and override.applied is Effort.HIGH  # cursor tops out at high
+
+
+def test_base_clone_of_cursor_with_no_model_is_an_honest_noop() -> None:
+    # Parity with base cursor's no-model branch: nothing to rewrite, so an honest no-op -- NOT a forced tier.
+    override = effort_overrides(_clone("my-cursor", "cursor"), Effort.HIGH, model=None)
+    assert override.applied is None
+
+
+def test_base_clone_of_a_knobless_base_is_still_an_honest_noop() -> None:
+    # goose has no effort knob; its clone inherits that honestly -- effort_base="goose" isn't in _BUILDERS.
+    override = effort_overrides(_clone("my-goose", "goose"), Effort.HIGH, model="m")
+    assert override.applied is None and "not supported by my-goose" in override.note
+
+
+def test_a_command_only_clone_has_no_effort_lineage() -> None:
+    # A raw command= agent that happens to exec an effort-capable adapter stays an honest no-op: lineage is
+    # NEVER inferred from command[0] (which here is the sh wrapper, not the adapter).
+    config = RutherfordConfig(
+        auto_detect_local_models=False,
+        agents={"raw": AgentConfig(command=["sh", "-c", "exec codex-acp"])},
+    )
+    descriptor = build_registry(config).get("raw")
+    assert descriptor.effort_base is None
+    override = effort_overrides(descriptor, Effort.HIGH, model="gpt-5.2")
+    assert override.applied is None and "not supported by raw" in override.note
+
+
+def test_a_same_id_override_of_codex_still_dispatches_to_codex() -> None:
+    # An in-place override keeps the base id, so effort_base == id == "codex": effort still works (it always
+    # did for same-id overrides, and the lineage stamp must not change that).
+    config = RutherfordConfig(auto_detect_local_models=False, agents={"codex": AgentConfig(default_model="gpt-5.2")})
+    descriptor = build_registry(config).get("codex")
+    assert descriptor.effort_base == "codex"
+    override = effort_overrides(descriptor, Effort.HIGH, model="gpt-5.2")
+    assert override.model == "gpt-5.2[high]" and override.applied is Effort.HIGH
 
 
 # --- effort resolution precedence (call > per-agent > default > none) --------

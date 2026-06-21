@@ -121,9 +121,9 @@ the Zed/Cline `acp.json` shape.
 | `handshake_timeout_s` | `float` or omitted | the built-in's (30s for a new agent) | Seconds for the `initialize` + `new_session` handshake (> 0). Raise it for a heavyweight agent. |
 | `timeout_s` | `float` or omitted | the global `default_timeout_s` | Per-agent run timeout (> 0) when a call names no `timeout_s`. |
 | `extra_args` | `list[str]` | `[]` | Extra arguments appended to the launch argv. |
-| `effort` | `string` or omitted | the global `default_effort` | Per-agent default reasoning-effort tier; a no-op for an agent with no effort knob. |
+| `effort` | `string` or omitted | the global `default_effort` | Per-agent default reasoning-effort tier; a no-op for an agent with no effort knob. A clone honors it only when it inherits a built-in's launch command via `base` (a raw-`command` clone has no knowable knob — see `base`). |
 | `fallback_model` | `string` or omitted | none | The model to retry with when the requested model is unavailable (F7 model fallback). `None` means this agent exposes no fallback model, so a model-unavailable failure does not retry it on another model. Most ACP agents cannot decline a named model, so this stays unset for them. |
-| `base` | `string` or omitted | none | Clone a *built-in* agent's launch command under this new id (e.g. `base = "goose"`). Mutually exclusive with `command`. |
+| `base` | `string` or omitted | none | Clone a *built-in* agent's launch command under this new id (e.g. `base = "goose"`). The clone inherits the base's launch command **and its reasoning-effort knob**, so a `base = "codex"` / `"claude_code"` / `"cursor"` / `"cline"` / `"kiro"` / `"junie"` clone honors `effort` (the same agent under a raw `command` cannot). Mutually exclusive with `command`. |
 | `backend` | `"ollama"` / `"lmstudio"` or omitted | none | Point this agent at a local model runtime. Requires `model`. See [local-models.md](local-models.md). |
 | `model` | `string` or omitted | none | The model id served by `backend` (required when `backend` is set); becomes the agent's default model. |
 | `host` | `string` or omitted | `localhost:11434` (Ollama) / `localhost:1234` (LM Studio) | The `backend` endpoint as `host:port`. |
