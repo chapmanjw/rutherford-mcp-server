@@ -65,7 +65,9 @@ class AgentConfig(BaseModel):
     fallback_model: str | None = None
     #: Reuse a BUILT-IN agent's launch command under this new id (e.g. ``base = "goose"``). The convenient
     #: way to clone a built-in -- typically paired with ``backend`` to point it at a local model runtime,
-    #: or with ``default_model`` to pin a model. Mutually exclusive with ``command``.
+    #: or with ``default_model`` to pin a model. A ``base`` clone also inherits the built-in's
+    #: reasoning-effort knob (effort resolves through the base; a raw-``command`` clone cannot). Mutually
+    #: exclusive with ``command``.
     base: str | None = None
     #: Point this agent at a LOCAL model runtime: ``"ollama"`` or ``"lmstudio"``. Rutherford fills in the
     #: right provider env for the ``base`` agent (only ``goose`` is supported as a base today), so a local

@@ -120,7 +120,10 @@ backend = "ollama"    # point it at a local runtime
 model   = "qwen3:8b"  # the model the runtime serves
 ```
 
-`base` and `command` are mutually exclusive: clone a built-in OR supply a raw command, not both. See
+`base` and `command` are mutually exclusive: clone a built-in OR supply a raw command, not both. A
+`base` clone also inherits the built-in's reasoning-effort knob, so a `base = "codex"` / `"claude_code"`
+/ `"cursor"` / `"cline"` / `"kiro"` / `"junie"` clone honors `effort` like the agent it clones; a clone
+that supplies its own raw `command` has no knowable knob and is an honest effort no-op. See
 [local-models.md](local-models.md) for the supported `(base, backend)` pairs and the requirements on
 the local model.
 
