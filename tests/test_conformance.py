@@ -51,6 +51,25 @@ def test_classify_covers_every_outcome() -> None:
     assert classify("x", _result(False, ErrorCode.ACP_SPAWN_FAILED)).installed is False
 
 
+def test_classify_model_unavailable_turn_error() -> None:
+    # A turn that reached the prompt (spawn + handshake OK) but failed because the harness/provider rejected
+    # the MODEL is reported distinctly -- the connection is healthy; only the model/provider config is wrong.
+    # This is the Bedrock/Vertex case: doctor must NOT call the agent broken just because a model id was not
+    # recognized.
+    rejected = DelegationResult(
+        target=Target(cli="x"),
+        ok=False,
+        error=ErrorInfo(code=ErrorCode.ACP_TURN_ERROR, message="the requested model is not available"),
+        text="",
+    )
+    report = classify("x", rejected)
+    assert report.status == "model_unavailable"
+    assert report.installed is True and report.answered is False
+    assert "model" in report.detail.lower()
+    # A generic turn error (no model-availability marker) still classifies as a plain "error".
+    assert classify("x", _result(False, ErrorCode.ACP_TURN_ERROR)).status == "error"
+
+
 async def test_probe_agent_working() -> None:
     report = await probe_agent(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
     assert report.status == "ok" and report.installed and report.answered
@@ -111,6 +130,33 @@ async def test_probe_connection_reachable_with_models(monkeypatch: Any) -> None:
 async def test_probe_connection_reachable_without_models() -> None:
     report = await probe_connection(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
     assert report.status == "reachable" and report.connected is True and report.models == []
+
+
+async def test_probe_connection_lists_config_option_models(monkeypatch: Any) -> None:
+    # claude_code's adapter advertises its models on the configOptions "model" channel, not SessionModelState.
+    # connect_only must surface them (it previously reported [] for such an agent -- the misleading case).
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet,haiku")
+    report = await probe_connection(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.status == "reachable" and report.models == ["default", "sonnet", "haiku"]
+
+
+async def test_probe_connection_unions_both_model_channels(monkeypatch: Any) -> None:
+    # When an agent advertises BOTH channels, available_models is the union in a deterministic order:
+    # SessionModelState ids first, then config-option values not already present.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "m1,m2")
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "m2,sonnet")
+    report = await probe_connection(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.models == ["m1", "m2", "sonnet"]
+
+
+async def test_probe_agent_model_unavailable_is_not_a_broken_agent(monkeypatch: Any) -> None:
+    # An agent that spawns + handshakes but whose turn fails because the harness/provider rejected the model
+    # (the Bedrock/Vertex Claude Code case) is reported as "model_unavailable", NOT a broken "error" /
+    # "handshake_failed". The ACP connection is healthy; only the model/provider config is wrong.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_UNAVAILABLE", "1")
+    report = await probe_agent(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.status == "model_unavailable"
+    assert report.installed is True and report.answered is False
 
 
 async def test_probe_connection_handshake_failed() -> None:

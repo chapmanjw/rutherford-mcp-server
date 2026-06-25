@@ -572,8 +572,12 @@ async def doctor(agent: str | None = None, timeout_s: float = 60.0, connect_only
     """Probe each agent (or one named `agent`) with a real read-only ACP round trip and report conformance.
 
     The trustworthy health check for ACP agents: whether each spawns, handshakes, and answers. Each report
-    is ok / no_answer / handshake_failed / not_installed / error. Slower than `capabilities` (it makes
-    a real call per agent); run it to see which of the roster actually drive on this machine. `connect_only`
+    is ok / no_answer / model_unavailable / handshake_failed / not_installed / error. `model_unavailable`
+    means spawn + handshake succeeded (the agent is reachable) but the harness/provider rejected the model on
+    the turn (a model/provider config issue, e.g. a Claude Code on AWS Bedrock / Vertex), so it is NOT reported
+    as a broken agent. Slower
+    than `capabilities` (it makes a real call per agent); run it to see which of the roster actually drive on
+    this machine. `connect_only`
     runs the lighter handshake-only check (spawn + handshake, no prompt) and reports reachable /
     handshake_failed / not_installed plus each agent's advertised models -- it shows whether Rutherford can
     talk to and configure an agent even when a model call would fail for a reason outside ACP (an auth /

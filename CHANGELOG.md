@@ -6,6 +6,27 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [3.0.3] - 2026-06-24
+
+### Fixed
+
+- **`doctor` no longer reports Claude Code (or any agent) as broken just because its model id is not a plain
+  cloud id.** When an agent is configured for a non-cloud provider -- AWS Bedrock or Vertex, where the model id
+  is e.g. `global.anthropic.claude-opus-4-8[1m]` rather than `claude-opus-4-8` -- a probe turn that fails
+  because the provider rejected the model is now reported with a new `model_unavailable` status (spawn +
+  handshake succeeded; only the model/provider config is wrong) instead of a generic `error`. The detail points
+  at the model/provider config to fix (the Bedrock/Vertex model id or `ANTHROPIC_MODEL`), so a recognizable
+  model rejection never reads as a broken agent.
+- **Model selection now reads BOTH ACP model channels.** Rutherford previously honored a requested model only
+  through `session.models` (SessionModelState). Claude Code's `claude-agent-acp` adapter advertises its
+  selectable models on the OTHER channel -- a `session.configOptions` select option whose `category` is
+  `model` (its `session.models` is empty) -- so a model could never be selected for it and `doctor
+  connect_only` misleadingly reported an empty model list. `session/set_model` (channel 1) and
+  `session/set_config_option` on a "model" option (channel 2) are both supported now, and `available_models`
+  reports the union of the two (SessionModelState ids first). As before, a model is sent only when the agent
+  advertised that exact value, so a Bedrock/Vertex harness is left on its provider's own configured model
+  rather than handed a rejected cloud id.
+
 ## [3.0.2] - 2026-06-15
 
 ### Added

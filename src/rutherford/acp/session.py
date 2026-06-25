@@ -163,6 +163,11 @@ class ACPSession:
         #: see what the agent offered -- the "configure" signal of a handshake-only connection check. ``[]``
         #: when the agent advertises no selectable models (it runs on its own default).
         self._available_models: list[str] = []
+        #: The model values advertised on the SECOND ACP model channel -- a ``configOptions`` "model" select
+        #: option. Some harnesses (claude_code via the claude-agent-acp adapter) surface their selectable models
+        #: HERE, not in ``session.models``; captured at open so :attr:`available_models` reports the union across
+        #: both channels (otherwise ``connect_only`` misleadingly reports ``[]`` for such an agent).
+        self._config_model_values: list[str] = []
         #: The session config options the agent advertised at open (``session.configOptions``), captured so
         #: the config-option effort path can find an advertised ``effort`` / ``reasoning_effort`` option and
         #: clamp the requested tier to its values. ``[]`` when the agent advertises none.
@@ -199,8 +204,17 @@ class ACPSession:
 
     @property
     def available_models(self) -> list[str]:
-        """The model ids the agent advertised at open (its selectable models); ``[]`` before open or if none."""
-        return list(self._available_models)
+        """The models the agent advertised at open across BOTH ACP model channels: the ``session.models``
+        (SessionModelState) ids first, then any ``configOptions`` "model" select values not already present
+        (claude_code's claude-agent-acp surfaces its models here, not in SessionModelState). ``[]`` before open
+        or when the agent offers neither -- a deterministic union so the order never depends on dict iteration."""
+        union = list(self._available_models)
+        seen = set(union)
+        for value in self._config_model_values:
+            if value not in seen:
+                union.append(value)
+                seen.add(value)
+        return union
 
     @property
     def partial_text(self) -> str:
@@ -295,6 +309,10 @@ class ACPSession:
                 session = await self._new_session(conn)
             self._available_models = _models_of(session)
             self._config_options = list(session.config_options or [])
+            # Capture the SECOND model channel (a configOptions "model" select option) so available_models can
+            # report the union -- claude_code's adapter advertises its models here, not in SessionModelState.
+            model_option = _model_config_option(self._config_options)
+            self._config_model_values = list(model_option[2]) if model_option is not None else []
             await self._select_model(conn, session)
             await self._select_effort(conn)
         except asyncio.CancelledError:
@@ -355,22 +373,41 @@ class ACPSession:
     async def _select_model(
         self, conn: ClientSideConnection, session: NewSessionResponse | LoadSessionResponse
     ) -> None:
-        """Best-effort ``session/set_model`` to the resolved model, so a chosen model (and a model-id-encoded
+        """Best-effort model selection across BOTH ACP model channels, so a chosen model (and a model-id-encoded
         effort tier for codex/cursor) actually takes effect over ACP. Never fatal.
 
-        The model is sent only when one is resolved AND the agent advertised it among ``session.models`` from
-        ``new_session`` -- so an agent that takes no model (or does not offer this one) is left on its default
-        rather than handed an unknown id. Any failure is swallowed: model selection is an enhancement, not a
+        Channel 1 -- ``session.models`` (SessionModelState): when the agent advertises the resolved model there,
+        ``session/set_model``. Channel 2 -- a ``session.configOptions`` "model" SELECT option: when the agent
+        advertises the resolved value there, ``session/set_config_option`` (claude_code's claude-agent-acp
+        surfaces its models this way, NOT in SessionModelState, so without this channel a model can never be
+        selected for it). The model is sent ONLY when the agent advertised the EXACT value on one of the
+        channels -- an agent that takes no model (or does not offer this one) is left on its own default rather
+        than handed an unknown id, which is what keeps a Bedrock/Vertex-configured harness on its provider's
+        model instead of a rejected cloud id. Any failure is swallowed: model selection is an enhancement, not a
         handshake requirement, and the turn proceeds on the agent's default model.
         """
         model = self._target.model
         if not model or self._session_id is None:
             return
-        if not _advertises_model(session, model):
+        # Channel 1: the ACP SessionModelState. Authoritative when it advertises the resolved model.
+        if _advertises_model(session, model):
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    conn.set_session_model(model_id=model, session_id=self._session_id),
+                    timeout=self._handshake_timeout,
+                )
+            return
+        # Channel 2: a "model" config option (alias-based harnesses, e.g. claude_code). Select via the
+        # config-option channel only when it advertises the EXACT requested value.
+        found = _model_config_option(self._config_options)
+        if found is None:
+            return
+        config_id, _current, values = found
+        if model not in values:
             return
         with contextlib.suppress(Exception):
             await asyncio.wait_for(
-                conn.set_session_model(model_id=model, session_id=self._session_id),
+                conn.set_config_option(config_id=config_id, value=model, session_id=self._session_id),
                 timeout=self._handshake_timeout,
             )
 
@@ -701,4 +738,48 @@ def _effort_config_option(options: list[object]) -> tuple[str, list[Effort]] | N
             except ValueError:
                 continue  # "default" / "off" and other non-tier option values are not effort tiers
         return str(config_id), supported
+    return None
+
+
+def _parse_model_option(option: object) -> tuple[str, str | None, list[str]] | None:
+    """Parse one config option as a model SELECT option, or ``None`` when it is not a usable select option.
+
+    A boolean option carries no value list and is skipped; only entries with a STRING ``value`` are kept, so a
+    grouped-option header (no flat ``value``) cannot leak a non-string into the model list or a
+    ``set_config_option`` call. ``current_value`` is returned when it is a string, else ``None``.
+    """
+    config_id = getattr(option, "id", None)
+    values = getattr(option, "options", None)
+    if values is None or not isinstance(config_id, str):
+        return None  # a boolean option (no value list) or a malformed option is not the model channel
+    selectable: list[str] = []
+    for entry in values:
+        raw = getattr(entry, "value", None)
+        if isinstance(raw, str):
+            selectable.append(raw)  # a grouped-option header has no flat str value and is skipped
+    current = getattr(option, "current_value", None)
+    return config_id, (current if isinstance(current, str) else None), selectable
+
+
+def _model_config_option(options: list[object]) -> tuple[str, str | None, list[str]] | None:
+    """The advertised model SELECT config option as ``(config_id, current_value, selectable_values)``, or ``None``.
+
+    The SECOND ACP model channel. Some harnesses advertise their selectable models NOT in ``session.models``
+    (SessionModelState) but as a ``session.configOptions`` select option -- claude_code's claude-agent-acp does
+    exactly this (its ``session.models`` is empty; the model lives in a select option whose values are aliases
+    like ``default`` / ``sonnet`` / ``haiku``). A semantic ``category == "model"`` option is AUTHORITATIVE; only
+    when none is advertised does a literal ``id == "model"`` option serve as the fallback -- two passes so the
+    advertised ORDER cannot let the id fallback win over a category-tagged option (a UX category is optional, so
+    the id is the fallback, not a co-equal match).
+    """
+    for option in options:
+        if getattr(option, "category", None) == "model":
+            parsed = _parse_model_option(option)
+            if parsed is not None:
+                return parsed
+    for option in options:
+        if getattr(option, "id", None) == "model":
+            parsed = _parse_model_option(option)
+            if parsed is not None:
+                return parsed
     return None

@@ -22,6 +22,7 @@ from ..domain.error_codes import ErrorCode
 from ..domain.models import DelegationResult
 from .adapters import install_hint as adapter_install_hint
 from .descriptors import AgentDescriptor
+from .failures import is_model_unavailable
 from .permission import PermissionPolicy
 from .session import ACPHandshakeError, ACPSession, run_acp_turn
 
@@ -33,7 +34,9 @@ class ConformanceReport(BaseModel):
     """The outcome of probing one agent's ACP server with a real round trip."""
 
     agent_id: str
-    #: ``ok`` (handshake + answered) | ``no_answer`` (answered empty / refused) | ``handshake_failed``
+    #: ``ok`` (handshake + answered) | ``no_answer`` (answered empty / refused) | ``model_unavailable`` (spawn +
+    #: handshake succeeded, but the turn failed because the harness/provider rejected the model -- a model/
+    #: provider config issue, e.g. a Bedrock/Vertex Claude Code, NOT a broken seat) | ``handshake_failed``
     #: (installed, but initialize/new_session failed) | ``not_installed`` (the launch command was not found)
     #: | ``error`` (some other failure).
     status: str
@@ -84,6 +87,24 @@ def classify(agent_id: str, result: DelegationResult) -> ConformanceReport:
             installed=True,
             answered=False,
             detail=message,
+            duration_s=result.duration_s,
+        )
+    # A turn that reached the prompt (spawn + handshake succeeded) but failed because the harness/provider
+    # REJECTED THE MODEL is not a broken seat -- it is a model/provider config problem. The common case: a
+    # Claude Code configured for a non-cloud provider (AWS Bedrock, Vertex) whose model id is e.g.
+    # ``global.anthropic.claude-opus-4-8[1m]`` rejects a plain cloud id. Report it distinctly so doctor does
+    # not call a reachable agent broken just because a model id was not recognized; the connection is healthy.
+    if code is ErrorCode.ACP_TURN_ERROR and is_model_unavailable(message):
+        return ConformanceReport(
+            agent_id=agent_id,
+            status="model_unavailable",
+            installed=True,
+            answered=False,
+            detail=(
+                "ACP spawn/handshake succeeded, but the prompt failed because the harness/provider rejected "
+                f"the model -- check the agent's model/provider configuration (e.g. Bedrock/Vertex model id or "
+                f"ANTHROPIC_MODEL): {message}"
+            ),
             duration_s=result.duration_s,
         )
     return ConformanceReport(
