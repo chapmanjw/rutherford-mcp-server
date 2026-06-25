@@ -3,9 +3,9 @@
 ## First step for any failure
 
 Run `doctor` before investigating further. It drives each agent with a real read-only ACP round trip
-— the only trustworthy health signal — and reports `ok`, `no_answer`, `handshake_failed`,
-`not_installed`, or `error` per agent. `capabilities` is the cheaper read (the registry, no calls) and
-tells you what is registered and how each agent launches.
+— the only trustworthy health signal — and reports `ok`, `no_answer`, `model_unavailable`,
+`handshake_failed`, `not_installed`, or `error` per agent. `capabilities` is the cheaper read (the
+registry, no calls) and tells you what is registered and how each agent launches.
 
 ---
 
@@ -52,6 +52,39 @@ model.
 - Sign in to the agent with its own login, or set its API key, then re-run `doctor`.
 - For a local-model agent, confirm the model supports tool-calling — a model without it handshakes but
   fails the agentic turn. See [local-models.md](local-models.md).
+
+### `model_unavailable` in doctor — `claude_code` 400 invalid model on Bedrock / Amazon Toolbox
+
+The seat spawned and handshook (it shows `reachable` under `doctor connect_only`), but the turn failed
+because the provider rejected the model id:
+
+```
+API Error (claude-opus-4-8): 400 The provided model identifier is invalid.
+```
+
+This is a Claude Code configured for **AWS Bedrock** / **Google Vertex**, or an enterprise wrapper such
+as **Amazon's Toolbox** build, where the third-party `claude-agent-acp` adapter resolves the model down
+to a bare cloud alias (`claude-opus-4-8`) that the provider rejects — it needs an inference-profile id
+like `us.anthropic.claude-opus-4-1-20250805-v1:0`. The standalone `claude` CLI works because it resolves
+the Bedrock model itself; the SDK/adapter path that Rutherford drives does not. `doctor` attaches a
+`remediation_hint` for this case.
+
+The fix is a per-agent `[agents.claude_code.env]` block in Rutherford's own config — it lives outside the
+`.claude` tree, so an enterprise wrapper that rewrites `settings.json` cannot revert it, and
+`ANTHROPIC_CUSTOM_MODEL_OPTION` survives an enforced model allowlist:
+
+```toml
+[agents.claude_code]
+default_model = "global.anthropic.claude-opus-4-8[1m]"
+
+[agents.claude_code.env]
+ANTHROPIC_MODEL = "global.anthropic.claude-opus-4-8[1m]"
+ANTHROPIC_CUSTOM_MODEL_OPTION = "global.anthropic.claude-opus-4-8[1m]"
+```
+
+Reconnect the MCP server (config is read once at start) and re-run `doctor agent=claude_code`. See
+**[Claude Code on Bedrock / enterprise wrappers](bedrock.md)** for the full mechanism and the approaches
+that do *not* work.
 
 ### `ACP_TURN_TIMEOUT` — the turn exceeded its limit
 
@@ -157,6 +190,7 @@ reported as a `ConfigError`, not a raw decode error.
 | `ACP_SPAWN_FAILED` | Run `doctor`; install the agent (and its ACP shim); confirm it is on PATH. |
 | `ACP_HANDSHAKE_FAILED` | Confirm the ACP launch command; raise `handshake_timeout_s`; check the agent's auth. |
 | `ACP_REFUSED` / `ACP_EMPTY_ANSWER` | The agent answered nothing; check auth, or a local model's tool-calling support. |
+| `model_unavailable` (doctor) | The provider rejected the model id; on Bedrock/Vertex/Toolbox pin one via `[agents.claude_code.env]` — see [bedrock.md](bedrock.md). |
 | `ACP_TURN_TIMEOUT` | Raise `timeout_s` or `default_timeout_s`; use `mode="async"` for long tasks. |
 | `ACP_TURN_ERROR` | A transport/protocol error mid-turn; re-run, and check `doctor`. |
 | `WORKSPACE_NOT_TRUSTED` | Pass `trust_workspace=true` or add the path to `trusted_workspaces`. |

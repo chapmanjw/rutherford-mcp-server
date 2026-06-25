@@ -315,11 +315,12 @@ class FakeAgent:
     ) -> PromptResponse:
         text = "\n".join(_block_text(block) for block in prompt)
         if os.environ.get("RUTHERFORD_FAKE_MODEL_UNAVAILABLE"):
-            # Simulate the harness/provider rejecting the model mid-turn (e.g. a Bedrock-configured Claude Code
-            # handed a plain cloud model id). Raise a RequestError so the JSON-RPC error MESSAGE (not just its
-            # data) carries the marker to the client, where session.prompt maps it to ACP_TURN_ERROR with this
-            # text -- which doctor then classifies as ``model_unavailable`` rather than a broken-agent error.
-            raise RequestError(-32603, "the requested model is not available on this provider (invalid model)")
+            # Simulate the provider rejecting the model mid-turn -- the real AWS Bedrock phrasing a Claude Code
+            # seat hits when handed a bare cloud alias. Raise a RequestError so the JSON-RPC error MESSAGE (not
+            # just its data) carries the marker to the client, where session.prompt maps it to ACP_TURN_ERROR
+            # with this text -- which doctor classifies as ``model_unavailable`` (and, on a Bedrock host, attaches
+            # the remediation hint).
+            raise RequestError(-32603, "API Error (claude-opus-4-8): 400 The provided model identifier is invalid.")
         if "HANG" in text:
             await asyncio.sleep(30)
         if "REFUSE" in text:

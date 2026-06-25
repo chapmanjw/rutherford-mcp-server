@@ -6,6 +6,30 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [3.0.5] - 2026-06-25
+
+### Added
+
+- **`doctor` remediation hint for Claude Code on AWS Bedrock / Google Vertex / enterprise wrappers.** When a
+  Claude Code seat's turn is rejected for its model id (`400 The provided model identifier is invalid`) and a
+  Bedrock/Vertex indicator is present, the conformance report carries a `remediation_hint` describing the
+  per-agent `[agents.<id>.env]` fix — pinning a valid provider model id (with `ANTHROPIC_CUSTOM_MODEL_OPTION`,
+  which survives an enterprise wrapper that rewrites `settings.json` and an enforced model allowlist).
+  `doctor` stays read-only; the hint is advisory text, gated to the Claude Code adapter seat. `setup` detects
+  a Bedrock/Vertex host and scaffolds the commented `[agents.claude_code.env]` block into the starter config.
+- **Docs: `docs/bedrock.md`** — "Claude Code on Bedrock / enterprise wrappers": the allowlist-rewrite
+  mechanism, the approaches that do *not* work, the working env-injection fix, and the
+  `ANTHROPIC_CUSTOM_MODEL_OPTION` exemption. `[agents.<id>.env]` is now documented first-class in
+  `docs/configuration.md`, and `docs/troubleshooting.md` gains a `model_unavailable` entry.
+
+### Fixed
+
+- **Hardened a flaky concurrency test.** `test_semaphore_serializes_a_wide_panel` dropped its `serial > 1.5x
+  parallel` ratio assertion — a loaded CI runner's fixed spawn overhead adds to both the serial and parallel
+  runs and compresses the ratio toward 1, which flaked on a busy Windows / Python 3.11 cell. It now asserts
+  only the spawn-overhead-invariant absolute serialization gap (`serial - parallel > 0.2s`), which is the
+  sound measure (the overhead cancels in the difference). No production code changed.
+
 ## [3.0.4] - 2026-06-25
 
 ### Fixed

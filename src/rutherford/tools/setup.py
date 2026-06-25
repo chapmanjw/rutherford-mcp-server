@@ -11,21 +11,41 @@ currently-registered agents) lets the caller see what they already have before t
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
 from ..acp.adapters import install_adapter, installable_adapters
+from ..acp.host_env import is_bedrock_or_vertex_host
 from ..config.loader import default_global_config_path
 from ..config.schema import RutherfordConfig
 from ..context import AppContext, tool_success
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 
+#: A commented, fill-in-the-id Bedrock/Vertex block for the starter config: pin a valid provider model id for
+#: the Claude Code seat. Scaffolded only when a Bedrock/Vertex host is detected. ``ANTHROPIC_CUSTOM_MODEL_OPTION``
+#: is exempt from an enforced model allowlist (so it survives where ANTHROPIC_MODEL is rewritten), and living in
+#: Rutherford's config (outside the .claude tree) means an org wrapper that rewrites settings.json cannot revert
+#: it. The example id is a placeholder -- replace it with your real inference-profile id. See docs/bedrock.md.
+_BEDROCK_BLOCK = [
+    "# AWS Bedrock / Vertex (or an enterprise wrapper like Amazon Toolbox) detected. Claude Code can reject the",
+    '# default model id here ("400 The provided model identifier is invalid"). Pin a valid provider model id',
+    "# for the claude_code seat below (replace the placeholder), then uncomment. This lives outside the .claude",
+    "# tree so an org wrapper that rewrites settings.json cannot revert it. See docs/bedrock.md.",
+    "# [agents.claude_code]",
+    '# default_model = "global.anthropic.claude-opus-4-8[1m]"',
+    "# [agents.claude_code.env]",
+    '# ANTHROPIC_MODEL = "global.anthropic.claude-opus-4-8[1m]"',
+    '# ANTHROPIC_CUSTOM_MODEL_OPTION = "global.anthropic.claude-opus-4-8[1m]"',
+    "",
+]
+
 #: The two scopes ``setup`` understands, listed in error messages.
 SCOPES = ("global", "project")
 
 
-def _starter_config(config: RutherfordConfig, *, trust_workspace: bool, cwd: Path) -> str:
+def _starter_config(config: RutherfordConfig, *, trust_workspace: bool, cwd: Path, bedrock: bool = False) -> str:
     """Build the starter ``config.toml`` as a hand-written, commented TOML string.
 
     The most useful settings appear at their *effective* defaults (read from ``config``) with a one-line
@@ -77,6 +97,8 @@ def _starter_config(config: RutherfordConfig, *, trust_workspace: bool, cwd: Pat
         "# editing panels.toon, call the reload_panels tool. See docs/ for the panels.toon schema.",
         "",
     ]
+    if bedrock:
+        lines += _BEDROCK_BLOCK
     return "\n".join(lines)
 
 
@@ -125,7 +147,8 @@ async def setup_tool(
 
     cwd = Path.cwd()
     path = _target_path(scope, cwd)
-    content = _starter_config(app.config, trust_workspace=trust_workspace, cwd=cwd)
+    bedrock = is_bedrock_or_vertex_host(os.environ)
+    content = _starter_config(app.config, trust_workspace=trust_workspace, cwd=cwd, bedrock=bedrock)
     agent_ids = app.descriptors.ids()
 
     exists = path.exists()
@@ -150,6 +173,15 @@ async def setup_tool(
         "agents": agent_ids,
         "content": content,
     }
+    if bedrock:
+        # Surface the Bedrock case explicitly: the starter config carries a commented [agents.claude_code.env]
+        # block, and a Bedrock/Vertex Claude Code often needs it (the default model id is rejected otherwise).
+        result["bedrock_detected"] = True
+        result["bedrock_note"] = (
+            "A Bedrock/Vertex Claude Code host was detected. The starter config includes a commented "
+            "[agents.claude_code.env] block -- uncomment it and set a valid provider model id if the "
+            "claude_code agent fails with '400 The provided model identifier is invalid'. See docs/bedrock.md."
+        )
     if note is not None:
         result["note"] = note
     result["adapters"] = await _adapters_section(app, install=install_adapters)

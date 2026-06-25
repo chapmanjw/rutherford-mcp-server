@@ -172,24 +172,24 @@ async def _slow_panel_elapsed(max_concurrency: int) -> tuple[float, ConsensusRes
 
 
 async def test_semaphore_serializes_a_wide_panel() -> None:
-    """With max_concurrency=1, two slow voices run SERIALLY, taking measurably longer than running in parallel.
+    """With max_concurrency=1, two slow voices run SERIALLY -- the serial run is ~one extra voice-sleep longer
+    than the parallel control, which proves the semaphore bounded concurrency to one.
 
-    The fake sleeps 0.4s per voice. Serialized that is ~0.8s of sleep; in parallel the sleeps overlap (~0.4s).
-    Asserting the serial run is measurably SLOWER than the parallel control proves the semaphore bounded
-    concurrency to one -- a relative comparison, robust to per-machine spawn overhead that a fixed floor is not.
-    The extra sleep the serialization forces (~0.4s) is the invariant; we require a margin well above timing
-    jitter (>0.2s) rather than tight wall-clock equality, so a loaded machine does not misorder the two runs.
+    The fake sleeps 0.4s per voice. Serialized that is ~0.8s of sleep; in parallel the sleeps overlap (~0.4s),
+    so serialization forces ~one extra 0.4s sleep. That absolute extra sleep is the INVARIANT: it stays ~0.4s
+    regardless of per-machine spawn overhead, because the overhead is present in BOTH runs and CANCELS in the
+    difference. We require the difference to clear half the nominal gap (>0.2s) -- well above timing jitter.
+
+    A ratio assertion (serial > 1.5x parallel) is deliberately NOT used: a loaded runner's fixed spawn overhead
+    adds to both runs and compresses the ratio toward 1 (e.g. observed serial=1.97s / parallel=1.33s -> 1.48x),
+    which flaked CI on a busy Windows runner even though the ~0.4s serialization gap held. The difference is the
+    sound measure of serialization; the ratio is not.
     """
     serial_elapsed, serial = await _slow_panel_elapsed(max_concurrency=1)
     parallel_elapsed, _ = await _slow_panel_elapsed(max_concurrency=2)
     assert len(serial.voices) == 2 and all(v.ok for v in serial.voices)
-    # Serialized adds ~one extra 0.4s sleep over the parallel run; require at least 0.2s of separation (half the
-    # nominal gap) so jitter cannot flip the order, and check the serial run is at least ~1.5x the parallel run.
     assert serial_elapsed - parallel_elapsed > 0.2, (
         f"serial={serial_elapsed:.2f}s parallel={parallel_elapsed:.2f}s -- the semaphore did not serialize"
-    )
-    assert serial_elapsed > 1.5 * parallel_elapsed, (
-        f"serial={serial_elapsed:.2f}s parallel={parallel_elapsed:.2f}s -- serial was not ~1.5x the parallel run"
     )
 
 
