@@ -66,6 +66,18 @@ def test_classify_model_unavailable_turn_error() -> None:
     assert report.status == "model_unavailable"
     assert report.installed is True and report.answered is False
     assert "model" in report.detail.lower()
+    # The exact AWS Bedrock rejection a Claude Code seat hits (word order "model identifier is invalid")
+    # must also classify as model_unavailable, not a generic broken-agent error.
+    bedrock = DelegationResult(
+        target=Target(cli="claude_code"),
+        ok=False,
+        error=ErrorInfo(
+            code=ErrorCode.ACP_TURN_ERROR,
+            message="Internal error: API Error (claude-opus-4-8): 400 The provided model identifier is invalid..",
+        ),
+        text="",
+    )
+    assert classify("claude_code", bedrock).status == "model_unavailable"
     # A generic turn error (no model-availability marker) still classifies as a plain "error".
     assert classify("x", _result(False, ErrorCode.ACP_TURN_ERROR)).status == "error"
 

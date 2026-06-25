@@ -58,6 +58,11 @@ _MODEL_UNAVAILABLE_MARKERS: tuple[str, ...] = (
     "upgrade plans to continue",
     "unknown model",
     "invalid model",
+    # AWS Bedrock / Vertex reject a model id the provider does not offer with this phrasing (note the word
+    # order differs from "invalid model" above, so it needs its own marker): e.g. a Claude Code on Bedrock
+    # handed the bare cloud alias "claude-opus-4-8" -> "The provided model identifier is invalid.".
+    "model identifier is invalid",
+    "provided model identifier",
 )
 
 

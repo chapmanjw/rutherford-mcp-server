@@ -95,6 +95,36 @@ def test_base_clones_a_builtin_launch() -> None:
     assert agent.display_name == "Goose"
 
 
+def test_base_clone_inherits_wrapped_adapter_identity() -> None:
+    # A renamed clone of a wrapped-adapter built-in (claude_code -> claude-agent-acp) keeps its underlying_cli
+    # and adapter_package, so it is still recognized as that adapter -- by doctor's install hint AND the
+    # Bedrock/Vertex model-env normalization gate (which keys off underlying_cli == "claude").
+    agent = build_registry(RutherfordConfig(agents={"bedrock_claude": AgentConfig(base="claude_code")})).get(
+        "bedrock_claude"
+    )
+    assert agent.command == ("claude-agent-acp",)
+    assert agent.underlying_cli == "claude"
+    assert agent.adapter_package == "@agentclientprotocol/claude-agent-acp"
+    assert agent.is_wrapped_adapter is True
+
+
+def test_same_id_override_preserves_wrapped_adapter_identity() -> None:
+    # Overriding a built-in in place (no raw command) must not strip its adapter identity.
+    agent = build_registry(RutherfordConfig(agents={"claude_code": AgentConfig(default_model="sonnet")})).get(
+        "claude_code"
+    )
+    assert agent.underlying_cli == "claude" and agent.is_wrapped_adapter is True
+
+
+def test_raw_command_override_drops_adapter_identity() -> None:
+    # A raw command override launches something else, so it must NOT inherit the built-in's adapter identity.
+    agent = build_registry(RutherfordConfig(agents={"claude_code": AgentConfig(command=["my-own-acp"])})).get(
+        "claude_code"
+    )
+    assert agent.command == ("my-own-acp",)
+    assert agent.underlying_cli is None and agent.is_wrapped_adapter is False
+
+
 def test_backend_ollama_fills_goose_env() -> None:
     config = RutherfordConfig(agents={"local": AgentConfig(base="goose", backend="ollama", model="gemma3:12b")})
     agent = build_registry(config).get("local")

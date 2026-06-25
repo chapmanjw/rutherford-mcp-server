@@ -50,6 +50,10 @@ def test_clean_codes_do_not_count_toward_cooldown(code: ErrorCode) -> None:
         "unknown model: gpt-9",
         "Please UPGRADE your plan to continue",
         "model_unavailable",
+        # The exact AWS Bedrock rejection a Claude Code seat hits when handed the bare cloud alias: the word
+        # order ("model identifier is invalid") differs from the "invalid model" marker, so it needs its own.
+        "ACP turn for claude_code failed: Internal error: API Error (claude-opus-4-8): 400 The provided model "
+        "identifier is invalid.. Try --model to switch to us.anthropic.claude-opus-4-1-20250805-v1:0.",
     ],
 )
 def test_model_unavailable_messages_are_detected(message: str) -> None:

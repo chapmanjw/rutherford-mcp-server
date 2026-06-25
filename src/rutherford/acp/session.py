@@ -43,6 +43,7 @@ from ..runtime.depth import child_env
 from .client import RutherfordACPClient
 from .descriptors import AgentDescriptor
 from .effort import EFFORT_CONFIG_OPTION_IDS, clamp_to_supported, effort_overrides
+from .host_env import claude_bedrock_env
 from .journal import EventJournal, journal_event_from_message
 from .launch import prepare_argv
 from .permission import PermissionPolicy
@@ -240,8 +241,14 @@ class ACPSession:
         # agent (codex/cursor) carries its effort in ``self._target.model`` instead, applied via set_model below.
         # N1 (item 3): the depth + count-first lineage env goes on last, so a spawned agent that is itself a
         # Rutherford host reads where it sits (the recursion guard) and the aggregate cap counts across layers.
+        # claude_bedrock_env normalizes a Bedrock/Vertex Claude Code seat: it resolves a valid ANTHROPIC_MODEL
+        # (so the claude-agent-acp adapter does not fall back to the bare cloud alias the provider rejects) from
+        # base_env -- so it never clobbers an explicit env override (already in base_env, re-set to the same
+        # value by precedence) -- and is a no-op ({}) for every other seat and every non-Bedrock host.
+        base_env = _resolve_env(self._descriptor)
         env = {
-            **_resolve_env(self._descriptor),
+            **base_env,
+            **claude_bedrock_env(self._descriptor, base_env, self._cwd),
             **self._override.env_dict,
             **child_env(self._base_depth, parent_run_id=self._parent_run_id),
         }

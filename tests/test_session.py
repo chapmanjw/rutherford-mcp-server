@@ -252,6 +252,41 @@ def test_model_config_option_matches_by_category_and_keeps_only_string_values() 
     assert _model_config_option([id_first, cat_second]) == ("ai_model", "default", ["default"])
 
 
+# --- Bedrock/Vertex model-env normalization (host_env.claude_bedrock_env) ------
+
+
+_CLAUDE_SEAT = AgentDescriptor(
+    "claude_code", "Claude Code", FAKE.command, provider="anthropic", underlying_cli="claude"
+)
+
+
+async def test_bedrock_claude_seat_gets_a_valid_model_injected(monkeypatch: pytest.MonkeyPatch) -> None:
+    # End-to-end: on a Bedrock host, Rutherford promotes ANTHROPIC_DEFAULT_OPUS_MODEL to ANTHROPIC_MODEL in the
+    # SPAWNED subprocess env, so the claude-agent-acp adapter no longer falls back to the bare cloud alias. The
+    # fake agent echoes its own ANTHROPIC_MODEL to prove the injection reached the subprocess.
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "us.anthropic.claude-opus-4-1-20250805-v1:0")
+    result = await run_acp_turn(
+        _CLAUDE_SEAT, "ENV=ANTHROPIC_MODEL", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0
+    )
+    assert result.ok is True
+    assert "ANTHROPIC_MODEL=us.anthropic.claude-opus-4-1-20250805-v1:0" in result.text
+
+
+async def test_non_bedrock_claude_seat_injects_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The gate: with no Bedrock/Vertex flag, behavior is identical to today -- no model is forced into the env,
+    # even when an ANTHROPIC_DEFAULT_OPUS_MODEL is present (a normal API-key seat is untouched).
+    monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "us.anthropic.should-not-be-used:0")
+    result = await run_acp_turn(
+        _CLAUDE_SEAT, "ENV=ANTHROPIC_MODEL", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0
+    )
+    assert result.ok is True and "ANTHROPIC_MODEL=(unset)" in result.text
+
+
 async def test_run_turn_handshake_failure() -> None:
     dead = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.exit(0)"))
     result = await run_acp_turn(dead, "hi", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=10.0)

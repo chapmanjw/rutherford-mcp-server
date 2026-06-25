@@ -6,6 +6,27 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [3.0.4] - 2026-06-25
+
+### Fixed
+
+- **Claude Code now drives on AWS Bedrock / Google Vertex.** When the host has `CLAUDE_CODE_USE_BEDROCK` (or
+  `CLAUDE_CODE_USE_VERTEX`) set, the `claude-agent-acp` adapter would fall back to the bare cloud alias
+  `claude-opus-4-8`, which the provider rejects (`400 The provided model identifier is invalid`) — so
+  delegate / consensus / doctor turns failed even though the seat was reachable. Rutherford now resolves a
+  valid provider model id and injects it as `ANTHROPIC_MODEL` (plus `ANTHROPIC_SMALL_FAST_MODEL` when
+  available) into the adapter's environment, so the SDK uses the real inference-profile id instead of the
+  rejected alias. The id is resolved, in order, from an already-set `ANTHROPIC_MODEL`, a `[agents.claude_code]
+  model` pinned to a raw provider id, `ANTHROPIC_DEFAULT_OPUS_MODEL`, then the `env` block of the host's
+  `~/.claude/settings.json` and `<cwd>/.claude/settings.json` (`ANTHROPIC_MODEL` then
+  `ANTHROPIC_DEFAULT_OPUS_MODEL`). It is gated to the Claude Code adapter seat and to a Bedrock/Vertex host, so
+  a normal API-key Claude Code and every other agent are untouched, and it never overrides an
+  already-configured model. Works with zero Rutherford config when the id lives in `settings.json`.
+- **`doctor` recognizes the Bedrock "invalid model identifier" rejection.** The model-unavailable classifier
+  now matches "model identifier is invalid" / "provided model identifier", so a provider model rejection is
+  reported as `model_unavailable` (the connection is healthy; the model/provider config is wrong) rather than
+  a generic `error`.
+
 ## [3.0.3] - 2026-06-24
 
 ### Fixed
