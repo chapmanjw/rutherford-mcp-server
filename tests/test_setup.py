@@ -114,6 +114,28 @@ async def test_generated_toml_parses_and_validates_against_config(tmp_path, monk
         RutherfordConfig.model_validate(parsed)  # raises on an unknown or invalid key
 
 
+async def test_bedrock_env_scaffolds_a_commented_claude_env_block(tmp_path, monkeypatch) -> None:
+    # On a Bedrock/Vertex host, setup surfaces the per-agent env fix as a commented block + a flag.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    data = decode(await setup_tool(_app(), scope="project"))
+    assert data["bedrock_detected"] is True
+    assert "bedrock_note" in data
+    assert "[agents.claude_code.env]" in data["content"]
+    assert "ANTHROPIC_CUSTOM_MODEL_OPTION" in data["content"]
+    # The block is all comments, so the scaffold still parses and validates (extra="forbid").
+    RutherfordConfig.model_validate(tomllib.loads(data["content"]))
+
+
+async def test_no_bedrock_block_off_bedrock(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    data = decode(await setup_tool(_app(), scope="project"))
+    assert "bedrock_detected" not in data
+    assert "[agents.claude_code.env]" not in data["content"]
+
+
 async def test_starter_reflects_effective_defaults(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     config = RutherfordConfig(

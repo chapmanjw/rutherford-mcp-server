@@ -82,6 +82,60 @@ def test_classify_model_unavailable_turn_error() -> None:
     assert classify("x", _result(False, ErrorCode.ACP_TURN_ERROR)).status == "error"
 
 
+_BEDROCK_CLAUDE = AgentDescriptor(
+    "claude_code", "Claude Code", FAKE.command, provider="anthropic", underlying_cli="claude"
+)
+
+
+async def test_doctor_attaches_bedrock_remediation_hint(monkeypatch: Any) -> None:
+    # A Bedrock Claude Code seat whose turn is rejected for its model id gets a targeted remediation hint
+    # pointing at the per-agent [agents.<id>.env] fix -- not just a bare model_unavailable.
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_UNAVAILABLE", "1")
+    report = await probe_agent(_BEDROCK_CLAUDE, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.status == "model_unavailable"
+    assert report.remediation_hint is not None
+    assert "[agents.claude_code.env]" in report.remediation_hint
+    assert "ANTHROPIC_CUSTOM_MODEL_OPTION" in report.remediation_hint
+
+
+async def test_doctor_no_remediation_hint_off_bedrock(monkeypatch: Any) -> None:
+    # The same model rejection with no Bedrock indicator: still model_unavailable, but no Bedrock remediation.
+    for var in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_UNAVAILABLE", "1")
+    report = await probe_agent(_BEDROCK_CLAUDE, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.status == "model_unavailable" and report.remediation_hint is None
+
+
+async def test_doctor_hint_sees_per_agent_env_overrides(monkeypatch: Any) -> None:
+    # The Bedrock indicator can come from the seat's own [agents.<id>.env] (descriptor.env_overrides), not just
+    # os.environ -- the hint reasons over the same env the subprocess gets.
+    for var in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "RUTHERFORD_FAKE_MODEL_UNAVAILABLE"):
+        monkeypatch.delenv(var, raising=False)
+    seat = AgentDescriptor(
+        "claude_code",
+        "Claude Code",
+        FAKE.command,
+        provider="anthropic",
+        underlying_cli="claude",
+        env_overrides=(("CLAUDE_CODE_USE_BEDROCK", "1"), ("RUTHERFORD_FAKE_MODEL_UNAVAILABLE", "1")),
+    )
+    report = await probe_agent(seat, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.status == "model_unavailable" and report.remediation_hint is not None
+
+
+async def test_doctor_envelope_round_trips_the_multiline_remediation_hint(monkeypatch: Any) -> None:
+    # The multi-line hint (a TOML snippet) must survive the TOON envelope serialization intact.
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_UNAVAILABLE", "1")
+    app = build_app_context(config=RutherfordConfig(), descriptors=DescriptorRegistry([_BEDROCK_CLAUDE]))
+    data = decode(await doctor_tool(app, timeout_s=60.0))
+    agent = data["agents"][0]
+    assert agent["status"] == "model_unavailable"
+    assert "ANTHROPIC_CUSTOM_MODEL_OPTION" in agent["remediation_hint"]
+
+
 async def test_probe_agent_working() -> None:
     report = await probe_agent(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
     assert report.status == "ok" and report.installed and report.answered

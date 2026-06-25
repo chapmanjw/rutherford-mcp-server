@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 from rutherford.acp.descriptors import AgentDescriptor
-from rutherford.acp.host_env import claude_bedrock_env
+from rutherford.acp.host_env import bedrock_remediation_hint, claude_bedrock_env, is_bedrock_or_vertex_host
 
 CLAUDE = AgentDescriptor(
     "claude_code",
@@ -158,3 +158,80 @@ def test_renamed_claude_seat_is_recognized_by_underlying_cli(tmp_path: Path) -> 
     )
     env = {**BEDROCK, "ANTHROPIC_DEFAULT_OPUS_MODEL": OPUS}
     assert claude_bedrock_env(renamed, env, str(tmp_path)) == {"ANTHROPIC_MODEL": OPUS}
+
+
+# --- doctor Bedrock remediation hint (bedrock_remediation_hint) ----------------
+
+INVALID = "API Error (claude-opus-4-8): 400 The provided model identifier is invalid."
+
+
+def test_is_bedrock_or_vertex_host() -> None:
+    assert is_bedrock_or_vertex_host({"CLAUDE_CODE_USE_BEDROCK": "1"}) is True
+    assert is_bedrock_or_vertex_host({"CLAUDE_CODE_USE_VERTEX": "true"}) is True
+    assert is_bedrock_or_vertex_host({"CLAUDE_CODE_USE_BEDROCK": "0"}) is False
+    assert is_bedrock_or_vertex_host({}) is False
+
+
+def test_remediation_hint_on_bedrock_claude_seat() -> None:
+    hint = bedrock_remediation_hint(CLAUDE, BEDROCK, INVALID)
+    assert hint is not None
+    # The hint names the per-agent env fix, the agent's own id, and the allowlist-exempt option.
+    assert "[agents.claude_code.env]" in hint
+    assert "ANTHROPIC_CUSTOM_MODEL_OPTION" in hint
+    assert "docs/bedrock.md" in hint
+
+
+def test_remediation_hint_templates_to_the_seat_id() -> None:
+    renamed = AgentDescriptor(
+        "bedrock_claude", "Bedrock Claude", ("claude-agent-acp",), provider="anthropic", underlying_cli="claude"
+    )
+    hint = bedrock_remediation_hint(renamed, BEDROCK, INVALID)
+    assert hint is not None and "[agents.bedrock_claude.env]" in hint
+
+
+def test_remediation_hint_echoes_a_real_id_but_never_the_bare_alias() -> None:
+    # A real provider id (here from ANTHROPIC_CUSTOM_MODEL_OPTION) is shown verbatim...
+    env = {**BEDROCK, "ANTHROPIC_CUSTOM_MODEL_OPTION": OPUS}
+    assert OPUS in (bedrock_remediation_hint(CLAUDE, env, INVALID) or "")
+    # ...but a bare cloud alias is NEVER echoed (pasting it would just reproduce the failure): use a placeholder.
+    alias_env = {**BEDROCK, "ANTHROPIC_MODEL": "claude-opus-4-8"}
+    hint = bedrock_remediation_hint(CLAUDE, alias_env, INVALID) or ""
+    assert "claude-opus-4-8>" in hint or "<your provider model id" in hint  # placeholder, not the bare alias pinned
+
+
+def test_remediation_hint_triggers_on_a_bedrock_profile_id_without_a_flag() -> None:
+    # No CLAUDE_CODE_USE_BEDROCK, but the configured model id looks like a Bedrock inference profile.
+    seat = AgentDescriptor(
+        "claude_code",
+        "Claude Code",
+        ("claude-agent-acp",),
+        provider="anthropic",
+        underlying_cli="claude",
+        default_model=OPUS,
+    )
+    assert bedrock_remediation_hint(seat, {}, INVALID) is not None
+
+
+def test_remediation_hint_triggers_on_a_custom_model_option_profile_id() -> None:
+    # The indicator also recognizes a Bedrock-shaped id supplied via ANTHROPIC_CUSTOM_MODEL_OPTION alone.
+    assert bedrock_remediation_hint(CLAUDE, {"ANTHROPIC_CUSTOM_MODEL_OPTION": OPUS}, INVALID) is not None
+
+
+def test_no_hint_without_a_bedrock_indicator() -> None:
+    # The invalid-model signature alone (no Bedrock flag, no Bedrock-shaped id) is not enough.
+    assert bedrock_remediation_hint(CLAUDE, {}, INVALID) is None
+
+
+def test_no_hint_for_a_non_signature_error() -> None:
+    assert bedrock_remediation_hint(CLAUDE, BEDROCK, "connection reset by peer") is None
+
+
+def test_no_hint_for_a_non_claude_seat() -> None:
+    # A generic 400 model error from another ACP agent must NOT get Anthropic-specific advice.
+    assert bedrock_remediation_hint(CODEX, BEDROCK, INVALID) is None
+
+
+def test_no_hint_for_a_raw_command_override() -> None:
+    # A raw-command override of claude_code drops underlying_cli, so it is not the adapter -> no hint.
+    override = AgentDescriptor("claude_code", "Claude Code", ("my-own-acp",), provider="anthropic")
+    assert bedrock_remediation_hint(override, BEDROCK, INVALID) is None
