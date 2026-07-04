@@ -65,7 +65,7 @@ agent's own account.
         +--> goose acp
         +--> codex-acp                 (the Zed adapter fronting Codex)
         +--> claude-agent-acp          (the Zed adapter fronting Claude Code)
-        +--> ... 16 more built-in agents, all config-driven
+        +--> ... 17 more built-in agents, all config-driven
 ```
 
 A voice that fails to spawn, handshake, or answer comes back as one failed result in a structured
@@ -195,7 +195,7 @@ scope), `safety_mode`, `timeout_s`, `role`, and `mode` (`sync` or `async`). `del
 
 ## The agent roster
 
-Rutherford ships **19 built-in agents** with curated launch commands and quirks (the Windows npm-shim
+Rutherford ships **20 built-in agents** with curated launch commands and quirks (the Windows npm-shim
 resolution, per-agent handshake budgets, a fixed provider) that a bare `acp.json` cannot express, so
 they work with zero config:
 
@@ -220,6 +220,7 @@ they work with zero config:
 | `gemini` | Gemini CLI | `gemini --acp` | Google / Gemini CLI login |
 | `qoder` | Qoder | `qodercli --acp` | Qoder login |
 | `grok` | Grok | `grok agent stdio` | xAI login + SuperGrok subscription |
+| `fast_agent` | fast-agent | `uvx fast-agent-acp==0.8.3` | provider API key (env or `fast-agent.secrets.yaml`) |
 
 `codex` and `claude_code` launch through the official Zed adapters (`codex-acp` and
 `claude-agent-acp`, npm `@agentclientprotocol/*`), which front the Codex and Claude Code CLIs as ACP

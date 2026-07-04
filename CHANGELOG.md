@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **New built-in agent: `fast_agent`** (evalstate's fast-agent, Apache-2.0), run as its own ACP server via
+  `uvx fast-agent-acp==0.8.3` — bringing the built-in roster to 20. The version is pinned (not `@latest`) so
+  the built-in launches the exact release whose ACP handshake was verified rather than a moving remote spec;
+  override with `[agents.fast_agent] command = [...]` to track a newer release. It is bring-your-own-model /
+  multi-provider (`provider=None`): a turn needs a provider key in the environment (`ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` / ...) or a `fast-agent.secrets.yaml`, which the agent advertises as its ACP `authMethod`.
+  ACP conformance is verified: it spawns, handshakes (`agentInfo` `fast-agent-acp` v0.8.3, `protocolVersion`
+  1), and reaches a turn that cleanly reports `Authentication required` with no key. Like `kimi` / `openhands`
+  it is a conformance-verified seat whose full answering turn is gated on the user's own provider key.
+
 ### Fixed
 
 - **A config clone of an effort-capable built-in now keeps its reasoning-effort tier.** Effort is a

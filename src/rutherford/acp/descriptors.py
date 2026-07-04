@@ -139,6 +139,19 @@ class DescriptorRegistry:
 #: connect_only`` reports ``reachable``), but a full turn needs a SuperGrok Heavy entitlement -- without it
 #: the model call returns ``403 SuperGrok Heavy subscription required`` and ``doctor`` reports it as a turn
 #: error. So it is wired up and reachable; it answers once the account is entitled.
+#:
+#: ``fast_agent`` is evalstate's fast-agent (Apache-2.0), run as its OWN ACP server via ``uvx
+#: fast-agent-acp==0.8.3`` (no separate shim -- ``uvx`` fetches and runs the package). The version is PINNED
+#: (not ``@latest``) so the built-in is reproducible: it launches the exact version whose ACP handshake was
+#: verified, not a moving remote spec resolved at each spawn. Override with ``[agents.fast_agent] command =
+#: [...]`` to track a newer release. ACP-conformance verified 2026-07-03: a real ``initialize`` handshake
+#: returns a clean result (``agentInfo`` name ``fast-agent-acp`` v0.8.3, ``protocolVersion`` 1, ``loadSession``
+#: / resume capabilities). It is bring-your-own-model / multi-provider (``provider=None``): a turn needs a
+#: provider key set in the environment (``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` / ...) or in a
+#: ``fast-agent.secrets.yaml``, which the agent advertises as its ``authMethod``. Verified to spawn,
+#: handshake, and reach a turn that cleanly reports ``Authentication required`` with no provider key -- so,
+#: like ``kimi`` / ``openhands`` (and ``grok``'s entitlement gate), it is a conformance-verified seat whose
+#: full answering turn is gated on the user's own provider key, not confirmed on the maintainer's machine.
 HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("goose", "Goose", ("goose", "acp")),
     AgentDescriptor("opencode", "OpenCode", ("opencode", "acp")),
@@ -173,6 +186,7 @@ HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("gemini", "Gemini CLI", ("gemini", "--acp"), provider="google"),
     AgentDescriptor("qoder", "Qoder", ("qodercli", "--acp"), provider="qoder"),
     AgentDescriptor("grok", "Grok", ("grok", "agent", "stdio"), provider="xai"),
+    AgentDescriptor("fast_agent", "fast-agent", ("uvx", "fast-agent-acp==0.8.3")),
 )
 
 

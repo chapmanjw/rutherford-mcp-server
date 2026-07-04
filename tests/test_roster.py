@@ -18,11 +18,12 @@ from rutherford.domain.errors import ConfigError
 def test_no_config_is_the_builtin_roster() -> None:
     # auto_detect_local_models off so the count is deterministic regardless of a running local backend.
     registry = build_registry(RutherfordConfig(auto_detect_local_models=False))
-    assert len(registry) == len(HIGH_FIDELITY) == 19
+    assert len(registry) == len(HIGH_FIDELITY) == 20
     assert registry.get("goose").command == ("goose", "acp")
     assert registry.get("gemini").command == ("gemini", "--acp")
     assert registry.get("qoder").command == ("qodercli", "--acp")
     assert registry.get("grok").command == ("grok", "agent", "stdio")
+    assert registry.get("fast_agent").command == ("uvx", "fast-agent-acp==0.8.3")
 
 
 def test_override_a_builtin_agent() -> None:
