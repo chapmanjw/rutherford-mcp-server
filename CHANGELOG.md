@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [3.0.6] - 2026-07-04
 
 ### Added
 
@@ -30,7 +30,10 @@ All notable changes to this project are documented in this file. The format is b
   stamped when a clone reuses a built-in's launch command) and effort dispatches on `effort_base or id`, so a
   clone resolves through the adapter it actually launches. Built-ins are unaffected (`effort_base` is `None`,
   resolving by id); a clone that supplies its own raw `command` stays an honest no-op by design (arbitrary
-  argv — the lineage is never inferred from `command[0]`). Non-breaking; no config-schema change.
+  argv — the lineage is never inferred from `command[0]`). Non-breaking; no config-schema change. Thanks to
+  Tony Stone ([@Tasktivity](https://github.com/Tasktivity)) for reporting and fixing this in [#7].
+
+[#7]: https://github.com/chapmanjw/rutherford-mcp-server/pull/7
 
 ## [3.0.5] - 2026-06-25
 
