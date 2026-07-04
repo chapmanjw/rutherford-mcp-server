@@ -177,6 +177,116 @@ async def test_run_turn_records_requested_model() -> None:
     assert result.ok is True and result.target.model == "fake-model"
 
 
+# --- model selection across the two ACP channels -----------------------------
+
+
+async def test_select_model_via_config_option_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    # claude_code's claude-agent-acp advertises its models on the configOptions "model" channel, NOT in
+    # SessionModelState. A requested model the option advertises is set via session/set_config_option, and the
+    # agent echoes it back -- proof the SECOND channel reached the agent (without this, no model is selectable
+    # for claude_code at all).
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet,haiku")
+    result = await run_acp_turn(FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
+    assert result.ok is True and "model=sonnet" in result.text
+
+
+async def test_unadvertised_model_is_not_forced_on_either_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A model advertised on NEITHER channel is left to the agent's own default -- no set_model, no
+    # set_config_option. This is what keeps a Bedrock/Vertex harness on its provider's model instead of being
+    # handed a rejected cloud id like "claude-opus-4-8".
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet,haiku")
+    result = await run_acp_turn(
+        FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="claude-opus-4-8"
+    )
+    assert result.ok is True and "model=(unset)" in result.text
+
+
+def test_model_config_option_matches_by_category_and_keeps_only_string_values() -> None:
+    from acp.schema import SessionConfigOptionBoolean, SessionConfigOptionSelect, SessionConfigSelectOption
+
+    from rutherford.acp.session import _model_config_option
+
+    # A boolean option (no value list) is skipped; the select is matched by category "model" even when its id
+    # is NOT literally "model"; only string option values are kept.
+    boolean = SessionConfigOptionBoolean(id="fast", name="Fast", type="boolean", current_value=False)
+    select = SessionConfigOptionSelect(
+        id="ai_model",
+        name="Model",
+        type="select",
+        current_value="default",
+        options=[
+            SessionConfigSelectOption(name="Default", value="default"),
+            SessionConfigSelectOption(name="Sonnet", value="sonnet"),
+        ],
+        category="model",
+    )
+    assert _model_config_option([boolean, select]) == ("ai_model", "default", ["default", "sonnet"])
+    # No model option among them -> None (a boolean alone is not the model channel).
+    assert _model_config_option([boolean]) is None
+    # Fallback match on a literal id "model" when no category is set.
+    by_id = SessionConfigOptionSelect(
+        id="model",
+        name="Model",
+        type="select",
+        current_value="haiku",
+        options=[SessionConfigSelectOption(name="Haiku", value="haiku")],
+    )
+    assert _model_config_option([by_id]) == ("model", "haiku", ["haiku"])
+    # A category-tagged option is AUTHORITATIVE over a literal id="model" fallback even when the id option is
+    # advertised FIRST -- precedence must not depend on advertised order.
+    id_first = SessionConfigOptionSelect(
+        id="model",
+        name="Mode-ish",
+        type="select",
+        current_value="x",
+        options=[SessionConfigSelectOption(name="X", value="x")],
+    )
+    cat_second = SessionConfigOptionSelect(
+        id="ai_model",
+        name="Model",
+        type="select",
+        current_value="default",
+        options=[SessionConfigSelectOption(name="Default", value="default")],
+        category="model",
+    )
+    assert _model_config_option([id_first, cat_second]) == ("ai_model", "default", ["default"])
+
+
+# --- Bedrock/Vertex model-env normalization (host_env.claude_bedrock_env) ------
+
+
+_CLAUDE_SEAT = AgentDescriptor(
+    "claude_code", "Claude Code", FAKE.command, provider="anthropic", underlying_cli="claude"
+)
+
+
+async def test_bedrock_claude_seat_gets_a_valid_model_injected(monkeypatch: pytest.MonkeyPatch) -> None:
+    # End-to-end: on a Bedrock host, Rutherford promotes ANTHROPIC_DEFAULT_OPUS_MODEL to ANTHROPIC_MODEL in the
+    # SPAWNED subprocess env, so the claude-agent-acp adapter no longer falls back to the bare cloud alias. The
+    # fake agent echoes its own ANTHROPIC_MODEL to prove the injection reached the subprocess.
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "us.anthropic.claude-opus-4-1-20250805-v1:0")
+    result = await run_acp_turn(
+        _CLAUDE_SEAT, "ENV=ANTHROPIC_MODEL", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0
+    )
+    assert result.ok is True
+    assert "ANTHROPIC_MODEL=us.anthropic.claude-opus-4-1-20250805-v1:0" in result.text
+
+
+async def test_non_bedrock_claude_seat_injects_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The gate: with no Bedrock/Vertex flag, behavior is identical to today -- no model is forced into the env,
+    # even when an ANTHROPIC_DEFAULT_OPUS_MODEL is present (a normal API-key seat is untouched).
+    monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "us.anthropic.should-not-be-used:0")
+    result = await run_acp_turn(
+        _CLAUDE_SEAT, "ENV=ANTHROPIC_MODEL", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0
+    )
+    assert result.ok is True and "ANTHROPIC_MODEL=(unset)" in result.text
+
+
 async def test_run_turn_handshake_failure() -> None:
     dead = AgentDescriptor("dead", "Dead", (sys.executable, "-c", "import sys; sys.exit(0)"))
     result = await run_acp_turn(dead, "hi", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=10.0)

@@ -115,7 +115,7 @@ the Zed/Cline `acp.json` shape.
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `true` | Set to `false` to remove this agent from the registry. |
 | `command` | `list[str]` or omitted | none | The launch argv for this agent's ACP server. Required to define a new agent; for a built-in it replaces the default launch command. Mutually exclusive with `base` / `backend`. |
-| `env` | `dict[str, str]` | `{}` | Environment variables set for the agent subprocess (layered on the inherited environment). Populated from an `acp.json` `env` block. |
+| `env` | `dict[str, str]` | `{}` | Environment variables set for **this agent's subprocess only**, layered on top of the inherited environment. Settable directly as an `[agents.<id>.env]` block (not only via an `acp.json` import). Because it lives in Rutherford's own config — outside the `.claude` tree — it survives an enterprise wrapper that rewrites `~/.claude/settings.json` on every launch. The canonical use is pinning a valid model id for a Bedrock/Vertex Claude Code seat; see **[Claude Code on Bedrock / enterprise wrappers](bedrock.md)**. |
 | `provider` | `string` or omitted | the built-in's | The fixed model vendor, recorded as provenance. |
 | `default_model` | `string` or omitted | the built-in's | The model used when a call names none. |
 | `handshake_timeout_s` | `float` or omitted | the built-in's (30s for a new agent) | Seconds for the `initialize` + `new_session` handshake (> 0). Raise it for a heavyweight agent. |
@@ -188,6 +188,13 @@ role_dirs = ["/home/user/.config/rutherford/roles"]
 [agents.claude_code]
 default_model = "claude-sonnet-4-6"
 
+# Pin a valid model id for a Bedrock / Vertex (or enterprise-wrapped) Claude Code seat, so the adapter
+# does not fall back to a bare cloud alias the provider rejects. This env lives outside the .claude tree,
+# so an org wrapper that rewrites settings.json cannot revert it. See docs/bedrock.md.
+[agents.claude_code.env]
+ANTHROPIC_MODEL = "global.anthropic.claude-opus-4-8[1m]"
+ANTHROPIC_CUSTOM_MODEL_OPTION = "global.anthropic.claude-opus-4-8[1m]"
+
 # Disable a built-in without dropping it from enabled_agents.
 [agents.codex]
 enabled = false
@@ -233,3 +240,10 @@ agent's own flow (or set its API key) before starting the server, so the headles
 reuse the session. `codex` (`codex-acp`) and `claude_code` (`claude-agent-acp`) reuse the existing
 Codex and Claude Code CLI logins over ACP and need no API key. Confirm what actually drives on this
 machine with `doctor`.
+
+**On AWS Bedrock / Google Vertex (or an enterprise wrapper such as Amazon Toolbox)** a `claude_code`
+turn can fail with `400 The provided model identifier is invalid` even though `doctor connect_only`
+reports the seat reachable. The fix is a per-agent `[agents.claude_code.env]` block pinning a valid
+provider model id — see **[Claude Code on Bedrock / enterprise wrappers](bedrock.md)** for the full
+explanation, the approaches that do *not* work, and the working configuration. `doctor` attaches a
+`remediation_hint` pointing at this fix when it detects the signature.

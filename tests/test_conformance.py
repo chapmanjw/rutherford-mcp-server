@@ -51,6 +51,91 @@ def test_classify_covers_every_outcome() -> None:
     assert classify("x", _result(False, ErrorCode.ACP_SPAWN_FAILED)).installed is False
 
 
+def test_classify_model_unavailable_turn_error() -> None:
+    # A turn that reached the prompt (spawn + handshake OK) but failed because the harness/provider rejected
+    # the MODEL is reported distinctly -- the connection is healthy; only the model/provider config is wrong.
+    # This is the Bedrock/Vertex case: doctor must NOT call the agent broken just because a model id was not
+    # recognized.
+    rejected = DelegationResult(
+        target=Target(cli="x"),
+        ok=False,
+        error=ErrorInfo(code=ErrorCode.ACP_TURN_ERROR, message="the requested model is not available"),
+        text="",
+    )
+    report = classify("x", rejected)
+    assert report.status == "model_unavailable"
+    assert report.installed is True and report.answered is False
+    assert "model" in report.detail.lower()
+    # The exact AWS Bedrock rejection a Claude Code seat hits (word order "model identifier is invalid")
+    # must also classify as model_unavailable, not a generic broken-agent error.
+    bedrock = DelegationResult(
+        target=Target(cli="claude_code"),
+        ok=False,
+        error=ErrorInfo(
+            code=ErrorCode.ACP_TURN_ERROR,
+            message="Internal error: API Error (claude-opus-4-8): 400 The provided model identifier is invalid..",
+        ),
+        text="",
+    )
+    assert classify("claude_code", bedrock).status == "model_unavailable"
+    # A generic turn error (no model-availability marker) still classifies as a plain "error".
+    assert classify("x", _result(False, ErrorCode.ACP_TURN_ERROR)).status == "error"
+
+
+_BEDROCK_CLAUDE = AgentDescriptor(
+    "claude_code", "Claude Code", FAKE.command, provider="anthropic", underlying_cli="claude"
+)
+
+
+async def test_doctor_attaches_bedrock_remediation_hint(monkeypatch: Any) -> None:
+    # A Bedrock Claude Code seat whose turn is rejected for its model id gets a targeted remediation hint
+    # pointing at the per-agent [agents.<id>.env] fix -- not just a bare model_unavailable.
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_UNAVAILABLE", "1")
+    report = await probe_agent(_BEDROCK_CLAUDE, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.status == "model_unavailable"
+    assert report.remediation_hint is not None
+    assert "[agents.claude_code.env]" in report.remediation_hint
+    assert "ANTHROPIC_CUSTOM_MODEL_OPTION" in report.remediation_hint
+
+
+async def test_doctor_no_remediation_hint_off_bedrock(monkeypatch: Any) -> None:
+    # The same model rejection with no Bedrock indicator: still model_unavailable, but no Bedrock remediation.
+    for var in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_UNAVAILABLE", "1")
+    report = await probe_agent(_BEDROCK_CLAUDE, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.status == "model_unavailable" and report.remediation_hint is None
+
+
+async def test_doctor_hint_sees_per_agent_env_overrides(monkeypatch: Any) -> None:
+    # The Bedrock indicator can come from the seat's own [agents.<id>.env] (descriptor.env_overrides), not just
+    # os.environ -- the hint reasons over the same env the subprocess gets.
+    for var in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "RUTHERFORD_FAKE_MODEL_UNAVAILABLE"):
+        monkeypatch.delenv(var, raising=False)
+    seat = AgentDescriptor(
+        "claude_code",
+        "Claude Code",
+        FAKE.command,
+        provider="anthropic",
+        underlying_cli="claude",
+        env_overrides=(("CLAUDE_CODE_USE_BEDROCK", "1"), ("RUTHERFORD_FAKE_MODEL_UNAVAILABLE", "1")),
+    )
+    report = await probe_agent(seat, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.status == "model_unavailable" and report.remediation_hint is not None
+
+
+async def test_doctor_envelope_round_trips_the_multiline_remediation_hint(monkeypatch: Any) -> None:
+    # The multi-line hint (a TOML snippet) must survive the TOON envelope serialization intact.
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_UNAVAILABLE", "1")
+    app = build_app_context(config=RutherfordConfig(), descriptors=DescriptorRegistry([_BEDROCK_CLAUDE]))
+    data = decode(await doctor_tool(app, timeout_s=60.0))
+    agent = data["agents"][0]
+    assert agent["status"] == "model_unavailable"
+    assert "ANTHROPIC_CUSTOM_MODEL_OPTION" in agent["remediation_hint"]
+
+
 async def test_probe_agent_working() -> None:
     report = await probe_agent(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
     assert report.status == "ok" and report.installed and report.answered
@@ -111,6 +196,33 @@ async def test_probe_connection_reachable_with_models(monkeypatch: Any) -> None:
 async def test_probe_connection_reachable_without_models() -> None:
     report = await probe_connection(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
     assert report.status == "reachable" and report.connected is True and report.models == []
+
+
+async def test_probe_connection_lists_config_option_models(monkeypatch: Any) -> None:
+    # claude_code's adapter advertises its models on the configOptions "model" channel, not SessionModelState.
+    # connect_only must surface them (it previously reported [] for such an agent -- the misleading case).
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet,haiku")
+    report = await probe_connection(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.status == "reachable" and report.models == ["default", "sonnet", "haiku"]
+
+
+async def test_probe_connection_unions_both_model_channels(monkeypatch: Any) -> None:
+    # When an agent advertises BOTH channels, available_models is the union in a deterministic order:
+    # SessionModelState ids first, then config-option values not already present.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "m1,m2")
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "m2,sonnet")
+    report = await probe_connection(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.models == ["m1", "m2", "sonnet"]
+
+
+async def test_probe_agent_model_unavailable_is_not_a_broken_agent(monkeypatch: Any) -> None:
+    # An agent that spawns + handshakes but whose turn fails because the harness/provider rejected the model
+    # (the Bedrock/Vertex Claude Code case) is reported as "model_unavailable", NOT a broken "error" /
+    # "handshake_failed". The ACP connection is healthy; only the model/provider config is wrong.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_UNAVAILABLE", "1")
+    report = await probe_agent(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert report.status == "model_unavailable"
+    assert report.installed is True and report.answered is False
 
 
 async def test_probe_connection_handshake_failed() -> None:

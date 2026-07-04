@@ -20,6 +20,72 @@ All notable changes to this project are documented in this file. The format is b
   resolving by id); a clone that supplies its own raw `command` stays an honest no-op by design (arbitrary
   argv — the lineage is never inferred from `command[0]`). Non-breaking; no config-schema change.
 
+## [3.0.5] - 2026-06-25
+
+### Added
+
+- **`doctor` remediation hint for Claude Code on AWS Bedrock / Google Vertex / enterprise wrappers.** When a
+  Claude Code seat's turn is rejected for its model id (`400 The provided model identifier is invalid`) and a
+  Bedrock/Vertex indicator is present, the conformance report carries a `remediation_hint` describing the
+  per-agent `[agents.<id>.env]` fix — pinning a valid provider model id (with `ANTHROPIC_CUSTOM_MODEL_OPTION`,
+  which survives an enterprise wrapper that rewrites `settings.json` and an enforced model allowlist).
+  `doctor` stays read-only; the hint is advisory text, gated to the Claude Code adapter seat. `setup` detects
+  a Bedrock/Vertex host and scaffolds the commented `[agents.claude_code.env]` block into the starter config.
+- **Docs: `docs/bedrock.md`** — "Claude Code on Bedrock / enterprise wrappers": the allowlist-rewrite
+  mechanism, the approaches that do *not* work, the working env-injection fix, and the
+  `ANTHROPIC_CUSTOM_MODEL_OPTION` exemption. `[agents.<id>.env]` is now documented first-class in
+  `docs/configuration.md`, and `docs/troubleshooting.md` gains a `model_unavailable` entry.
+
+### Fixed
+
+- **Hardened a flaky concurrency test.** `test_semaphore_serializes_a_wide_panel` dropped its `serial > 1.5x
+  parallel` ratio assertion — a loaded CI runner's fixed spawn overhead adds to both the serial and parallel
+  runs and compresses the ratio toward 1, which flaked on a busy Windows / Python 3.11 cell. It now asserts
+  only the spawn-overhead-invariant absolute serialization gap (`serial - parallel > 0.2s`), which is the
+  sound measure (the overhead cancels in the difference). No production code changed.
+
+## [3.0.4] - 2026-06-25
+
+### Fixed
+
+- **Claude Code now drives on AWS Bedrock / Google Vertex.** When the host has `CLAUDE_CODE_USE_BEDROCK` (or
+  `CLAUDE_CODE_USE_VERTEX`) set, the `claude-agent-acp` adapter would fall back to the bare cloud alias
+  `claude-opus-4-8`, which the provider rejects (`400 The provided model identifier is invalid`) — so
+  delegate / consensus / doctor turns failed even though the seat was reachable. Rutherford now resolves a
+  valid provider model id and injects it as `ANTHROPIC_MODEL` (plus `ANTHROPIC_SMALL_FAST_MODEL` when
+  available) into the adapter's environment, so the SDK uses the real inference-profile id instead of the
+  rejected alias. The id is resolved, in order, from an already-set `ANTHROPIC_MODEL`, a `[agents.claude_code]
+  model` pinned to a raw provider id, `ANTHROPIC_DEFAULT_OPUS_MODEL`, then the `env` block of the host's
+  `~/.claude/settings.json` and `<cwd>/.claude/settings.json` (`ANTHROPIC_MODEL` then
+  `ANTHROPIC_DEFAULT_OPUS_MODEL`). It is gated to the Claude Code adapter seat and to a Bedrock/Vertex host, so
+  a normal API-key Claude Code and every other agent are untouched, and it never overrides an
+  already-configured model. Works with zero Rutherford config when the id lives in `settings.json`.
+- **`doctor` recognizes the Bedrock "invalid model identifier" rejection.** The model-unavailable classifier
+  now matches "model identifier is invalid" / "provided model identifier", so a provider model rejection is
+  reported as `model_unavailable` (the connection is healthy; the model/provider config is wrong) rather than
+  a generic `error`.
+
+## [3.0.3] - 2026-06-24
+
+### Fixed
+
+- **`doctor` no longer reports Claude Code (or any agent) as broken just because its model id is not a plain
+  cloud id.** When an agent is configured for a non-cloud provider -- AWS Bedrock or Vertex, where the model id
+  is e.g. `global.anthropic.claude-opus-4-8[1m]` rather than `claude-opus-4-8` -- a probe turn that fails
+  because the provider rejected the model is now reported with a new `model_unavailable` status (spawn +
+  handshake succeeded; only the model/provider config is wrong) instead of a generic `error`. The detail points
+  at the model/provider config to fix (the Bedrock/Vertex model id or `ANTHROPIC_MODEL`), so a recognizable
+  model rejection never reads as a broken agent.
+- **Model selection now reads BOTH ACP model channels.** Rutherford previously honored a requested model only
+  through `session.models` (SessionModelState). Claude Code's `claude-agent-acp` adapter advertises its
+  selectable models on the OTHER channel -- a `session.configOptions` select option whose `category` is
+  `model` (its `session.models` is empty) -- so a model could never be selected for it and `doctor
+  connect_only` misleadingly reported an empty model list. `session/set_model` (channel 1) and
+  `session/set_config_option` on a "model" option (channel 2) are both supported now, and `available_models`
+  reports the union of the two (SessionModelState ids first). As before, a model is sent only when the agent
+  advertised that exact value, so a Bedrock/Vertex harness is left on its provider's own configured model
+  rather than handed a rejected cloud id.
+
 ## [3.0.2] - 2026-06-15
 
 ### Added

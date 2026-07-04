@@ -194,27 +194,49 @@ def _advertised_models() -> SessionModelState | None:
 
 
 def _advertised_config_options() -> list[SessionConfigOptionSelect | SessionConfigOptionBoolean] | None:
-    """A reasoning-effort select config option from ``RUTHERFORD_FAKE_EFFORT_OPTION``, else ``None``.
+    """The select config options this fake advertises at ``new_session`` (from env), or ``None`` when none.
 
-    Drives the config-option effort path (F8a) without a real CLI: a test opts in by setting the env to
-    ``<id>:<v1,v2,...>`` (e.g. ``reasoning_effort:low,medium,high,xhigh`` for codex, ``effort:low,medium,high,
-    xhigh,max`` for claude_code). Off by default so the existing tests, which expect no ``set_config_option``
-    call, are unchanged. The first value is the advertised current value.
+    Off by default so the existing tests, which expect no ``set_config_option`` call, are unchanged. Two opt-in
+    env vars, either or both:
+
+    * ``RUTHERFORD_FAKE_EFFORT_OPTION=<id>:<v1,v2,...>`` -- a reasoning-effort select option (F8a), e.g.
+      ``reasoning_effort:low,medium,high,xhigh`` for codex, ``effort:low,medium,high,xhigh,max`` for claude_code.
+    * ``RUTHERFORD_FAKE_MODEL_OPTION=<v1,v2,...>`` -- a ``model`` select option (id ``model``, category
+      ``model``), the SECOND ACP model channel that claude_code's claude-agent-acp uses INSTEAD of
+      ``session.models``; the values are model aliases (e.g. ``default,sonnet,haiku``).
+
+    The first value of each is its advertised current value.
     """
-    raw = os.environ.get("RUTHERFORD_FAKE_EFFORT_OPTION")
-    if not raw:
-        return None
-    option_id, _, values_raw = raw.partition(":")
-    values = [item.strip() for item in values_raw.split(",") if item.strip()]
-    if not option_id or not values:
-        return None
-    options = [SessionConfigSelectOption(name=value, value=value) for value in values]
-    advertised: list[SessionConfigOptionSelect | SessionConfigOptionBoolean] = [
-        SessionConfigOptionSelect(
-            id=option_id.strip(), name="Effort", type="select", current_value=values[0], options=options
-        )
-    ]
-    return advertised
+    advertised: list[SessionConfigOptionSelect | SessionConfigOptionBoolean] = []
+    effort_raw = os.environ.get("RUTHERFORD_FAKE_EFFORT_OPTION")
+    if effort_raw:
+        option_id, _, values_raw = effort_raw.partition(":")
+        values = [item.strip() for item in values_raw.split(",") if item.strip()]
+        if option_id.strip() and values:
+            advertised.append(
+                SessionConfigOptionSelect(
+                    id=option_id.strip(),
+                    name="Effort",
+                    type="select",
+                    current_value=values[0],
+                    options=[SessionConfigSelectOption(name=value, value=value) for value in values],
+                )
+            )
+    model_raw = os.environ.get("RUTHERFORD_FAKE_MODEL_OPTION")
+    if model_raw:
+        model_values = [item.strip() for item in model_raw.split(",") if item.strip()]
+        if model_values:
+            advertised.append(
+                SessionConfigOptionSelect(
+                    id="model",
+                    name="Model",
+                    type="select",
+                    current_value=model_values[0],
+                    options=[SessionConfigSelectOption(name=value, value=value) for value in model_values],
+                    category="model",
+                )
+            )
+    return advertised or None
 
 
 class FakeAgent:
@@ -228,6 +250,9 @@ class FakeAgent:
         #: The effort tier a ``session/set_config_option`` set, so an ``EFFORT?`` prompt can prove Rutherford's
         #: config-option effort path reached the agent and with which (clamped) value. ``None`` until set.
         self._effort_set: str | None = None
+        #: The model value a ``session/set_config_option`` set on the ``model`` config option, so a ``MODEL?``
+        #: prompt can prove Rutherford's SECOND-channel model selection reached the agent. ``None`` until set.
+        self._model_set: str | None = None
 
     def on_connect(self, conn: Any) -> None:
         self._client = conn
@@ -267,10 +292,13 @@ class FakeAgent:
     async def set_config_option(
         self, config_id: str, session_id: str, value: str | bool, **kwargs: Any
     ) -> SetSessionConfigOptionResponse:
-        # Record the effort tier the config-option path set, so an EFFORT? prompt can echo it back -- proof the
-        # tier reached the agent (after Rutherford's clamp to the advertised values).
+        # Record what the config-option path set, so an EFFORT? / MODEL? prompt can echo it back -- proof the
+        # value reached the agent (effort after Rutherford's clamp; model after the second-channel selection).
         if isinstance(value, str):
-            self._effort_set = value
+            if config_id == "model":
+                self._model_set = value
+            else:
+                self._effort_set = value
         # The response REQUIRES the full set of options with their updated current values (a real agent echoes
         # them back), so reflect the new current_value on the matching option rather than returning an empty set.
         options = _advertised_config_options() or []
@@ -286,11 +314,25 @@ class FakeAgent:
         self, prompt: list[Any], session_id: str, message_id: str | None = None, **kwargs: Any
     ) -> PromptResponse:
         text = "\n".join(_block_text(block) for block in prompt)
+        if os.environ.get("RUTHERFORD_FAKE_MODEL_UNAVAILABLE"):
+            # Simulate the provider rejecting the model mid-turn -- the real AWS Bedrock phrasing a Claude Code
+            # seat hits when handed a bare cloud alias. Raise a RequestError so the JSON-RPC error MESSAGE (not
+            # just its data) carries the marker to the client, where session.prompt maps it to ACP_TURN_ERROR
+            # with this text -- which doctor classifies as ``model_unavailable`` (and, on a Bedrock host, attaches
+            # the remediation hint).
+            raise RequestError(-32603, "API Error (claude-opus-4-8): 400 The provided model identifier is invalid.")
         if "HANG" in text:
             await asyncio.sleep(30)
         if "REFUSE" in text:
             return PromptResponse(stop_reason="refusal")
         if "EMPTY" in text:
+            return PromptResponse(stop_reason="end_turn")
+        if "MODEL?" in text:
+            # Report the model value set via session/set_config_option (or '(unset)'), so a test can prove the
+            # SECOND-channel (configOptions "model") selection reached the agent.
+            await self._client.session_update(
+                session_id, update_agent_message_text(f"model={self._model_set or '(unset)'}")
+            )
             return PromptResponse(stop_reason="end_turn")
         if "EFFORT?" in text:
             # Report the effort tier set via session/set_config_option (or '(unset)'), so a test can prove the

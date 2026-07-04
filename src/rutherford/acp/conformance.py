@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import tempfile
 import time
 
@@ -22,6 +23,8 @@ from ..domain.error_codes import ErrorCode
 from ..domain.models import DelegationResult
 from .adapters import install_hint as adapter_install_hint
 from .descriptors import AgentDescriptor
+from .failures import is_model_unavailable
+from .host_env import bedrock_remediation_hint
 from .permission import PermissionPolicy
 from .session import ACPHandshakeError, ACPSession, run_acp_turn
 
@@ -33,7 +36,9 @@ class ConformanceReport(BaseModel):
     """The outcome of probing one agent's ACP server with a real round trip."""
 
     agent_id: str
-    #: ``ok`` (handshake + answered) | ``no_answer`` (answered empty / refused) | ``handshake_failed``
+    #: ``ok`` (handshake + answered) | ``no_answer`` (answered empty / refused) | ``model_unavailable`` (spawn +
+    #: handshake succeeded, but the turn failed because the harness/provider rejected the model -- a model/
+    #: provider config issue, e.g. a Bedrock/Vertex Claude Code, NOT a broken seat) | ``handshake_failed``
     #: (installed, but initialize/new_session failed) | ``not_installed`` (the launch command was not found)
     #: | ``error`` (some other failure).
     status: str
@@ -44,6 +49,10 @@ class ConformanceReport(BaseModel):
     #: When ``status`` is ``not_installed`` but the agent's underlying CLI IS present (its npm ACP adapter
     #: shim is the only missing piece), the one-line ``npm i -g`` instruction to set it up; ``None`` otherwise.
     install_hint: str | None = None
+    #: A targeted fix for a recognizable, config-shaped failure -- today: a Claude Code seat whose model id a
+    #: Bedrock/Vertex (or enterprise-wrapped) provider rejected, pointing at the per-agent ``[agents.<id>.env]``
+    #: config that survives an org wrapper. ``None`` when no remediation is known. Purely advisory text.
+    remediation_hint: str | None = None
 
 
 def classify(agent_id: str, result: DelegationResult) -> ConformanceReport:
@@ -86,6 +95,24 @@ def classify(agent_id: str, result: DelegationResult) -> ConformanceReport:
             detail=message,
             duration_s=result.duration_s,
         )
+    # A turn that reached the prompt (spawn + handshake succeeded) but failed because the harness/provider
+    # REJECTED THE MODEL is not a broken seat -- it is a model/provider config problem. The common case: a
+    # Claude Code configured for a non-cloud provider (AWS Bedrock, Vertex) whose model id is e.g.
+    # ``global.anthropic.claude-opus-4-8[1m]`` rejects a plain cloud id. Report it distinctly so doctor does
+    # not call a reachable agent broken just because a model id was not recognized; the connection is healthy.
+    if code is ErrorCode.ACP_TURN_ERROR and is_model_unavailable(message):
+        return ConformanceReport(
+            agent_id=agent_id,
+            status="model_unavailable",
+            installed=True,
+            answered=False,
+            detail=(
+                "ACP spawn/handshake succeeded, but the prompt failed because the harness/provider rejected "
+                f"the model -- check the agent's model/provider configuration (e.g. Bedrock/Vertex model id or "
+                f"ANTHROPIC_MODEL): {message}"
+            ),
+            duration_s=result.duration_s,
+        )
     return ConformanceReport(
         agent_id=agent_id, status="error", installed=True, answered=False, detail=message, duration_s=result.duration_s
     )
@@ -102,6 +129,16 @@ async def _probe_in(descriptor: AgentDescriptor, cwd: str, timeout_s: float) -> 
         hint = adapter_install_hint(descriptor)
         if hint is not None:
             return report.model_copy(update={"install_hint": hint, "detail": f"{report.detail} ({hint})"})
+    # A FAILED turn whose error is a Bedrock/Vertex (or enterprise-wrapped) model-id rejection on a Claude Code
+    # seat gets a targeted remediation hint (the per-agent [agents.<id>.env] fix). Signature- and host-gated, so
+    # it stays quiet for everyone else; purely advisory, so doctor remains read-only. The env the hint reasons
+    # over is the same shape the subprocess got -- os.environ with the descriptor's [agents.<id>.env] overrides
+    # layered on top -- so an indicator/model id the user already set via config is seen (mirrors _resolve_env).
+    if not result.ok and result.error is not None:
+        effective_env = {**os.environ, **dict(descriptor.env_overrides)}
+        remediation = bedrock_remediation_hint(descriptor, effective_env, result.error.message)
+        if remediation is not None:
+            return report.model_copy(update={"remediation_hint": remediation})
     return report
 
 

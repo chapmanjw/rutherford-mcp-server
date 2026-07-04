@@ -68,6 +68,13 @@ def _merge(agent_id: str, entry: AgentConfig, existing: AgentDescriptor | None) 
         )
     env = _backend_env(agent_id, entry, source) if entry.backend is not None else {}
     env.update(entry.env)  # an explicit env wins over the backend defaults
+    # When this entry INHERITS a built-in's launch command (no raw ``command`` override), it also inherits that
+    # built-in's wrapped-adapter identity (``underlying_cli`` / ``adapter_package``) -- so a clone or override of
+    # a wrapped-adapter agent (codex / claude_code / pi) is still recognized AS that adapter: ``doctor``'s npm
+    # install hint, and the Bedrock/Vertex model-env normalization gate, both key off it. A raw ``command``
+    # override launches something else entirely, so it inherits neither (they stay ``None``).
+    # Inherit the built-in's wrapped-adapter identity ONLY when this entry also inherits its launch command.
+    inherits_launch = entry.command is None and source is not None
     return AgentDescriptor(
         id=agent_id,
         display_name=source.display_name if source is not None else agent_id,
@@ -80,11 +87,13 @@ def _merge(agent_id: str, entry: AgentConfig, existing: AgentDescriptor | None) 
         else (source.handshake_timeout_s if source is not None else 30.0),
         env_overrides=tuple(env.items()),
         fallback_model=_first(entry.fallback_model, source.fallback_model if source is not None else None),
+        underlying_cli=source.underlying_cli if (inherits_launch and source is not None) else None,
+        adapter_package=source.adapter_package if (inherits_launch and source is not None) else None,
         # Effort is a capability of the launched adapter, not the agent id: a clone that inherits a built-in's
         # launch command (``base=`` / ``backend=``, i.e. no explicit ``command``) records that built-in as its
         # effort lineage so ``effort_overrides`` resolves the right knob. A clone with its own ``command`` is
         # arbitrary argv (possibly a ``sh -c`` wrapper) -- no knowable lineage, so it stays an honest no-op.
-        effort_base=source.id if (source is not None and entry.command is None) else None,
+        effort_base=source.id if (inherits_launch and source is not None) else None,
     )
 
 

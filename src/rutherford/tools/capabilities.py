@@ -56,7 +56,11 @@ async def doctor_tool(
     """Probe each agent (or one named ``agent``) with a real read-only ACP round trip and report conformance.
 
     The only trustworthy health signal for an ACP agent: whether it spawns, handshakes, and answers. Probes
-    run in parallel; each report says ok / no_answer / handshake_failed / not_installed / error.
+    run in parallel; each report says ok / no_answer / model_unavailable / handshake_failed / not_installed /
+    error. ``model_unavailable`` means spawn + handshake succeeded (the ACP transport is reachable) but the
+    harness/provider rejected the model on the turn -- a model/provider config issue (e.g. a Claude Code
+    pointed at AWS Bedrock / Vertex), not a broken agent -- so a recognizable model rejection is not reported
+    as a generic failure.
     ``timeout_s`` is the per-agent budget; a LOCAL-model agent (Ollama / LM Studio) gets a generous floor over
     it, because a cold local model loads on its first prompt and the cloud default would false-flag it.
 
