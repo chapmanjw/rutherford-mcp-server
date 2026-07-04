@@ -125,6 +125,28 @@ def test_raw_command_override_drops_adapter_identity() -> None:
     assert agent.underlying_cli is None and agent.is_wrapped_adapter is False
 
 
+def test_clone_records_effort_lineage() -> None:
+    # effort_base lets effort dispatch follow the launched adapter, not the new config id. It is stamped only
+    # when the clone inherits a built-in's launch command (no explicit command=); a raw command= agent gets
+    # None (no knowable knob), and a same-id override gets its own id.
+    config = RutherfordConfig(
+        auto_detect_local_models=False,
+        agents={
+            "my-codex": AgentConfig(base="codex"),
+            "my-goose": AgentConfig(base="goose"),
+            "raw": AgentConfig(command=["raw-acp"]),
+            "codex": AgentConfig(default_model="gpt-5.2"),
+        },
+    )
+    registry = build_registry(config)
+    assert registry.get("my-codex").effort_base == "codex"  # base clone -> base id
+    assert registry.get("my-goose").effort_base == "goose"  # knob-less base, still stamped (resolves to no-op)
+    assert registry.get("raw").effort_base is None  # raw command= -> no lineage
+    assert registry.get("codex").effort_base == "codex"  # same-id override -> its own id
+    # Built-ins themselves never carry a lineage.
+    assert all(descriptor.effort_base is None for descriptor in HIGH_FIDELITY)
+
+
 def test_backend_ollama_fills_goose_env() -> None:
     config = RutherfordConfig(agents={"local": AgentConfig(base="goose", backend="ollama", model="gemma3:12b")})
     agent = build_registry(config).get("local")

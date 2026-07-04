@@ -52,6 +52,15 @@ class AgentDescriptor:
     #: ``"@agentclientprotocol/codex-acp"``. Set together with :attr:`underlying_cli`; ``None`` otherwise. The
     #: value is a curated constant (never user input), so building the install argv from it cannot inject.
     adapter_package: str | None = None
+    #: The built-in id whose reasoning-effort knob this descriptor inherits when its own ``id`` is not itself
+    #: effort-capable. Set by :func:`rutherford.acp.roster._merge` for a config clone of a built-in (a
+    #: ``base=`` clone, or a local ``backend=`` clone) so effort resolves through the adapter the clone
+    #: actually launches, not its new config id (:func:`rutherford.acp.effort.effort_overrides` dispatches on
+    #: ``effort_base or id``). ``None`` for every built-in (it resolves by its own id) and for a brand-new
+    #: command-only agent (an honest no-op -- an operator's arbitrary argv carries no knowable knob). This is
+    #: effort-specific on purpose: do NOT reuse :attr:`underlying_cli` / :attr:`adapter_package`, which are CLI
+    #: binary names (``"codex"`` / ``"claude"``), not agent ids (``"codex"`` / ``"claude_code"``).
+    effort_base: str | None = None
 
     @property
     def is_wrapped_adapter(self) -> bool:

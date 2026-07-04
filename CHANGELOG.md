@@ -6,6 +6,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **A config clone of an effort-capable built-in now keeps its reasoning-effort tier.** Effort is a
+  capability of the launched ACP adapter, not the agent id, but the per-call effort dispatch keyed on the
+  agent id alone — so a `base=` clone (or a local `backend=` clone) of `codex` / `claude_code` / `cursor` /
+  `cline` / `kiro` / `junie` got a new id, fell through the dispatch table, and had its requested tier
+  silently dropped to a no-op (`effort_applied` null) across every channel (the `model[effort]` model-id, the
+  `--thinking` / `--effort` launch flag, the `JUNIE_EFFORT` env, and the `effort` / `reasoning_effort` config
+  options). The descriptor now records the built-in whose knob it inherits (`AgentDescriptor.effort_base`,
+  stamped when a clone reuses a built-in's launch command) and effort dispatches on `effort_base or id`, so a
+  clone resolves through the adapter it actually launches. Built-ins are unaffected (`effort_base` is `None`,
+  resolving by id); a clone that supplies its own raw `command` stays an honest no-op by design (arbitrary
+  argv — the lineage is never inferred from `command[0]`). Non-breaking; no config-schema change.
+
 ## [3.0.5] - 2026-06-25
 
 ### Added

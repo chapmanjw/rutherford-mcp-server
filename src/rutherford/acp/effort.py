@@ -93,12 +93,15 @@ def effort_overrides(descriptor: AgentDescriptor, effort: Effort | None, *, mode
     descriptor default. ``effort=None`` (no tier requested) is always a clean no-op. Otherwise the agent's own
     knob is consulted: a known agent gets its real mechanism (a model-id rewrite for codex/cursor, a launch
     flag for cline, an env var for junie), and an agent with no verifiable knob -- including ``pi`` -- gets a
-    no-op carrying a note that says so. The dispatch keys on the agent ``id`` so a config clone keeps its
-    base's knob only if it keeps the id.
+    no-op carrying a note that says so. The dispatch resolves on ``descriptor.effort_base or descriptor.id``:
+    a built-in (``effort_base is None``) resolves by its own id, while a config clone of an effort-capable
+    built-in carries its base id in ``effort_base`` (stamped by :func:`rutherford.acp.roster._merge`) and so
+    inherits the base adapter's knob -- effort follows the launched adapter, not the new agent id. The no-op
+    note still names ``descriptor.id`` (the seat the caller addressed).
     """
     if effort is None:
         return _NONE
-    builder = _BUILDERS.get(descriptor.id)
+    builder = _BUILDERS.get(descriptor.effort_base or descriptor.id)
     if builder is None:
         return EffortOverride(note=f"effort '{effort.value}' is not supported by {descriptor.id}; ignored")
     return builder(model, effort)

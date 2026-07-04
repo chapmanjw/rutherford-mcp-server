@@ -89,6 +89,11 @@ def _merge(agent_id: str, entry: AgentConfig, existing: AgentDescriptor | None) 
         fallback_model=_first(entry.fallback_model, source.fallback_model if source is not None else None),
         underlying_cli=source.underlying_cli if (inherits_launch and source is not None) else None,
         adapter_package=source.adapter_package if (inherits_launch and source is not None) else None,
+        # Effort is a capability of the launched adapter, not the agent id: a clone that inherits a built-in's
+        # launch command (``base=`` / ``backend=``, i.e. no explicit ``command``) records that built-in as its
+        # effort lineage so ``effort_overrides`` resolves the right knob. A clone with its own ``command`` is
+        # arbitrary argv (possibly a ``sh -c`` wrapper) -- no knowable lineage, so it stays an honest no-op.
+        effort_base=source.id if (inherits_launch and source is not None) else None,
     )
 
 
