@@ -205,7 +205,8 @@ def _advertised_config_options() -> list[SessionConfigOptionSelect | SessionConf
       ``model``), the SECOND ACP model channel that claude_code's claude-agent-acp uses INSTEAD of
       ``session.models``; the values are model aliases (e.g. ``default,sonnet,haiku``).
 
-    The first value of each is its advertised current value.
+    The first value of each is its advertised current value. Optional ``RUTHERFORD_FAKE_MODEL_MISMATCH=1``
+    makes ``set_config_option`` echo a non-matching ``current_value`` (confirmation failure path).
     """
     advertised: list[SessionConfigOptionSelect | SessionConfigOptionBoolean] = []
     effort_raw = os.environ.get("RUTHERFORD_FAKE_EFFORT_OPTION")
@@ -253,6 +254,9 @@ class FakeAgent:
         #: The model value a ``session/set_config_option`` set on the ``model`` config option, so a ``MODEL?``
         #: prompt can prove Rutherford's SECOND-channel model selection reached the agent. ``None`` until set.
         self._model_set: str | None = None
+        #: Call counters for dual-channel routing tests (Cursor: set_model advertised/no-op, config wins).
+        self._set_model_calls = 0
+        self._set_config_model_calls = 0
 
     def on_connect(self, conn: Any) -> None:
         self._client = conn
@@ -282,11 +286,12 @@ class FakeAgent:
         # Resume: the agent reloads the named conversation. session/load keeps the requested id (no new one is
         # minted), so the client runs the next prompt under ``session_id``. Recorded so WHOAMI can confirm it.
         self._loaded_session = session_id
-        return LoadSessionResponse(models=_advertised_models())
+        return LoadSessionResponse(models=_advertised_models(), config_options=_advertised_config_options())
 
     async def set_session_model(self, model_id: str, session_id: str, **kwargs: Any) -> None:
-        # Accepting any advertised id is enough for the client's best-effort set_model call to succeed (e.g. an
-        # effort-rewritten 'gpt-5.2[high]'); the client suppresses any error, so an unknown id is safe too.
+        # Accept any advertised id. Dual-channel Cursor-style agents treat this as a no-op for the real model
+        # channel -- only set_config_option updates ``_model_set`` / current_value.
+        self._set_model_calls += 1
         return None
 
     async def set_config_option(
@@ -297,13 +302,21 @@ class FakeAgent:
         if isinstance(value, str):
             if config_id == "model":
                 self._model_set = value
+                self._set_config_model_calls += 1
             else:
                 self._effort_set = value
         # The response REQUIRES the full set of options with their updated current values (a real agent echoes
         # them back), so reflect the new current_value on the matching option rather than returning an empty set.
+        # RUTHERFORD_FAKE_MODEL_MISMATCH=1 leaves model current_value stale so confirmation fails.
         options = _advertised_config_options() or []
+        mismatch = os.environ.get("RUTHERFORD_FAKE_MODEL_MISMATCH") == "1"
         for option in options:
-            if isinstance(option, SessionConfigOptionSelect) and option.id == config_id and isinstance(value, str):
+            if (
+                isinstance(option, SessionConfigOptionSelect)
+                and option.id == config_id
+                and isinstance(value, str)
+                and not (mismatch and config_id == "model")
+            ):
                 option.current_value = value
         return SetSessionConfigOptionResponse(config_options=options)
 
@@ -328,10 +341,15 @@ class FakeAgent:
         if "EMPTY" in text:
             return PromptResponse(stop_reason="end_turn")
         if "MODEL?" in text:
-            # Report the model value set via session/set_config_option (or '(unset)'), so a test can prove the
-            # SECOND-channel (configOptions "model") selection reached the agent.
+            # Report the model value set via session/set_config_option (or '(unset)'), plus call counts so a
+            # dual-channel test can prove config was preferred over set_model (and already-current skipped RPC).
             await self._client.session_update(
-                session_id, update_agent_message_text(f"model={self._model_set or '(unset)'}")
+                session_id,
+                update_agent_message_text(
+                    f"model={self._model_set or '(unset)'} "
+                    f"set_model_calls={self._set_model_calls} "
+                    f"set_config_calls={self._set_config_model_calls}"
+                ),
             )
             return PromptResponse(stop_reason="end_turn")
         if "EFFORT?" in text:
@@ -410,7 +428,9 @@ class FakeAgent:
 
 
 async def _main() -> None:
-    await run_agent(FakeAgent())  # type: ignore[arg-type]  # a partial Agent: only the methods tests drive
+    # session/set_model is an unstable ACP method in the Python SDK agent router; enable it so
+    # set_model-only selection tests (and codex model-id effort) can confirm over the fake agent.
+    await run_agent(FakeAgent(), use_unstable_protocol=True)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

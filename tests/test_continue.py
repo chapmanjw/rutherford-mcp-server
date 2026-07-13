@@ -36,7 +36,14 @@ _DrainJob = Callable[[JobStore, str], Awaitable[JobRecord]]
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
 FAKE = AgentDescriptor("fake", "Fake", _FAKE_CMD)
-FAKE_A = AgentDescriptor("fake_a", "Fake A", _FAKE_CMD, provider="alpha", default_model="model-a")
+FAKE_A = AgentDescriptor(
+    "fake_a",
+    "Fake A",
+    _FAKE_CMD,
+    provider="alpha",
+    default_model="model-a",
+    env_overrides=(("RUTHERFORD_FAKE_MODELS", "model-a"),),
+)
 # A fake that does NOT advertise the ACP loadSession capability, so a resume against it is RESUME_FAILED.
 NO_RESUME = AgentDescriptor(
     "fake_noresume", "No Resume", _FAKE_CMD, env_overrides=(("RUTHERFORD_FAKE_NO_LOADSESSION", "1"),)

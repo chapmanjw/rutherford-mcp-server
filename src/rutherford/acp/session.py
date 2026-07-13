@@ -20,7 +20,6 @@ import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 
-from acp import PROTOCOL_VERSION, spawn_agent_process, text_block
 from acp.client.connection import ClientSideConnection
 from acp.connection import StreamDirection, StreamEvent
 from acp.schema import (
@@ -35,6 +34,8 @@ from acp.schema import (
     ResourceContentBlock,
     TextContentBlock,
 )
+
+from acp import PROTOCOL_VERSION, spawn_agent_process, text_block
 
 from ..domain.enums import Effort, ReexecutionSafety
 from ..domain.error_codes import ErrorCode
@@ -135,7 +136,12 @@ class ACPSession:
         # Resolve effort to this agent's per-call ACP override (extra args / env / a rewritten model id), or a
         # reported no-op when the agent has no knob (F8a, 2-L). The override is computed against the RESOLVED
         # model so codex/cursor (which encode effort in the model id) rewrite the model the session will use.
-        resolved_model = model or descriptor.default_model
+        # requested_model is the pre-effort id (caller / descriptor default); target.model is post-rewrite.
+        # _caller_model is exactly what the caller passed (None when omitted) so selection can tell an explicit
+        # request from a descriptor-default-only soft path on a channel-less agent.
+        self._caller_model = model
+        self._requested_model = model or descriptor.default_model
+        resolved_model = self._requested_model
         self._effort = effort
         self._override = effort_overrides(descriptor, effort, model=resolved_model)
         #: The tier this session actually applied. Seeded from the launch-time override (cline/kiro/junie/
@@ -143,6 +149,11 @@ class ACPSession:
         #: updates it at open once the agent's advertised effort options are known. ``None`` for a no-op.
         self._effort_applied = self._override.applied
         self._target = Target(cli=descriptor.id, model=self._override.model or resolved_model)
+        #: The effective model ACP selection confirmed (config current_value or set_model success). ``None``
+        #: until :meth:`_select_model` confirms; never set to an unconfirmed request.
+        self._selected_model: str | None = None
+        #: Whether :meth:`_select_model` confirmed the effective model over an ACP channel.
+        self._model_confirmed = False
         # F2 replay-completeness: the LOGICAL launch argv (the agent's ACP-server command plus any
         # effort-override extra args), pinned here so a persisted run records what it was issued with. Kept
         # distinct from the platform-resolved spawn argv (``prepare_argv`` below), whose npm-shim resolution
@@ -190,8 +201,23 @@ class ACPSession:
 
     @property
     def target(self) -> Target:
-        """The resolved ``(cli, model)`` this session answers under."""
+        """The resolved ``(cli, model)`` this session answers under (``model`` is post-effort-rewrite)."""
         return self._target
+
+    @property
+    def requested_model(self) -> str | None:
+        """The model before effort rewrite (caller / descriptor default), or ``None`` on the agent-default path."""
+        return self._requested_model
+
+    @property
+    def selected_model(self) -> str | None:
+        """The effective model ACP selection confirmed, or ``None`` when unconfirmed / not selected."""
+        return self._selected_model
+
+    @property
+    def model_confirmed(self) -> bool:
+        """Whether ACP model selection confirmed the effective model for this session."""
+        return self._model_confirmed
 
     @property
     def launch_argv(self) -> list[str]:
@@ -380,43 +406,92 @@ class ACPSession:
     async def _select_model(
         self, conn: ClientSideConnection, session: NewSessionResponse | LoadSessionResponse
     ) -> None:
-        """Best-effort model selection across BOTH ACP model channels, so a chosen model (and a model-id-encoded
-        effort tier for codex/cursor) actually takes effect over ACP. Never fatal.
+        """Select the effective model across ACP channels, preferring a verifiable config option.
 
-        Channel 1 -- ``session.models`` (SessionModelState): when the agent advertises the resolved model there,
-        ``session/set_model``. Channel 2 -- a ``session.configOptions`` "model" SELECT option: when the agent
-        advertises the resolved value there, ``session/set_config_option`` (claude_code's claude-agent-acp
-        surfaces its models this way, NOT in SessionModelState, so without this channel a model can never be
-        selected for it). The model is sent ONLY when the agent advertised the EXACT value on one of the
-        channels -- an agent that takes no model (or does not offer this one) is left on its own default rather
-        than handed an unknown id, which is what keeps a Bedrock/Vertex-configured harness on its provider's
-        model instead of a rejected cloud id. Any failure is swallowed: model selection is an enhancement, not a
-        handshake requirement, and the turn proceeds on the agent's default model.
+        When an effective model is set (caller / descriptor default / effort rewrite), selection prefers a
+        verifiable config option, then ``session/set_model``. An unadvertised or unconfirmed model is a hard
+        :class:`ACPHandshakeError` (``MODEL_UNAVAILABLE``) when the caller named a model, effort rewrote one,
+        or the agent advertises model channels that omit the target -- never a silent fall-through that
+        reports the request as selected. ``model=None`` with no descriptor default skips selection (the
+        agent's own default path). A descriptor-default-only request on a channel-less agent also skips
+        selection (ACP cannot confirm it) without claiming ``selected_model`` / ``confirmed``.
+
+        Priority: when a ``session.configOptions`` model SELECT advertises the target, use
+        ``session/set_config_option`` and verify the returned ``current_value`` (Cursor dual-channel agents
+        advertise ``session/set_model`` but only the config option is authoritative). Skip the RPC when
+        ``current_value`` is already the target. Only when no suitable config option exists, use
+        ``session/set_model`` for a model advertised in ``SessionModelState``; a successful ACP response is
+        confirmation for set_model-only agents.
         """
         model = self._target.model
         if not model or self._session_id is None:
             return
-        # Channel 1: the ACP SessionModelState. Authoritative when it advertises the resolved model.
-        if _advertises_model(session, model):
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(
-                    conn.set_session_model(model_id=model, session_id=self._session_id),
-                    timeout=self._handshake_timeout,
+        found = _model_config_option(self._config_options)
+        in_config = found is not None and model in found[2]
+        in_session = _advertises_model(session, model)
+        has_channels = bool(_models_of(session)) or (found is not None and bool(found[2]))
+        if not in_config and not in_session:
+            # Soft path: descriptor-default-only on a channel-less agent cannot be selected over ACP (the agent
+            # runs its own default). An explicit caller model, an effort-rewritten id, or any advertising
+            # channel that omits the target is a hard MODEL_UNAVAILABLE -- never silently continue as if selected.
+            explicit = self._caller_model is not None
+            rewritten = self._override.model is not None
+            if has_channels or explicit or rewritten:
+                raise ACPHandshakeError(
+                    ErrorCode.MODEL_UNAVAILABLE,
+                    f"model {model!r} is not available on {self._descriptor.id}: "
+                    "not advertised by session.models or a model config option",
+                    ReexecutionSafety.SAFE,
                 )
             return
-        # Channel 2: a "model" config option (alias-based harnesses, e.g. claude_code). Select via the
-        # config-option channel only when it advertises the EXACT requested value.
-        found = _model_config_option(self._config_options)
-        if found is None:
+        # * Prefer the verifiable config-option channel whenever it advertises the target (Cursor dual-channel).
+        if in_config:
+            assert found is not None  # narrowed by in_config
+            config_id, current, _values = found
+            if current == model:
+                self._selected_model = model
+                self._model_confirmed = True
+                return
+            try:
+                response = await asyncio.wait_for(
+                    conn.set_config_option(config_id=config_id, value=model, session_id=self._session_id),
+                    timeout=self._handshake_timeout,
+                )
+            except Exception as exc:
+                raise ACPHandshakeError(
+                    ErrorCode.MODEL_UNAVAILABLE,
+                    f"model {model!r} selection via set_config_option failed on {self._descriptor.id}: {exc}",
+                    ReexecutionSafety.SAFE,
+                ) from exc
+            options = list(getattr(response, "config_options", None) or [])
+            if options:
+                self._config_options = options
+                model_option = _model_config_option(options)
+                self._config_model_values = list(model_option[2]) if model_option is not None else []
+            if not _config_option_current_equals(response, config_id, model):
+                raise ACPHandshakeError(
+                    ErrorCode.MODEL_UNAVAILABLE,
+                    f"model {model!r} selection was not confirmed by {self._descriptor.id}: "
+                    "set_config_option did not return matching current_value",
+                    ReexecutionSafety.SAFE,
+                )
+            self._selected_model = model
+            self._model_confirmed = True
             return
-        config_id, _current, values = found
-        if model not in values:
-            return
-        with contextlib.suppress(Exception):
+        # set_model-only: SessionModelState advertises the id; a successful ACP response is confirmation.
+        try:
             await asyncio.wait_for(
-                conn.set_config_option(config_id=config_id, value=model, session_id=self._session_id),
+                conn.set_session_model(model_id=model, session_id=self._session_id),
                 timeout=self._handshake_timeout,
             )
+        except Exception as exc:
+            raise ACPHandshakeError(
+                ErrorCode.MODEL_UNAVAILABLE,
+                f"model {model!r} selection via set_model failed on {self._descriptor.id}: {exc}",
+                ReexecutionSafety.SAFE,
+            ) from exc
+        self._selected_model = model
+        self._model_confirmed = True
 
     async def _select_effort(self, conn: ClientSideConnection) -> None:
         """Best-effort ``session/set_config_option`` for an agent that carries effort via a config option.
@@ -496,7 +571,17 @@ class ACPSession:
             sampler.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sampler
-        result = _reduce(self._descriptor, self._target, self._policy, self._journal, response, self._session_id, start)
+        result = _reduce(
+            self._descriptor,
+            self._target,
+            self._policy,
+            self._journal,
+            response,
+            self._session_id,
+            start,
+            selected_model=self._selected_model,
+            model_confirmed=self._model_confirmed,
+        )
         return self._stamp(result)
 
     async def _sample_observed_agents(self) -> None:
@@ -527,12 +612,15 @@ class ACPSession:
         ``effort`` / ``effort_applied`` echo what was requested and what the agent applied after clamping;
         ``observed_peak_agents`` carries the live sampler's high-water mark up so a panel can roll it into
         its :class:`~rutherford.domain.models.Topology` (a floor, ``None`` when nothing was sampled); ``argv``
-        pins the logical launch for an F2 replay.
+        pins the logical launch for an F2 replay. ``requested_model`` / ``selected_model`` separate the
+        pre-effort request from the ACP-confirmed selection.
         """
         result.effort = self._effort
         result.effort_applied = self._effort_applied
         result.observed_peak_agents = self._observed_peak_agents
         result.argv = list(self._launch_argv)
+        result.requested_model = self._requested_model
+        result.selected_model = self._selected_model
         return result
 
     async def cancel(self) -> None:
@@ -614,6 +702,8 @@ async def run_acp_turn(
         result.effort = effort
         result.effort_applied = session.effort_applied
         result.argv = session.launch_argv  # F2: a spawn-failed leaf still records the argv it tried
+        result.requested_model = session.requested_model
+        result.selected_model = session.selected_model
         return result
 
 
@@ -625,6 +715,9 @@ def _reduce(
     response: PromptResponse,
     session_id: str,
     start: float,
+    *,
+    selected_model: str | None,
+    model_confirmed: bool,
 ) -> DelegationResult:
     """Project the finished turn's journal + stop reason into a normalized result."""
     text = journal.message_text().strip()
@@ -649,6 +742,8 @@ def _reduce(
             ReexecutionSafety.DUPLICATE_COST,
             cost=cost,
         )
+    # Provenance.model is only the confirmed selection -- never an unconfirmed requested/rewritten target.
+    provenance_model = selected_model if model_confirmed else None
     return DelegationResult(
         target=target,
         ok=True,
@@ -656,7 +751,9 @@ def _reduce(
         cost=cost,
         session_id=session_id,
         duration_s=round(time.monotonic() - start, 3),
-        provenance=Provenance(provider=descriptor.provider, model=target.model, confirmed=False),
+        provenance=Provenance(
+            provider=descriptor.provider, model=provenance_model, confirmed=model_confirmed and bool(provenance_model)
+        ),
         safety_mode=policy.mode,
     )
 
@@ -709,6 +806,19 @@ def _advertises_model(session: NewSessionResponse | LoadSessionResponse, model_i
     if state is None or state.available_models is None:
         return False
     return any(info.model_id == model_id for info in state.available_models)
+
+
+def _config_option_current_equals(response: object, config_id: str, model: str) -> bool:
+    """Whether a ``set_config_option`` response confirms ``config_id``'s ``current_value`` equals ``model``."""
+    options = getattr(response, "config_options", None)
+    if not options:
+        return False
+    for option in options:
+        if getattr(option, "id", None) != config_id:
+            continue
+        current = getattr(option, "current_value", None)
+        return isinstance(current, str) and current == model
+    return False
 
 
 def _models_of(session: NewSessionResponse | LoadSessionResponse) -> list[str]:

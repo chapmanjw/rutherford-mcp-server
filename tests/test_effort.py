@@ -91,11 +91,48 @@ def test_cursor_appends_a_model_suffix_and_clamps_xhigh() -> None:
     assert "clamped from xhigh" in xhigh.note
 
 
+def test_cursor_updates_bracket_effort_without_suffix() -> None:
+    # Compound Cursor ids carry effort= inside [...]; rewriting must not append -<tier> after the bracket.
+    updated = effort_overrides(_descriptor("cursor"), Effort.HIGH, model="grok-4.5[effort=medium,fast=true]")
+    assert updated.model == "grok-4.5[effort=high,fast=true]"
+    assert updated.applied is Effort.HIGH
+    same = effort_overrides(_descriptor("cursor"), Effort.HIGH, model="grok-4.5[effort=high,fast=true]")
+    assert same.model is None and "already carries" in same.note
+    inserted = effort_overrides(_descriptor("cursor"), Effort.LOW, model="grok-4.5[fast=true]")
+    assert inserted.model == "grok-4.5[effort=low,fast=true]"
+
+
 def test_cursor_leaves_auto_and_already_tiered_models_unchanged() -> None:
     auto = effort_overrides(_descriptor("cursor"), Effort.HIGH, model="auto")
     assert auto.model is None and auto.applied is Effort.HIGH  # nothing rewritten, but the tier is reported
     tiered = effort_overrides(_descriptor("cursor"), Effort.HIGH, model="gpt-5.2-medium")
     assert tiered.model is None and "already carries" in tiered.note
+
+
+async def test_cursor_effort_requested_vs_selected_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    # requested_model stays pre-rewrite; selected_model / target.model are the effort-rewritten id.
+    from rutherford.acp.permission import PermissionPolicy
+    from rutherford.acp.session import run_acp_turn
+    from rutherford.domain.enums import SafetyMode
+
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "gpt-5.2-high,gpt-5.2")
+    cursor = AgentDescriptor("cursor", "Cursor", _FAKE_CMD)
+    outcome = await run_acp_turn(
+        cursor,
+        "what is 17 + 25?",
+        policy=PermissionPolicy(SafetyMode.READ_ONLY),
+        cwd=str(REPO_ROOT),
+        timeout_s=60.0,
+        model="gpt-5.2",
+        effort=Effort.HIGH,
+    )
+    assert outcome.ok is True
+    assert outcome.requested_model == "gpt-5.2"
+    assert outcome.selected_model == "gpt-5.2-high"
+    assert outcome.target.model == "gpt-5.2-high"
+    assert outcome.provenance is not None
+    assert outcome.provenance.model == "gpt-5.2-high"
+    assert outcome.provenance.confirmed is True
 
 
 def test_cline_uses_the_thinking_launch_flag_for_every_tier() -> None:

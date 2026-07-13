@@ -122,15 +122,14 @@ class Provenance(BaseModel):
       (``bedrock`` / ``vertex`` / ``aws`` / ``azure`` / ``openrouter`` / ``groq`` / ...); ``None`` for
       a direct vendor call or a local model. Kept separate from ``provider`` so "the same model served
       two ways" is not counted as two providers.
-    * ``model`` -- the resolved requested model (the model the CLI was asked to use; for a CLI whose
-      selector namespaces the vendor, e.g. OpenCode, the bare model id). Rutherford does not currently
-      read a CLI-reported resolved id back from the output, so this may be an alias (``opus``) rather
-      than a pinned snapshot id -- which is why two CLIs naming the same model differently read as two
-      distinct models (see :class:`DiversityReport`).
+    * ``model`` -- the model ACP selection confirmed for the turn (``selected_model``), not merely the
+      caller's request before effort rewrite. Rutherford does not scrape a CLI-reported id from stdout; when
+      selection was confirmed over ACP this is the effective id, otherwise the field stays ``None`` rather
+      than echoing an unconfirmed request.
     * ``cli_version`` -- the CLI build that produced the answer, for drift forensics.
-    * ``confirmed`` -- ``True`` when provider/model came from a definitive signal (the model string the
-      CLI was given and uses, an explicit backend flag, a fixed-vendor CLI); ``False`` when inferred by
-      a fallible heuristic (a model-name pattern, a home-vendor default).
+    * ``confirmed`` -- ``True`` only after a successful, verified model selection (config-option
+      ``current_value`` match, or a successful ``session/set_model`` response on a set_model-only agent);
+      ``False`` when provider/model were inferred or no model was selected.
     """
 
     provider: str | None = None
@@ -513,6 +512,14 @@ class DelegationResult(BaseModel):
     The same shape regardless of the CLI's native output format. ``text`` is the clean final
     answer; ``raw`` is the unparsed stdout/stderr, included only when the caller asks for it.
     ``session_id`` is opaque and round-trips to the CLI's own resume mechanism.
+
+    Model fields (requested vs selected vs ``target.model``):
+
+    * ``requested_model`` -- the model before effort rewrite (caller / descriptor default).
+    * ``selected_model`` -- the effective model ACP selection confirmed; ``None`` when unconfirmed.
+    * ``target.model`` -- the effective post-effort-rewrite id this turn was configured for (equals
+      ``selected_model`` when selection confirmed). Kept for backward compatibility with callers that
+      already read ``target.model`` as the resolved invocation model.
     """
 
     target: Target
@@ -529,6 +536,12 @@ class DelegationResult(BaseModel):
     #: adapter's fallback model, this records the model that was requested. ``target.model`` then
     #: holds the model that actually answered. ``None`` means no fallback happened.
     fallback_from: str | None = None
+    #: The model asked for BEFORE effort rewrite (and before ACP selection). ``None`` when the caller
+    #: named none and the descriptor has no default -- the agent's own default path.
+    requested_model: str | None = None
+    #: The effective model ACP selection confirmed for this turn. ``None`` when no model was selected
+    #: or confirmation failed (a failed selection returns an error rather than echoing the request).
+    selected_model: str | None = None
     #: When a cross-target fallback chain fired (F7), the display labels of the targets that failed
     #: before the one that answered, in order. ``target`` then holds the target that actually answered.
     #: ``None`` means no cross-target fallback happened.

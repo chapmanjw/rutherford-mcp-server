@@ -170,11 +170,46 @@ def test_post_prompt_safety_classification() -> None:
     assert _post_prompt_safety(EventJournal()) is ReexecutionSafety.DUPLICATE_COST
 
 
-async def test_run_turn_records_requested_model() -> None:
+async def test_run_turn_records_requested_and_selected_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    # set_model-only: advertise the id, select it, and stamp requested/selected/confirmed on the envelope.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "fake-model")
     result = await run_acp_turn(
         FAKE, "what is 17 + 25?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="fake-model"
     )
-    assert result.ok is True and result.target.model == "fake-model"
+    assert result.ok is True
+    assert result.target.model == "fake-model"
+    assert result.requested_model == "fake-model"
+    assert result.selected_model == "fake-model"
+    assert result.provenance is not None
+    assert result.provenance.model == "fake-model"
+    assert result.provenance.confirmed is True
+
+
+async def test_run_turn_without_model_keeps_default_path() -> None:
+    # model=None and no descriptor default: no selection, no confirmed provenance model.
+    result = await run_acp_turn(FAKE, "what is 17 + 25?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert result.ok is True
+    assert result.target.model is None
+    assert result.requested_model is None
+    assert result.selected_model is None
+    assert result.provenance is not None
+    assert result.provenance.model is None
+    assert result.provenance.confirmed is False
+
+
+async def test_descriptor_default_on_channel_less_agent_is_soft(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Descriptor default with no ACP model channels: turn runs on the agent default without claiming selection.
+    monkeypatch.delenv("RUTHERFORD_FAKE_MODELS", raising=False)
+    monkeypatch.delenv("RUTHERFORD_FAKE_MODEL_OPTION", raising=False)
+    desc = AgentDescriptor("fake", "Fake", FAKE.command, default_model="m1")
+    result = await run_acp_turn(desc, "what is 17 + 25?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert result.ok is True
+    assert result.requested_model == "m1"
+    assert result.target.model == "m1"
+    assert result.selected_model is None
+    assert result.provenance is not None
+    assert result.provenance.model is None
+    assert result.provenance.confirmed is False
 
 
 # --- model selection across the two ACP channels -----------------------------
@@ -187,18 +222,68 @@ async def test_select_model_via_config_option_channel(monkeypatch: pytest.Monkey
     # for claude_code at all).
     monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet,haiku")
     result = await run_acp_turn(FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
-    assert result.ok is True and "model=sonnet" in result.text
+    assert result.ok is True
+    assert "model=sonnet" in result.text
+    assert result.selected_model == "sonnet"
+    assert result.provenance is not None and result.provenance.confirmed is True
 
 
-async def test_unadvertised_model_is_not_forced_on_either_channel(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A model advertised on NEITHER channel is left to the agent's own default -- no set_model, no
-    # set_config_option. This is what keeps a Bedrock/Vertex harness on its provider's model instead of being
-    # handed a rejected cloud id like "claude-opus-4-8".
+async def test_unadvertised_model_is_model_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A model advertised on NEITHER channel fails hard (MODEL_UNAVAILABLE) instead of silently running on the
+    # agent default -- an explicit request must not be reported as selected when it was never applied.
     monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet,haiku")
     result = await run_acp_turn(
         FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="claude-opus-4-8"
     )
-    assert result.ok is True and "model=(unset)" in result.text
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.MODEL_UNAVAILABLE
+    assert result.selected_model is None
+    assert result.requested_model == "claude-opus-4-8"
+
+
+async def test_dual_channel_prefers_verified_config_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Cursor dual-channel: both session.models and a model config option advertise the id. set_model is a
+    # no-op for the real channel; Rutherford must use set_config_option (and not call set_model).
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "sonnet,default")
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet")
+    result = await run_acp_turn(FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
+    assert result.ok is True
+    assert "model=sonnet" in result.text
+    assert "set_model_calls=0" in result.text
+    assert "set_config_calls=1" in result.text
+    assert result.selected_model == "sonnet"
+    assert result.provenance is not None and result.provenance.confirmed is True
+
+
+async def test_already_current_config_model_skips_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
+    # When current_value already equals the target, skip set_config_option and still confirm.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "sonnet,haiku")
+    result = await run_acp_turn(FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
+    assert result.ok is True
+    assert "model=(unset)" in result.text  # no set_config_option call, so fake never recorded a set
+    assert "set_config_calls=0" in result.text
+    assert result.selected_model == "sonnet"
+    assert result.provenance is not None and result.provenance.confirmed is True
+
+
+async def test_config_option_current_value_mismatch_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet")
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_MISMATCH", "1")
+    result = await run_acp_turn(FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.MODEL_UNAVAILABLE
+    assert "not confirmed" in (result.error.message or "")
+    assert result.selected_model is None
+
+
+async def test_set_model_only_channel_confirms(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "gpt-5.2,gpt-4")
+    result = await run_acp_turn(
+        FAKE, "what is 17 + 25?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="gpt-5.2"
+    )
+    assert result.ok is True
+    assert result.selected_model == "gpt-5.2"
+    assert result.provenance is not None and result.provenance.confirmed is True
 
 
 def test_model_config_option_matches_by_category_and_keeps_only_string_values() -> None:

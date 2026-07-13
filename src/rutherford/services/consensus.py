@@ -665,6 +665,8 @@ class ConsensusService:
         # carries the peak the session's sampler observed before the cut (a floor) into the panel topology.
         observed = session.observed_peak_agents if session is not None else None
         if partial:
+            confirmed = session.model_confirmed if session is not None else False
+            selected = session.selected_model if session is not None else None
             return DelegationResult(
                 target=session.target if session is not None else Target(cli=target.cli, model=target.model),
                 ok=True,
@@ -675,10 +677,12 @@ class ConsensusService:
                 effort_applied=applied,
                 safety_mode=req.safety_mode,
                 observed_peak_agents=observed,
+                requested_model=session.requested_model if session is not None else target.model,
+                selected_model=selected,
                 provenance=Provenance(
                     provider=self._descriptors.get(target.cli).provider if self._descriptors.has(target.cli) else None,
-                    model=session.target.model if session is not None else target.model,
-                    confirmed=False,
+                    model=selected if confirmed else None,
+                    confirmed=confirmed and bool(selected),
                 ),
             )
         return DelegationResult(
@@ -694,6 +698,8 @@ class ConsensusService:
             effort_applied=applied,
             safety_mode=req.safety_mode,
             observed_peak_agents=observed,
+            requested_model=session.requested_model if session is not None else target.model,
+            selected_model=session.selected_model if session is not None else None,
         )
 
     def _rollup(
