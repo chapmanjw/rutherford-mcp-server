@@ -9,6 +9,7 @@ from typing import Any
 
 from ..acp.conformance import probe_agent, probe_connection
 from ..acp.descriptors import AgentDescriptor
+from ..acp.effort import supports_effort
 from ..context import AppContext, tool_success
 from .common import ensure_known_agent
 
@@ -19,6 +20,12 @@ _LOCAL_PROVIDERS = frozenset({"ollama", "lmstudio"})
 #: The probe budget for a local-model agent (cold start headroom). Applied as a floor over the call's
 #: ``timeout_s``, so an explicit larger ``timeout_s`` still wins and a cloud agent keeps the shorter default.
 _LOCAL_PROBE_TIMEOUT_S = 180.0
+
+#: Static notes for MCP agent-users: capabilities never spawns agents, so live model catalogs stay on doctor.
+_CAPABILITIES_NOTES: tuple[str, ...] = (
+    "Model resolution: explicit model -> agent default_model -> agent-native default.",
+    "Live advertised model ids: doctor(agent=<id>, connect_only=true).",
+)
 
 
 def _probe_timeout(descriptor: AgentDescriptor, default: float) -> float:
@@ -36,18 +43,36 @@ def _probe_timeout(descriptor: AgentDescriptor, default: float) -> float:
     return default
 
 
+def _model_selection(descriptor: AgentDescriptor) -> str:
+    """How Rutherford applies a resolved model for this agent (static; not a live channel probe)."""
+    # * Launch-flag agents (Cursor) pass the model on argv; everyone else uses in-session ACP selection.
+    return "launch_argv" if descriptor.model_launch_flag else "in_session"
+
+
+def _agent_capability(descriptor: AgentDescriptor) -> dict[str, Any]:
+    """One registry row for ``capabilities``: identity plus static model/effort roster fields."""
+    return {
+        "id": descriptor.id,
+        "display_name": descriptor.display_name,
+        "command": " ".join(descriptor.command),
+        "provider": descriptor.provider,
+        "default_model": descriptor.default_model,
+        "fallback_model": descriptor.fallback_model,
+        "model_selection": _model_selection(descriptor),
+        "effort_capable": supports_effort(descriptor),
+    }
+
+
 async def capabilities_tool(app: AppContext) -> str:
-    """Return the registered ACP agents (id, display name, launch command, provider) -- the cheap snapshot."""
-    agents: list[dict[str, Any]] = [
-        {
-            "id": descriptor.id,
-            "display_name": descriptor.display_name,
-            "command": " ".join(descriptor.command),
-            "provider": descriptor.provider,
-        }
-        for descriptor in app.descriptors.all()
-    ]
-    return tool_success({"agents": agents})
+    """Return the registered ACP agents as a cheap static roster (no spawn).
+
+    Each agent includes id, display name, launch command, provider, configured ``default_model`` /
+    ``fallback_model``, how Rutherford selects models (``launch_argv`` vs ``in_session``), and whether
+    ``effort`` has a known knob. Live advertised model catalogs are not included -- use
+    ``doctor(agent=<id>, connect_only=true)`` for that.
+    """
+    agents = [_agent_capability(descriptor) for descriptor in app.descriptors.all()]
+    return tool_success({"agents": agents, "notes": list(_CAPABILITIES_NOTES)})
 
 
 async def doctor_tool(

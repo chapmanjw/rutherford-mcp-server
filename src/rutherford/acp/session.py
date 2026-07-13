@@ -43,7 +43,12 @@ from ..domain.models import Cost, DelegationResult, ErrorInfo, Provenance, Targe
 from ..runtime.depth import child_env
 from .client import RutherfordACPClient
 from .descriptors import AgentDescriptor
-from .effort import EFFORT_CONFIG_OPTION_IDS, clamp_to_supported, effort_overrides
+from .effort import (
+    EFFORT_CONFIG_OPTION_IDS,
+    clamp_to_supported,
+    effort_overrides,
+    launch_advertisement_compatible,
+)
 from .host_env import claude_bedrock_env
 from .journal import EventJournal, journal_event_from_message
 from .launch import prepare_argv
@@ -360,8 +365,10 @@ class ACPSession:
                 session = await self._resume(conn, init)
             else:
                 session = await self._new_session(conn)
+            # * Legacy SessionModelState (session.models) is optional: ACP SDK 0.11+ removes the field; access
+            # only via defensive helpers so a config-only response never AttributeErrors before launch validation.
             self._available_models = _models_of(session)
-            self._config_options = list(session.config_options or [])
+            self._config_options = list(getattr(session, "config_options", None) or [])
             # Capture the SECOND model channel (a configOptions "model" select option) so available_models can
             # report the union -- claude_code's adapter advertises its models here, not in SessionModelState.
             model_option = _model_config_option(self._config_options)
@@ -506,10 +513,20 @@ class ACPSession:
             self._selected_model = model
             self._model_confirmed = True
             return
-        # set_model-only: SessionModelState advertises the id; a successful ACP response is confirmation.
+        # set_model-only: legacy SessionModelState advertises the id. ACP SDK 0.11+ drops set_session_model --
+        # call only when the connection still exposes it; otherwise a structured MODEL_UNAVAILABLE (not AttributeError).
+        set_model = getattr(conn, "set_session_model", None)
+        if not callable(set_model):
+            raise ACPHandshakeError(
+                ErrorCode.MODEL_UNAVAILABLE,
+                f"model {model!r} is not available on {self._descriptor.id}: "
+                "advertised only via legacy session.models, but this ACP client has no set_session_model "
+                "(use a model config option or a launch --model agent)",
+                ReexecutionSafety.SAFE,
+            )
         try:
             await asyncio.wait_for(
-                conn.set_session_model(model_id=model, session_id=self._session_id),
+                set_model(model_id=model, session_id=self._session_id),
                 timeout=self._handshake_timeout,
             )
         except Exception as exc:
@@ -528,12 +545,16 @@ class ACPSession:
         both ACP model channels and the request was explicit, effort-rewritten, or the agent advertises
         channels. Soft-skips only for a descriptor-default-only request on a channel-less agent (same rule
         as the in-session path). Does not set :attr:`selected_model` / :attr:`model_confirmed`.
+
+        Launch-only compatibility: an advertised compound id that differs solely in a boolean ``fast=``
+        value still counts (exact argv / caller intent is unchanged). In-session :meth:`_select_model`
+        keeps strict exact-match advertisement checks.
         """
         found = _model_config_option(self._config_options)
-        in_config = found is not None and model in found[2]
-        in_session = _advertises_model(session, model)
-        has_channels = bool(_models_of(session)) or (found is not None and bool(found[2]))
-        if in_config or in_session:
+        config_values = list(found[2]) if found is not None else []
+        session_values = _models_of(session)
+        has_channels = bool(session_values) or bool(config_values)
+        if _launch_model_advertised(model, config_values) or _launch_model_advertised(model, session_values):
             return
         explicit = self._caller_model is not None
         rewritten = self._override.model is not None
@@ -854,12 +875,28 @@ def _resolve_env(descriptor: AgentDescriptor) -> dict[str, str]:
     return env
 
 
-def _advertises_model(session: NewSessionResponse | LoadSessionResponse, model_id: str) -> bool:
-    """Whether the session advertised ``model_id`` among its selectable models (so set_model is safe)."""
-    state = session.models
-    if state is None or state.available_models is None:
-        return False
-    return any(info.model_id == model_id for info in state.available_models)
+def _legacy_model_state(session: object) -> object | None:
+    """The unstable ``session.models`` SessionModelState when the SDK still exposes it, else ``None``.
+
+    ACP 0.10.x typed responses carry an optional ``models`` field; ACP 0.11+ removes the attribute entirely.
+    Production code must never require ``.models`` -- a missing attribute is treated as no legacy channel.
+    """
+    return getattr(session, "models", None)
+
+
+def _advertises_model(session: object, model_id: str) -> bool:
+    """Whether the legacy SessionModelState channel advertised ``model_id`` (so set_model is safe)."""
+    return model_id in _models_of(session)
+
+
+def _launch_model_advertised(model: str, advertised: list[str]) -> bool:
+    """Whether launch validation accepts ``model`` against an advertised id list.
+
+    Exact membership first; then :func:`launch_advertisement_compatible` (boolean ``fast=`` only).
+    """
+    if model in advertised:
+        return True
+    return any(launch_advertisement_compatible(model, item) for item in advertised)
 
 
 def _config_option_current_equals(response: object, config_id: str, model: str) -> bool:
@@ -875,12 +912,24 @@ def _config_option_current_equals(response: object, config_id: str, model: str) 
     return False
 
 
-def _models_of(session: NewSessionResponse | LoadSessionResponse) -> list[str]:
-    """The model ids the session advertised (its selectable models), or ``[]`` when it offers none."""
-    state = session.models
-    if state is None or state.available_models is None:
+def _models_of(session: object) -> list[str]:
+    """Legacy SessionModelState model ids, or ``[]`` when the channel is absent / empty.
+
+    Safe on ACP 0.10.1 typed objects (``models`` may be ``None``) and on ACP 0.11+ / duck-typed responses that
+    omit the attribute entirely. Only string ``model_id`` values are kept.
+    """
+    state = _legacy_model_state(session)
+    if state is None:
         return []
-    return [info.model_id for info in state.available_models]
+    available = getattr(state, "available_models", None)
+    if not available:
+        return []
+    ids: list[str] = []
+    for info in available:
+        model_id = getattr(info, "model_id", None)
+        if isinstance(model_id, str):
+            ids.append(model_id)
+    return ids
 
 
 def _effort_config_option(options: list[object]) -> tuple[str, list[Effort]] | None:

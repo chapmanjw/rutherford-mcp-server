@@ -431,7 +431,14 @@ async def debate(
 
 @mcp.tool
 async def capabilities() -> str:
-    """List the ACP agents Rutherford can drive (id, display name, launch command, provider)."""
+    """List the ACP agents Rutherford can drive (static roster; no spawn).
+
+    Each agent includes id, display name, launch command, provider, configured `default_model` /
+    `fallback_model`, `model_selection` (`launch_argv` for Cursor-style launch flags, else
+    `in_session`), and `effort_capable`. Model resolution is: explicit `model` -> agent
+    `default_model` -> agent-native default. For live advertised model ids, use
+    `doctor(agent=<id>, connect_only=true)` -- capabilities never probes an agent.
+    """
     return await _guarded(capabilities_tool(get_app()))
 
 

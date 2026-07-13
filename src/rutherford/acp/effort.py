@@ -88,6 +88,15 @@ def _clamp(effort: Effort, ceiling: Effort) -> Effort:
     return ceiling
 
 
+def supports_effort(descriptor: AgentDescriptor) -> bool:
+    """Whether Rutherford knows a reasoning-effort knob for ``descriptor`` (including clones via ``effort_base``).
+
+    Static roster signal for ``capabilities``: true when :func:`effort_overrides` would apply a real mechanism
+    for a concrete tier, false when any requested effort is a reported no-op.
+    """
+    return (descriptor.effort_base or descriptor.id) in _BUILDERS
+
+
 def effort_overrides(descriptor: AgentDescriptor, effort: Effort | None, *, model: str | None) -> EffortOverride:
     """Map ``effort`` to ``descriptor``'s per-call ACP override, or a reported no-op.
 
@@ -254,6 +263,82 @@ def _cursor_bracket_effort(model: str, effort: Effort) -> str:
     if not replaced:
         new_parts.insert(0, f"effort={effort_value}")
     return f"{base}[{','.join(new_parts)}]"
+
+
+@dataclass(frozen=True, slots=True)
+class CompoundModelId:
+    """A parsed compound model id: bare ``base`` or ``base[key=value,...]`` (keys lowercased)."""
+
+    base: str
+    #: Normalized ``(key, value)`` pairs in advertisement order; keys are lowercased, values stripped.
+    params: tuple[tuple[str, str], ...]
+
+
+_BOOLEAN_PARAM_VALUES = frozenset({"true", "false"})
+
+
+def parse_compound_model_id(model_id: str) -> CompoundModelId | None:
+    """Parse a bare or bracketed compound model id; ``None`` when malformed (fail closed).
+
+    Accepts ``base`` or ``base[k=v,k2=v2]``. Rejects empty base, unclosed / nested brackets, empty
+    segments, missing ``=``, empty keys/values, and duplicate keys (case-insensitive). No vendor-specific
+    model table -- structural parsing only.
+    """
+    if not model_id or model_id != model_id.strip():
+        return None
+    if "[" not in model_id:
+        if "]" in model_id:
+            return None
+        return CompoundModelId(base=model_id, params=())
+    if model_id.count("[") != 1 or not model_id.endswith("]"):
+        return None
+    base, _, rest = model_id.partition("[")
+    if not base:
+        return None
+    params_str = rest[:-1]
+    if not params_str:
+        return CompoundModelId(base=base, params=())
+    params: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for part in params_str.split(","):
+        if not part.strip():
+            return None
+        key, sep, value = part.partition("=")
+        if not sep:
+            return None
+        key_n = key.strip().lower()
+        value_n = value.strip()
+        if not key_n or not value_n or key_n in seen:
+            return None
+        seen.add(key_n)
+        params.append((key_n, value_n))
+    return CompoundModelId(base=base, params=tuple(params))
+
+
+def launch_advertisement_compatible(requested: str, advertised: str) -> bool:
+    """Whether ``requested`` may pass launch-only advertisement checks against ``advertised``.
+
+    Exact string match wins. Otherwise both ids must parse, share the same base and the same param
+    key set, match on every non-``fast`` value, and differ only in a boolean ``fast=`` value when they
+    differ at all. Malformed either side, unknown base, or a differing ``effort`` (or any other param)
+    returns ``False`` -- callers raise ``MODEL_UNAVAILABLE``. Does not rewrite either id.
+    """
+    if requested == advertised:
+        return True
+    left = parse_compound_model_id(requested)
+    right = parse_compound_model_id(advertised)
+    if left is None or right is None or left.base != right.base:
+        return False
+    left_map = dict(left.params)
+    right_map = dict(right.params)
+    if set(left_map) != set(right_map):
+        return False
+    differing = [key for key, value in left_map.items() if right_map[key] != value]
+    if not differing:
+        return True
+    if differing != ["fast"]:
+        return False
+    return left_map["fast"].lower() in _BOOLEAN_PARAM_VALUES and right_map["fast"].lower() in _BOOLEAN_PARAM_VALUES
 
 
 #: One agent's effort builder: ``(resolved model, tier)`` -> its override. The ``None`` effort case

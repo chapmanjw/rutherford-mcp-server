@@ -133,6 +133,17 @@ descendant process tree (`teardown.py`): a wrapper adapter spawns the underlying
 the SDK transport terminates only the direct child, so the descendants are snapshotted before
 teardown and reaped after.
 
+**ACP SDK model channels (0.10.x vs 0.11+).** Session model advertisement has two channels: the unstable
+legacy `session.models` / `session/set_model` surface (present in `agent-client-protocol` 0.10.x) and the
+stable `configOptions` model select + `session/set_config_option` surface. SDK 0.11+ removes the legacy
+field and client method; Rutherford reads `session.models` only via defensive accessors and calls
+`set_session_model` only when the connection still exposes it, so a config-only SDK does not fail open
+with `AttributeError`. Cursor continues to use `model_launch_flag` (launch `--model`) with advertisement
+validated on whichever channel the agent exposes. Launch-only validation also accepts a compound id that
+differs solely in a boolean `fast=` value (argv stays exact; envelope stays unconfirmed). In-session
+selection remains exact-match. Live Cursor may still record a `*-fast` runtime slug despite `fast=false`
+on launch — do not treat that as a routing failure.
+
 ---
 
 ## The event journal
@@ -302,7 +313,8 @@ workspace setup against the real repo). The probe classifies the outcome:
 | `error` | some other failure |
 
 This is the only trustworthy health signal for an ACP agent, since there is no cheap non-interactive
-auth check. `capabilities` is the cheap snapshot (just the registry); `doctor` makes a real call per
+auth check. `capabilities` is the cheap static roster (registry fields including `default_model`,
+`model_selection`, and `effort_capable`; no spawn); `doctor` makes a real call per
 agent.
 
 ---

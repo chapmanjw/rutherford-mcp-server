@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
-from rutherford.acp.effort import EffortOverride, clamp_to_supported, effort_overrides
+from rutherford.acp.effort import EffortOverride, clamp_to_supported, effort_overrides, supports_effort
 from rutherford.acp.roster import build_registry
 from rutherford.config.schema import AgentConfig, RutherfordConfig
 from rutherford.domain.enums import Effort
@@ -23,6 +23,21 @@ _FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_age
 
 def _descriptor(agent_id: str, *, model: str | None = None) -> AgentDescriptor:
     return AgentDescriptor(agent_id, agent_id.title(), _FAKE_CMD, default_model=model)
+
+
+def test_supports_effort_follows_builders_and_effort_base() -> None:
+    assert supports_effort(_descriptor("cursor")) is True
+    assert supports_effort(_descriptor("codex")) is True
+    assert supports_effort(_descriptor("goose")) is False
+    clone = AgentDescriptor(
+        "cursor-grok-high",
+        "Cursor Grok High",
+        _FAKE_CMD,
+        effort_base="cursor",
+        model_launch_flag="--model",
+    )
+    assert supports_effort(clone) is True
+    assert supports_effort(AgentDescriptor("custom", "Custom", _FAKE_CMD, effort_base=None)) is False
 
 
 # --- the per-agent override mapping ------------------------------------------
@@ -100,6 +115,39 @@ def test_cursor_updates_bracket_effort_without_suffix() -> None:
     assert same.model is None and "already carries" in same.note
     inserted = effort_overrides(_descriptor("cursor"), Effort.LOW, model="grok-4.5[fast=true]")
     assert inserted.model == "grok-4.5[effort=low,fast=true]"
+
+
+def test_parse_compound_model_id_and_launch_fast_compat() -> None:
+    from rutherford.acp.effort import CompoundModelId, launch_advertisement_compatible, parse_compound_model_id
+
+    assert parse_compound_model_id("composer-2.5") == CompoundModelId(base="composer-2.5", params=())
+    assert parse_compound_model_id("composer-2.5[fast=false]") == CompoundModelId(
+        base="composer-2.5", params=(("fast", "false"),)
+    )
+    assert parse_compound_model_id("grok-4.5[effort=high,fast=true]") == CompoundModelId(
+        base="grok-4.5", params=(("effort", "high"), ("fast", "true"))
+    )
+    # * Fail closed: malformed / duplicate params.
+    for bad in (
+        "",
+        " [fast=true]",
+        "x[fast=true",
+        "x[[fast=true]",
+        "x[fast]",
+        "x[=true]",
+        "x[fast=]",
+        "x[fast=true,fast=false]",
+        "x[fast=true,,effort=high]",
+    ):
+        assert parse_compound_model_id(bad) is None, bad
+
+    assert launch_advertisement_compatible("composer-2.5[fast=false]", "composer-2.5[fast=true]")
+    assert launch_advertisement_compatible("grok-4.5[effort=high,fast=false]", "grok-4.5[effort=high,fast=true]")
+    assert launch_advertisement_compatible("composer-2.5[fast=true]", "composer-2.5[fast=true]")
+    assert not launch_advertisement_compatible("grok-4.5[effort=high,fast=false]", "grok-4.5[effort=low,fast=true]")
+    assert not launch_advertisement_compatible("unknown[fast=false]", "composer-2.5[fast=true]")
+    assert not launch_advertisement_compatible("composer-2.5[fast=false]", "composer-2.5")
+    assert not launch_advertisement_compatible("composer-2.5[fast=false,fast=true]", "composer-2.5[fast=true]")
 
 
 def test_cursor_leaves_auto_and_already_tiered_models_unchanged() -> None:

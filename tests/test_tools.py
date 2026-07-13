@@ -60,6 +60,41 @@ def test_envelope_helpers() -> None:
 async def test_capabilities_tool_lists_agents() -> None:
     data = decode(await capabilities_tool(_app()))
     assert any(agent["id"] == "fake" for agent in data["agents"])
+    assert data["notes"]
+    assert any("connect_only" in note for note in data["notes"])
+    fake = next(agent for agent in data["agents"] if agent["id"] == "fake")
+    assert fake["default_model"] is None
+    assert fake["fallback_model"] is None
+    assert fake["model_selection"] == "in_session"
+    assert fake["effort_capable"] is False
+
+
+async def test_capabilities_tool_reports_static_model_fields() -> None:
+    cursor = AgentDescriptor(
+        "cursor",
+        "Cursor",
+        ("cursor-agent", "acp"),
+        default_model="grok-4.5[effort=high,fast=true]",
+        fallback_model="composer-2.5[fast=true]",
+        model_launch_flag="--model",
+    )
+    clone = AgentDescriptor(
+        "cursor-grok-high",
+        "Cursor Grok High",
+        ("cursor-agent", "acp"),
+        default_model="grok-4.5[effort=high,fast=true]",
+        effort_base="cursor",
+        model_launch_flag="--model",
+    )
+    app = build_app_context(config=RutherfordConfig(), descriptors=DescriptorRegistry([cursor, clone]))
+    data = decode(await capabilities_tool(app))
+    by_id = {agent["id"]: agent for agent in data["agents"]}
+    assert by_id["cursor"]["model_selection"] == "launch_argv"
+    assert by_id["cursor"]["effort_capable"] is True
+    assert by_id["cursor"]["default_model"] == "grok-4.5[effort=high,fast=true]"
+    assert by_id["cursor"]["fallback_model"] == "composer-2.5[fast=true]"
+    assert by_id["cursor-grok-high"]["model_selection"] == "launch_argv"
+    assert by_id["cursor-grok-high"]["effort_capable"] is True
 
 
 async def test_delegate_tool_ok_and_unknown() -> None:

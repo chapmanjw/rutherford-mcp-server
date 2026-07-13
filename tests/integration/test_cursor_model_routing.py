@@ -4,9 +4,12 @@
 
 Proves the only working Cursor contract on cursor-agent 2026.06+: the effective model rides the process
 launch argv (``cursor-agent acp --model <id>``), not in-session ACP ``set_config_option`` /
-``set_model``. A unique marker ties Rutherford's ``session_id`` to ``~/.cursor/acp-sessions/<id>/store.db``;
-the blob graph is searched for ``providerOptions.cursor.modelName`` matching the expected runtime family
-(``grok`` or ``composer``).
+``set_model``. Exact opt-in ids are ``composer-2.5[fast=false]`` and ``grok-4.5[effort=high,fast=false]``.
+A unique marker ties Rutherford's ``session_id`` to ``~/.cursor/acp-sessions/<id>/store.db``; the blob
+graph is searched for ``providerOptions.cursor.modelName`` matching the expected runtime family
+via explicit prefixes (Grok: ``grok-`` / ``cursor-grok-``; Composer: ``composer-``), not a bare
+substring. A ``*-fast`` runtime slug is not treated as failure: live Cursor/entitlement
+often forces fast even when launch requested ``fast=false``.
 
 Skips when ``cursor-agent`` is missing, the turn fails, or the session DB is absent -- no user-specific
 paths (resolves under ``Path.home()`` after restoring the real home). Deselected by default with the rest
@@ -36,12 +39,18 @@ pytestmark = pytest.mark.integration
 #: Captured at import (before the hermetic-home autouse fixture) so Cursor can find auth + write acp-sessions.
 _REAL_HOME = {key: os.environ[key] for key in ("USERPROFILE", "HOME") if key in os.environ}
 _CURSOR_INSTALLED = shutil.which("cursor-agent") is not None
-#: Advertised Cursor Grok bracket id; launch ``--model`` resolves to runtime ``cursor-grok-4.5-high-fast``.
-_GROK_MODEL = "grok-4.5[effort=high,fast=true]"
-#: Advertised Cursor Composer bracket id; launch ``--model`` must land a Composer runtime modelName.
-_COMPOSER_MODEL = "composer-2.5[fast=true]"
+#: Exact user opt-in Grok bracket id (launch ``--model``); family routing must land a Grok runtime.
+_GROK_MODEL = "grok-4.5[effort=high,fast=false]"
+#: Exact user opt-in Composer bracket id (launch ``--model``); family routing must land a Composer runtime.
+_COMPOSER_MODEL = "composer-2.5[fast=false]"
 #: Live turn budget; Cursor ACP handshake + short read-only reply should finish well under this.
 _LIVE_TURN_TIMEOUT_S = 90.0
+#: Allowed ``providerOptions.cursor.modelName`` prefixes per launch family (case-insensitive startswith).
+#: Explicit prefixes avoid false positives from unrelated ids that merely contain a family substring.
+_RUNTIME_FAMILY_PREFIXES: dict[str, tuple[str, ...]] = {
+    "grok": ("grok-", "cursor-grok-"),
+    "composer": ("composer-",),
+}
 
 
 @pytest.fixture
@@ -101,13 +110,29 @@ def _walk_model_names(node: object) -> list[str]:
     return found
 
 
-async def _assert_launch_model_in_session_db(*, model: str, runtime_needle: str) -> DelegationResult:
-    """Run a read-only launch-``--model`` turn and assert store.db records ``runtime_needle``.
+def _runtime_matches_family(names: list[str], family: str) -> bool:
+    """True when any runtime name starts with an allowed prefix for ``family``.
+
+    Matching is case-insensitive ``startswith`` against :data:`_RUNTIME_FAMILY_PREFIXES` (not a bare
+    substring). Unknown families never match. Runtime speed (``*-fast``) is not inspected.
+    """
+    prefixes = _RUNTIME_FAMILY_PREFIXES.get(family.lower())
+    if not prefixes:
+        return False
+    for name in names:
+        lowered = name.lower()
+        if any(lowered.startswith(prefix) for prefix in prefixes):
+            return True
+    return False
+
+
+async def _assert_launch_model_in_session_db(*, model: str, runtime_family: str) -> DelegationResult:
+    """Run a read-only launch-``--model`` turn and assert store.db records ``runtime_family``.
 
     Envelope stays honest: ``selected_model`` / ``provenance.confirmed`` are not claimed from argv
-    (ACP has no runtime attestation). ``runtime_needle`` is matched case-insensitively against
-    ``providerOptions.cursor.modelName`` values so the Grok case cannot pass on a Composer runtime
-    and vice versa.
+    (ACP has no runtime attestation). Family match uses explicit runtime prefixes (see
+    :func:`_runtime_matches_family`). A ``*-fast`` runtime slug is allowed: Cursor may force fast
+    despite an exact ``fast=false`` launch id.
     """
     sessions_root = _acp_sessions_root()
     if not sessions_root.is_dir():
@@ -142,10 +167,9 @@ async def _assert_launch_model_in_session_db(*, model: str, runtime_needle: str)
 
     model_names = _model_names_from_store(store)
     assert model_names, f"no providerOptions.cursor.modelName in {store}"
-    needle = runtime_needle.lower()
-    assert any(needle in name.lower() for name in model_names), (
-        f"expected a {runtime_needle!r} runtime modelName after launch --model, got {model_names!r}; "
-        f"marker={marker} session_id={result.session_id}"
+    assert _runtime_matches_family(model_names, runtime_family), (
+        f"expected a {runtime_family!r} runtime modelName after launch --model {model!r}, "
+        f"got {model_names!r}; marker={marker} session_id={result.session_id}"
     )
     # * Evidence for the live-validation report (opt-in suite; not ordinary CI).
     print(
@@ -157,11 +181,11 @@ async def _assert_launch_model_in_session_db(*, model: str, runtime_needle: str)
 
 @pytest.mark.skipif(not _CURSOR_INSTALLED, reason="cursor-agent is not installed")
 async def test_cursor_launch_model_routes_grok_in_session_db(_real_agent_home: None) -> None:
-    """Read-only turn with launch ``--model`` Grok; session store must record a Grok runtime modelName."""
-    await _assert_launch_model_in_session_db(model=_GROK_MODEL, runtime_needle="grok")
+    """Read-only turn with launch ``--model`` Grok fast=false; session store must record a Grok family runtime."""
+    await _assert_launch_model_in_session_db(model=_GROK_MODEL, runtime_family="grok")
 
 
 @pytest.mark.skipif(not _CURSOR_INSTALLED, reason="cursor-agent is not installed")
 async def test_cursor_launch_model_routes_composer_in_session_db(_real_agent_home: None) -> None:
-    """Read-only turn with launch ``--model`` Composer; session store must record a Composer runtime modelName."""
-    await _assert_launch_model_in_session_db(model=_COMPOSER_MODEL, runtime_needle="composer")
+    """Launch ``--model`` Composer fast=false; session store must record a Composer family runtime."""
+    await _assert_launch_model_in_session_db(model=_COMPOSER_MODEL, runtime_family="composer")
