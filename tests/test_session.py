@@ -6,13 +6,24 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
+from acp.schema import ModelInfo, NewSessionResponse, SessionModelState
+from pydantic import BaseModel, ConfigDict, Field
 
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.acp.journal import EventJournal, JournalEvent
 from rutherford.acp.permission import PermissionPolicy
-from rutherford.acp.session import ACPHandshakeError, ACPSession, _post_prompt_safety, run_acp_turn
+from rutherford.acp.session import (
+    ACPHandshakeError,
+    ACPSession,
+    _advertises_model,
+    _models_of,
+    _post_prompt_safety,
+    _session_model_state,
+    run_acp_turn,
+)
 from rutherford.config.schema import RutherfordConfig
 from rutherford.domain.enums import ReexecutionSafety, SafetyMode
 from rutherford.domain.error_codes import ErrorCode
@@ -313,3 +324,53 @@ async def test_acp_session_open_raises_on_bad_agent() -> None:
         await session.open()
     assert exc.value.code is ErrorCode.ACP_SPAWN_FAILED
     assert exc.value.safety is ReexecutionSafety.SAFE
+
+
+class _NewSessionResponseWithoutModels(BaseModel):
+    """``NewSessionResponse`` EXACTLY as agent-client-protocol 0.11.0 defines it: no ``models`` field.
+
+    0.11.0 deleted ACP model channel 1 wholesale, and acp's models declare no ``extra="allow"``, so pydantic
+    does not stash the unknown key either -- ``response.models`` raises ``AttributeError`` rather than
+    returning ``None``. This stub reproduces that shape so the regression is caught in CI on the pinned
+    0.10.1 lockfile, WITHOUT having to resolve 0.11 to prove it. Reading ``.models`` on this object is what
+    took down every agent on every turn.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    session_id: str = Field(alias="sessionId")
+    modes: object | None = None
+    config_options: list[object] | None = Field(default=None, alias="configOptions")
+
+
+def test_session_model_state_absent_channel_degrades_instead_of_raising() -> None:
+    # The regression: on acp 0.11 the attribute is GONE, not None. A bare `session.models` raises here.
+    absent = cast("NewSessionResponse", _NewSessionResponseWithoutModels(session_id="s1"))
+    assert not hasattr(absent, "models")  # the stub really is 0.11-shaped, so the test cannot pass vacuously
+
+    assert _session_model_state(absent) is None
+    assert _models_of(absent) == []  # no channel 1 == advertises no models; callers fall through to channel 2
+    assert _advertises_model(absent, "opus") is False  # never claim an absent channel advertised a model
+
+
+def test_session_model_state_present_channel_still_reads_models() -> None:
+    # The other side of the guard: where channel 1 DOES exist (acp 0.10.x), it must still be read, or the
+    # getattr would have silently disabled model selection for every agent on the supported version.
+    present = NewSessionResponse(
+        session_id="s1",
+        models=SessionModelState(
+            available_models=[ModelInfo(model_id="opus", name="Opus"), ModelInfo(model_id="haiku", name="Haiku")],
+            current_model_id="opus",
+        ),
+    )
+    assert _models_of(present) == ["opus", "haiku"]
+    assert _advertises_model(present, "opus") is True
+    assert _advertises_model(present, "gpt-5") is False  # a model it never advertised
+
+
+def test_session_model_state_null_channel_is_not_an_error() -> None:
+    # Channel 1 present-but-null (an agent that advertises no models) must behave like the absent case.
+    null_channel = NewSessionResponse(session_id="s1", models=None)
+    assert _session_model_state(null_channel) is None
+    assert _models_of(null_channel) == []
+    assert _advertises_model(null_channel, "opus") is False

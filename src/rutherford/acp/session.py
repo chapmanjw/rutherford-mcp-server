@@ -19,6 +19,7 @@ import os
 import time
 from contextlib import AsyncExitStack
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from acp import PROTOCOL_VERSION, spawn_agent_process, text_block
 from acp.client.connection import ClientSideConnection
@@ -48,6 +49,13 @@ from .journal import EventJournal, journal_event_from_message
 from .launch import prepare_argv
 from .permission import PermissionPolicy
 from .teardown import count_descendants, reap, snapshot_descendants
+
+if TYPE_CHECKING:
+    # ACP model channel 1 (``SessionModelState``) was REMOVED in agent-client-protocol 0.11.0, so this name
+    # does not exist at runtime there. Import it for typing only -- ``from __future__ import annotations``
+    # keeps every annotation a string, so this block never executes and can never raise ImportError on an
+    # acp release that dropped the symbol. The runtime reads go through ``getattr`` (see _models_of below).
+    from acp.schema import SessionModelState
 
 #: How often the live observed-agent sampler walks the agent's process tree during a turn (N1, item 3). A
 #: coarse cadence: the sampler exists to catch a peak fan-out, not to track every transient process, and a
@@ -703,9 +711,28 @@ def _resolve_env(descriptor: AgentDescriptor) -> dict[str, str]:
     return env
 
 
+def _session_model_state(session: NewSessionResponse | LoadSessionResponse) -> SessionModelState | None:
+    """ACP model channel 1 (``session.models``), or ``None`` when the protocol does not carry it.
+
+    ``getattr``, not a bare ``session.models``, because agent-client-protocol 0.11.0 REMOVED the whole
+    channel -- ``NewSessionResponse.models`` / ``LoadSessionResponse.models``, ``SessionModelState``,
+    ``ModelInfo``, and ``session/set_model``. On 0.11+ the attribute simply is not there (acp's models set
+    no ``extra="allow"``, so pydantic does not stash it either) and a bare read raises ``AttributeError``.
+    That read sits on the UNCONDITIONAL session-open path, so it took down every agent, every turn, on both
+    the fresh and resume paths -- and because it is not an ``ACPHandshakeError`` it escaped ``open()`` raw,
+    skipping ``__aexit__`` and leaking the spawned agent process.
+
+    Absent channel 1 is treated exactly like an agent that advertises no models: callers fall through to
+    channel 2 (the ``configOptions`` "model" select option), which survives in 0.11 and is how claude_code
+    advertises its models anyway. Degrade, never crash.
+    """
+    state: SessionModelState | None = getattr(session, "models", None)
+    return state
+
+
 def _advertises_model(session: NewSessionResponse | LoadSessionResponse, model_id: str) -> bool:
     """Whether the session advertised ``model_id`` among its selectable models (so set_model is safe)."""
-    state = session.models
+    state = _session_model_state(session)
     if state is None or state.available_models is None:
         return False
     return any(info.model_id == model_id for info in state.available_models)
@@ -713,7 +740,7 @@ def _advertises_model(session: NewSessionResponse | LoadSessionResponse, model_i
 
 def _models_of(session: NewSessionResponse | LoadSessionResponse) -> list[str]:
     """The model ids the session advertised (its selectable models), or ``[]`` when it offers none."""
-    state = session.models
+    state = _session_model_state(session)
     if state is None or state.available_models is None:
         return []
     return [info.model_id for info in state.available_models]
