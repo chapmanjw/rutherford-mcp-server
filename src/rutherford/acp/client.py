@@ -28,10 +28,14 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from acp import RequestError
 from acp.schema import (
     AllowedOutcome,
+    CreateElicitationResponse,
     CreateTerminalResponse,
+    DeclineElicitationResponse,
     DeniedOutcome,
+    ElicitationMode,
     EnvVariable,
     KillTerminalResponse,
     PermissionOption,
@@ -43,8 +47,6 @@ from acp.schema import (
     WaitForTerminalExitResponse,
     WriteTextFileResponse,
 )
-
-from acp import RequestError
 
 from .journal import EventJournal, JournalEvent
 from .permission import PermissionPolicy
@@ -248,7 +250,7 @@ class RutherfordACPClient:
         return None
 
     async def request_permission(
-        self, options: list[PermissionOption], session_id: str, tool_call: Any, **kwargs: Any
+        self, session_id: str, tool_call: Any, options: list[PermissionOption], **kwargs: Any
     ) -> RequestPermissionResponse:
         """Grant or decline a tool-call permission request per the policy."""
         option_id = self.policy.select_permission(options)
@@ -260,7 +262,7 @@ class RutherfordACPClient:
         return RequestPermissionResponse(outcome=AllowedOutcome(outcome="selected", option_id=option_id))
 
     async def read_text_file(
-        self, path: str, session_id: str, limit: int | None = None, line: int | None = None, **kwargs: Any
+        self, session_id: str, path: str, line: int | None = None, limit: int | None = None, **kwargs: Any
     ) -> ReadTextFileResponse:
         """Serve a file read (always permitted), optionally windowed by 1-based ``line`` and ``limit``.
 
@@ -290,7 +292,7 @@ class RutherfordACPClient:
         return ReadTextFileResponse(content=text)
 
     async def write_text_file(
-        self, content: str, path: str, session_id: str, **kwargs: Any
+        self, session_id: str, path: str, content: str, **kwargs: Any
     ) -> WriteTextFileResponse | None:
         """Apply a file write when the policy allows it, else decline and journal the denial.
 
@@ -320,11 +322,11 @@ class RutherfordACPClient:
 
     async def create_terminal(
         self,
-        command: str,
         session_id: str,
+        command: str,
         args: list[str] | None = None,
-        cwd: str | None = None,
         env: list[EnvVariable] | None = None,
+        cwd: str | None = None,
         output_byte_limit: int | None = None,
         **kwargs: Any,
     ) -> CreateTerminalResponse:
@@ -378,6 +380,21 @@ class RutherfordACPClient:
         """Tear down every brokered terminal (called by the session on close). Best-effort; never raises."""
         if self._broker is not None:
             await self._broker.shutdown()
+
+    async def create_elicitation(self, message: str, mode: ElicitationMode, **kwargs: Any) -> CreateElicitationResponse:
+        """Decline every elicitation (ACP 0.11): Rutherford drives agents headless, with no user to answer.
+
+        Elicitation is an agent asking the end user for structured input mid-turn. An orchestrated turn has no
+        interactive human, so the only honest answer is to decline -- the agent then continues without the
+        elicited value instead of blocking on a prompt that can never be answered. Journaled like every other
+        client-side decision, and (like a denied permission) it is not a side effect or tool activity.
+        """
+        self.journal.append(JournalEvent(kind="elicitation_declined", detail=message[:200]))
+        return DeclineElicitationResponse(action="decline")
+
+    async def complete_elicitation(self, elicitation_id: str, **kwargs: Any) -> None:
+        """No-op: Rutherford never accepts an elicitation, so there is never one to complete (ACP 0.11)."""
+        return None
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         raise RequestError(_METHOD_NOT_FOUND, f"unsupported ext method: {method}")

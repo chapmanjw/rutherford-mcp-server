@@ -242,6 +242,19 @@ async def test_unadvertised_model_is_model_unavailable(monkeypatch: pytest.Monke
     assert result.requested_model == "claude-opus-4-8"
 
 
+async def test_open_tears_down_agent_on_model_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression: _select_model raises MODEL_UNAVAILABLE AFTER the agent process is spawned. open() is entered
+    # via ``async with`` (run_acp_turn), so Python skips ``__aexit__`` when open() raises -- open() must tear the
+    # agent down itself on that raise, or the spawned process leaks (the same leak class an unguarded channel-1
+    # read caused). Removing the try/except guarding _select_model / _select_effort in open() fails this test.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet")
+    session = ACPSession(FAKE, policy=_READ_ONLY, cwd=str(REPO_ROOT), model="claude-opus-4-8")
+    with pytest.raises(ACPHandshakeError) as exc:
+        await session.open()
+    assert exc.value.code is ErrorCode.MODEL_UNAVAILABLE
+    assert session._pid is None  # close() ran on the failure path -> the spawned agent was reaped, not leaked
+
+
 async def test_dual_channel_prefers_verified_config_option(monkeypatch: pytest.MonkeyPatch) -> None:
     # Dual-channel without model_launch_flag: both session.models and a model config option advertise the id.
     # set_model is a no-op for the real channel; Rutherford must use set_config_option (and not call set_model).
@@ -353,17 +366,15 @@ def test_models_of_and_advertises_tolerate_missing_models_attr() -> None:
 
 
 def test_models_of_extracts_legacy_typed_state() -> None:
+    # The legacy channel-1 shape (session.models -> available_models -> model_id) via a duck-typed stand-in:
+    # SessionModelState / ModelInfo were removed in ACP 0.11+, and _models_of reads the channel purely through
+    # getattr, so a SimpleNamespace exercises the exact extraction path a real 0.10.x SessionModelState would.
     from types import SimpleNamespace
-
-    import acp.schema as acp_schema
-
-    if not hasattr(acp_schema, "SessionModelState") or not hasattr(acp_schema, "ModelInfo"):
-        pytest.skip("ACP SDK has no SessionModelState/ModelInfo (0.11+)")
 
     from rutherford.acp.session import _advertises_model, _models_of
 
-    state = acp_schema.SessionModelState(
-        available_models=[acp_schema.ModelInfo(model_id="gpt-5.2", name="GPT")],
+    state = SimpleNamespace(
+        available_models=[SimpleNamespace(model_id="gpt-5.2", name="GPT")],
         current_model_id="gpt-5.2",
     )
     session = SimpleNamespace(models=state)

@@ -20,6 +20,7 @@ import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 
+from acp import PROTOCOL_VERSION, spawn_agent_process, text_block
 from acp.client.connection import ClientSideConnection
 from acp.connection import StreamDirection, StreamEvent
 from acp.schema import (
@@ -34,8 +35,6 @@ from acp.schema import (
     ResourceContentBlock,
     TextContentBlock,
 )
-
-from acp import PROTOCOL_VERSION, spawn_agent_process, text_block
 
 from ..domain.enums import Effort, ReexecutionSafety
 from ..domain.error_codes import ErrorCode
@@ -373,8 +372,18 @@ class ACPSession:
             # report the union -- claude_code's adapter advertises its models here, not in SessionModelState.
             model_option = _model_config_option(self._config_options)
             self._config_model_values = list(model_option[2]) if model_option is not None else []
-            await self._select_model(conn, session)
-            await self._select_effort(conn)
+            # Model / effort selection runs AFTER the agent process is spawned and can raise ACPHandshakeError
+            # (e.g. MODEL_UNAVAILABLE for an unadvertised model). open() is entered via ``async with`` in
+            # run_acp_turn, so Python skips ``__aexit__`` when open() raises -- tear the agent down here before
+            # propagating, or the spawned process leaks just as an unguarded handshake read would. The earlier
+            # initialize / _new_session / _resume steps already close on their own faults; this guards the
+            # post-session-open steps, which under the confirmed-selection contract are no longer best-effort.
+            try:
+                await self._select_model(conn, session)
+                await self._select_effort(conn)
+            except Exception:
+                await self.close()
+                raise
         except asyncio.CancelledError:
             await self.close()
             raise

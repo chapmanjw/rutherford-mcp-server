@@ -44,6 +44,7 @@ if sys.path and sys.path[0] == _TESTS_DIR:
     sys.path.pop(0)
 
 import acp.schema as _acp_schema  # noqa: E402
+from acp import PROTOCOL_VERSION, RequestError, run_agent  # noqa: E402
 from acp.helpers import update_agent_message_text, update_agent_thought_text  # noqa: E402
 from acp.schema import (  # noqa: E402
     AgentCapabilities,
@@ -56,8 +57,6 @@ from acp.schema import (  # noqa: E402
     SessionConfigSelectOption,
     SetSessionConfigOptionResponse,
 )
-
-from acp import PROTOCOL_VERSION, RequestError, run_agent  # noqa: E402
 
 # * Legacy SessionModelState / ModelInfo exist only on ACP 0.10.x; 0.11+ removes them. Never copy protocol
 # classes -- optional getattr keeps this module importable on both SDKs.

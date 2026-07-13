@@ -8,9 +8,9 @@ import sys
 from pathlib import Path
 
 import pytest
+from acp import RequestError
 from acp.schema import PermissionOption
 
-from acp import RequestError
 from rutherford.acp.client import RutherfordACPClient
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry, default_registry
 from rutherford.acp.journal import EventJournal, JournalEvent, journal_event_from_message
@@ -175,10 +175,10 @@ async def test_client_permission_allow_and_cancel() -> None:
         PermissionOption(kind="reject_once", name="Reject", option_id="r"),
     ]
     write_client, _ = _client(SafetyMode.WRITE)
-    allowed = await write_client.request_permission(options, "s", None)
+    allowed = await write_client.request_permission(session_id="s", tool_call=None, options=options)
     assert allowed.outcome.outcome == "selected"
     read_client, journal = _client(SafetyMode.READ_ONLY)
-    denied = await read_client.request_permission([], "s", None)
+    denied = await read_client.request_permission(session_id="s", tool_call=None, options=[])
     assert denied.outcome.outcome == "cancelled"
     assert "permission_request" in journal.kinds()
 
@@ -188,17 +188,17 @@ async def test_client_read_and_write(tmp_path: object) -> None:
     src = base / "a.txt"  # type: ignore[operator]
     src.write_text("l1\nl2\nl3\n", encoding="utf-8")
     client, journal = _client(SafetyMode.READ_ONLY, cwd=str(base))
-    whole = await client.read_text_file(str(src), "s")
+    whole = await client.read_text_file(session_id="s", path=str(src))
     assert whole.content == "l1\nl2\nl3\n"
-    windowed = await client.read_text_file(str(src), "s", limit=1, line=2)
+    windowed = await client.read_text_file(session_id="s", path=str(src), limit=1, line=2)
     assert windowed.content == "l2\n"
     with pytest.raises(RequestError):
-        await client.read_text_file(str(base / "missing.txt"), "s")  # type: ignore[operator]
+        await client.read_text_file(session_id="s", path=str(base / "missing.txt"))  # type: ignore[operator]
     with pytest.raises(RequestError):
-        await client.write_text_file("data", str(base / "b.txt"), "s")  # type: ignore[operator]
+        await client.write_text_file(session_id="s", path=str(base / "b.txt"), content="data")  # type: ignore[operator]
     assert "fs_write_denied" in journal.kinds()
     write_client, write_journal = _client(SafetyMode.WRITE, cwd=str(base))
-    await write_client.write_text_file("data", str(base / "b.txt"), "s")  # type: ignore[operator]
+    await write_client.write_text_file(session_id="s", path=str(base / "b.txt"), content="data")  # type: ignore[operator]
     assert (base / "b.txt").read_text(encoding="utf-8") == "data"  # type: ignore[operator]
     assert "fs_write" in write_journal.kinds()
 
@@ -206,7 +206,7 @@ async def test_client_read_and_write(tmp_path: object) -> None:
 async def test_client_terminal_and_ext_declined() -> None:
     client, _ = _client(SafetyMode.WRITE)
     for coro in (
-        client.create_terminal("ls", "s"),
+        client.create_terminal(session_id="s", command="ls"),
         client.terminal_output("s", "t"),
         client.wait_for_terminal_exit("s", "t"),
         client.kill_terminal("s", "t"),
