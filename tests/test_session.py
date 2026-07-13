@@ -20,7 +20,8 @@ from rutherford.domain.models import DelegationRequest, DelegationResult, Target
 from rutherford.services.delegation import DelegationService
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-FAKE = AgentDescriptor("fake", "Fake", (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py")))
+FAKE_ACP_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
+FAKE = AgentDescriptor("fake", "Fake", FAKE_ACP_CMD)
 _READ_ONLY = PermissionPolicy(SafetyMode.READ_ONLY)
 
 

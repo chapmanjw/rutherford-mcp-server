@@ -28,7 +28,6 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from acp import RequestError
 from acp.schema import (
     AllowedOutcome,
     CreateTerminalResponse,
@@ -44,6 +43,8 @@ from acp.schema import (
     WaitForTerminalExitResponse,
     WriteTextFileResponse,
 )
+
+from acp import RequestError
 
 from .journal import EventJournal, JournalEvent
 from .permission import PermissionPolicy

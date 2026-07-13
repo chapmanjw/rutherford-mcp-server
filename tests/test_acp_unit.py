@@ -8,9 +8,9 @@ import sys
 from pathlib import Path
 
 import pytest
-from acp import RequestError
 from acp.schema import PermissionOption
 
+from acp import RequestError
 from rutherford.acp.client import RutherfordACPClient
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry, default_registry
 from rutherford.acp.journal import EventJournal, JournalEvent, journal_event_from_message

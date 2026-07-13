@@ -138,7 +138,6 @@ async def test_write_to_an_absolute_path_outside_the_root_is_rejected(tmp_path: 
     a write whose ABSOLUTE target is outside the sandbox root is refused and journaled.
     """
     from acp import RequestError
-
     from rutherford.acp.client import RutherfordACPClient
     from rutherford.acp.journal import EventJournal
 
@@ -386,7 +385,6 @@ async def test_terminal_broker_captures_output_and_exit(tmp_path: Path) -> None:
 async def test_terminal_broker_unknown_id_and_failed_spawn(tmp_path: Path) -> None:
     """An unknown terminal id and an unspawnnable command both surface a clean RequestError."""
     from acp import RequestError
-
     from rutherford.acp.client import TerminalBroker
 
     broker = TerminalBroker(tmp_path)
@@ -458,7 +456,6 @@ def test_git_repo_with_no_commit_falls_back_to_copy(tmp_path: Path) -> None:
 async def test_sandboxed_read_confined_to_root_rejects_escape(tmp_path: Path) -> None:
     """A sandboxed client serves a read inside the root but rejects one that escapes it."""
     from acp import RequestError
-
     from rutherford.acp.client import RutherfordACPClient
     from rutherford.acp.journal import EventJournal
 
