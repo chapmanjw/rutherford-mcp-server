@@ -125,11 +125,14 @@ class Provenance(BaseModel):
     * ``model`` -- the model ACP selection confirmed for the turn (``selected_model``), not merely the
       caller's request before effort rewrite. Rutherford does not scrape a CLI-reported id from stdout; when
       selection was confirmed over ACP this is the effective id, otherwise the field stays ``None`` rather
-      than echoing an unconfirmed request.
+      than echoing an unconfirmed request. Launch-argv model intent (e.g. Cursor ``--model``) is never
+      treated as confirmation -- ACP PromptResponse carries no runtime model attestation.
     * ``cli_version`` -- the CLI build that produced the answer, for drift forensics.
-    * ``confirmed`` -- ``True`` only after a successful, verified model selection (config-option
-      ``current_value`` match, or a successful ``session/set_model`` response on a set_model-only agent);
-      ``False`` when provider/model were inferred or no model was selected.
+    * ``confirmed`` -- ``True`` only after a successful, verified in-session ACP model selection
+      (config-option ``current_value`` match after ``set_config_option``, or a successful
+      ``session/set_model`` response on a set_model-only agent). ``False`` when provider/model were
+      inferred, when selection used a launch flag only, or when no model was selected. An ACP config
+      echo or argv intent alone is never attestation of actual inference.
     """
 
     provider: str | None = None

@@ -132,7 +132,10 @@ def test_third_wave_descriptors() -> None:
     """cursor/kiro (probed live with the docs-confirmed commands) launch over ACP."""
     registry = default_registry()
     # cursor's `acp` subcommand is hidden from --help but real; cursor-agent IS the `agent` binary.
-    assert registry.get("cursor").command == ("cursor-agent", "acp")
+    # Model selection is the launch ``--model`` flag (not in-session ACP RPCs).
+    cursor = registry.get("cursor")
+    assert cursor.command == ("cursor-agent", "acp")
+    assert cursor.model_launch_flag == "--model"
     # kiro's ACP binary is kiro-cli (the `kiro` binary is the IDE launcher).
     assert registry.get("kiro").command == ("kiro-cli", "acp")
     # pi runs through the pi-acp wrapper (npm pi-acp), which spawns `pi --mode rpc`.

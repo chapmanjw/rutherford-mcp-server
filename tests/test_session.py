@@ -242,8 +242,8 @@ async def test_unadvertised_model_is_model_unavailable(monkeypatch: pytest.Monke
 
 
 async def test_dual_channel_prefers_verified_config_option(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Cursor dual-channel: both session.models and a model config option advertise the id. set_model is a
-    # no-op for the real channel; Rutherford must use set_config_option (and not call set_model).
+    # Dual-channel without model_launch_flag: both session.models and a model config option advertise the id.
+    # set_model is a no-op for the real channel; Rutherford must use set_config_option (and not call set_model).
     monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "sonnet,default")
     monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet")
     result = await run_acp_turn(FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
@@ -256,7 +256,7 @@ async def test_dual_channel_prefers_verified_config_option(monkeypatch: pytest.M
 
 
 async def test_already_current_config_model_skips_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
-    # When current_value already equals the target, skip set_config_option and still confirm.
+    # When current_value already equals the target, skip set_config_option and still confirm (in-session path).
     monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "sonnet,haiku")
     result = await run_acp_turn(FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
     assert result.ok is True
@@ -284,6 +284,75 @@ async def test_set_model_only_channel_confirms(monkeypatch: pytest.MonkeyPatch) 
     assert result.ok is True
     assert result.selected_model == "gpt-5.2"
     assert result.provenance is not None and result.provenance.confirmed is True
+
+
+# --- launch-flag model selection (Cursor-style model_launch_flag) -------------
+
+
+def test_model_launch_flag_appends_effective_model_without_mutating_command() -> None:
+    # Effective model (post-effort) is layered onto a fresh argv; the descriptor command tuple stays immutable.
+    from rutherford.domain.enums import Effort
+
+    command = FAKE_ACP_CMD
+    desc = AgentDescriptor("cursorish", "Cursorish", command, model_launch_flag="--model", effort_base="cursor")
+    session = ACPSession(desc, policy=_READ_ONLY, cwd=str(REPO_ROOT), model="gpt-5.2", effort=Effort.HIGH)
+    assert desc.command == command
+    assert session.launch_argv == [*command, "--model", "gpt-5.2-high"]
+    assert session.target.model == "gpt-5.2-high"
+    assert session.requested_model == "gpt-5.2"
+
+
+def test_model_launch_flag_omitted_when_no_model() -> None:
+    desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
+    session = ACPSession(desc, policy=_READ_ONLY, cwd=str(REPO_ROOT))
+    assert session.launch_argv == list(FAKE_ACP_CMD)
+    assert session.target.model is None
+
+
+async def test_launch_model_skips_in_session_rpc_and_stays_unconfirmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Cursor-like: config option already current (and session.models also advertise). Launch path must NOT
+    # call set_config_option / set_model, must NOT treat the echo as confirmed selected_model.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "sonnet,default")
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "sonnet,default")
+    desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
+    result = await run_acp_turn(desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
+    assert result.ok is True
+    assert "--model" in (result.argv or [])
+    assert result.argv is not None and result.argv[result.argv.index("--model") + 1] == "sonnet"
+    assert "launch_model=sonnet" in result.text
+    assert "model=(unset)" in result.text
+    assert "set_model_calls=0" in result.text
+    assert "set_config_calls=0" in result.text
+    assert result.requested_model == "sonnet"
+    assert result.target.model == "sonnet"
+    assert result.selected_model is None
+    assert result.provenance is not None
+    assert result.provenance.model is None
+    assert result.provenance.confirmed is False
+
+
+async def test_launch_model_unadvertised_is_model_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet")
+    desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
+    result = await run_acp_turn(
+        desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="claude-opus-4-8"
+    )
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.MODEL_UNAVAILABLE
+    assert result.selected_model is None
+    assert result.requested_model == "claude-opus-4-8"
+    assert result.argv is not None and "--model" in result.argv
+
+
+async def test_launch_model_default_path_without_model() -> None:
+    # model=None and no descriptor default: no --model flag, no selection claim.
+    desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
+    result = await run_acp_turn(desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert result.ok is True
+    assert result.argv is not None and "--model" not in result.argv
+    assert "launch_model=(unset)" in result.text
+    assert result.selected_model is None
+    assert result.provenance is not None and result.provenance.confirmed is False
 
 
 def test_model_config_option_matches_by_category_and_keeps_only_string_values() -> None:

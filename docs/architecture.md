@@ -84,6 +84,7 @@ hand-written subprocess adapter:
 | `fallback_model` | the model to retry with when the requested one is unavailable; `None` (every built-in) means no fallback |
 | `handshake_timeout_s` | seconds allotted for `initialize` + `new_session` before it is judged failed |
 | `env_overrides` | env vars to set for the subprocess (e.g. a local-runtime provider env) |
+| `model_launch_flag` | when set (Cursor: `--model`), the effective model is passed on launch argv; in-session `set_config_option` / `set_model` are skipped and `provenance.confirmed` stays false (ACP does not attest runtime inference) |
 
 `DescriptorRegistry` is an immutable id → descriptor mapping with fail-fast lookup, mirroring the v2
 adapter registry's closed-mapping contract. `HIGH_FIDELITY` is the built-in roster. There is
@@ -238,7 +239,7 @@ Every turn reduces to a `DelegationResult`:
 | `duration_s` | `float` | wall-clock seconds, rounded to milliseconds |
 | `session_id` | `str \| None` | the agent's ACP session id, for provenance / a later resume |
 | `cost` | `Cost \| None` | token counts where the agent reported usage |
-| `provenance` | `Provenance \| None` | provider, model, and a `confirmed` flag |
+| `provenance` | `Provenance \| None` | provider, model, and a `confirmed` flag (`confirmed` only after verified in-session ACP selection — not launch argv / config echo alone) |
 | `partial` | `str \| None` | streamed answer text preserved when a turn was cut at its timeout |
 | `error` | `ErrorInfo \| None` | structured error on failure; `None` on success |
 | `safety_mode` | `SafetyMode` | echoes the mode the turn ran under |

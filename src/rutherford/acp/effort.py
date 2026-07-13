@@ -18,7 +18,9 @@ Launch-time channels (this table):
   unconfirmed -- see the note).
 * ``cursor`` (``cursor-agent``) -- effort rides the model id: a ``model-<tier>`` suffix on bare ids, or an
   in-bracket ``effort=...`` update on compound Cursor ids like ``grok-4.5[effort=high,fast=true]`` (clamps to
-  ``high``). Needs a concrete model; a no-op when none.
+  ``high``). Needs a concrete model; a no-op when none. The rewritten id is passed on the launch
+  ``--model`` flag (:attr:`~rutherford.acp.descriptors.AgentDescriptor.model_launch_flag`), not via
+  in-session ``set_model`` / ``set_config_option``.
 * ``codex`` (``codex-acp``) WITH a concrete model -- effort rides the ACP **model id** as ``model[effort]``
   (the bracket syntax codex-acp advertises and parses; tops out at ``xhigh``), so one ``set_model`` selects
   both the model and the tier.
@@ -159,7 +161,8 @@ def _cursor(model: str | None, effort: Effort) -> EffortOverride:
 
     Needs a concrete model to rewrite -- effort is part of the id, not a free-standing flag -- so a call with
     no model resolved is a reported no-op. An ``auto`` model, a model already carrying the requested tier
-    (suffix or ``effort=``), or a ``-thinking`` / bare ``-fast`` variant is left unchanged.
+    (suffix or ``effort=``), or a ``-thinking`` / bare ``-fast`` variant is left unchanged. The rewritten id
+    is selected at spawn via Cursor's launch ``--model`` flag, not an in-session ACP model RPC.
     """
     applied = _clamp(effort, Effort.HIGH)
     if not model:

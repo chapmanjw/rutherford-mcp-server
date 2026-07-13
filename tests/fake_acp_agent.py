@@ -193,6 +193,21 @@ def _advertised_models() -> SessionModelState | None:
     return SessionModelState(available_models=infos, current_model_id=ids[0])
 
 
+def _launch_model_from_argv() -> str | None:
+    """The ``--model <id>`` value from this process argv, if Rutherford launched the fake that way.
+
+    Distinct from a config-option echo: a launch-selected model is process intent, not proof of in-session
+    selection or of runtime inference. ``None`` when the flag is absent.
+    """
+    try:
+        index = sys.argv.index("--model")
+    except ValueError:
+        return None
+    if index + 1 >= len(sys.argv):
+        return None
+    return sys.argv[index + 1]
+
+
 def _advertised_config_options() -> list[SessionConfigOptionSelect | SessionConfigOptionBoolean] | None:
     """The select config options this fake advertises at ``new_session`` (from env), or ``None`` when none.
 
@@ -254,9 +269,11 @@ class FakeAgent:
         #: The model value a ``session/set_config_option`` set on the ``model`` config option, so a ``MODEL?``
         #: prompt can prove Rutherford's SECOND-channel model selection reached the agent. ``None`` until set.
         self._model_set: str | None = None
-        #: Call counters for dual-channel routing tests (Cursor: set_model advertised/no-op, config wins).
+        #: Call counters for dual-channel routing tests (config preferred over set_model when both advertise).
         self._set_model_calls = 0
         self._set_config_model_calls = 0
+        #: Model id from launch argv ``--model`` (process intent), distinct from config-option ``_model_set``.
+        self._launch_model = _launch_model_from_argv()
 
     def on_connect(self, conn: Any) -> None:
         self._client = conn
@@ -341,12 +358,13 @@ class FakeAgent:
         if "EMPTY" in text:
             return PromptResponse(stop_reason="end_turn")
         if "MODEL?" in text:
-            # Report the model value set via session/set_config_option (or '(unset)'), plus call counts so a
-            # dual-channel test can prove config was preferred over set_model (and already-current skipped RPC).
+            # Report config-option selection separately from launch argv ``--model``. A config echo is not
+            # runtime attestation; launch_model proves the spawn flag reached the agent process.
             await self._client.session_update(
                 session_id,
                 update_agent_message_text(
                     f"model={self._model_set or '(unset)'} "
+                    f"launch_model={self._launch_model or '(unset)'} "
                     f"set_model_calls={self._set_model_calls} "
                     f"set_config_calls={self._set_config_model_calls}"
                 ),

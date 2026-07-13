@@ -110,13 +110,14 @@ def test_cursor_leaves_auto_and_already_tiered_models_unchanged() -> None:
 
 
 async def test_cursor_effort_requested_vs_selected_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
-    # requested_model stays pre-rewrite; selected_model / target.model are the effort-rewritten id.
+    # requested_model stays pre-rewrite; target.model is the effort-rewritten id on launch --model.
+    # Launch selection is not in-session attestation: selected_model / provenance.confirmed stay unset.
     from rutherford.acp.permission import PermissionPolicy
     from rutherford.acp.session import run_acp_turn
     from rutherford.domain.enums import SafetyMode
 
     monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "gpt-5.2-high,gpt-5.2")
-    cursor = AgentDescriptor("cursor", "Cursor", _FAKE_CMD)
+    cursor = AgentDescriptor("cursor", "Cursor", _FAKE_CMD, model_launch_flag="--model")
     outcome = await run_acp_turn(
         cursor,
         "what is 17 + 25?",
@@ -128,11 +129,12 @@ async def test_cursor_effort_requested_vs_selected_envelope(monkeypatch: pytest.
     )
     assert outcome.ok is True
     assert outcome.requested_model == "gpt-5.2"
-    assert outcome.selected_model == "gpt-5.2-high"
     assert outcome.target.model == "gpt-5.2-high"
+    assert outcome.selected_model is None
+    assert outcome.argv is not None and outcome.argv[-2:] == ["--model", "gpt-5.2-high"]
     assert outcome.provenance is not None
-    assert outcome.provenance.model == "gpt-5.2-high"
-    assert outcome.provenance.confirmed is True
+    assert outcome.provenance.model is None
+    assert outcome.provenance.confirmed is False
 
 
 def test_cline_uses_the_thinking_launch_flag_for_every_tier() -> None:

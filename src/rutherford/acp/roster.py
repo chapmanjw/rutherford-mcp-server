@@ -94,6 +94,9 @@ def _merge(agent_id: str, entry: AgentConfig, existing: AgentDescriptor | None) 
         # effort lineage so ``effort_overrides`` resolves the right knob. A clone with its own ``command`` is
         # arbitrary argv (possibly a ``sh -c`` wrapper) -- no knowable lineage, so it stays an honest no-op.
         effort_base=source.id if (inherits_launch and source is not None) else None,
+        # Launch-flag model selection is likewise a property of the inherited launch command (Cursor's
+        # ``--model``), not of the config id -- a raw ``command=`` override drops it with the other quirks.
+        model_launch_flag=source.model_launch_flag if (inherits_launch and source is not None) else None,
     )
 
 
