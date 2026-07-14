@@ -473,14 +473,17 @@ class ACPSession:
         found = _model_config_option(self._config_options)
         in_config = found is not None and model in found[2]
         in_session = _advertises_model(session, model)
-        has_channels = bool(_models_of(session)) or (found is not None and bool(found[2]))
         if not in_config and not in_session:
-            # Soft path: descriptor-default-only on a channel-less agent cannot be selected over ACP (the agent
-            # runs its own default). An explicit caller model, an effort-rewritten id, or any advertising
-            # channel that omits the target is a hard MODEL_UNAVAILABLE -- never silently continue as if selected.
+            # Hard-fail only a model Rutherford is ACTIVELY selecting over ACP: an explicit caller model, or an
+            # effort-rewritten id, that the agent advertises on no channel -- never silently report it as
+            # selected. A descriptor-DEFAULT the agent does not advertise is a soft-skip, even when the agent
+            # advertises OTHER models on a channel: it may be applied out-of-band -- the agent's own default, or
+            # an injected ANTHROPIC_MODEL on a Bedrock/Vertex seat whose provider id is deliberately absent from
+            # the alias config option. Hard-failing that would break every turn of a config-advertising seat
+            # like claude_code on Bedrock (the shipped remediation sets default_model to a provider id).
             explicit = self._caller_model is not None
             rewritten = self._override.model is not None
-            if has_channels or explicit or rewritten:
+            if explicit or rewritten:
                 raise ACPHandshakeError(
                     ErrorCode.MODEL_UNAVAILABLE,
                     f"model {model!r} is not available on {self._descriptor.id}: "
@@ -548,32 +551,29 @@ class ACPSession:
         self._model_confirmed = True
 
     async def _validate_launch_model(self, session: NewSessionResponse | LoadSessionResponse, model: str) -> None:
-        """Require a launch-selected model to be advertised; never claim in-session confirmation.
+        """Soft advertisement check for a launch-flag model: never fatal, never claims confirmation.
 
-        Raises :class:`ACPHandshakeError` (``MODEL_UNAVAILABLE``) when the effective model is missing from
-        both ACP model channels and the request was explicit, effort-rewritten, or the agent advertises
-        channels. Soft-skips only for a descriptor-default-only request on a channel-less agent (same rule
-        as the in-session path). Does not set :attr:`selected_model` / :attr:`model_confirmed`.
+        A launch-flag agent (Cursor's ``--model``) is handed its model on the process argv, so the agent
+        applies it regardless of what it advertises over ACP -- and acp 0.11 removed the legacy
+        ``session.models`` channel, so an agent that surfaced its models only there now advertises nothing
+        Rutherford can read. Raising ``MODEL_UNAVAILABLE`` on a missing ACP advertisement would therefore
+        block the very launch-flag routing this method guards (the id is already on argv and will run). So it
+        stays advisory: it returns whether or not the model is advertised and NEVER sets
+        :attr:`selected_model` / :attr:`model_confirmed` (ACP does not attest a launch-argv model). A model
+        the agent genuinely cannot run surfaces later as that agent's own prompt-time error, not a
+        pre-emptive handshake failure here.
 
-        Launch-only compatibility: an advertised compound id that differs solely in a boolean ``fast=``
-        value still counts (exact argv / caller intent is unchanged). In-session :meth:`_select_model`
-        keeps strict exact-match advertisement checks.
+        Launch-only compatibility: an advertised compound id that differs solely in a boolean ``fast=`` value
+        counts as the same model (exact argv / caller intent is unchanged). In-session :meth:`_select_model`
+        keeps strict exact-match advertisement checks, because there the model IS selected over ACP.
         """
         found = _model_config_option(self._config_options)
         config_values = list(found[2]) if found is not None else []
         session_values = _models_of(session)
-        has_channels = bool(session_values) or bool(config_values)
-        if _launch_model_advertised(model, config_values) or _launch_model_advertised(model, session_values):
-            return
-        explicit = self._caller_model is not None
-        rewritten = self._override.model is not None
-        if has_channels or explicit or rewritten:
-            raise ACPHandshakeError(
-                ErrorCode.MODEL_UNAVAILABLE,
-                f"model {model!r} is not available on {self._descriptor.id}: "
-                "not advertised by session.models or a model config option",
-                ReexecutionSafety.SAFE,
-            )
+        # Advisory only: advertised or not, a launch-flag model proceeds (it is applied via argv). The check is
+        # kept so the intent is explicit and so future non-fatal signalling has a single home.
+        _advertised = _launch_model_advertised(model, config_values) or _launch_model_advertised(model, session_values)
+        return
 
     async def _select_effort(self, conn: ClientSideConnection) -> None:
         """Best-effort ``session/set_config_option`` for an agent that carries effort via a config option.
@@ -661,7 +661,6 @@ class ACPSession:
             response,
             self._session_id,
             start,
-            selected_model=self._selected_model,
             model_confirmed=self._model_confirmed,
         )
         return self._stamp(result)
@@ -799,7 +798,6 @@ def _reduce(
     session_id: str,
     start: float,
     *,
-    selected_model: str | None,
     model_confirmed: bool,
 ) -> DelegationResult:
     """Project the finished turn's journal + stop reason into a normalized result."""
@@ -825,9 +823,10 @@ def _reduce(
             ReexecutionSafety.DUPLICATE_COST,
             cost=cost,
         )
-    # Provenance.model is only an in-session confirmed selection -- never an unconfirmed request, a
-    # rewritten target, or a launch-argv intent (ACP does not attest runtime inference).
-    provenance_model = selected_model if model_confirmed else None
+    # Provenance.model is the EFFECTIVE model the turn ran under (target.model) -- the identity F3 diversity and
+    # the correlation discount key on. ``confirmed`` alone attests whether an in-session ACP selection was
+    # verified; the model id is never nulled when unconfirmed, or a launch-argv / env-injected model (which
+    # still ran) would lose its lineage and two same-model voices would dodge the correlation discount.
     return DelegationResult(
         target=target,
         ok=True,
@@ -835,9 +834,7 @@ def _reduce(
         cost=cost,
         session_id=session_id,
         duration_s=round(time.monotonic() - start, 3),
-        provenance=Provenance(
-            provider=descriptor.provider, model=provenance_model, confirmed=model_confirmed and bool(provenance_model)
-        ),
+        provenance=Provenance(provider=descriptor.provider, model=target.model, confirmed=model_confirmed),
         safety_mode=policy.mode,
     )
 

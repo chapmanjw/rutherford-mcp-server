@@ -207,9 +207,30 @@ async def test_descriptor_default_on_channel_less_agent_is_soft(monkeypatch: pyt
     assert result.ok is True
     assert result.requested_model == "m1"
     assert result.target.model == "m1"
-    assert result.selected_model is None
+    assert result.selected_model is None  # never in-session confirmed
     assert result.provenance is not None
-    assert result.provenance.model is None
+    assert result.provenance.model == "m1"  # effective model that ran (for F3 lineage); confirmed carries attestation
+    assert result.provenance.confirmed is False
+
+
+async def test_descriptor_default_unadvertised_on_config_agent_is_soft(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression (Bedrock/Vertex seat): a config-ADVERTISING agent (claude_code advertises alias options) whose
+    # descriptor default_model is NOT among the advertised values. The shipped Bedrock remediation sets
+    # default_model to a provider inference-profile id that is applied via injected ANTHROPIC_MODEL, never on an
+    # ACP channel. With no explicit caller model and no effort rewrite this must SOFT-SKIP (the model is applied
+    # out-of-band), not hard-fail MODEL_UNAVAILABLE. Before the fix, has_channels=True forced a raise and broke
+    # every turn of the seat -- the older soft test used a channel-LESS fake, which claude_code is not.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet,haiku")  # the agent DOES advertise a channel
+    provider_id = "global.anthropic.claude-opus-4-8[1m]"
+    desc = AgentDescriptor("bedrockish", "Bedrockish", FAKE.command, default_model=provider_id)
+    result = await run_acp_turn(desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert result.ok is True  # soft-skip, not MODEL_UNAVAILABLE
+    assert result.requested_model == provider_id
+    assert result.target.model == provider_id
+    assert result.selected_model is None  # never selected over ACP
+    assert "set_config_calls=0" in result.text  # no in-session selection attempted for the out-of-band default
+    assert result.provenance is not None
+    assert result.provenance.model == provider_id  # effective model kept for F3 lineage
     assert result.provenance.confirmed is False
 
 
@@ -420,7 +441,10 @@ async def test_launch_validate_passes_config_only_advertisement(monkeypatch: pyt
     assert result.provenance is not None and result.provenance.confirmed is False
 
 
-async def test_launch_invalid_model_config_only_is_model_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_launch_unadvertised_model_config_only_proceeds_via_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Launch-flag agent on a 0.11 config-only response that does NOT advertise the requested model. The id is
+    # applied via the --model argv regardless, so the turn proceeds unconfirmed rather than hard-failing:
+    # launch routing must never be blocked on an ACP advertisement the agent may not carry on 0.11.
     config_only = _config_only_session(values=["default", "sonnet"], current="default")
 
     async def _fake_new(self: ACPSession, conn: object) -> object:
@@ -432,10 +456,10 @@ async def test_launch_invalid_model_config_only_is_model_unavailable(monkeypatch
     result = await run_acp_turn(
         desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="claude-opus-4-8"
     )
-    assert result.ok is False
-    assert result.error is not None and result.error.code is ErrorCode.MODEL_UNAVAILABLE
-    assert result.selected_model is None
+    assert result.ok is True
+    assert result.selected_model is None  # applied via argv, never in-session confirmed
     assert result.requested_model == "claude-opus-4-8"
+    assert result.argv is not None and result.argv[-2:] == ["--model", "claude-opus-4-8"]
 
 
 async def test_in_session_select_via_config_only_no_models_attr(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -497,7 +521,7 @@ async def test_launch_model_skips_in_session_rpc_and_stays_unconfirmed(monkeypat
     assert result.target.model == "sonnet"
     assert result.selected_model is None
     assert result.provenance is not None
-    assert result.provenance.model is None
+    assert result.provenance.model == "sonnet"  # effective model that ran (for F3 lineage); not in-session confirmed
     assert result.provenance.confirmed is False
 
 
@@ -566,7 +590,10 @@ async def test_launch_model_accepts_grok_fast_variant_same_effort(monkeypatch: p
     assert result.provenance is not None and result.provenance.confirmed is False
 
 
-async def test_launch_model_rejects_differing_effort_or_unknown_base(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_launch_model_unadvertised_variants_proceed_unconfirmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # None of these launch ids match the advertised config values (differing effort, unknown base, extra/dup
+    # params). On a launch-flag agent the id is applied via argv regardless, so each proceeds unconfirmed
+    # rather than hard-failing -- launch routing is never blocked on an ACP advertisement 0.11 may not carry.
     monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "grok-4.5[effort=high,fast=true],composer-2.5[fast=true]")
     desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
     for model in (
@@ -576,9 +603,9 @@ async def test_launch_model_rejects_differing_effort_or_unknown_base(monkeypatch
         "composer-2.5[fast=false,fast=true]",
     ):
         result = await run_acp_turn(desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model=model)
-        assert result.ok is False, model
-        assert result.error is not None and result.error.code is ErrorCode.MODEL_UNAVAILABLE, model
-        assert result.selected_model is None
+        assert result.ok is True, model
+        assert result.selected_model is None, model  # unconfirmed; applied via --model argv
+        assert result.argv is not None and result.argv[-2:] == ["--model", model], model
 
 
 async def test_in_session_select_model_still_requires_exact_advertisement(
@@ -599,17 +626,21 @@ async def test_in_session_select_model_still_requires_exact_advertisement(
     assert result.error is not None and result.error.code is ErrorCode.MODEL_UNAVAILABLE
 
 
-async def test_launch_model_unadvertised_is_model_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_launch_model_unadvertised_proceeds_unconfirmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A launch-flag model absent from the advertised config channel proceeds unconfirmed (applied via the
+    # --model argv), NOT a hard MODEL_UNAVAILABLE -- a pre-emptive block would break Cursor on acp 0.11, where
+    # the legacy channel is gone and the agent may advertise nothing Rutherford can read.
     monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet")
     desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
     result = await run_acp_turn(
         desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="claude-opus-4-8"
     )
-    assert result.ok is False
-    assert result.error is not None and result.error.code is ErrorCode.MODEL_UNAVAILABLE
+    assert result.ok is True
     assert result.selected_model is None
     assert result.requested_model == "claude-opus-4-8"
-    assert result.argv is not None and "--model" in result.argv
+    assert result.provenance is not None and result.provenance.model == "claude-opus-4-8"  # effective, unconfirmed
+    assert result.provenance.confirmed is False
+    assert result.argv is not None and result.argv[-2:] == ["--model", "claude-opus-4-8"]
 
 
 async def test_launch_model_default_path_without_model() -> None:

@@ -178,10 +178,10 @@ async def test_cursor_effort_requested_vs_selected_envelope(monkeypatch: pytest.
     assert outcome.ok is True
     assert outcome.requested_model == "gpt-5.2"
     assert outcome.target.model == "gpt-5.2-high"
-    assert outcome.selected_model is None
+    assert outcome.selected_model is None  # launch-flag model is applied via argv, never in-session confirmed
     assert outcome.argv is not None and outcome.argv[-2:] == ["--model", "gpt-5.2-high"]
     assert outcome.provenance is not None
-    assert outcome.provenance.model is None
+    assert outcome.provenance.model == "gpt-5.2-high"  # effective model that ran (for F3 lineage); confirmed=False
     assert outcome.provenance.confirmed is False
 
 

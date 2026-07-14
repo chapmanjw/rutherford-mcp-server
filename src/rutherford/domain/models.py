@@ -122,11 +122,13 @@ class Provenance(BaseModel):
       (``bedrock`` / ``vertex`` / ``aws`` / ``azure`` / ``openrouter`` / ``groq`` / ...); ``None`` for
       a direct vendor call or a local model. Kept separate from ``provider`` so "the same model served
       two ways" is not counted as two providers.
-    * ``model`` -- the model ACP selection confirmed for the turn (``selected_model``), not merely the
-      caller's request before effort rewrite. Rutherford does not scrape a CLI-reported id from stdout; when
-      selection was confirmed over ACP this is the effective id, otherwise the field stays ``None`` rather
-      than echoing an unconfirmed request. Launch-argv model intent (e.g. Cursor ``--model``) is never
-      treated as confirmation -- ACP PromptResponse carries no runtime model attestation.
+    * ``model`` -- the EFFECTIVE model the turn ran under (the post-effort-rewrite ``target.model``): the
+      identity F3 diversity and the correlation discount group on. Whether that selection was *attested* over
+      ACP is carried separately by ``confirmed`` (below); ``model`` is NOT nulled when unconfirmed, because a
+      launch-argv (Cursor ``--model``) or env-injected (Bedrock ``ANTHROPIC_MODEL``) model still ran and must
+      keep its lineage, or two same-model voices would dodge the correlation discount. Rutherford does not
+      scrape a CLI-reported id from stdout, so for an alias-configured seat this may be an alias (``opus``)
+      rather than a pinned snapshot id.
     * ``cli_version`` -- the CLI build that produced the answer, for drift forensics.
     * ``confirmed`` -- ``True`` only after a successful, verified in-session ACP model selection
       (config-option ``current_value`` match after ``set_config_option``, or a successful
