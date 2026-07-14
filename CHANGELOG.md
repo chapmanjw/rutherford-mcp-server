@@ -4,6 +4,50 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [3.0.7] - 2026-07-13
+
+### Changed
+
+- **Migrated to `agent-client-protocol` 0.11** (pinned `>=0.11,<0.12`). ACP 0.11 removed model channel 1
+  (`session.models` / `SessionModelState` / `ModelInfo` / `session/set_model`) outright. Rutherford now reads
+  the legacy channel defensively (a config-only 0.11 response no longer `AttributeError`s at session open) and
+  selects models through the surviving `configOptions` channel and, for launch-flag agents, the process argv.
+  The ACP client conforms to the 0.11 `Client` protocol — it adds the elicitation callbacks
+  (`create_elicitation` is declined, since Rutherford drives agents headless) and matches the reordered
+  filesystem / terminal / permission signatures. The upper cap is load-bearing: it keeps a future breaking
+  minor from resolving into a runtime break rather than an install-time error.
+- **Provenance is stricter.** `DelegationResult` now tracks `requested_model` (the pre-effort request) versus
+  `selected_model` (the model an in-session ACP selection actually confirmed), and `provenance.confirmed` is
+  `True` only after a verified in-session selection — never a config echo or a launch-argv intent.
+  `provenance.model` remains the effective model that ran, so cross-model diversity and the correlation
+  discount keep their lineage key.
+
+### Added
+
+- **Cursor model selection via a launch `--model` flag** (new `AgentDescriptor.model_launch_flag`). Cursor
+  applies its model from the process argv rather than an in-session ACP call, including effort-encoded
+  compound ids (`…[effort=high,fast=false]`), and inherits the flag on a config clone that reuses the built-in
+  launch command. Launch-flag selection is validated advisorily and never blocks a turn on a missing ACP
+  advertisement (the model is on the argv regardless). Contributed by
+  [@Artemonim](https://github.com/Artemonim) in [#10].
+- **`capabilities` reports static per-agent model metadata** — `default_model`, `fallback_model`,
+  `model_selection` (`launch_argv` for launch-flag agents, else `in_session`), and `effort_capable` — without
+  spawning the agent; use `doctor(connect_only=true)` for live advertised model ids.
+
+### Fixed
+
+- **An unconfirmable requested model fails loudly instead of silently running the wrong one.** When a caller
+  names a model (or effort rewrites one) that the agent advertises on no ACP channel, the turn fails
+  `MODEL_UNAVAILABLE` rather than quietly falling back to the agent's default. A descriptor default the agent
+  does not advertise — for example a Bedrock/Vertex provider id applied via an injected `ANTHROPIC_MODEL`,
+  never on an ACP channel — remains a soft-skip, so a Bedrock/Vertex Claude Code seat is unaffected.
+- **A model-selection failure can no longer leak the spawned agent process.** The session tears the agent down
+  before a post-handshake `MODEL_UNAVAILABLE` propagates, so a rejected model does not orphan a process tree.
+
+Thanks to [@Artemonim](https://github.com/Artemonim) for the Cursor ACP model-routing contribution in [#10].
+
+[#10]: https://github.com/chapmanjw/rutherford-mcp-server/pull/10
+
 ## [3.0.6] - 2026-07-04
 
 ### Added
