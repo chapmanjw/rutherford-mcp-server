@@ -153,7 +153,7 @@ async def test_write_to_an_absolute_path_outside_the_root_is_rejected(tmp_path: 
         sandbox_root=str(root),
     )
     with pytest.raises(RequestError):
-        await client.write_text_file("pwned", str(outside), "s")
+        await client.write_text_file(session_id="s", path=str(outside), content="pwned")
     assert not outside.exists()
     assert "fs_write_denied" in journal.kinds()
 
@@ -474,10 +474,10 @@ async def test_sandboxed_read_confined_to_root_rejects_escape(tmp_path: Path) ->
         cwd=str(root),
         sandbox_root=str(root),
     )
-    served = await client.read_text_file(str(root / "inside.txt"), "s")
+    served = await client.read_text_file(session_id="s", path=str(root / "inside.txt"))
     assert served.content == "ok\n"
     with pytest.raises(RequestError):
-        await client.read_text_file(str(outside), "s")
+        await client.read_text_file(session_id="s", path=str(outside))
     assert "fs_read_denied" in journal.kinds()
 
 
@@ -863,15 +863,24 @@ def test_copy_tree_does_not_leak_a_temp_dir_on_a_build_failure(tmp_path: Path, m
     import tempfile
 
     (tmp_path / "f.txt").write_text("x\n", encoding="utf-8")
-    temp_root = Path(tempfile.gettempdir())
-    before = set(temp_root.glob("rutherford-sbx-*"))
+    created: list[Path] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def tracking_mkdtemp(suffix: str | None = None, prefix: str | None = None, dir: str | None = None) -> str:
+        path = real_mkdtemp(suffix=suffix, prefix=prefix, dir=dir)
+        created.append(Path(path))
+        return path
 
     def boom(src: object, dst: object, **kw: object) -> None:
         raise OSError("copytree failed (simulated)")
 
     # Patch via the module-qualified string so the sandbox module's ``shutil.copytree`` is the one replaced.
+    # Track mkdtemp so the assertion is immune to other xdist workers creating/removing rutherford-sbx-* dirs.
+    monkeypatch.setattr("rutherford.acp.sandbox.tempfile.mkdtemp", tracking_mkdtemp)
     monkeypatch.setattr("rutherford.acp.sandbox.shutil.copytree", boom)
     manager = SandboxManager()
     with pytest.raises(OSError):
         manager.open(str(tmp_path))
-    assert set(temp_root.glob("rutherford-sbx-*")) == before, "a temp sandbox dir leaked on a build failure"
+    assert created, "expected the sandbox build to create a temp dir before failing"
+    leaked = [path for path in created if path.exists()]
+    assert not leaked, f"a temp sandbox dir leaked on a build failure: {leaked}"

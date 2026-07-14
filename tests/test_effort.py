@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
-from rutherford.acp.effort import EffortOverride, clamp_to_supported, effort_overrides
+from rutherford.acp.effort import EffortOverride, clamp_to_supported, effort_overrides, supports_effort
 from rutherford.acp.roster import build_registry
 from rutherford.config.schema import AgentConfig, RutherfordConfig
 from rutherford.domain.enums import Effort
@@ -23,6 +23,21 @@ _FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_age
 
 def _descriptor(agent_id: str, *, model: str | None = None) -> AgentDescriptor:
     return AgentDescriptor(agent_id, agent_id.title(), _FAKE_CMD, default_model=model)
+
+
+def test_supports_effort_follows_builders_and_effort_base() -> None:
+    assert supports_effort(_descriptor("cursor")) is True
+    assert supports_effort(_descriptor("codex")) is True
+    assert supports_effort(_descriptor("goose")) is False
+    clone = AgentDescriptor(
+        "cursor-grok-high",
+        "Cursor Grok High",
+        _FAKE_CMD,
+        effort_base="cursor",
+        model_launch_flag="--model",
+    )
+    assert supports_effort(clone) is True
+    assert supports_effort(AgentDescriptor("custom", "Custom", _FAKE_CMD, effort_base=None)) is False
 
 
 # --- the per-agent override mapping ------------------------------------------
@@ -91,11 +106,83 @@ def test_cursor_appends_a_model_suffix_and_clamps_xhigh() -> None:
     assert "clamped from xhigh" in xhigh.note
 
 
+def test_cursor_updates_bracket_effort_without_suffix() -> None:
+    # Compound Cursor ids carry effort= inside [...]; rewriting must not append -<tier> after the bracket.
+    updated = effort_overrides(_descriptor("cursor"), Effort.HIGH, model="grok-4.5[effort=medium,fast=true]")
+    assert updated.model == "grok-4.5[effort=high,fast=true]"
+    assert updated.applied is Effort.HIGH
+    same = effort_overrides(_descriptor("cursor"), Effort.HIGH, model="grok-4.5[effort=high,fast=true]")
+    assert same.model is None and "already carries" in same.note
+    inserted = effort_overrides(_descriptor("cursor"), Effort.LOW, model="grok-4.5[fast=true]")
+    assert inserted.model == "grok-4.5[effort=low,fast=true]"
+
+
+def test_parse_compound_model_id_and_launch_fast_compat() -> None:
+    from rutherford.acp.effort import CompoundModelId, launch_advertisement_compatible, parse_compound_model_id
+
+    assert parse_compound_model_id("composer-2.5") == CompoundModelId(base="composer-2.5", params=())
+    assert parse_compound_model_id("composer-2.5[fast=false]") == CompoundModelId(
+        base="composer-2.5", params=(("fast", "false"),)
+    )
+    assert parse_compound_model_id("grok-4.5[effort=high,fast=true]") == CompoundModelId(
+        base="grok-4.5", params=(("effort", "high"), ("fast", "true"))
+    )
+    # * Fail closed: malformed / duplicate params.
+    for bad in (
+        "",
+        " [fast=true]",
+        "x[fast=true",
+        "x[[fast=true]",
+        "x[fast]",
+        "x[=true]",
+        "x[fast=]",
+        "x[fast=true,fast=false]",
+        "x[fast=true,,effort=high]",
+    ):
+        assert parse_compound_model_id(bad) is None, bad
+
+    assert launch_advertisement_compatible("composer-2.5[fast=false]", "composer-2.5[fast=true]")
+    assert launch_advertisement_compatible("grok-4.5[effort=high,fast=false]", "grok-4.5[effort=high,fast=true]")
+    assert launch_advertisement_compatible("composer-2.5[fast=true]", "composer-2.5[fast=true]")
+    assert not launch_advertisement_compatible("grok-4.5[effort=high,fast=false]", "grok-4.5[effort=low,fast=true]")
+    assert not launch_advertisement_compatible("unknown[fast=false]", "composer-2.5[fast=true]")
+    assert not launch_advertisement_compatible("composer-2.5[fast=false]", "composer-2.5")
+    assert not launch_advertisement_compatible("composer-2.5[fast=false,fast=true]", "composer-2.5[fast=true]")
+
+
 def test_cursor_leaves_auto_and_already_tiered_models_unchanged() -> None:
     auto = effort_overrides(_descriptor("cursor"), Effort.HIGH, model="auto")
     assert auto.model is None and auto.applied is Effort.HIGH  # nothing rewritten, but the tier is reported
     tiered = effort_overrides(_descriptor("cursor"), Effort.HIGH, model="gpt-5.2-medium")
     assert tiered.model is None and "already carries" in tiered.note
+
+
+async def test_cursor_effort_requested_vs_selected_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    # requested_model stays pre-rewrite; target.model is the effort-rewritten id on launch --model.
+    # Launch selection is not in-session attestation: selected_model / provenance.confirmed stay unset.
+    from rutherford.acp.permission import PermissionPolicy
+    from rutherford.acp.session import run_acp_turn
+    from rutherford.domain.enums import SafetyMode
+
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "gpt-5.2-high,gpt-5.2")
+    cursor = AgentDescriptor("cursor", "Cursor", _FAKE_CMD, model_launch_flag="--model")
+    outcome = await run_acp_turn(
+        cursor,
+        "what is 17 + 25?",
+        policy=PermissionPolicy(SafetyMode.READ_ONLY),
+        cwd=str(REPO_ROOT),
+        timeout_s=60.0,
+        model="gpt-5.2",
+        effort=Effort.HIGH,
+    )
+    assert outcome.ok is True
+    assert outcome.requested_model == "gpt-5.2"
+    assert outcome.target.model == "gpt-5.2-high"
+    assert outcome.selected_model is None  # launch-flag model is applied via argv, never in-session confirmed
+    assert outcome.argv is not None and outcome.argv[-2:] == ["--model", "gpt-5.2-high"]
+    assert outcome.provenance is not None
+    assert outcome.provenance.model == "gpt-5.2-high"  # effective model that ran (for F3 lineage); confirmed=False
+    assert outcome.provenance.confirmed is False
 
 
 def test_cline_uses_the_thinking_launch_flag_for_every_tier() -> None:

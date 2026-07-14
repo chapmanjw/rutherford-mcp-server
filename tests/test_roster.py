@@ -148,6 +148,23 @@ def test_clone_records_effort_lineage() -> None:
     assert all(descriptor.effort_base is None for descriptor in HIGH_FIDELITY)
 
 
+def test_clone_inherits_model_launch_flag() -> None:
+    # model_launch_flag follows the inherited launch command (Cursor's --model), like wrapped-adapter quirks.
+    config = RutherfordConfig(
+        auto_detect_local_models=False,
+        agents={
+            "my-cursor": AgentConfig(base="cursor"),
+            "raw": AgentConfig(command=["raw-acp"]),
+            "cursor": AgentConfig(default_model="auto"),
+        },
+    )
+    registry = build_registry(config)
+    assert registry.get("cursor").model_launch_flag == "--model"
+    assert registry.get("my-cursor").model_launch_flag == "--model"
+    assert registry.get("raw").model_launch_flag is None
+    assert build_registry(RutherfordConfig(auto_detect_local_models=False)).get("goose").model_launch_flag is None
+
+
 def test_backend_ollama_fills_goose_env() -> None:
     config = RutherfordConfig(agents={"local": AgentConfig(base="goose", backend="ollama", model="gemma3:12b")})
     agent = build_registry(config).get("local")

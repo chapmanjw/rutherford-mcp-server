@@ -33,8 +33,22 @@ from rutherford.tools.panels import panel_for_call, reload_panels_tool
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
 FAKE = AgentDescriptor("fake", "Fake", _FAKE_CMD)
-FAKE_A = AgentDescriptor("fake_a", "Fake A", _FAKE_CMD, provider="alpha", default_model="model-a")
-FAKE_B = AgentDescriptor("fake_b", "Fake B", _FAKE_CMD, provider="beta", default_model="model-b")
+FAKE_A = AgentDescriptor(
+    "fake_a",
+    "Fake A",
+    _FAKE_CMD,
+    provider="alpha",
+    default_model="model-a",
+    env_overrides=(("RUTHERFORD_FAKE_MODELS", "model-a"),),
+)
+FAKE_B = AgentDescriptor(
+    "fake_b",
+    "Fake B",
+    _FAKE_CMD,
+    provider="beta",
+    default_model="model-b",
+    env_overrides=(("RUTHERFORD_FAKE_MODELS", "model-b"),),
+)
 
 #: The agent ids the panel loader validates targets against in these tests.
 KNOWN = ["fake", "fake_a", "fake_b"]

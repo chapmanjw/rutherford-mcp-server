@@ -61,6 +61,13 @@ class AgentDescriptor:
     #: effort-specific on purpose: do NOT reuse :attr:`underlying_cli` / :attr:`adapter_package`, which are CLI
     #: binary names (``"codex"`` / ``"claude"``), not agent ids (``"codex"`` / ``"claude_code"``).
     effort_base: str | None = None
+    #: When set, the effective model (caller / descriptor default / effort rewrite) is passed as a launch
+    #: flag+value on the ACP-server argv (e.g. Cursor's ``--model``), not via in-session ``set_config_option`` /
+    #: ``set_model``. ``None`` means the agent uses the ordinary ACP in-session model channels. Inherited by a
+    #: config clone that reuses a built-in's launch command (:func:`rutherford.acp.roster._merge`); a raw
+    #: ``command=`` override drops it (arbitrary argv has no knowable model flag). ACP config echoes and
+    #: argv intent are not runtime attestation -- see :class:`~rutherford.acp.session.ACPSession`.
+    model_launch_flag: str | None = None
 
     @property
     def is_wrapped_adapter(self) -> bool:
@@ -117,8 +124,9 @@ class DescriptorRegistry:
 #: ``11-official-adapters-auth-test.md``). The launch command is the adapter shim, not the underlying CLI.
 #:
 #: ``copilot``/``droid``/``cursor``/``kiro``/``pi`` are bring-your-own-model (provider ``None``); ``qwen``
-#: and ``hermes`` carry their vendor as an unconfirmed guess. ``cursor``'s ``acp`` subcommand is real but
-#: hidden from ``--help``; ``kiro``'s ACP binary is ``kiro-cli`` (the ``kiro`` binary is the IDE launcher);
+#: and ``hermes`` carry their vendor as an unconfirmed guess. ``cursor`` selects models via the launch
+#: ``--model`` flag (:attr:`AgentDescriptor.model_launch_flag`); its ``acp`` subcommand is real but
+#: hidden from ``--help``. ``kiro``'s ACP binary is ``kiro-cli`` (the ``kiro`` binary is the IDE launcher);
 #: ``pi`` runs through the ``pi-acp`` wrapper (``npm i -g pi-acp``), which spawns ``pi --mode rpc``;
 #: ``hermes`` depends on the configured Nous model (a slow one can blow a turn budget); ``cline`` drives
 #: over ACP only with Cline's own service auth -- a ChatGPT-subscription or OpenRouter provider set in the
@@ -179,7 +187,7 @@ HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("copilot", "GitHub Copilot", ("copilot", "--acp")),
     AgentDescriptor("qwen", "Qwen Code", ("qwen", "--acp"), provider="alibaba"),
     AgentDescriptor("droid", "Factory Droid", ("droid", "exec", "--output-format", "acp")),
-    AgentDescriptor("cursor", "Cursor", ("cursor-agent", "acp")),
+    AgentDescriptor("cursor", "Cursor", ("cursor-agent", "acp"), model_launch_flag="--model"),
     AgentDescriptor("kiro", "Kiro", ("kiro-cli", "acp")),
     AgentDescriptor("pi", "Pi", ("pi-acp",), underlying_cli="pi", adapter_package="pi-acp"),
     AgentDescriptor("hermes", "Hermes", ("hermes", "acp"), provider="nous"),

@@ -26,11 +26,14 @@ persistence, timeouts — has a default; add an argument only to override it.
 
 > Which coding agents can Rutherford reach right now? Then run doctor and tell me which actually drive.
 
-`capabilities` is an instant snapshot of the registered agents (id, display name, launch command,
-provider). `doctor` goes further: it drives each agent with a real read-only ACP round trip — the only
-trustworthy health signal — and reports `ok`, `no_answer`, `handshake_failed`, `not_installed`, or
-`error`. Run `doctor` first whenever a setup feels off; multi-agent auth and PATH is the most common
-thing that goes wrong.
+`capabilities` is an instant snapshot of the registered agents: id, display name, launch command,
+provider, configured `default_model` / `fallback_model`, how Rutherford selects models
+(`launch_argv` vs `in_session`), and whether `effort` has a known knob. It does not spawn agents.
+`doctor(connect_only=true)` is the handshake-only probe that returns each agent's live advertised
+model ids; full `doctor` goes further with a real read-only ACP turn — the only trustworthy health
+signal — and reports `ok`, `no_answer`, `handshake_failed`, `not_installed`, or `error`. Run
+`doctor` first whenever a setup feels off; multi-agent auth and PATH is the most common thing that
+goes wrong.
 
 ## Hand one task to one agent
 

@@ -665,6 +665,11 @@ class ConsensusService:
         # carries the peak the session's sampler observed before the cut (a floor) into the panel topology.
         observed = session.observed_peak_agents if session is not None else None
         if partial:
+            confirmed = session.model_confirmed if session is not None else False
+            selected = session.selected_model if session is not None else None
+            # provenance.model is the EFFECTIVE model the turn ran under (target.model), so F3 diversity /
+            # correlation-discount keep their lineage key; `confirmed` alone attests an in-session selection.
+            effective = session.target.model if session is not None else target.model
             return DelegationResult(
                 target=session.target if session is not None else Target(cli=target.cli, model=target.model),
                 ok=True,
@@ -675,10 +680,12 @@ class ConsensusService:
                 effort_applied=applied,
                 safety_mode=req.safety_mode,
                 observed_peak_agents=observed,
+                requested_model=session.requested_model if session is not None else target.model,
+                selected_model=selected,
                 provenance=Provenance(
                     provider=self._descriptors.get(target.cli).provider if self._descriptors.has(target.cli) else None,
-                    model=session.target.model if session is not None else target.model,
-                    confirmed=False,
+                    model=effective,
+                    confirmed=confirmed,
                 ),
             )
         return DelegationResult(
@@ -694,6 +701,8 @@ class ConsensusService:
             effort_applied=applied,
             safety_mode=req.safety_mode,
             observed_peak_agents=observed,
+            requested_model=session.requested_model if session is not None else target.model,
+            selected_model=session.selected_model if session is not None else None,
         )
 
     def _rollup(

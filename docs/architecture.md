@@ -84,6 +84,7 @@ hand-written subprocess adapter:
 | `fallback_model` | the model to retry with when the requested one is unavailable; `None` (every built-in) means no fallback |
 | `handshake_timeout_s` | seconds allotted for `initialize` + `new_session` before it is judged failed |
 | `env_overrides` | env vars to set for the subprocess (e.g. a local-runtime provider env) |
+| `model_launch_flag` | when set (Cursor: `--model`), the effective model is passed on launch argv; in-session `set_config_option` / `set_model` are skipped and `provenance.confirmed` stays false (ACP does not attest runtime inference) |
 
 `DescriptorRegistry` is an immutable id → descriptor mapping with fail-fast lookup, mirroring the v2
 adapter registry's closed-mapping contract. `HIGH_FIDELITY` is the built-in roster. There is
@@ -131,6 +132,17 @@ from raw stdout.
 descendant process tree (`teardown.py`): a wrapper adapter spawns the underlying CLI as a child, and
 the SDK transport terminates only the direct child, so the descendants are snapshotted before
 teardown and reaped after.
+
+**ACP SDK model channels (0.10.x vs 0.11+).** Session model advertisement has two channels: the unstable
+legacy `session.models` / `session/set_model` surface (present in `agent-client-protocol` 0.10.x) and the
+stable `configOptions` model select + `session/set_config_option` surface. SDK 0.11+ removes the legacy
+field and client method; Rutherford reads `session.models` only via defensive accessors and calls
+`set_session_model` only when the connection still exposes it, so a config-only SDK does not fail open
+with `AttributeError`. Cursor continues to use `model_launch_flag` (launch `--model`) with advertisement
+validated on whichever channel the agent exposes. Launch-only validation also accepts a compound id that
+differs solely in a boolean `fast=` value (argv stays exact; envelope stays unconfirmed). In-session
+selection remains exact-match. Live Cursor may still record a `*-fast` runtime slug despite `fast=false`
+on launch — do not treat that as a routing failure.
 
 ---
 
@@ -238,7 +250,7 @@ Every turn reduces to a `DelegationResult`:
 | `duration_s` | `float` | wall-clock seconds, rounded to milliseconds |
 | `session_id` | `str \| None` | the agent's ACP session id, for provenance / a later resume |
 | `cost` | `Cost \| None` | token counts where the agent reported usage |
-| `provenance` | `Provenance \| None` | provider, model, and a `confirmed` flag |
+| `provenance` | `Provenance \| None` | provider, model, and a `confirmed` flag (`confirmed` only after verified in-session ACP selection — not launch argv / config echo alone) |
 | `partial` | `str \| None` | streamed answer text preserved when a turn was cut at its timeout |
 | `error` | `ErrorInfo \| None` | structured error on failure; `None` on success |
 | `safety_mode` | `SafetyMode` | echoes the mode the turn ran under |
@@ -301,7 +313,8 @@ workspace setup against the real repo). The probe classifies the outcome:
 | `error` | some other failure |
 
 This is the only trustworthy health signal for an ACP agent, since there is no cheap non-interactive
-auth check. `capabilities` is the cheap snapshot (just the registry); `doctor` makes a real call per
+auth check. `capabilities` is the cheap static roster (registry fields including `default_model`,
+`model_selection`, and `effort_capable`; no spawn); `doctor` makes a real call per
 agent.
 
 ---

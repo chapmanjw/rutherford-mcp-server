@@ -39,8 +39,22 @@ from rutherford.services.delegation import DelegationService
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
 FAKE = AgentDescriptor("fake", "Fake", _FAKE_CMD)
-FAKE_A = AgentDescriptor("fake_a", "Fake A", _FAKE_CMD, provider="alpha", default_model="model-a")
-FAKE_B = AgentDescriptor("fake_b", "Fake B", _FAKE_CMD, provider="beta", default_model="model-b")
+FAKE_A = AgentDescriptor(
+    "fake_a",
+    "Fake A",
+    _FAKE_CMD,
+    provider="alpha",
+    default_model="model-a",
+    env_overrides=(("RUTHERFORD_FAKE_MODELS", "model-a"),),
+)
+FAKE_B = AgentDescriptor(
+    "fake_b",
+    "Fake B",
+    _FAKE_CMD,
+    provider="beta",
+    default_model="model-b",
+    env_overrides=(("RUTHERFORD_FAKE_MODELS", "model-b"),),
+)
 # A slow agent: streams a partial then sleeps, so a panel can mix a fast and a slow voice, or a serialized
 # pair takes measurably longer than a parallel one. The 0.4s sleep is sub-second on purpose: the semaphore
 # bounds concurrency at asyncio resolution, so a serialized pair (two 0.4s sleeps back-to-back, ~0.8s) only

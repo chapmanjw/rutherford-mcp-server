@@ -571,8 +571,10 @@ class DelegationService:
             session_id=result.session_id,
             continued_from=req.continues_run_id,
             cli=req.target.cli,
-            requested_model=req.target.model,  # pre-fallback; result.target.model is the resolved one
-            model=result.target.model,
+            # Pre-effort request when the session stamped it; else the request target (pre-fallback).
+            requested_model=result.requested_model if result.requested_model is not None else req.target.model,
+            # Confirmed selection when present; else the effective post-rewrite target.model.
+            model=result.selected_model if result.selected_model is not None else result.target.model,
             provenance=result.provenance,
             safety_mode=req.safety_mode,
             # F8a: the effort requested for this run and the tier the agent actually applied (post-clamp).

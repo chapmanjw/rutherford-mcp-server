@@ -6,24 +6,13 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import cast
 
 import pytest
-from acp.schema import ModelInfo, NewSessionResponse, SessionModelState
-from pydantic import BaseModel, ConfigDict, Field
 
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.acp.journal import EventJournal, JournalEvent
 from rutherford.acp.permission import PermissionPolicy
-from rutherford.acp.session import (
-    ACPHandshakeError,
-    ACPSession,
-    _advertises_model,
-    _models_of,
-    _post_prompt_safety,
-    _session_model_state,
-    run_acp_turn,
-)
+from rutherford.acp.session import ACPHandshakeError, ACPSession, _post_prompt_safety, run_acp_turn
 from rutherford.config.schema import RutherfordConfig
 from rutherford.domain.enums import ReexecutionSafety, SafetyMode
 from rutherford.domain.error_codes import ErrorCode
@@ -31,7 +20,8 @@ from rutherford.domain.models import DelegationRequest, DelegationResult, Target
 from rutherford.services.delegation import DelegationService
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-FAKE = AgentDescriptor("fake", "Fake", (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py")))
+FAKE_ACP_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
+FAKE = AgentDescriptor("fake", "Fake", FAKE_ACP_CMD)
 _READ_ONLY = PermissionPolicy(SafetyMode.READ_ONLY)
 
 
@@ -181,11 +171,67 @@ def test_post_prompt_safety_classification() -> None:
     assert _post_prompt_safety(EventJournal()) is ReexecutionSafety.DUPLICATE_COST
 
 
-async def test_run_turn_records_requested_model() -> None:
+async def test_run_turn_records_requested_and_selected_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    # set_model-only: advertise the id, select it, and stamp requested/selected/confirmed on the envelope.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "fake-model")
     result = await run_acp_turn(
         FAKE, "what is 17 + 25?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="fake-model"
     )
-    assert result.ok is True and result.target.model == "fake-model"
+    assert result.ok is True
+    assert result.target.model == "fake-model"
+    assert result.requested_model == "fake-model"
+    assert result.selected_model == "fake-model"
+    assert result.provenance is not None
+    assert result.provenance.model == "fake-model"
+    assert result.provenance.confirmed is True
+
+
+async def test_run_turn_without_model_keeps_default_path() -> None:
+    # model=None and no descriptor default: no selection, no confirmed provenance model.
+    result = await run_acp_turn(FAKE, "what is 17 + 25?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert result.ok is True
+    assert result.target.model is None
+    assert result.requested_model is None
+    assert result.selected_model is None
+    assert result.provenance is not None
+    assert result.provenance.model is None
+    assert result.provenance.confirmed is False
+
+
+async def test_descriptor_default_on_channel_less_agent_is_soft(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Descriptor default with no ACP model channels: turn runs on the agent default without claiming selection.
+    monkeypatch.delenv("RUTHERFORD_FAKE_MODELS", raising=False)
+    monkeypatch.delenv("RUTHERFORD_FAKE_MODEL_OPTION", raising=False)
+    desc = AgentDescriptor("fake", "Fake", FAKE.command, default_model="m1")
+    result = await run_acp_turn(desc, "what is 17 + 25?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert result.ok is True
+    assert result.requested_model == "m1"
+    assert result.target.model == "m1"
+    assert result.selected_model is None  # never in-session confirmed
+    assert result.provenance is not None
+    assert result.provenance.model == "m1"  # effective model that ran (for F3 lineage); confirmed carries attestation
+    assert result.provenance.confirmed is False
+
+
+async def test_descriptor_default_unadvertised_on_config_agent_is_soft(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression (Bedrock/Vertex seat): a config-ADVERTISING agent (claude_code advertises alias options) whose
+    # descriptor default_model is NOT among the advertised values. The shipped Bedrock remediation sets
+    # default_model to a provider inference-profile id that is applied via injected ANTHROPIC_MODEL, never on an
+    # ACP channel. With no explicit caller model and no effort rewrite this must SOFT-SKIP (the model is applied
+    # out-of-band), not hard-fail MODEL_UNAVAILABLE. Before the fix, has_channels=True forced a raise and broke
+    # every turn of the seat -- the older soft test used a channel-LESS fake, which claude_code is not.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet,haiku")  # the agent DOES advertise a channel
+    provider_id = "global.anthropic.claude-opus-4-8[1m]"
+    desc = AgentDescriptor("bedrockish", "Bedrockish", FAKE.command, default_model=provider_id)
+    result = await run_acp_turn(desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert result.ok is True  # soft-skip, not MODEL_UNAVAILABLE
+    assert result.requested_model == provider_id
+    assert result.target.model == provider_id
+    assert result.selected_model is None  # never selected over ACP
+    assert "set_config_calls=0" in result.text  # no in-session selection attempted for the out-of-band default
+    assert result.provenance is not None
+    assert result.provenance.model == provider_id  # effective model kept for F3 lineage
+    assert result.provenance.confirmed is False
 
 
 # --- model selection across the two ACP channels -----------------------------
@@ -198,18 +244,414 @@ async def test_select_model_via_config_option_channel(monkeypatch: pytest.Monkey
     # for claude_code at all).
     monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet,haiku")
     result = await run_acp_turn(FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
-    assert result.ok is True and "model=sonnet" in result.text
+    assert result.ok is True
+    assert "model=sonnet" in result.text
+    assert result.selected_model == "sonnet"
+    assert result.provenance is not None and result.provenance.confirmed is True
 
 
-async def test_unadvertised_model_is_not_forced_on_either_channel(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A model advertised on NEITHER channel is left to the agent's own default -- no set_model, no
-    # set_config_option. This is what keeps a Bedrock/Vertex harness on its provider's model instead of being
-    # handed a rejected cloud id like "claude-opus-4-8".
+async def test_unadvertised_model_is_model_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A model advertised on NEITHER channel fails hard (MODEL_UNAVAILABLE) instead of silently running on the
+    # agent default -- an explicit request must not be reported as selected when it was never applied.
     monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet,haiku")
     result = await run_acp_turn(
         FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="claude-opus-4-8"
     )
-    assert result.ok is True and "model=(unset)" in result.text
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.MODEL_UNAVAILABLE
+    assert result.selected_model is None
+    assert result.requested_model == "claude-opus-4-8"
+
+
+async def test_open_tears_down_agent_on_model_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression: _select_model raises MODEL_UNAVAILABLE AFTER the agent process is spawned. open() is entered
+    # via ``async with`` (run_acp_turn), so Python skips ``__aexit__`` when open() raises -- open() must tear the
+    # agent down itself on that raise, or the spawned process leaks (the same leak class an unguarded channel-1
+    # read caused). Removing the try/except guarding _select_model / _select_effort in open() fails this test.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet")
+    session = ACPSession(FAKE, policy=_READ_ONLY, cwd=str(REPO_ROOT), model="claude-opus-4-8")
+    with pytest.raises(ACPHandshakeError) as exc:
+        await session.open()
+    assert exc.value.code is ErrorCode.MODEL_UNAVAILABLE
+    assert session._pid is None  # close() ran on the failure path -> the spawned agent was reaped, not leaked
+
+
+async def test_dual_channel_prefers_verified_config_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Dual-channel without model_launch_flag: both session.models and a model config option advertise the id.
+    # set_model is a no-op for the real channel; Rutherford must use set_config_option (and not call set_model).
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "sonnet,default")
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet")
+    result = await run_acp_turn(FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
+    assert result.ok is True
+    assert "model=sonnet" in result.text
+    assert "set_model_calls=0" in result.text
+    assert "set_config_calls=1" in result.text
+    assert result.selected_model == "sonnet"
+    assert result.provenance is not None and result.provenance.confirmed is True
+
+
+async def test_already_current_config_model_skips_rpc(monkeypatch: pytest.MonkeyPatch) -> None:
+    # When current_value already equals the target, skip set_config_option and still confirm (in-session path).
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "sonnet,haiku")
+    result = await run_acp_turn(FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
+    assert result.ok is True
+    assert "model=(unset)" in result.text  # no set_config_option call, so fake never recorded a set
+    assert "set_config_calls=0" in result.text
+    assert result.selected_model == "sonnet"
+    assert result.provenance is not None and result.provenance.confirmed is True
+
+
+async def test_config_option_current_value_mismatch_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet")
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_MISMATCH", "1")
+    result = await run_acp_turn(FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.MODEL_UNAVAILABLE
+    assert "not confirmed" in (result.error.message or "")
+    assert result.selected_model is None
+
+
+async def test_set_model_only_channel_confirms(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "gpt-5.2,gpt-4")
+    result = await run_acp_turn(
+        FAKE, "what is 17 + 25?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="gpt-5.2"
+    )
+    assert result.ok is True
+    assert result.selected_model == "gpt-5.2"
+    assert result.provenance is not None and result.provenance.confirmed is True
+
+
+async def test_legacy_set_model_unavailable_when_sdk_lacks_method(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ACP 0.11+ drops ClientSideConnection.set_session_model. A legacy-only advertisement must fail as
+    # MODEL_UNAVAILABLE with a clear detail -- never AttributeError / INTERNAL. On 0.10.x the method is
+    # removed only when present; on 0.11+ it is already absent (no unconditional delattr).
+    from types import SimpleNamespace
+
+    from acp.client.connection import ClientSideConnection
+
+    if hasattr(ClientSideConnection, "set_session_model"):
+        monkeypatch.delattr(ClientSideConnection, "set_session_model")
+    # * Inject a duck-typed legacy SessionModelState so the path is exercised even when the fake/SDK cannot
+    # emit typed session.models (ACP 0.11+). No config option -- set_model-only branch.
+    legacy_models = SimpleNamespace(
+        available_models=[SimpleNamespace(model_id="gpt-5.2"), SimpleNamespace(model_id="gpt-4")]
+    )
+    legacy_only = SimpleNamespace(session_id="legacy-only-1", config_options=None, models=legacy_models)
+
+    async def _fake_new(self: ACPSession, conn: object) -> object:
+        self._session_id = "legacy-only-1"
+        return legacy_only
+
+    monkeypatch.setattr(ACPSession, "_new_session", _fake_new)
+    result = await run_acp_turn(
+        FAKE, "what is 17 + 25?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="gpt-5.2"
+    )
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.MODEL_UNAVAILABLE
+    assert "set_session_model" in (result.error.message or "")
+    assert result.selected_model is None
+    assert result.requested_model == "gpt-5.2"
+
+
+# --- ACP 0.11 config-only responses (no session.models attribute) -------------
+
+
+def _config_only_session(*, values: list[str], current: str | None = None, session_id: str = "cfg-only-1") -> object:
+    """A NewSessionResponse-shaped object with configOptions model select and NO ``.models`` attribute."""
+    from types import SimpleNamespace
+
+    from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
+
+    current_value = current if current is not None else values[0]
+    select = SessionConfigOptionSelect(
+        id="model",
+        name="Model",
+        type="select",
+        current_value=current_value,
+        options=[SessionConfigSelectOption(name=value, value=value) for value in values],
+        category="model",
+    )
+    return SimpleNamespace(session_id=session_id, config_options=[select])
+
+
+def test_models_of_and_advertises_tolerate_missing_models_attr() -> None:
+    # ACP 0.11 response shape: attribute absent entirely (not models=None).
+    from types import SimpleNamespace
+
+    from rutherford.acp.session import _advertises_model, _models_of
+
+    session = SimpleNamespace(session_id="s1", config_options=[])
+    assert not hasattr(session, "models")
+    assert _models_of(session) == []
+    assert _advertises_model(session, "sonnet") is False
+
+
+def test_models_of_extracts_legacy_typed_state() -> None:
+    # The legacy channel-1 shape (session.models -> available_models -> model_id) via a duck-typed stand-in:
+    # SessionModelState / ModelInfo were removed in ACP 0.11+, and _models_of reads the channel purely through
+    # getattr, so a SimpleNamespace exercises the exact extraction path a real 0.10.x SessionModelState would.
+    from types import SimpleNamespace
+
+    from rutherford.acp.session import _advertises_model, _models_of
+
+    state = SimpleNamespace(
+        available_models=[SimpleNamespace(model_id="gpt-5.2", name="GPT")],
+        current_model_id="gpt-5.2",
+    )
+    session = SimpleNamespace(models=state)
+    assert _models_of(session) == ["gpt-5.2"]
+    assert _advertises_model(session, "gpt-5.2") is True
+    assert _advertises_model(session, "other") is False
+
+
+async def test_open_and_available_models_with_config_only_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    # open() must not AttributeError when session/new returns a config-only shape; available_models is the union.
+    config_only = _config_only_session(values=["default", "sonnet", "haiku"], current="default")
+
+    async def _fake_new(self: ACPSession, conn: object) -> object:
+        self._session_id = "cfg-only-1"
+        return config_only
+
+    monkeypatch.setattr(ACPSession, "_new_session", _fake_new)
+    session = ACPSession(FAKE, policy=_READ_ONLY, cwd=str(REPO_ROOT))
+    await session.open()
+    try:
+        assert session.available_models == ["default", "sonnet", "haiku"]
+        assert session.session_id == "cfg-only-1"
+    finally:
+        await session.close()
+
+
+async def test_launch_validate_passes_config_only_advertisement(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Cursor launch path: validate via config option when legacy .models is absent; stay unconfirmed.
+    config_only = _config_only_session(values=["sonnet", "haiku"], current="sonnet")
+
+    async def _fake_new(self: ACPSession, conn: object) -> object:
+        self._session_id = "cfg-only-1"
+        return config_only
+
+    monkeypatch.setattr(ACPSession, "_new_session", _fake_new)
+    desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
+    result = await run_acp_turn(desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
+    assert result.ok is True
+    assert result.argv is not None and result.argv[-2:] == ["--model", "sonnet"]
+    assert result.requested_model == "sonnet"
+    assert result.target.model == "sonnet"
+    assert result.selected_model is None
+    assert result.provenance is not None and result.provenance.confirmed is False
+
+
+async def test_launch_unadvertised_model_config_only_proceeds_via_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Launch-flag agent on a 0.11 config-only response that does NOT advertise the requested model. The id is
+    # applied via the --model argv regardless, so the turn proceeds unconfirmed rather than hard-failing:
+    # launch routing must never be blocked on an ACP advertisement the agent may not carry on 0.11.
+    config_only = _config_only_session(values=["default", "sonnet"], current="default")
+
+    async def _fake_new(self: ACPSession, conn: object) -> object:
+        self._session_id = "cfg-only-1"
+        return config_only
+
+    monkeypatch.setattr(ACPSession, "_new_session", _fake_new)
+    desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
+    result = await run_acp_turn(
+        desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="claude-opus-4-8"
+    )
+    assert result.ok is True
+    assert result.selected_model is None  # applied via argv, never in-session confirmed
+    assert result.requested_model == "claude-opus-4-8"
+    assert result.argv is not None and result.argv[-2:] == ["--model", "claude-opus-4-8"]
+
+
+async def test_in_session_select_via_config_only_no_models_attr(monkeypatch: pytest.MonkeyPatch) -> None:
+    # In-session path on a 0.11-shaped response: set_config_option confirms; no legacy channel required.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet")
+    config_only = _config_only_session(values=["default", "sonnet"], current="default")
+
+    async def _fake_new(self: ACPSession, conn: object) -> object:
+        self._session_id = "cfg-only-1"
+        return config_only
+
+    monkeypatch.setattr(ACPSession, "_new_session", _fake_new)
+    result = await run_acp_turn(FAKE, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
+    assert result.ok is True
+    assert result.selected_model == "sonnet"
+    assert result.provenance is not None and result.provenance.confirmed is True
+    assert "model=sonnet" in result.text
+    assert "set_config_calls=1" in result.text
+
+
+# --- launch-flag model selection (Cursor-style model_launch_flag) -------------
+
+
+def test_model_launch_flag_appends_effective_model_without_mutating_command() -> None:
+    # Effective model (post-effort) is layered onto a fresh argv; the descriptor command tuple stays immutable.
+    from rutherford.domain.enums import Effort
+
+    command = FAKE_ACP_CMD
+    desc = AgentDescriptor("cursorish", "Cursorish", command, model_launch_flag="--model", effort_base="cursor")
+    session = ACPSession(desc, policy=_READ_ONLY, cwd=str(REPO_ROOT), model="gpt-5.2", effort=Effort.HIGH)
+    assert desc.command == command
+    assert session.launch_argv == [*command, "--model", "gpt-5.2-high"]
+    assert session.target.model == "gpt-5.2-high"
+    assert session.requested_model == "gpt-5.2"
+
+
+def test_model_launch_flag_omitted_when_no_model() -> None:
+    desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
+    session = ACPSession(desc, policy=_READ_ONLY, cwd=str(REPO_ROOT))
+    assert session.launch_argv == list(FAKE_ACP_CMD)
+    assert session.target.model is None
+
+
+async def test_launch_model_skips_in_session_rpc_and_stays_unconfirmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Cursor-like: config option already current (and session.models also advertise). Launch path must NOT
+    # call set_config_option / set_model, must NOT treat the echo as confirmed selected_model.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "sonnet,default")
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "sonnet,default")
+    desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
+    result = await run_acp_turn(desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="sonnet")
+    assert result.ok is True
+    assert "--model" in (result.argv or [])
+    assert result.argv is not None and result.argv[result.argv.index("--model") + 1] == "sonnet"
+    assert "launch_model=sonnet" in result.text
+    assert "model=(unset)" in result.text
+    assert "set_model_calls=0" in result.text
+    assert "set_config_calls=0" in result.text
+    assert result.requested_model == "sonnet"
+    assert result.target.model == "sonnet"
+    assert result.selected_model is None
+    assert result.provenance is not None
+    assert result.provenance.model == "sonnet"  # effective model that ran (for F3 lineage); not in-session confirmed
+    assert result.provenance.confirmed is False
+
+
+def test_split_csv_respecting_brackets() -> None:
+    from tests.fake_acp_agent import _split_csv_respecting_brackets
+
+    assert _split_csv_respecting_brackets("sonnet,default,haiku") == ["sonnet", "default", "haiku"]
+    assert _split_csv_respecting_brackets("grok-4.5[effort=high,fast=true]") == ["grok-4.5[effort=high,fast=true]"]
+    assert _split_csv_respecting_brackets("composer-2.5[fast=true],grok-4.5[effort=high,fast=true]") == [
+        "composer-2.5[fast=true]",
+        "grok-4.5[effort=high,fast=true]",
+    ]
+    assert _split_csv_respecting_brackets("  a , b  ") == ["a", "b"]
+    assert _split_csv_respecting_brackets("") == []
+    # * Fail-safe unbalanced: commas stay inside an open bracket; stray ']' does not raise.
+    assert _split_csv_respecting_brackets("x[a,b") == ["x[a,b"]
+    assert _split_csv_respecting_brackets("a],b") == ["a]", "b"]
+    assert _split_csv_respecting_brackets("x[[a,b],c]") == ["x[[a,b],c]"]
+
+
+def test_cursor_runtime_family_prefix_matching() -> None:
+    from tests.integration.test_cursor_model_routing import _runtime_matches_family
+
+    assert _runtime_matches_family(["cursor-grok-4.5-high-fast"], "grok")
+    assert _runtime_matches_family(["grok-4.5-high"], "grok")
+    assert _runtime_matches_family(["Composer-2.5-fast"], "composer")
+    assert not _runtime_matches_family(["not-a-grok-model"], "grok")
+    assert not _runtime_matches_family(["my-composer-fork"], "composer")
+    assert not _runtime_matches_family(["cursor-grok-4.5"], "composer")
+    assert not _runtime_matches_family(["composer-2.5"], "grok")
+    assert not _runtime_matches_family(["composer-2.5"], "unknown")
+    assert not _runtime_matches_family([], "grok")
+
+
+async def test_launch_model_accepts_boolean_fast_variant(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Live Cursor advertises fast=true while callers may request exact fast=false on --model; launch-only
+    # validation must accept that boolean mismatch without rewriting argv or claiming confirmation.
+    monkeypatch.setenv(
+        "RUTHERFORD_FAKE_MODEL_OPTION",
+        "composer-2.5[fast=true],grok-4.5[effort=high,fast=true]",
+    )
+    command = FAKE_ACP_CMD
+    desc = AgentDescriptor("cursorish", "Cursorish", command, model_launch_flag="--model")
+    requested = "composer-2.5[fast=false]"
+    result = await run_acp_turn(desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model=requested)
+    assert result.ok is True
+    assert desc.command == command
+    assert result.argv is not None and result.argv[-2:] == ["--model", requested]
+    assert "launch_model=" + requested in result.text
+    assert "set_model_calls=0" in result.text
+    assert "set_config_calls=0" in result.text
+    assert result.requested_model == requested
+    assert result.target.model == requested
+    assert result.selected_model is None
+    assert result.provenance is not None and result.provenance.confirmed is False
+
+
+async def test_launch_model_accepts_grok_fast_variant_same_effort(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "grok-4.5[effort=high,fast=true]")
+    requested = "grok-4.5[effort=high,fast=false]"
+    desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
+    result = await run_acp_turn(desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model=requested)
+    assert result.ok is True
+    assert result.argv is not None and result.argv[-2:] == ["--model", requested]
+    assert result.selected_model is None
+    assert result.provenance is not None and result.provenance.confirmed is False
+
+
+async def test_launch_model_unadvertised_variants_proceed_unconfirmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # None of these launch ids match the advertised config values (differing effort, unknown base, extra/dup
+    # params). On a launch-flag agent the id is applied via argv regardless, so each proceeds unconfirmed
+    # rather than hard-failing -- launch routing is never blocked on an ACP advertisement 0.11 may not carry.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "grok-4.5[effort=high,fast=true],composer-2.5[fast=true]")
+    desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
+    for model in (
+        "grok-4.5[effort=low,fast=false]",
+        "unknown-model[fast=false]",
+        "composer-2.5[fast=false,extra=1]",
+        "composer-2.5[fast=false,fast=true]",
+    ):
+        result = await run_acp_turn(desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model=model)
+        assert result.ok is True, model
+        assert result.selected_model is None, model  # unconfirmed; applied via --model argv
+        assert result.argv is not None and result.argv[-2:] == ["--model", model], model
+
+
+async def test_in_session_select_model_still_requires_exact_advertisement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # * Do not weaken in-session validation: fast=false vs advertised fast=true stays MODEL_UNAVAILABLE.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "composer-2.5[fast=true]")
+    desc = AgentDescriptor("plain", "Plain", FAKE_ACP_CMD)  # no model_launch_flag
+    result = await run_acp_turn(
+        desc,
+        "MODEL?",
+        policy=_READ_ONLY,
+        cwd=str(REPO_ROOT),
+        timeout_s=60.0,
+        model="composer-2.5[fast=false]",
+    )
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.MODEL_UNAVAILABLE
+
+
+async def test_launch_model_unadvertised_proceeds_unconfirmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A launch-flag model absent from the advertised config channel proceeds unconfirmed (applied via the
+    # --model argv), NOT a hard MODEL_UNAVAILABLE -- a pre-emptive block would break Cursor on acp 0.11, where
+    # the legacy channel is gone and the agent may advertise nothing Rutherford can read.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "default,sonnet")
+    desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
+    result = await run_acp_turn(
+        desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0, model="claude-opus-4-8"
+    )
+    assert result.ok is True
+    assert result.selected_model is None
+    assert result.requested_model == "claude-opus-4-8"
+    assert result.provenance is not None and result.provenance.model == "claude-opus-4-8"  # effective, unconfirmed
+    assert result.provenance.confirmed is False
+    assert result.argv is not None and result.argv[-2:] == ["--model", "claude-opus-4-8"]
+
+
+async def test_launch_model_default_path_without_model() -> None:
+    # model=None and no descriptor default: no --model flag, no selection claim.
+    desc = AgentDescriptor("cursorish", "Cursorish", FAKE_ACP_CMD, model_launch_flag="--model")
+    result = await run_acp_turn(desc, "MODEL?", policy=_READ_ONLY, cwd=str(REPO_ROOT), timeout_s=60.0)
+    assert result.ok is True
+    assert result.argv is not None and "--model" not in result.argv
+    assert "launch_model=(unset)" in result.text
+    assert result.selected_model is None
+    assert result.provenance is not None and result.provenance.confirmed is False
 
 
 def test_model_config_option_matches_by_category_and_keeps_only_string_values() -> None:
@@ -324,53 +766,3 @@ async def test_acp_session_open_raises_on_bad_agent() -> None:
         await session.open()
     assert exc.value.code is ErrorCode.ACP_SPAWN_FAILED
     assert exc.value.safety is ReexecutionSafety.SAFE
-
-
-class _NewSessionResponseWithoutModels(BaseModel):
-    """``NewSessionResponse`` EXACTLY as agent-client-protocol 0.11.0 defines it: no ``models`` field.
-
-    0.11.0 deleted ACP model channel 1 wholesale, and acp's models declare no ``extra="allow"``, so pydantic
-    does not stash the unknown key either -- ``response.models`` raises ``AttributeError`` rather than
-    returning ``None``. This stub reproduces that shape so the regression is caught in CI on the pinned
-    0.10.1 lockfile, WITHOUT having to resolve 0.11 to prove it. Reading ``.models`` on this object is what
-    took down every agent on every turn.
-    """
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    session_id: str = Field(alias="sessionId")
-    modes: object | None = None
-    config_options: list[object] | None = Field(default=None, alias="configOptions")
-
-
-def test_session_model_state_absent_channel_degrades_instead_of_raising() -> None:
-    # The regression: on acp 0.11 the attribute is GONE, not None. A bare `session.models` raises here.
-    absent = cast("NewSessionResponse", _NewSessionResponseWithoutModels(session_id="s1"))
-    assert not hasattr(absent, "models")  # the stub really is 0.11-shaped, so the test cannot pass vacuously
-
-    assert _session_model_state(absent) is None
-    assert _models_of(absent) == []  # no channel 1 == advertises no models; callers fall through to channel 2
-    assert _advertises_model(absent, "opus") is False  # never claim an absent channel advertised a model
-
-
-def test_session_model_state_present_channel_still_reads_models() -> None:
-    # The other side of the guard: where channel 1 DOES exist (acp 0.10.x), it must still be read, or the
-    # getattr would have silently disabled model selection for every agent on the supported version.
-    present = NewSessionResponse(
-        session_id="s1",
-        models=SessionModelState(
-            available_models=[ModelInfo(model_id="opus", name="Opus"), ModelInfo(model_id="haiku", name="Haiku")],
-            current_model_id="opus",
-        ),
-    )
-    assert _models_of(present) == ["opus", "haiku"]
-    assert _advertises_model(present, "opus") is True
-    assert _advertises_model(present, "gpt-5") is False  # a model it never advertised
-
-
-def test_session_model_state_null_channel_is_not_an_error() -> None:
-    # Channel 1 present-but-null (an agent that advertises no models) must behave like the absent case.
-    null_channel = NewSessionResponse(session_id="s1", models=None)
-    assert _session_model_state(null_channel) is None
-    assert _models_of(null_channel) == []
-    assert _advertises_model(null_channel, "opus") is False

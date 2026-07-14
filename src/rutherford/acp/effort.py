@@ -16,8 +16,11 @@ Launch-time channels (this table):
   (so no clamp: it covers every Rutherford tier).
 * ``junie`` (``junie --acp=true``) -- the ``JUNIE_EFFORT`` env var (best-effort; ACP-mode application
   unconfirmed -- see the note).
-* ``cursor`` (``cursor-agent``) -- effort rides the model id as a ``model-<tier>`` suffix (clamps to
-  ``high``). Needs a concrete model; a no-op when none.
+* ``cursor`` (``cursor-agent``) -- effort rides the model id: a ``model-<tier>`` suffix on bare ids, or an
+  in-bracket ``effort=...`` update on compound Cursor ids like ``grok-4.5[effort=high,fast=true]`` (clamps to
+  ``high``). Needs a concrete model; a no-op when none. The rewritten id is passed on the launch
+  ``--model`` flag (:attr:`~rutherford.acp.descriptors.AgentDescriptor.model_launch_flag`), not via
+  in-session ``set_model`` / ``set_config_option``.
 * ``codex`` (``codex-acp``) WITH a concrete model -- effort rides the ACP **model id** as ``model[effort]``
   (the bracket syntax codex-acp advertises and parses; tops out at ``xhigh``), so one ``set_model`` selects
   both the model and the tier.
@@ -83,6 +86,15 @@ def _clamp(effort: Effort, ceiling: Effort) -> Effort:
     if EFFORT_ORDER.index(effort) <= EFFORT_ORDER.index(ceiling):
         return effort
     return ceiling
+
+
+def supports_effort(descriptor: AgentDescriptor) -> bool:
+    """Whether Rutherford knows a reasoning-effort knob for ``descriptor`` (including clones via ``effort_base``).
+
+    Static roster signal for ``capabilities``: true when :func:`effort_overrides` would apply a real mechanism
+    for a concrete tier, false when any requested effort is a reported no-op.
+    """
+    return (descriptor.effort_base or descriptor.id) in _BUILDERS
 
 
 def effort_overrides(descriptor: AgentDescriptor, effort: Effort | None, *, model: str | None) -> EffortOverride:
@@ -154,19 +166,23 @@ def _kiro(model: str | None, effort: Effort) -> EffortOverride:
 
 
 def _cursor(model: str | None, effort: Effort) -> EffortOverride:
-    """Cursor: encode effort in the model id as a ``-<tier>`` suffix (``gpt-5.2-high``); tops out at ``high``.
+    """Cursor: encode effort in the model id (suffix or in-bracket ``effort=``); tops out at ``high``.
 
-    Needs a concrete model to rewrite -- the suffix is part of the id, not a free-standing flag -- so a call
-    with no model resolved is a reported no-op. An ``auto`` model, a model already carrying a tier, or a
-    ``-thinking`` / ``-fast`` variant is left unchanged (the user's explicit choice wins).
+    Needs a concrete model to rewrite -- effort is part of the id, not a free-standing flag -- so a call with
+    no model resolved is a reported no-op. An ``auto`` model, a model already carrying the requested tier
+    (suffix or ``effort=``), or a ``-thinking`` / bare ``-fast`` variant is left unchanged. The rewritten id
+    is selected at spawn via Cursor's launch ``--model`` flag, not an in-session ACP model RPC.
     """
     applied = _clamp(effort, Effort.HIGH)
     if not model:
         return EffortOverride(
-            note=f"effort '{effort.value}' needs a model for cursor's '-{applied.value}' suffix; none resolved, ignored"
+            note=f"effort '{effort.value}' needs a model for cursor's effort encoding; none resolved, ignored"
         )
     rewritten = _cursor_model(model, applied)
-    note = f"reasoning effort via the cursor model-id '-{applied.value}' suffix"
+    if "[" in model and model.endswith("]"):
+        note = f"reasoning effort via the cursor model-id bracket effort={applied.value}"
+    else:
+        note = f"reasoning effort via the cursor model-id '-{applied.value}' suffix"
     if applied is not effort:
         note += f" (clamped from {effort.value})"
     if rewritten == model:
@@ -202,18 +218,127 @@ def _codex_model(model: str, effort: Effort) -> str:
 
 
 def _cursor_model(model: str, effort: Effort) -> str:
-    """Append cursor's ``-<tier>`` reasoning suffix to a bare model id, or leave it unchanged.
+    """Encode cursor effort on a model id: update bracket ``effort=`` when present, else append ``-<tier>``.
 
-    Mirrors v2's guards: ``auto``, a ``-thinking`` extended-thinking variant, a ``-fast`` latency variant,
-    and a model already ending in a reasoning tier are all returned untouched -- a plain ``-<tier>`` is the
-    cross-family effort suffix, and an explicit tier the user chose is respected.
+    Compound Cursor ids (``name[effort=high,fast=true]``) keep non-effort bracket params and only rewrite the
+    ``effort=`` entry (or insert one when missing). Identical effort leaves the id unchanged. Bare ids still
+    use the ``-<tier>`` suffix. Guards: ``auto``, a ``-thinking`` variant, a bare ``-fast`` latency variant,
+    and a model already ending in a reasoning-tier suffix are returned untouched.
     """
     lowered = model.lower()
-    if model == "auto" or "thinking" in lowered or lowered.endswith("-fast"):
+    if model == "auto" or "thinking" in lowered:
+        return model
+    # * Compound bracket ids (Cursor dual-channel / Grok-style): update effort= inside [...], keep other params.
+    if "[" in model and model.endswith("]"):
+        return _cursor_bracket_effort(model, effort)
+    if lowered.endswith("-fast"):
         return model
     if any(lowered.endswith(f"-{tier.value}") for tier in EFFORT_ORDER):
         return model
     return f"{model}-{effort.value}"
+
+
+def _cursor_bracket_effort(model: str, effort: Effort) -> str:
+    """Rewrite ``effort=...`` inside a Cursor compound bracket id, preserving sibling params."""
+    base, _, rest = model.partition("[")
+    params = rest[:-1]  # drop the trailing ']'
+    parts = [part.strip() for part in params.split(",") if part.strip()]
+    effort_value = effort.value
+    replaced = False
+    unchanged = False
+    new_parts: list[str] = []
+    for part in parts:
+        key, sep, value = part.partition("=")
+        if sep and key.strip().lower() == "effort":
+            replaced = True
+            if value.strip().lower() == effort_value:
+                unchanged = True
+                new_parts.append(part)
+            else:
+                new_parts.append(f"effort={effort_value}")
+        else:
+            new_parts.append(part)
+    if unchanged:
+        return model
+    if not replaced:
+        new_parts.insert(0, f"effort={effort_value}")
+    return f"{base}[{','.join(new_parts)}]"
+
+
+@dataclass(frozen=True, slots=True)
+class CompoundModelId:
+    """A parsed compound model id: bare ``base`` or ``base[key=value,...]`` (keys lowercased)."""
+
+    base: str
+    #: Normalized ``(key, value)`` pairs in advertisement order; keys are lowercased, values stripped.
+    params: tuple[tuple[str, str], ...]
+
+
+_BOOLEAN_PARAM_VALUES = frozenset({"true", "false"})
+
+
+def parse_compound_model_id(model_id: str) -> CompoundModelId | None:
+    """Parse a bare or bracketed compound model id; ``None`` when malformed (fail closed).
+
+    Accepts ``base`` or ``base[k=v,k2=v2]``. Rejects empty base, unclosed / nested brackets, empty
+    segments, missing ``=``, empty keys/values, and duplicate keys (case-insensitive). No vendor-specific
+    model table -- structural parsing only.
+    """
+    if not model_id or model_id != model_id.strip():
+        return None
+    if "[" not in model_id:
+        if "]" in model_id:
+            return None
+        return CompoundModelId(base=model_id, params=())
+    if model_id.count("[") != 1 or not model_id.endswith("]"):
+        return None
+    base, _, rest = model_id.partition("[")
+    if not base:
+        return None
+    params_str = rest[:-1]
+    if not params_str:
+        return CompoundModelId(base=base, params=())
+    params: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for part in params_str.split(","):
+        if not part.strip():
+            return None
+        key, sep, value = part.partition("=")
+        if not sep:
+            return None
+        key_n = key.strip().lower()
+        value_n = value.strip()
+        if not key_n or not value_n or key_n in seen:
+            return None
+        seen.add(key_n)
+        params.append((key_n, value_n))
+    return CompoundModelId(base=base, params=tuple(params))
+
+
+def launch_advertisement_compatible(requested: str, advertised: str) -> bool:
+    """Whether ``requested`` may pass launch-only advertisement checks against ``advertised``.
+
+    Exact string match wins. Otherwise both ids must parse, share the same base and the same param
+    key set, match on every non-``fast`` value, and differ only in a boolean ``fast=`` value when they
+    differ at all. Malformed either side, unknown base, or a differing ``effort`` (or any other param)
+    returns ``False`` -- callers raise ``MODEL_UNAVAILABLE``. Does not rewrite either id.
+    """
+    if requested == advertised:
+        return True
+    left = parse_compound_model_id(requested)
+    right = parse_compound_model_id(advertised)
+    if left is None or right is None or left.base != right.base:
+        return False
+    left_map = dict(left.params)
+    right_map = dict(right.params)
+    if set(left_map) != set(right_map):
+        return False
+    differing = [key for key, value in left_map.items() if right_map[key] != value]
+    if not differing:
+        return True
+    if differing != ["fast"]:
+        return False
+    return left_map["fast"].lower() in _BOOLEAN_PARAM_VALUES and right_map["fast"].lower() in _BOOLEAN_PARAM_VALUES
 
 
 #: One agent's effort builder: ``(resolved model, tier)`` -> its override. The ``None`` effort case

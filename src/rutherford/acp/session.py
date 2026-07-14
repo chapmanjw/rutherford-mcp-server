@@ -19,7 +19,6 @@ import os
 import time
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from acp import PROTOCOL_VERSION, spawn_agent_process, text_block
 from acp.client.connection import ClientSideConnection
@@ -43,19 +42,17 @@ from ..domain.models import Cost, DelegationResult, ErrorInfo, Provenance, Targe
 from ..runtime.depth import child_env
 from .client import RutherfordACPClient
 from .descriptors import AgentDescriptor
-from .effort import EFFORT_CONFIG_OPTION_IDS, clamp_to_supported, effort_overrides
+from .effort import (
+    EFFORT_CONFIG_OPTION_IDS,
+    clamp_to_supported,
+    effort_overrides,
+    launch_advertisement_compatible,
+)
 from .host_env import claude_bedrock_env
 from .journal import EventJournal, journal_event_from_message
 from .launch import prepare_argv
 from .permission import PermissionPolicy
 from .teardown import count_descendants, reap, snapshot_descendants
-
-if TYPE_CHECKING:
-    # ACP model channel 1 (``SessionModelState``) was REMOVED in agent-client-protocol 0.11.0, so this name
-    # does not exist at runtime there. Import it for typing only -- ``from __future__ import annotations``
-    # keeps every annotation a string, so this block never executes and can never raise ImportError on an
-    # acp release that dropped the symbol. The runtime reads go through ``getattr`` (see _models_of below).
-    from acp.schema import SessionModelState
 
 #: How often the live observed-agent sampler walks the agent's process tree during a turn (N1, item 3). A
 #: coarse cadence: the sampler exists to catch a peak fan-out, not to track every transient process, and a
@@ -143,7 +140,12 @@ class ACPSession:
         # Resolve effort to this agent's per-call ACP override (extra args / env / a rewritten model id), or a
         # reported no-op when the agent has no knob (F8a, 2-L). The override is computed against the RESOLVED
         # model so codex/cursor (which encode effort in the model id) rewrite the model the session will use.
-        resolved_model = model or descriptor.default_model
+        # requested_model is the pre-effort id (caller / descriptor default); target.model is post-rewrite.
+        # _caller_model is exactly what the caller passed (None when omitted) so selection can tell an explicit
+        # request from a descriptor-default-only soft path on a channel-less agent.
+        self._caller_model = model
+        self._requested_model = model or descriptor.default_model
+        resolved_model = self._requested_model
         self._effort = effort
         self._override = effort_overrides(descriptor, effort, model=resolved_model)
         #: The tier this session actually applied. Seeded from the launch-time override (cline/kiro/junie/
@@ -151,11 +153,25 @@ class ACPSession:
         #: updates it at open once the agent's advertised effort options are known. ``None`` for a no-op.
         self._effort_applied = self._override.applied
         self._target = Target(cli=descriptor.id, model=self._override.model or resolved_model)
+        #: The effective model ACP in-session selection confirmed (config current_value after a set, or
+        #: set_model success). ``None`` until :meth:`_select_model` confirms; never set from launch argv alone
+        #: or from an already-current config echo without a verified channel that actually selected.
+        self._selected_model: str | None = None
+        #: Whether :meth:`_select_model` confirmed the effective model over an in-session ACP channel.
+        self._model_confirmed = False
         # F2 replay-completeness: the LOGICAL launch argv (the agent's ACP-server command plus any
-        # effort-override extra args), pinned here so a persisted run records what it was issued with. Kept
+        # effort-override extra args and, when :attr:`AgentDescriptor.model_launch_flag` is set, the
+        # flag+effective-model pair). Pinned here so a persisted run records what it was issued with. Kept
         # distinct from the platform-resolved spawn argv (``prepare_argv`` below), whose npm-shim resolution
-        # bakes in machine-specific absolute paths a replay on another host could not reuse.
+        # bakes in machine-specific absolute paths a replay on another host could not reuse. The descriptor's
+        # ``command`` tuple is never mutated -- model/effort args are layered onto a fresh list.
         self._launch_argv = [*descriptor.command, *self._override.extra_args]
+        #: Whether the effective model was appended to launch argv via :attr:`AgentDescriptor.model_launch_flag`.
+        #: Internal only: launch intent is not runtime provenance (ACP cannot attest inference).
+        self._model_via_launch = False
+        if descriptor.model_launch_flag and self._target.model:
+            self._launch_argv.extend([descriptor.model_launch_flag, self._target.model])
+            self._model_via_launch = True
         # The FileGateway / TerminalBroker confinement root for a mutating sandbox (the worktree / temp copy);
         # None for a non-sandboxed session, where reads are served anywhere and terminal stays denied. Resolved
         # so the client's path-escape guard compares against a canonical absolute root.
@@ -198,8 +214,32 @@ class ACPSession:
 
     @property
     def target(self) -> Target:
-        """The resolved ``(cli, model)`` this session answers under."""
+        """The resolved ``(cli, model)`` this session answers under (``model`` is post-effort-rewrite)."""
         return self._target
+
+    @property
+    def requested_model(self) -> str | None:
+        """The model before effort rewrite (caller / descriptor default), or ``None`` on the agent-default path."""
+        return self._requested_model
+
+    @property
+    def selected_model(self) -> str | None:
+        """The effective model confirmed over an in-session ACP channel, or ``None`` when unconfirmed.
+
+        Launch-argv selection (:attr:`AgentDescriptor.model_launch_flag`) does not populate this -- ACP
+        cannot attest the runtime model, so intent stays on :attr:`requested_model` / :attr:`target`.
+        """
+        return self._selected_model
+
+    @property
+    def model_confirmed(self) -> bool:
+        """Whether in-session ACP model selection verified the effective model for this session.
+
+        ``True`` only after a verified ``set_config_option`` current_value match (including when the
+        option was already current, so the RPC was skipped) or a successful ``session/set_model``.
+        Launch-flag intent alone is never confirmation -- ACP does not attest runtime inference.
+        """
+        return self._model_confirmed
 
     @property
     def launch_argv(self) -> list[str]:
@@ -246,7 +286,9 @@ class ACPSession:
         """Spawn the agent and complete the handshake, or raise :class:`ACPHandshakeError`."""
         # Layer this turn's effort override onto the launch: extra env on top of the resolved environment, and
         # extra args appended to the agent's own argv (e.g. cline's ``--thinking high``). A model-id-encoding
-        # agent (codex/cursor) carries its effort in ``self._target.model`` instead, applied via set_model below.
+        # agent without :attr:`AgentDescriptor.model_launch_flag` (codex) carries its effort in
+        # ``self._target.model``, applied via in-session set_model below; Cursor passes the rewritten id on
+        # launch argv instead (in-session config/set_model are not authoritative for its inference).
         # N1 (item 3): the depth + count-first lineage env goes on last, so a spawned agent that is itself a
         # Rutherford host reads where it sits (the recursion guard) and the aggregate cap counts across layers.
         # claude_bedrock_env normalizes a Bedrock/Vertex Claude Code seat: it resolves a valid ANTHROPIC_MODEL
@@ -322,14 +364,26 @@ class ACPSession:
                 session = await self._resume(conn, init)
             else:
                 session = await self._new_session(conn)
+            # * Legacy SessionModelState (session.models) is optional: ACP SDK 0.11+ removes the field; access
+            # only via defensive helpers so a config-only response never AttributeErrors before launch validation.
             self._available_models = _models_of(session)
-            self._config_options = list(session.config_options or [])
+            self._config_options = list(getattr(session, "config_options", None) or [])
             # Capture the SECOND model channel (a configOptions "model" select option) so available_models can
             # report the union -- claude_code's adapter advertises its models here, not in SessionModelState.
             model_option = _model_config_option(self._config_options)
             self._config_model_values = list(model_option[2]) if model_option is not None else []
-            await self._select_model(conn, session)
-            await self._select_effort(conn)
+            # Model / effort selection runs AFTER the agent process is spawned and can raise ACPHandshakeError
+            # (e.g. MODEL_UNAVAILABLE for an unadvertised model). open() is entered via ``async with`` in
+            # run_acp_turn, so Python skips ``__aexit__`` when open() raises -- tear the agent down here before
+            # propagating, or the spawned process leaks just as an unguarded handshake read would. The earlier
+            # initialize / _new_session / _resume steps already close on their own faults; this guards the
+            # post-session-open steps, which under the confirmed-selection contract are no longer best-effort.
+            try:
+                await self._select_model(conn, session)
+                await self._select_effort(conn)
+            except Exception:
+                await self.close()
+                raise
         except asyncio.CancelledError:
             await self.close()
             raise
@@ -388,43 +442,138 @@ class ACPSession:
     async def _select_model(
         self, conn: ClientSideConnection, session: NewSessionResponse | LoadSessionResponse
     ) -> None:
-        """Best-effort model selection across BOTH ACP model channels, so a chosen model (and a model-id-encoded
-        effort tier for codex/cursor) actually takes effect over ACP. Never fatal.
+        """Select or validate the effective model across ACP channels.
 
-        Channel 1 -- ``session.models`` (SessionModelState): when the agent advertises the resolved model there,
-        ``session/set_model``. Channel 2 -- a ``session.configOptions`` "model" SELECT option: when the agent
-        advertises the resolved value there, ``session/set_config_option`` (claude_code's claude-agent-acp
-        surfaces its models this way, NOT in SessionModelState, so without this channel a model can never be
-        selected for it). The model is sent ONLY when the agent advertised the EXACT value on one of the
-        channels -- an agent that takes no model (or does not offer this one) is left on its own default rather
-        than handed an unknown id, which is what keeps a Bedrock/Vertex-configured harness on its provider's
-        model instead of a rejected cloud id. Any failure is swallowed: model selection is an enhancement, not a
-        handshake requirement, and the turn proceeds on the agent's default model.
+        When :attr:`AgentDescriptor.model_launch_flag` carried the effective model on argv, only validate
+        that the agent advertises it on a model channel after ``new_session`` -- never call in-session
+        ``set_config_option`` / ``set_model`` (Cursor echoes those without changing inference and may mutate
+        global acp-config), and never set ``selected_model`` / ``confirmed`` (ACP PromptResponse carries no
+        runtime model attestation; launch argv is intent, not provenance).
+
+        Otherwise, when an effective model is set (caller / descriptor default / effort rewrite), selection
+        prefers a verifiable config option, then ``session/set_model``. An unadvertised or unconfirmed model
+        is a hard :class:`ACPHandshakeError` (``MODEL_UNAVAILABLE``) when the caller named a model, effort
+        rewrote one, or the agent advertises model channels that omit the target -- never a silent
+        fall-through that reports the request as selected. ``model=None`` with no descriptor default skips
+        selection (the agent's own default path). A descriptor-default-only request on a channel-less agent
+        also skips selection (ACP cannot confirm it) without claiming ``selected_model`` / ``confirmed``.
+
+        Priority for in-session agents: when a ``session.configOptions`` model SELECT advertises the target,
+        use ``session/set_config_option`` and verify the returned ``current_value``. Skip the RPC when
+        ``current_value`` is already the target (still confirmed for that channel). Only when no suitable
+        config option exists, use ``session/set_model`` for a model advertised in ``SessionModelState``; a
+        successful ACP response is confirmation for set_model-only agents.
         """
         model = self._target.model
         if not model or self._session_id is None:
             return
-        # Channel 1: the ACP SessionModelState. Authoritative when it advertises the resolved model.
-        if _advertises_model(session, model):
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(
-                    conn.set_session_model(model_id=model, session_id=self._session_id),
-                    timeout=self._handshake_timeout,
+        if self._model_via_launch:
+            await self._validate_launch_model(session, model)
+            return
+        found = _model_config_option(self._config_options)
+        in_config = found is not None and model in found[2]
+        in_session = _advertises_model(session, model)
+        if not in_config and not in_session:
+            # Hard-fail only a model Rutherford is ACTIVELY selecting over ACP: an explicit caller model, or an
+            # effort-rewritten id, that the agent advertises on no channel -- never silently report it as
+            # selected. A descriptor-DEFAULT the agent does not advertise is a soft-skip, even when the agent
+            # advertises OTHER models on a channel: it may be applied out-of-band -- the agent's own default, or
+            # an injected ANTHROPIC_MODEL on a Bedrock/Vertex seat whose provider id is deliberately absent from
+            # the alias config option. Hard-failing that would break every turn of a config-advertising seat
+            # like claude_code on Bedrock (the shipped remediation sets default_model to a provider id).
+            explicit = self._caller_model is not None
+            rewritten = self._override.model is not None
+            if explicit or rewritten:
+                raise ACPHandshakeError(
+                    ErrorCode.MODEL_UNAVAILABLE,
+                    f"model {model!r} is not available on {self._descriptor.id}: "
+                    "not advertised by session.models or a model config option",
+                    ReexecutionSafety.SAFE,
                 )
             return
-        # Channel 2: a "model" config option (alias-based harnesses, e.g. claude_code). Select via the
-        # config-option channel only when it advertises the EXACT requested value.
-        found = _model_config_option(self._config_options)
-        if found is None:
+        # * Prefer the verifiable config-option channel whenever it advertises the target.
+        if in_config:
+            assert found is not None  # narrowed by in_config
+            config_id, current, _values = found
+            if current == model:
+                self._selected_model = model
+                self._model_confirmed = True
+                return
+            try:
+                response = await asyncio.wait_for(
+                    conn.set_config_option(config_id=config_id, value=model, session_id=self._session_id),
+                    timeout=self._handshake_timeout,
+                )
+            except Exception as exc:
+                raise ACPHandshakeError(
+                    ErrorCode.MODEL_UNAVAILABLE,
+                    f"model {model!r} selection via set_config_option failed on {self._descriptor.id}: {exc}",
+                    ReexecutionSafety.SAFE,
+                ) from exc
+            options = list(getattr(response, "config_options", None) or [])
+            if options:
+                self._config_options = options
+                model_option = _model_config_option(options)
+                self._config_model_values = list(model_option[2]) if model_option is not None else []
+            if not _config_option_current_equals(response, config_id, model):
+                raise ACPHandshakeError(
+                    ErrorCode.MODEL_UNAVAILABLE,
+                    f"model {model!r} selection was not confirmed by {self._descriptor.id}: "
+                    "set_config_option did not return matching current_value",
+                    ReexecutionSafety.SAFE,
+                )
+            self._selected_model = model
+            self._model_confirmed = True
             return
-        config_id, _current, values = found
-        if model not in values:
-            return
-        with contextlib.suppress(Exception):
+        # set_model-only: legacy SessionModelState advertises the id. ACP SDK 0.11+ drops set_session_model --
+        # call only when the connection still exposes it; otherwise a structured MODEL_UNAVAILABLE (not AttributeError).
+        set_model = getattr(conn, "set_session_model", None)
+        if not callable(set_model):
+            raise ACPHandshakeError(
+                ErrorCode.MODEL_UNAVAILABLE,
+                f"model {model!r} is not available on {self._descriptor.id}: "
+                "advertised only via legacy session.models, but this ACP client has no set_session_model "
+                "(use a model config option or a launch --model agent)",
+                ReexecutionSafety.SAFE,
+            )
+        try:
             await asyncio.wait_for(
-                conn.set_config_option(config_id=config_id, value=model, session_id=self._session_id),
+                set_model(model_id=model, session_id=self._session_id),
                 timeout=self._handshake_timeout,
             )
+        except Exception as exc:
+            raise ACPHandshakeError(
+                ErrorCode.MODEL_UNAVAILABLE,
+                f"model {model!r} selection via set_model failed on {self._descriptor.id}: {exc}",
+                ReexecutionSafety.SAFE,
+            ) from exc
+        self._selected_model = model
+        self._model_confirmed = True
+
+    async def _validate_launch_model(self, session: NewSessionResponse | LoadSessionResponse, model: str) -> None:
+        """Soft advertisement check for a launch-flag model: never fatal, never claims confirmation.
+
+        A launch-flag agent (Cursor's ``--model``) is handed its model on the process argv, so the agent
+        applies it regardless of what it advertises over ACP -- and acp 0.11 removed the legacy
+        ``session.models`` channel, so an agent that surfaced its models only there now advertises nothing
+        Rutherford can read. Raising ``MODEL_UNAVAILABLE`` on a missing ACP advertisement would therefore
+        block the very launch-flag routing this method guards (the id is already on argv and will run). So it
+        stays advisory: it returns whether or not the model is advertised and NEVER sets
+        :attr:`selected_model` / :attr:`model_confirmed` (ACP does not attest a launch-argv model). A model
+        the agent genuinely cannot run surfaces later as that agent's own prompt-time error, not a
+        pre-emptive handshake failure here.
+
+        Launch-only compatibility: an advertised compound id that differs solely in a boolean ``fast=`` value
+        counts as the same model (exact argv / caller intent is unchanged). In-session :meth:`_select_model`
+        keeps strict exact-match advertisement checks, because there the model IS selected over ACP.
+        """
+        found = _model_config_option(self._config_options)
+        config_values = list(found[2]) if found is not None else []
+        session_values = _models_of(session)
+        # Advisory only: advertised or not, a launch-flag model proceeds (it is applied via argv). The check is
+        # kept so the intent is explicit and so future non-fatal signalling has a single home.
+        _advertised = _launch_model_advertised(model, config_values) or _launch_model_advertised(model, session_values)
+        return
 
     async def _select_effort(self, conn: ClientSideConnection) -> None:
         """Best-effort ``session/set_config_option`` for an agent that carries effort via a config option.
@@ -504,7 +653,16 @@ class ACPSession:
             sampler.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await sampler
-        result = _reduce(self._descriptor, self._target, self._policy, self._journal, response, self._session_id, start)
+        result = _reduce(
+            self._descriptor,
+            self._target,
+            self._policy,
+            self._journal,
+            response,
+            self._session_id,
+            start,
+            model_confirmed=self._model_confirmed,
+        )
         return self._stamp(result)
 
     async def _sample_observed_agents(self) -> None:
@@ -535,12 +693,16 @@ class ACPSession:
         ``effort`` / ``effort_applied`` echo what was requested and what the agent applied after clamping;
         ``observed_peak_agents`` carries the live sampler's high-water mark up so a panel can roll it into
         its :class:`~rutherford.domain.models.Topology` (a floor, ``None`` when nothing was sampled); ``argv``
-        pins the logical launch for an F2 replay.
+        pins the logical launch for an F2 replay. ``requested_model`` / ``selected_model`` separate the
+        pre-effort request from an in-session ACP-confirmed selection (launch-flag intent never fills
+        ``selected_model``).
         """
         result.effort = self._effort
         result.effort_applied = self._effort_applied
         result.observed_peak_agents = self._observed_peak_agents
         result.argv = list(self._launch_argv)
+        result.requested_model = self._requested_model
+        result.selected_model = self._selected_model
         return result
 
     async def cancel(self) -> None:
@@ -622,6 +784,8 @@ async def run_acp_turn(
         result.effort = effort
         result.effort_applied = session.effort_applied
         result.argv = session.launch_argv  # F2: a spawn-failed leaf still records the argv it tried
+        result.requested_model = session.requested_model
+        result.selected_model = session.selected_model
         return result
 
 
@@ -633,6 +797,8 @@ def _reduce(
     response: PromptResponse,
     session_id: str,
     start: float,
+    *,
+    model_confirmed: bool,
 ) -> DelegationResult:
     """Project the finished turn's journal + stop reason into a normalized result."""
     text = journal.message_text().strip()
@@ -657,6 +823,10 @@ def _reduce(
             ReexecutionSafety.DUPLICATE_COST,
             cost=cost,
         )
+    # Provenance.model is the EFFECTIVE model the turn ran under (target.model) -- the identity F3 diversity and
+    # the correlation discount key on. ``confirmed`` alone attests whether an in-session ACP selection was
+    # verified; the model id is never nulled when unconfirmed, or a launch-argv / env-injected model (which
+    # still ran) would lose its lineage and two same-model voices would dodge the correlation discount.
     return DelegationResult(
         target=target,
         ok=True,
@@ -664,7 +834,7 @@ def _reduce(
         cost=cost,
         session_id=session_id,
         duration_s=round(time.monotonic() - start, 3),
-        provenance=Provenance(provider=descriptor.provider, model=target.model, confirmed=False),
+        provenance=Provenance(provider=descriptor.provider, model=target.model, confirmed=model_confirmed),
         safety_mode=policy.mode,
     )
 
@@ -711,39 +881,61 @@ def _resolve_env(descriptor: AgentDescriptor) -> dict[str, str]:
     return env
 
 
-def _session_model_state(session: NewSessionResponse | LoadSessionResponse) -> SessionModelState | None:
-    """ACP model channel 1 (``session.models``), or ``None`` when the protocol does not carry it.
+def _legacy_model_state(session: object) -> object | None:
+    """The unstable ``session.models`` SessionModelState when the SDK still exposes it, else ``None``.
 
-    ``getattr``, not a bare ``session.models``, because agent-client-protocol 0.11.0 REMOVED the whole
-    channel -- ``NewSessionResponse.models`` / ``LoadSessionResponse.models``, ``SessionModelState``,
-    ``ModelInfo``, and ``session/set_model``. On 0.11+ the attribute simply is not there (acp's models set
-    no ``extra="allow"``, so pydantic does not stash it either) and a bare read raises ``AttributeError``.
-    That read sits on the UNCONDITIONAL session-open path, so it took down every agent, every turn, on both
-    the fresh and resume paths -- and because it is not an ``ACPHandshakeError`` it escaped ``open()`` raw,
-    skipping ``__aexit__`` and leaking the spawned agent process.
-
-    Absent channel 1 is treated exactly like an agent that advertises no models: callers fall through to
-    channel 2 (the ``configOptions`` "model" select option), which survives in 0.11 and is how claude_code
-    advertises its models anyway. Degrade, never crash.
+    ACP 0.10.x typed responses carry an optional ``models`` field; ACP 0.11+ removes the attribute entirely.
+    Production code must never require ``.models`` -- a missing attribute is treated as no legacy channel.
     """
-    state: SessionModelState | None = getattr(session, "models", None)
-    return state
+    return getattr(session, "models", None)
 
 
-def _advertises_model(session: NewSessionResponse | LoadSessionResponse, model_id: str) -> bool:
-    """Whether the session advertised ``model_id`` among its selectable models (so set_model is safe)."""
-    state = _session_model_state(session)
-    if state is None or state.available_models is None:
+def _advertises_model(session: object, model_id: str) -> bool:
+    """Whether the legacy SessionModelState channel advertised ``model_id`` (so set_model is safe)."""
+    return model_id in _models_of(session)
+
+
+def _launch_model_advertised(model: str, advertised: list[str]) -> bool:
+    """Whether launch validation accepts ``model`` against an advertised id list.
+
+    Exact membership first; then :func:`launch_advertisement_compatible` (boolean ``fast=`` only).
+    """
+    if model in advertised:
+        return True
+    return any(launch_advertisement_compatible(model, item) for item in advertised)
+
+
+def _config_option_current_equals(response: object, config_id: str, model: str) -> bool:
+    """Whether a ``set_config_option`` response confirms ``config_id``'s ``current_value`` equals ``model``."""
+    options = getattr(response, "config_options", None)
+    if not options:
         return False
-    return any(info.model_id == model_id for info in state.available_models)
+    for option in options:
+        if getattr(option, "id", None) != config_id:
+            continue
+        current = getattr(option, "current_value", None)
+        return isinstance(current, str) and current == model
+    return False
 
 
-def _models_of(session: NewSessionResponse | LoadSessionResponse) -> list[str]:
-    """The model ids the session advertised (its selectable models), or ``[]`` when it offers none."""
-    state = _session_model_state(session)
-    if state is None or state.available_models is None:
+def _models_of(session: object) -> list[str]:
+    """Legacy SessionModelState model ids, or ``[]`` when the channel is absent / empty.
+
+    Safe on ACP 0.10.1 typed objects (``models`` may be ``None``) and on ACP 0.11+ / duck-typed responses that
+    omit the attribute entirely. Only string ``model_id`` values are kept.
+    """
+    state = _legacy_model_state(session)
+    if state is None:
         return []
-    return [info.model_id for info in state.available_models]
+    available = getattr(state, "available_models", None)
+    if not available:
+        return []
+    ids: list[str] = []
+    for info in available:
+        model_id = getattr(info, "model_id", None)
+        if isinstance(model_id, str):
+            ids.append(model_id)
+    return ids
 
 
 def _effort_config_option(options: list[object]) -> tuple[str, list[Effort]] | None:

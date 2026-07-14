@@ -208,11 +208,18 @@ async def test_probe_connection_lists_config_option_models(monkeypatch: Any) -> 
 
 async def test_probe_connection_unions_both_model_channels(monkeypatch: Any) -> None:
     # When an agent advertises BOTH channels, available_models is the union in a deterministic order:
-    # SessionModelState ids first, then config-option values not already present.
+    # SessionModelState ids first, then config-option values not already present. ACP 0.11+ removed the legacy
+    # SessionModelState channel, so the fake cannot advertise it there and the union degrades cleanly to the
+    # config-option channel alone -- never an error. Assert whichever the installed SDK can actually express.
+    import acp.schema as _acp_schema
+
     monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "m1,m2")
     monkeypatch.setenv("RUTHERFORD_FAKE_MODEL_OPTION", "m2,sonnet")
     report = await probe_connection(FAKE, cwd=str(REPO_ROOT), timeout_s=60.0)
-    assert report.models == ["m1", "m2", "sonnet"]
+    if hasattr(_acp_schema, "SessionModelState"):
+        assert report.models == ["m1", "m2", "sonnet"]  # ACP 0.10.x: both channels unioned, channel 1 first
+    else:
+        assert report.models == ["m2", "sonnet"]  # ACP 0.11+: legacy channel gone, config-option channel only
 
 
 async def test_probe_agent_model_unavailable_is_not_a_broken_agent(monkeypatch: Any) -> None:
