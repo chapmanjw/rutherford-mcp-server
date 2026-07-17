@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`rutherford trust` / `rutherford untrust` CLI** — from a repo root, register (or remove) the current
+  directory in the platform global `trusted_workspaces` allowlist so `write` / `yolo` delegations pass the
+  trusted-workspace gate without a per-call `trust_workspace=true`. Optional path argument;
+  `trust --list` prints the global list. Creates the global `config.toml` when missing, preserves unrelated
+  keys, refuses a malformed file. Console script alias `rutherford` added alongside `rutherford-mcp-server`.
+
 ## [3.0.7] - 2026-07-13
 
 ### Changed

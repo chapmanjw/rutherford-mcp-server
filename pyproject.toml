@@ -57,6 +57,8 @@ Changelog = "https://github.com/chapmanjw/rutherford-mcp-server/blob/main/CHANGE
 
 [project.scripts]
 rutherford-mcp-server = "rutherford.server:main"
+# * Short alias for terminal subcommands (`rutherford trust` / `init` / `discover`); same entry as the MCP server.
+rutherford = "rutherford.server:main"
 
 [dependency-groups]
 dev = [

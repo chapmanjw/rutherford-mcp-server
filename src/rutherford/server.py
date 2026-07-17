@@ -24,6 +24,12 @@ from fastmcp.exceptions import ToolError
 
 from .config.loader import default_global_config_path, load_config
 from .config.schema import RutherfordConfig
+from .config.trust import (
+    TrustResult,
+    read_global_trusted_workspaces,
+    trust_workspace,
+    untrust_workspace,
+)
 from .context import AppContext, build_app_context, error_payload_from, tool_error
 from .domain.enums import ActivityEventKind
 from .domain.error_codes import ErrorCode
@@ -725,9 +731,87 @@ def _discover(args: list[str]) -> None:
     print(out)
 
 
+def _trust_cli(args: list[str]) -> None:
+    """Trust CLI (``python -m rutherford trust [--list] [PATH]``): add cwd/PATH to the global allowlist.
+
+    Edits the platform global ``config.toml`` only. ``--list`` prints the current global
+    ``trusted_workspaces`` and exits without writing. An explicit command is consent; there is no
+    confirmation prompt.
+    """
+    flags = {a for a in args if a.startswith("-")}
+    unknown = flags - {"--list"}
+    if unknown:
+        print(f"rutherford trust: unknown option(s): {', '.join(sorted(unknown))}", file=sys.stderr)
+        print("rutherford trust: usage: trust [--list] [PATH]", file=sys.stderr)
+        raise SystemExit(2)
+    if "--list" in flags:
+        if any(not a.startswith("-") for a in args):
+            print("rutherford trust: --list does not take a PATH", file=sys.stderr)
+            raise SystemExit(2)
+        _list_trusted_cli()
+        return
+    path_args = [a for a in args if not a.startswith("-")]
+    if len(path_args) > 1:
+        print("rutherford trust: usage: trust [--list] [PATH]", file=sys.stderr)
+        raise SystemExit(2)
+    workspace = path_args[0] if path_args else None
+    try:
+        result = trust_workspace(workspace)
+    except ConfigError as exc:
+        print(f"rutherford trust: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    _print_trust_result("trust", result)
+
+
+def _untrust_cli(args: list[str]) -> None:
+    """Untrust CLI (``python -m rutherford untrust [PATH]``): remove cwd/PATH from the global allowlist."""
+    path_args = [a for a in args if not a.startswith("-")]
+    if len(path_args) > 1 or any(a.startswith("-") for a in args):
+        print("rutherford untrust: usage: untrust [PATH]", file=sys.stderr)
+        raise SystemExit(2)
+    workspace = path_args[0] if path_args else None
+    try:
+        result = untrust_workspace(workspace)
+    except ConfigError as exc:
+        print(f"rutherford untrust: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    _print_trust_result("untrust", result)
+
+
+def _list_trusted_cli() -> None:
+    """Print the global ``trusted_workspaces`` allowlist (``rutherford trust --list``)."""
+    try:
+        path, workspaces = read_global_trusted_workspaces()
+    except ConfigError as exc:
+        print(f"rutherford trust: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    print(f"rutherford: global config: {path}")
+    if not workspaces:
+        print("trusted_workspaces: (empty)")
+        return
+    print(f"trusted_workspaces ({len(workspaces)}):")
+    for entry in workspaces:
+        print(f"  - {entry}")
+
+
+def _print_trust_result(command: str, result: TrustResult) -> None:
+    """Print a one-shot trust/untrust outcome to stdout."""
+    print(f"rutherford {command}: {result.action} -- {result.workspace}")
+    print(f"global config: {result.config_path}")
+    if result.note:
+        print(result.note)
+    if result.trusted_workspaces:
+        print(f"trusted_workspaces ({len(result.trusted_workspaces)}):")
+        for entry in result.trusted_workspaces:
+            print(f"  - {entry}")
+    else:
+        print("trusted_workspaces: (empty)")
+
+
 def main() -> None:
     """Console entry point: start the stdio MCP server. ``--smoke`` builds the app and exits, no server loop;
-    ``init`` scaffolds a starter config and exits; ``discover`` finds installed ACP agents and exits.
+    ``init`` scaffolds a starter config and exits; ``discover`` finds installed ACP agents and exits;
+    ``trust`` / ``untrust`` edit the global ``trusted_workspaces`` allowlist and exit.
 
     The smoke path is the entrypoint health check (``just smoke``): it loads config and builds the full app
     context -- exercising config validation and registry build -- then prints a line and returns instead of
@@ -739,6 +823,12 @@ def main() -> None:
         return
     if argv and argv[0] == "discover":
         _discover(argv[1:])
+        return
+    if argv and argv[0] == "trust":
+        _trust_cli(argv[1:])
+        return
+    if argv and argv[0] == "untrust":
+        _untrust_cli(argv[1:])
         return
     smoke = "--smoke" in sys.argv
     try:
