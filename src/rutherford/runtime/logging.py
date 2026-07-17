@@ -13,9 +13,12 @@ the error code). ``log_format = "off"`` silences it entirely.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import queue
 import sys
+import threading
 import time
 from typing import Any
 
@@ -31,21 +34,88 @@ _LEVELS: dict[str, int] = {
 
 _logger = logging.getLogger(LOGGER_NAME)
 
+#: A blocked MCP host must bound memory as well as keep the event loop responsive.
+_LOG_QUEUE_SIZE = 1024
+#: Healthy sinks receive a brief bounded drain window; blocked sinks can stall only the daemon writer.
+_LOG_CLOSE_TIMEOUT_S = 0.05
+_STOP = object()
+
+
+class _BackgroundStreamHandler(logging.Handler):
+    """Write formatted records from a daemon thread without blocking the caller on stderr backpressure."""
+
+    def __init__(self, stream: Any) -> None:
+        super().__init__()
+        self._stream = stream
+        self._records: queue.Queue[str | object] = queue.Queue(maxsize=_LOG_QUEUE_SIZE)
+        self._stop_requested = threading.Event()
+        self._worker = threading.Thread(
+            target=self._drain,
+            name="rutherford-log-writer",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Enqueue one record, evicting the oldest when a blocked sink has exhausted the bounded queue."""
+        try:
+            message = self.format(record)
+        except Exception:
+            # * Diagnostics must never block or recursively log a formatting failure.
+            return
+        try:
+            self._records.put_nowait(message)
+        except queue.Full:
+            # * Preserve the latest lifecycle state, especially terminal finish/error records, under saturation.
+            with contextlib.suppress(queue.Empty):
+                self._records.get_nowait()
+            with contextlib.suppress(queue.Full):
+                self._records.put_nowait(message)
+
+    def _drain(self) -> None:
+        """Drain queued records until closed; a blocked stream can stall only this daemon thread."""
+        while True:
+            if self._stop_requested.is_set() and self._records.empty():
+                return
+            try:
+                item = self._records.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is _STOP:
+                return
+            try:
+                self._stream.write(f"{item}\n")
+                self._stream.flush()
+            except Exception:
+                return
+
+    def close(self) -> None:
+        """Drain a healthy sink briefly, then leave any blocked write isolated on the daemon thread."""
+        first_close = not self._stop_requested.is_set()
+        if first_close:
+            self._stop_requested.set()
+            with contextlib.suppress(queue.Full):
+                self._records.put_nowait(_STOP)
+            self._worker.join(timeout=_LOG_CLOSE_TIMEOUT_S)
+        super().close()
+
 
 def configure_logging(level: str = "info", fmt: str = "json", *, stream: Any | None = None) -> None:
-    """Configure the package logger to emit JSON lines to stderr (or silence it when ``fmt='off'``).
+    """Configure structured logging, using a non-blocking background writer for the default stderr sink.
 
-    Idempotent: existing handlers on the logger are cleared first, so calling it again re-configures
-    cleanly. ``stream`` is injectable for tests; it defaults to ``sys.stderr``.
+    Idempotent: existing handlers on the logger are closed and cleared first. ``stream`` is injectable for
+    deterministic tests and uses a regular synchronous handler; the production ``sys.stderr`` path is queued
+    so an MCP host that does not drain its stderr pipe cannot freeze Rutherford's asyncio event loop.
     """
-    for handler in list(_logger.handlers):
-        _logger.removeHandler(handler)
+    for old_handler in list(_logger.handlers):
+        _logger.removeHandler(old_handler)
+        old_handler.close()
     _logger.propagate = False
     if fmt == "off":
         _logger.addHandler(logging.NullHandler())
         _logger.setLevel(logging.CRITICAL + 1)
         return
-    handler = logging.StreamHandler(sys.stderr if stream is None else stream)
+    handler: logging.Handler = _BackgroundStreamHandler(sys.stderr) if stream is None else logging.StreamHandler(stream)
     handler.setFormatter(logging.Formatter("%(message)s"))
     _logger.addHandler(handler)
     _logger.setLevel(_LEVELS.get(level, logging.INFO))

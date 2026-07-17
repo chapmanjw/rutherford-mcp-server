@@ -3,9 +3,9 @@
 """Integration test: connect to the real ``grok agent stdio`` agent (local only, run with -m integration).
 
 A CONNECTION test, not a turn test. Grok is ACP-native (xAI), but a *completed* turn needs a SuperGrok
-subscription -- without it the model call returns ``403 SuperGrok Heavy subscription required`` (which
-surfaces only in grok's own stderr, not the structured ACP error). So this verifies what works regardless of
-entitlement: Rutherford can spawn Grok, complete the ACP handshake, open a session, and read its advertised
+subscription -- without it the model call returns ``403 SuperGrok Heavy subscription required`` only on
+Grok's raw stderr, which Rutherford deliberately detaches from the MCP host pipe. So this verifies what works
+regardless of entitlement: Rutherford can spawn Grok, complete the ACP handshake, open a session, and read its
 models (communicate + configure). It then confirms a full turn is at least ATTEMPTED past spawn + handshake
 and handled as a structured result (``ok`` if entitled, else a generic turn ``error``), without claiming the
 specific 403. Skips when the grok CLI is not installed.
@@ -92,12 +92,11 @@ async def test_grok_connects_and_advertises_models(_real_agent_home: None) -> No
 async def test_grok_turn_is_attempted_past_the_handshake(_real_agent_home: None) -> None:
     """After a verified connection, a full turn runs PAST spawn + handshake and returns a STRUCTURED result.
 
-    The outcome depends on the account: ``ok`` if entitled (it answered), else a turn ``error``. NB: the
-    structured error detail is generic ("ACP turn for grok failed: Internal error") -- the actual
-    ``403 SuperGrok Heavy subscription required`` surfaces only in grok's own stderr, NOT the ACP error -- so
-    this asserts the turn was attempted and cleanly handled (NOT ``not_installed``, and NOT ``handshake_failed``
-    after the auth-race retry, i.e. it got past spawn + handshake), not the specific 403. Grok being wired up
-    end to end is what this proves; the 403 itself is observed manually via `doctor`.
+    The outcome depends on the account: ``ok`` if entitled (it answered), else a turn ``error``. The structured
+    detail is generic ("ACP turn for grok failed: Internal error"), while raw agent stderr is detached from the
+    MCP host pipe to prevent backpressure deadlocks. This therefore asserts only that the turn was attempted and
+    cleanly handled (NOT ``not_installed`` and NOT ``handshake_failed`` after the auth-race retry), not the
+    account-specific 403 text.
     """
     grok = default_registry().get("grok")
     connect = await _connect_with_retry(grok)

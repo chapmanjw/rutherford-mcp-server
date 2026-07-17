@@ -10,14 +10,18 @@ and accumulates across repeated ``doctor`` probes. So Rutherford captures the ag
 close, reaps the descendant tree the transport leaves behind.
 
 The snapshot must be taken *before* the parent is terminated: once a process dies its children reparent and
-drop out of the walk from that pid (notably on Windows), so :func:`snapshot_descendants` runs first and
-:func:`reap` runs after the connection is closed. Both are best-effort and never raise -- teardown must not
-turn a good result into a failure.
+drop out of the walk from that pid (notably on Windows). Rutherford therefore snapshots first, hard-kills the
+direct adapter so it cannot spawn replacements, reaps the captured descendants, and only then permits
+EOF-sensitive transport cleanup. The synchronous primitives are best-effort and never raise -- teardown must
+not turn a good result into a failure.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import threading
+from concurrent.futures import Future
 
 import psutil
 
@@ -28,6 +32,30 @@ def snapshot_descendants(pid: int) -> list[psutil.Process]:
         return psutil.Process(pid).children(recursive=True)
     except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
         return []
+
+
+async def snapshot_descendants_eagerly(pid: int) -> list[psutil.Process]:
+    """Start a dedicated snapshot thread immediately and await its result without using the shared executor.
+
+    The default executor can be saturated by file and terminal callbacks. Queueing this pre-parent-death snapshot
+    there permits the adapter to exit before enumeration starts, after which reparented children are no longer
+    discoverable from ``pid``. A short-lived daemon thread gives teardown its own execution slot; caller
+    cancellation does not cancel the underlying snapshot.
+    """
+    result: Future[list[psutil.Process]] = Future()
+
+    def _capture() -> None:
+        try:
+            result.set_result(snapshot_descendants(pid))
+        except BaseException as exc:  # pragma: no cover - snapshot_descendants is best-effort and does not raise
+            result.set_exception(exc)
+
+    threading.Thread(
+        target=_capture,
+        name="rutherford-process-snapshot",
+        daemon=True,
+    ).start()
+    return await asyncio.shield(asyncio.wrap_future(result))
 
 
 def count_descendants(pid: int) -> int:
