@@ -11,7 +11,8 @@ partial) but not that the agent was actually torn down. These close that gap:
    start/closed guards (a cancel before start, or after a clean close, emits nothing) -- AND that a real
    running consensus/debate actually drives it (cancel a live panel, assert one ``job_cancelled``).
 2. ``ACPSession.close()`` snapshots the agent's descendants BEFORE the transport tears down (Windows
-   reparenting), shuts a brokered terminal, tears the transport down, then reaps -- the close-path ORDER.
+   reparenting), shuts brokered terminals, reaps descendants that can hold inherited pipes, then closes the
+   transport -- the deadlock-safe close-path ORDER.
 3. ``ACPSession.open()`` tears the spawned agent down when a cancel lands DURING the handshake (a
    ``CancelledError`` is a ``BaseException``, so the per-stage ``except Exception`` guards miss it).
 4. ``ACPSession.prompt`` issues ``session/cancel`` (the real ACP RPC) on a turn timeout.
@@ -25,13 +26,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import pytest
+from acp import spawn_agent_process as sdk_spawn_agent_process
 
 from rutherford.acp.client import TerminalBroker
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
@@ -198,10 +202,10 @@ async def test_cancel_job_cancels_a_running_panel_and_closes_its_stream(monkeypa
     assert terminals == [ActivityEventKind.JOB_CANCELLED]  # the poll buffer closes with exactly one cut
 
 
-# --- 2. ACPSession.close(): snapshot -> shut terminals -> teardown -> reap ----
+# --- 2. ACPSession.close(): snapshot -> shut terminals -> reap -> teardown ----
 
 
-async def test_close_snapshots_before_teardown_then_shuts_terminals_then_reaps(monkeypatch: Any) -> None:
+async def test_close_snapshots_then_shuts_terminals_reaps_and_closes_transport(monkeypatch: Any) -> None:
     session = ACPSession(FAKE, policy=_READ_ONLY, cwd=str(REPO_ROOT))
     await session.open()
     calls: list[str] = []
@@ -210,7 +214,7 @@ async def test_close_snapshots_before_teardown_then_shuts_terminals_then_reaps(m
         calls.append("snapshot")
         return [424242]  # a fake descendant so the reap branch is exercised and observable
 
-    monkeypatch.setattr("rutherford.acp.session.snapshot_descendants", snapshot_spy)
+    monkeypatch.setattr("rutherford.acp.teardown.snapshot_descendants", snapshot_spy)
     monkeypatch.setattr("rutherford.acp.session.reap", lambda pids: calls.append(f"reap:{pids}"))
     original_shutdown = session._client.shutdown_terminals
 
@@ -219,7 +223,7 @@ async def test_close_snapshots_before_teardown_then_shuts_terminals_then_reaps(m
         await original_shutdown()
 
     monkeypatch.setattr(session._client, "shutdown_terminals", shutdown_spy)
-    # Wrap the exit stack's teardown too, so the test pins reap-AFTER-transport-close, not just reap-last.
+    # * Wrap transport teardown so the test pins descendant reap before any EOF-sensitive transport wait.
     original_aclose = session._stack.aclose
 
     async def aclose_spy() -> None:
@@ -228,13 +232,210 @@ async def test_close_snapshots_before_teardown_then_shuts_terminals_then_reaps(m
 
     monkeypatch.setattr(session._stack, "aclose", aclose_spy)
     await session.close()
-    # The exact close-path order: snapshot the descendants BEFORE the transport teardown (a dead parent's
-    # children reparent and drop out of the walk on Windows), shut the brokered terminal, tear the transport
-    # down, and reap AFTER -- so a CLI a wrapper adapter fronts is killed, never orphaned in the working dir.
-    assert calls == ["snapshot", "shutdown_terminals", "transport_close", "reap:[424242]"]
+    # * Snapshot before parent death, then kill holders of inherited stdio handles before transport EOF waits.
+    assert calls == ["snapshot", "shutdown_terminals", "reap:[424242]", "transport_close"]
+
+
+async def test_close_kills_direct_process_when_transport_teardown_ignores_eof(monkeypatch: Any) -> None:
+    session = ACPSession(FAKE, policy=_READ_ONLY, cwd=str(REPO_ROOT))
+    await session.open()
+    process = session._process
+    assert process is not None and process.returncode is None
+    original_aclose = session._stack.aclose
+    transport_started = asyncio.Event()
+    transport_cancelled = asyncio.Event()
+    never = asyncio.Event()
+
+    async def hanging_aclose() -> None:
+        transport_started.set()
+        try:
+            await never.wait()
+        finally:
+            transport_cancelled.set()
+
+    monkeypatch.setattr("rutherford.acp.session._TRANSPORT_CLOSE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(session._stack, "aclose", hanging_aclose)
+    started = time.monotonic()
+    await asyncio.wait_for(session.close(), timeout=0.5)
+    elapsed = time.monotonic() - started
+
+    assert transport_started.is_set()
+    assert elapsed < 0.3
+    await asyncio.wait_for(transport_cancelled.wait(), timeout=0.5)
+    return_code = await asyncio.wait_for(process.wait(), timeout=0.5)
+    assert isinstance(return_code, int)
+    await original_aclose()
+
+
+async def test_close_continues_after_its_waiter_is_cancelled(monkeypatch: Any) -> None:
+    session = ACPSession(FAKE, policy=_READ_ONLY, cwd=str(REPO_ROOT))
+    transport_started = asyncio.Event()
+    release_transport = asyncio.Event()
+    transport_finished = asyncio.Event()
+    calls = 0
+
+    async def slow_aclose() -> None:
+        nonlocal calls
+        calls += 1
+        transport_started.set()
+        await release_transport.wait()
+        transport_finished.set()
+
+    monkeypatch.setattr(session._stack, "aclose", slow_aclose)
+    waiter = asyncio.create_task(session.close())
+    await asyncio.wait_for(transport_started.wait(), timeout=0.5)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    release_transport.set()
+    await asyncio.wait_for(session.close(), timeout=0.5)
+    assert transport_finished.is_set()
+    assert calls == 1
+
+
+async def test_descendant_snapshot_starts_while_default_executor_is_saturated(monkeypatch: Any) -> None:
+    loop = asyncio.get_running_loop()
+    old_executor = getattr(loop, "_default_executor", None)
+    saturated = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(saturated)
+    executor_started = threading.Event()
+    release_executor = threading.Event()
+    snapshot_started = threading.Event()
+
+    def block_executor() -> None:
+        executor_started.set()
+        release_executor.wait(timeout=2.0)
+
+    def snapshot_spy(pid: int) -> list[Any]:
+        assert pid == 12345
+        snapshot_started.set()
+        return []
+
+    blocker = loop.run_in_executor(None, block_executor)
+    assert executor_started.wait(timeout=0.5)
+    monkeypatch.setattr("rutherford.acp.teardown.snapshot_descendants", snapshot_spy)
+    session = ACPSession(FAKE, policy=_READ_ONLY, cwd=str(REPO_ROOT))
+    session._pid = 12345
+
+    try:
+        await asyncio.wait_for(session.close(), timeout=0.5)
+        assert snapshot_started.is_set()
+    finally:
+        release_executor.set()
+        await asyncio.wait_for(blocker, timeout=0.5)
+        if old_executor is not None:
+            loop.set_default_executor(old_executor)
+        else:
+            loop.set_default_executor(ThreadPoolExecutor())
+        saturated.shutdown(wait=True)
+
+
+async def test_cancel_returns_when_agent_ignores_session_cancel(monkeypatch: Any) -> None:
+    session = ACPSession(FAKE, policy=_READ_ONLY, cwd=str(REPO_ROOT))
+    await session.open()
+    cancel_started = asyncio.Event()
+    cancel_cancelled = asyncio.Event()
+    never = asyncio.Event()
+
+    async def hanging_cancel(*, session_id: str) -> None:
+        assert session_id == session._session_id
+        cancel_started.set()
+        try:
+            await never.wait()
+        finally:
+            cancel_cancelled.set()
+
+    try:
+        monkeypatch.setattr("rutherford.acp.session._CANCEL_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(session._conn, "cancel", hanging_cancel)
+        started = time.monotonic()
+        await asyncio.wait_for(session.cancel(), timeout=0.5)
+        elapsed = time.monotonic() - started
+
+        assert cancel_started.is_set()
+        assert elapsed < 0.3
+        await asyncio.wait_for(cancel_cancelled.wait(), timeout=0.5)
+    finally:
+        await session.close()
+
+
+async def test_agent_stderr_is_detached_from_the_mcp_host_pipe(monkeypatch: Any) -> None:
+    captured: list[dict[str, Any]] = []
+
+    def spawn_spy(*args: Any, **kwargs: Any) -> Any:
+        captured.append(kwargs)
+        return sdk_spawn_agent_process(*args, **kwargs)
+
+    monkeypatch.setattr("rutherford.acp.session.spawn_agent_process", spawn_spy)
+    session = ACPSession(FAKE, policy=_READ_ONLY, cwd=str(REPO_ROOT))
+    await session.open()
+    await session.close()
+
+    assert captured
+    assert captured[0]["transport_kwargs"]["stderr"] == subprocess.DEVNULL
 
 
 # --- 2b. a LIVE brokered terminal is actually killed on shutdown -------------
+
+
+async def test_broker_shutdown_starts_all_terminal_kills_concurrently(monkeypatch: Any) -> None:
+    broker = TerminalBroker(REPO_ROOT)
+    started: list[str] = []
+    all_started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _SlowTerminal:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        async def kill(self) -> None:
+            started.append(self._name)
+            if len(started) == 2:
+                all_started.set()
+            await release.wait()
+
+    monkeypatch.setattr(
+        broker,
+        "_terminals",
+        {"first": _SlowTerminal("first"), "second": _SlowTerminal("second")},
+    )
+    shutdown = asyncio.create_task(broker.shutdown())
+    await asyncio.wait_for(all_started.wait(), timeout=0.5)
+    release.set()
+    await asyncio.wait_for(shutdown, timeout=0.5)
+
+    assert set(started) == {"first", "second"}
+    assert not broker._terminals
+
+
+async def test_broker_shutdown_cancellation_retains_terminal_until_shared_kill_finishes(monkeypatch: Any) -> None:
+    broker = TerminalBroker(REPO_ROOT)
+    term_id = await broker.create(sys.executable, ["-c", "import time; time.sleep(5)"], None)
+    terminal = broker._terminals[term_id]
+    process = terminal.process
+    snapshot_started = asyncio.Event()
+    release_snapshot = asyncio.Event()
+
+    async def slow_snapshot(pid: int) -> list[Any]:
+        assert pid == process.pid
+        snapshot_started.set()
+        await release_snapshot.wait()
+        return []
+
+    monkeypatch.setattr("rutherford.acp.client.snapshot_descendants_eagerly", slow_snapshot)
+    shutdown = asyncio.create_task(broker.shutdown())
+    await asyncio.wait_for(snapshot_started.wait(), timeout=0.5)
+    shutdown.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await shutdown
+
+    assert broker._terminals.get(term_id) is terminal
+    release_snapshot.set()
+    await asyncio.wait_for(broker.shutdown(), timeout=0.5)
+    await asyncio.to_thread(process.wait, 2.0)
+    assert process.returncode is not None
+    assert term_id not in broker._terminals
 
 
 async def test_broker_shutdown_kills_a_live_terminal() -> None:

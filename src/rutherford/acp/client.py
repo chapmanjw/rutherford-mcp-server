@@ -50,7 +50,7 @@ from acp.schema import (
 
 from .journal import EventJournal, JournalEvent
 from .permission import PermissionPolicy
-from .teardown import reap, snapshot_descendants
+from .teardown import reap, snapshot_descendants_eagerly
 
 #: JSON-RPC error code Rutherford returns when it declines an agent callback (an internal-error code; the
 #: protocol has no dedicated "permission denied" callback code, so the message carries the reason).
@@ -64,6 +64,8 @@ _TERMINAL_TIMEOUT_S = 120.0
 #: Max bytes of combined stdout/stderr a brokered terminal keeps; output past it is truncated (the response
 #: reports ``truncated=True``). Bounds memory against a command that floods output.
 _TERMINAL_OUTPUT_CAP = 1 * 1024 * 1024
+#: Maximum wait after a hard kill before terminal teardown proceeds to descendant reap and reader cancellation.
+_TERMINAL_KILL_WAIT_S = 2.0
 
 
 def _confine(root: Path, raw_path: str) -> Path:
@@ -93,6 +95,7 @@ class _BrokeredTerminal:
         self.truncated = False
         self.exit_code: int | None = None
         self._reader = asyncio.create_task(self._pump())
+        self._kill_task: asyncio.Task[None] | None = None
 
     async def _pump(self) -> None:
         """Drain the process's combined stdout/stderr into the bounded buffer until it closes."""
@@ -132,14 +135,36 @@ class _BrokeredTerminal:
         return code
 
     async def kill(self) -> None:
-        """Terminate the command and reap its descendant tree (best-effort; never raises)."""
+        """Await one shared kill task so cancellation of a caller cannot strand the process or lose ownership."""
+        if self._kill_task is None:
+            self._kill_task = asyncio.create_task(
+                self._kill_body(),
+                name=f"rutherford-terminal-kill-{self.process.pid}",
+            )
+        await asyncio.shield(self._kill_task)
+
+    async def _kill_body(self) -> None:
+        """Snapshot descendants, hard-kill the command, reap its tree, and stop the output reader."""
+        descendants: list[Any] = []
+        try:
+            if self.process.poll() is None:
+                with contextlib.suppress(Exception):
+                    descendants = await snapshot_descendants_eagerly(self.process.pid)
+        finally:
+            # * The direct command is killed even if snapshot enumeration or its waiter is cancelled.
+            if self.process.poll() is None:
+                with contextlib.suppress(OSError):  # pragma: no cover - already dead
+                    self.process.kill()
         if self.process.poll() is None:
-            descendants = await asyncio.to_thread(snapshot_descendants, self.process.pid)
-            with contextlib.suppress(OSError):  # pragma: no cover - already dead
-                self.process.kill()
-            await asyncio.to_thread(reap, descendants)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                await asyncio.to_thread(self.process.wait, _TERMINAL_KILL_WAIT_S)
+        if descendants:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(reap, descendants)
         if not self._reader.done():
             self._reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reader
 
 
 class TerminalBroker:
@@ -195,16 +220,22 @@ class TerminalBroker:
         await self._get(terminal_id).kill()
 
     async def release(self, terminal_id: str) -> None:
-        """Kill and forget the terminal, freeing its tracking slot."""
-        term = self._terminals.pop(terminal_id, None)
+        """Kill and forget the terminal, retaining ownership until its shared kill task has completed."""
+        term = self._terminals.get(terminal_id)
         if term is not None:
             await term.kill()
+            if self._terminals.get(terminal_id) is term:
+                self._terminals.pop(terminal_id, None)
 
     async def shutdown(self) -> None:
-        """Kill and forget every tracked terminal (called when the session closes). Best-effort."""
-        for term in list(self._terminals.values()):
-            await term.kill()
-        self._terminals.clear()
+        """Kill tracked terminals concurrently and forget each only after its shared kill task has completed."""
+        terminals = list(self._terminals.items())
+        if not terminals:
+            return
+        await asyncio.gather(*(term.kill() for _, term in terminals), return_exceptions=True)
+        for terminal_id, term in terminals:
+            if self._terminals.get(terminal_id) is term:
+                self._terminals.pop(terminal_id, None)
 
     def _get(self, terminal_id: str) -> _BrokeredTerminal:
         term = self._terminals.get(terminal_id)
