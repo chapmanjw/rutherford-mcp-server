@@ -716,6 +716,9 @@ def _git_read(working_dir: str, *args: str) -> str | None:
             text=True,
             timeout=_FINGERPRINT_TIMEOUT_S,
             check=False,
+            # Never inherit the MCP stdio pipe: on Windows a pending host read on the shared stdin file object
+            # deadlocks git's CRT init into an unkillable freeze (see sandbox._git for the full story).
+            stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
