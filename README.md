@@ -114,8 +114,9 @@ uv tool install rutherford-mcp-server
 # or: pipx install rutherford-mcp-server  /  pip install rutherford-mcp-server
 ```
 
-This puts the console entry point `rutherford-mcp-server` on your PATH. The same command starts the
-stdio server on Windows, macOS, and Linux; `python -m rutherford` is equivalent.
+This puts the console entry points `rutherford-mcp-server` and `rutherford` on your PATH (same
+process; the short name is for terminal subcommands). The same command starts the stdio server on
+Windows, macOS, and Linux; `python -m rutherford` is equivalent.
 
 **2. Register it with your MCP client.**
 
@@ -138,7 +139,7 @@ with the interpreter from the environment where you installed it. More clients a
 run the one-shot CLI from your terminal:
 
 ```sh
-rutherford-mcp-server init          # or: python -m rutherford init  [--global] [--yes]
+rutherford init          # or: rutherford-mcp-server init / python -m rutherford init  [--global] [--yes]
 ```
 
 or, once it is registered with a client, ask for the `setup` tool:
@@ -148,6 +149,15 @@ or, once it is registered with a client, ask for the `setup` tool:
 Both resolve the config path, write a commented starter `config.toml` at the effective defaults, and never
 clobber an existing file. `init` targets `<cwd>/.rutherford/config.toml` (or the global path with
 `--global`); `setup` returns the path and content to the client and writes with `write=true`.
+
+To allow `write` / `yolo` delegations into the current repo without a per-call `trust_workspace=true`,
+register cwd in the global allowlist:
+
+```sh
+rutherford trust                 # adds cwd to global trusted_workspaces
+rutherford trust --list
+rutherford untrust               # removes cwd from the global allowlist
+```
 
 **4. Run `doctor` first.** Multi-agent auth and PATH is the most common thing that goes wrong, so
 confirm the crew actually drives before your first real task:

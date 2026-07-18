@@ -79,7 +79,20 @@ Two ways to pass the gate:
 
 1. **Allowlist.** Add an absolute path to `trusted_workspaces` in config. Any `working_dir` that
    resolves to that path or a subdirectory of it is allowed. Paths are resolved with `Path.resolve()`
-   before comparison, so symlinks and relative segments do not bypass the check.
+   before comparison, so symlinks and relative segments do not bypass the check. From a repo root,
+   register the current directory in the **global** allowlist with:
+
+   ```sh
+   rutherford trust              # or: python -m rutherford trust
+   rutherford trust --list       # show the global allowlist
+   rutherford untrust            # remove cwd from the global allowlist
+   ```
+
+   `trust` / `untrust` edit only the platform global `config.toml`
+   (`%APPDATA%\rutherford\config.toml` on Windows, `$XDG_CONFIG_HOME/rutherford/config.toml` elsewhere).
+   They create the file when missing, never clobber unrelated keys, and refuse a malformed TOML. A
+   project-local `trusted_workspaces` still *replaces* the global list at load time (it does not union).
+
 2. **Per-call flag.** Pass `trust_workspace=true` in the tool call — an explicit, call-site opt-in for
    a directory not on the allowlist.
 
