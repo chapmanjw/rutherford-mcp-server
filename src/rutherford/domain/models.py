@@ -501,6 +501,13 @@ class DelegationRequest(BaseModel):
     #: Per-call confirmation that a write/yolo delegation may mutate ``working_dir`` even when
     #: it is not on the configured trusted-workspace allowlist.
     trust_workspace: bool = False
+    #: Run the turn inside the isolated worktree / temp-copy sandbox (the default). ``False`` runs a
+    #: ``write`` / ``yolo`` delegation DIRECTLY in ``working_dir`` (inherited from the server process cwd
+    #: when omitted): the agent edits the real tree and may run terminal commands there, with no diff
+    #: capture or apply-back step. The trusted-workspace gate still applies. ``propose`` cannot run
+    #: unsandboxed (its diff is computed from the sandbox) -- ``INVALID_INPUT``; ``read_only`` already
+    #: runs direct, so the flag is a no-op there.
+    sandbox: bool = True
     #: When the requested model is unavailable, retry once with the adapter's fallback model.
     allow_model_fallback: bool = True
     #: An ordered list of alternate targets to try when the primary delegation fails on a retryable

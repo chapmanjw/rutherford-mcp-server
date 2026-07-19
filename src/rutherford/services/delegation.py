@@ -27,7 +27,15 @@ from ..acp.permission import PermissionPolicy
 from ..acp.sandbox import SandboxManager
 from ..acp.session import run_acp_turn
 from ..config.schema import RutherfordConfig
-from ..domain.enums import ActivityEventKind, Effort, JobStatus, ReexecutionSafety, is_mutating, runs_sandboxed
+from ..domain.enums import (
+    ActivityEventKind,
+    Effort,
+    JobStatus,
+    ReexecutionSafety,
+    SafetyMode,
+    is_mutating,
+    runs_sandboxed,
+)
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import ActivityEvent, DelegationRequest, DelegationResult, ErrorInfo, RunRecord, Target, Topology
@@ -198,11 +206,27 @@ class DelegationService:
         except RutherfordError as exc:
             return _fail(req, exc.code, exc.message, details=exc.details)
 
+        # propose without a sandbox is meaningless: the diff IS the product and it is computed from the
+        # sandbox tree; without one the policy would deny writes (read_only-equivalent) and there would be
+        # nothing to diff. Fail loud rather than silently degrade.
+        if not req.sandbox and req.safety_mode is SafetyMode.PROPOSE:
+            return _fail(
+                req,
+                ErrorCode.INVALID_INPUT,
+                "propose mode requires the sandbox: its diff is computed from the isolated worktree. "
+                "Use sandbox=true (the default), or write/yolo for an unsandboxed mutating run.",
+            )
+        # An unsandboxed run with no working_dir inherits the server process cwd -- for a stdio MCP server
+        # that is the caller's own workspace. Pin it into the request NOW so the trusted-workspace gate
+        # below evaluates the directory the agent will actually mutate.
+        if not req.sandbox and not req.working_dir:
+            req = req.model_copy(update={"working_dir": str(Path.cwd())})
+
         # A sandboxed mode (propose / write / yolo) MUST have a working_dir: it is the tree the sandbox is
         # built from. Without one there is nothing to isolate and the turn would fall through to the direct
         # path in the server's own cwd with writes allowed -- an unsandboxed write into Rutherford's directory.
         # So require it up front (this also closes a trust_workspace=true + no-working_dir bypass).
-        if runs_sandboxed(req.safety_mode) and not req.working_dir:
+        if runs_sandboxed(req.safety_mode) and req.sandbox and not req.working_dir:
             return _fail(
                 req,
                 ErrorCode.INVALID_INPUT,
@@ -270,7 +294,7 @@ class DelegationService:
         cwd = req.working_dir or str(Path.cwd())
         timeout = req.timeout_s or self._config.timeout_for(req.target.cli) or self._config.default_timeout_s
         prompt = _compose_prompt(req.prompt, req.files)
-        if runs_sandboxed(req.safety_mode) and req.working_dir:
+        if runs_sandboxed(req.safety_mode) and req.sandbox and req.working_dir:
             result = await self._run_sandboxed(req, descriptor, prompt, cwd, timeout_s=timeout, base_depth=base_depth)
         else:
             result = await self._run_direct(req, descriptor, prompt, cwd, timeout_s=timeout, base_depth=base_depth)
