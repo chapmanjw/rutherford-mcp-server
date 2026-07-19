@@ -33,6 +33,7 @@ async def delegate_tool(
     safety_mode: str | None = None,
     timeout_s: float | None = None,
     trust_workspace: bool = False,
+    sandbox: bool = True,
     role: str | None = None,
     effort: str | None = None,
     fallback: list[Any] | None = None,
@@ -60,6 +61,11 @@ async def delegate_tool(
     default) lets a model-unavailable failure retry the SAME agent on its configured ``fallback_model`` first,
     where it has one (most ACP agents do not -- a clean no-op).
 
+    ``sandbox=False`` runs a ``write`` / ``yolo`` delegation DIRECTLY in ``working_dir`` (inherited from the
+    server process cwd when omitted) instead of an isolated worktree / temp copy: the agent edits the real
+    tree and may run terminal commands there, with no diff capture or apply-back. The trusted-workspace gate
+    still applies. ``propose`` cannot run unsandboxed (``INVALID_INPUT``); ``read_only`` is unaffected.
+
     ``persist`` keeps this run as a durable job under ``<jobs_dir>/<run_id>/`` (F2: ``state.json`` plus the
     answer / diff artifacts), so it survives the process. ``None`` follows the configured
     ``default_persistence`` (``ephemeral`` out of the box -- nothing on disk unless asked); ``True`` / ``False``
@@ -86,6 +92,7 @@ async def delegate_tool(
         safety_mode=safety,
         timeout_s=timeout_s,
         trust_workspace=trust_workspace,
+        sandbox=sandbox,
         effort=parse_effort(effort),
         fallback=fallback_targets,
         allow_model_fallback=allow_model_fallback,
