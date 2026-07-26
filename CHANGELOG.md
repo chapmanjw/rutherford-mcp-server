@@ -8,11 +8,34 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
-- **`rutherford trust` / `rutherford untrust` CLI** — from a repo root, register (or remove) the current
-  directory in the platform global `trusted_workspaces` allowlist so `write` / `yolo` delegations pass the
-  trusted-workspace gate without a per-call `trust_workspace=true`. Optional path argument;
-  `trust --list` prints the global list. Creates the global `config.toml` when missing, preserves unrelated
-  keys, refuses a malformed file. Console script alias `rutherford` added alongside `rutherford-mcp-server`.
+- **`trust` / `untrust` CLI for the global workspace allowlist** — from a repo root,
+  `python -m rutherford trust` registers (or `untrust` removes) the current directory in the platform
+  global `trusted_workspaces` allowlist, so `write` / `yolo` delegations pass the trusted-workspace gate
+  without a per-call `trust_workspace=true`. Takes an optional path argument; `trust --list` prints the
+  global list. Creates the global `config.toml` when missing, preserves unrelated keys and comments, and
+  refuses to run against a config that is already malformed. Rutherford reads config once at server start,
+  so restart or reconnect the server after a `trust` for it to take effect. Contributed by
+  [@Artemonim](https://github.com/Artemonim) in [#12].
+- **The allowlist writer validates before it writes.** The rewritten `config.toml` is rendered, parsed, and
+  round-trip-checked in memory and only then swapped into place with an atomic replace, so a path that
+  cannot be represented in TOML is refused with the existing config untouched rather than truncated. The
+  assignment scanner is string- and comment-aware, so a `[` or `]` inside a trusted path can no longer walk
+  past the end of the array and drop the `[agents.*]` tables below it. Unrelated keys and comments are kept
+  as written, while the block's own managed header is rewritten in place instead of accumulating a copy per
+  edit. Path quoting goes through the one shared hardened quoter (`io/tomltext.py`), and the file mode is
+  carried across the replace so an owner-only config does not widen to the umask default.
+
+### Documentation
+
+- **The trusted-workspace allowlist is documented end to end** — `docs/security.md` covers the
+  `trust` / `untrust` commands, the platform global config path, and the fact that a project-local
+  `trusted_workspaces` *replaces* rather than unions the global list at load time (previously undocumented
+  anywhere). `docs/troubleshooting.md` points `WORKSPACE_NOT_TRUSTED` at the one-shot CLI, and `README.md`
+  and `docs/configuration.md` follow.
+
+Thanks to [@Artemonim](https://github.com/Artemonim) for the trusted-workspace CLI contribution in [#12].
+
+[#12]: https://github.com/chapmanjw/rutherford-mcp-server/pull/12
 
 ## [3.0.7] - 2026-07-13
 

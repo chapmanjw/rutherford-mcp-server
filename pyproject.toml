@@ -56,9 +56,10 @@ Issues = "https://github.com/chapmanjw/rutherford-mcp-server/issues"
 Changelog = "https://github.com/chapmanjw/rutherford-mcp-server/blob/main/CHANGELOG.md"
 
 [project.scripts]
+# NOTE: deliberately no bare `rutherford` alias. The sibling product rutherford-cli builds its binary from
+# cmd/rutherford, so it installs an executable named exactly `rutherford`; shipping one here too would make
+# the two race on PATH for anyone with both. Terminal subcommands run as `python -m rutherford <cmd>`.
 rutherford-mcp-server = "rutherford.server:main"
-# * Short alias for terminal subcommands (`rutherford trust` / `init` / `discover`); same entry as the MCP server.
-rutherford = "rutherford.server:main"
 
 [dependency-groups]
 dev = [
