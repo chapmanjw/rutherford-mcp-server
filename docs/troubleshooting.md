@@ -121,6 +121,14 @@ agent is spawned. A delegation that omits `working_dir` also fails.
 trusted_workspaces = ["/home/user/projects/myapp", "C:\\Users\\user\\projects\\myapp"]
 ```
 
+From the repo root, the one-shot CLI registers cwd in the **global** allowlist:
+
+```sh
+rutherford trust                 # or: python -m rutherford trust [/path]
+rutherford untrust               # remove cwd (or a path) from the global allowlist
+rutherford trust --list
+```
+
 Or set `RUTHERFORD_TRUSTED_WORKSPACES` (paths separated by `;` on Windows, `:` on POSIX).
 
 ### `UNKNOWN_TARGET` — agent id not recognized
