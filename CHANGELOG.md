@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Subprocess deadlock from the inherited MCP stdio pipe** — `npm install`,
+  the sandbox `git` calls, and workspace fingerprinting now pass
+  `stdin=subprocess.DEVNULL`. On Windows a child inheriting the live MCP stdin
+  deadlocks inside CRT init against the host's pending read: a 0-CPU, kill-immune
+  freeze that only clears when the server exits.
+
 ## [3.1.0] - 2026-07-26
 
 ### Added

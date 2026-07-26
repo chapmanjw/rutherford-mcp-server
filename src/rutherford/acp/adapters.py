@@ -118,7 +118,15 @@ def _run_npm(cmd: tuple[str, ...]) -> tuple[bool, str]:
     # launch path the agent spawns use, so it cannot inject a shell or an arbitrary command.
     argv = prepare_argv(cmd)
     try:
-        completed = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=_INSTALL_TIMEOUT_S)
+        completed = subprocess.run(
+            # stdin=DEVNULL: never hand the MCP stdio pipe to a child (Windows CRT-init deadlock; see sandbox._git).
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_INSTALL_TIMEOUT_S,
+            stdin=subprocess.DEVNULL,
+        )
     except (OSError, subprocess.SubprocessError) as exc:  # npm vanished mid-call, or the install timed out
         return False, f"npm install failed: {exc}"
     if completed.returncode == 0:

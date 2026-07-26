@@ -466,6 +466,11 @@ class SandboxManager:
                 text=True,
                 timeout=_GIT_TIMEOUT_S,
                 check=False,
+                # Never inherit this server's stdin: it is the live MCP stdio pipe with a pending host read, and
+                # git's CRT startup probes inherited std handles -- on Windows the NPFS file-object lock shared
+                # with that pending read deadlocks the child INSIDE process init: a 0-CPU, kill-immune freeze
+                # that only clears when the server dies. DEVNULL breaks the shared-object cycle.
+                stdin=subprocess.DEVNULL,
             )
         except FileNotFoundError as exc:
             raise RutherfordError(ErrorCode.INTERNAL, "git is not installed; the write sandbox needs git") from exc
