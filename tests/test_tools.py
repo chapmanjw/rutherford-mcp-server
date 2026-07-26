@@ -137,9 +137,14 @@ def test_get_app_and_main(monkeypatch: Any) -> None:
     assert app is not None
     assert server.get_app() is app  # cached on the second call
     monkeypatch.setattr(server, "_APP", None)
-    monkeypatch.setattr(server.mcp, "run", lambda **kwargs: None)
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(server.mcp, "run", lambda **kwargs: captured.update(kwargs))
     server.main()
     assert server._APP is not None
+    # * The transport must be NAMED, not inherited. FastMCP falls back to fastmcp.settings.transport,
+    # which reads FASTMCP_TRANSPORT from the environment or a .env file, so an unpinned call could be
+    # flipped to an HTTP server -- the only way the transitive HTTP stack becomes reachable at all.
+    assert captured["transport"] == "stdio"
 
 
 # --- Advisory persistence notices (F2 nudge) --------------------------------------------------------------

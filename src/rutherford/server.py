@@ -851,7 +851,13 @@ def main() -> None:
     if smoke:
         print(f"rutherford: smoke ok -- {len(_APP.descriptors)} agents registered")
         return
-    mcp.run(show_banner=False)
+    # * Name the transport rather than inheriting it. FastMCP resolves an omitted transport through
+    # fastmcp.settings.transport, a pydantic-settings field with env_prefix "FASTMCP_" and .env support,
+    # so FASTMCP_TRANSPORT=http in the environment would otherwise start a Starlette HTTP server with no
+    # code change. Rutherford is an ACP orchestrator spoken to over stdio by an MCP client; the HTTP
+    # server stack arrives only as a transitive dependency and is neither used nor tested here. Pinning
+    # makes stdio an invariant instead of a default, which is what keeps that stack unreachable.
+    mcp.run(transport="stdio", show_banner=False)
 
 
 if __name__ == "__main__":
