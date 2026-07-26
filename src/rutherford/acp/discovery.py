@@ -14,12 +14,21 @@ probe is the only trustworthy signal, exactly as it is for the built-in roster.
 
 Trust model. Probing SPAWNS the resolved binary (with the registry-supplied args) before the ACP handshake,
 so discovery executes installed programs that match a registry agent's name -- including ones found off PATH
-under ``~/.<vendor>/bin``. Two guards bound this: an agent is never resolved to a shell/interpreter
-(:func:`_is_interpreter`), so a tampered registry cannot name ``powershell``/``python`` with hostile args;
-and the registry default is the official HTTPS endpoint (a ``file://`` or ``$RUTHERFORD_ACP_REGISTRY_URL``
-override, and the on-disk cache, are trusted inputs the user controls). What remains -- a malicious binary
-planted under a scanned dir whose name matches an agent -- requires write access to the user's home and is
-no worse than the existing trust in PATH; ``discover`` is an explicit, user-invoked action, like ``doctor``.
+under ``~/.<vendor>/bin``. Three things bound this, and it is worth being exact about what each does and
+does not buy:
+
+* The registry default is the official HTTPS endpoint. A ``file://`` or ``$RUTHERFORD_ACP_REGISTRY_URL``
+  override, and the on-disk cache, are inputs the user controls. The cache is written only after a
+  response parses (:func:`rutherford.acp.registry.fetch_registry`), so a hostile body is not persisted
+  and replayed as the trusted fallback.
+* An agent is never resolved to a program that runs its own arguments as code (:func:`_is_interpreter`),
+  which is what stops a tampered registry from naming ``powershell``/``python``/``git`` with hostile args.
+  This is a DENYLIST of known program-runner families, so it is defense in depth rather than a boundary:
+  it covers the families listed below, and a name outside them is not proven safe.
+* ``discover`` is an explicit, user-invoked action, like ``doctor`` -- not something that runs on its own.
+
+What remains -- a malicious binary planted under a scanned dir whose name matches an agent -- requires
+write access to the user's home and is no worse than the existing trust in PATH.
 """
 
 from __future__ import annotations
@@ -50,8 +59,14 @@ _EXE_SUFFIXES = ("", ".exe", ".cmd", ".bat")
 #: ``pwsh-preview``), variant (``pythonw``, ``pyw``), and shim (``node.cmd``, ``npx.cmd``). Matching the family
 #: rather than enumerating forms ends the bypass arms race. No real ACP agent binary is an interpreter, so
 #: this costs no legitimate agent (a real ``gemini.cmd`` shim has family ``gemini``; ``share-cli`` -> family
-#: ``share``). Defense in depth: the registry default is the official HTTPS endpoint, and this guards a
-#: tampered cache / URL override / MITM -- it is not claimed to be an exhaustive interpreter list.
+#: ``share``) -- true of every agent in the CURRENT roster and registry, which is what was checked; it is
+#: not a guarantee about a future name. Beyond shells and language runtimes the list also covers program
+#: RUNNERS -- package managers, build tools, VCS/infra/container CLIs, network fetchers, launchers -- because each
+#: executes attacker-chosen work from its own args just as directly as ``sh -c`` does (``pip install
+#: --index-url ...``, ``cargo install`` via build.rs, ``git -c protocol.ext.allow=always clone ext::sh -c
+#: ...``, ``docker run -v /:/mnt``). Defense in depth: the registry default is the official HTTPS endpoint,
+#: and this guards a tampered cache / URL override / MITM. It is a denylist, so it is explicitly NOT claimed
+#: to be exhaustive -- a name it does not match is unrecognized, not vouched for.
 _INTERPRETER_STEMS = frozenset(
     {
         # shells
@@ -120,7 +135,7 @@ _INTERPRETER_STEMS = frozenset(
         "jq",
         "bc",
         "dc",
-        # package runners that fetch+execute
+        # package runners / package managers that fetch+execute
         "npx",
         "npm",
         "pnpm",
@@ -129,11 +144,84 @@ _INTERPRETER_STEMS = frozenset(
         "uvx",
         "uv",
         "pipx",
+        "pip",
+        "pipenv",
+        "poetry",
+        "pdm",
+        "hatch",
+        "rye",
+        "conda",
+        "mamba",
+        "cargo",
+        "rustup",
+        "go",
+        "gem",
+        "composer",
+        "nix",
+        "brew",
+        "apt",
+        "dnf",
+        "yum",
+        "pacman",
+        "apk",
+        "snap",
+        "flatpak",
+        "winget",
+        "choco",
+        "scoop",
+        # build tools / task runners: every one executes attacker-authored steps from a file it is
+        # pointed at, or straight from its args
+        "make",
+        "cmake",
+        "ninja",
+        "mvn",
+        "gradle",
+        "sbt",
+        "rake",
+        "ant",
+        "bazel",
+        "buck",
+        "task",
+        "just",
+        "tox",
+        "nox",
+        # VCS / forge / infra CLIs with documented arbitrary-command escapes (git's ext:: transport and
+        # core.sshCommand, terraform/ansible local-exec, kubectl/helm exec plugins, the cloud CLIs)
+        "git",
+        "hg",
+        "svn",
+        "gh",
+        "glab",
+        "terraform",
+        "tofu",
+        "pulumi",
+        "ansible",
+        "kubectl",
+        "helm",
+        "aws",
+        "az",
+        "gcloud",
+        # container runtimes: a run/exec invocation is arbitrary code, and a bind mount is arbitrary FS
+        "docker",
+        "podman",
+        "nerdctl",
+        "containerd",
+        # network fetchers that can write a file or open a remote shell
+        "curl",
+        "wget",
+        "ssh",
+        "scp",
+        "sftp",
+        "rsync",
+        "socat",
+        "ncat",
+        "telnet",
         # platform launchers / privilege / debuggers that take a program + args
         "env",
         "wsl",
         "sudo",
         "doas",
+        "runas",
         "osascript",
         "cscript",
         "wscript",
@@ -143,6 +231,30 @@ _INTERPRETER_STEMS = frozenset(
         "dotnet",
         "gdb",
         "lldb",
+        "strace",
+        "ltrace",
+        "valgrind",
+        "chroot",
+        "unshare",
+        "nsenter",
+        "setarch",
+        "xargs",
+        "find",
+        "parallel",
+        "watch",
+        "timeout",
+        "nohup",
+        "stdbuf",
+        "start",
+        "at",
+        "batch",
+        "cron",
+        "crontab",
+        "systemd",  # systemd-run: the family is the leading alpha run, which stops at the hyphen
+        "launchctl",
+        "schtasks",
+        "screen",
+        "tmux",
     }
 )
 #: Executable / script extensions stripped before the family check, so a shim name (``npx.cmd``,

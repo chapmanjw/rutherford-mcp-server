@@ -101,6 +101,30 @@ def test_falls_back_to_cache_when_the_network_fails(tmp_path: Path) -> None:
     assert source == "cache" and {a.id for a in agents} == {"gemini", "goose"}
 
 
+def test_an_unparseable_network_body_never_becomes_the_cache(tmp_path: Path) -> None:
+    """The cache is the fallback replayed on every later network failure, so only a parsed body earns it.
+
+    Caching before validating would let one malformed or hostile response go sticky: served from disk
+    on each subsequent run, long after the network recovered.
+    """
+    cache = tmp_path / "acp-registry.json"
+    cache.write_text(json.dumps(_FIXTURE), encoding="utf-8")
+    bad_url = _write(tmp_path, {"agents": "not-a-list"})  # valid JSON, invalid registry
+    with pytest.raises(RegistryError):
+        fetch_registry(url=bad_url, cache_path=cache)
+    # The previously-good cache survived untouched, so the next offline run still works.
+    assert json.loads(cache.read_text(encoding="utf-8")) == _FIXTURE
+    agents, source = fetch_registry(url=(tmp_path / "missing.json").as_uri(), cache_path=cache)
+    assert source == "cache" and {a.id for a in agents} == {"gemini", "goose"}
+
+
+def test_no_cache_is_written_when_the_first_fetch_is_unparseable(tmp_path: Path) -> None:
+    cache = tmp_path / "cache" / "acp-registry.json"
+    with pytest.raises(RegistryError):
+        fetch_registry(url=_write(tmp_path, {"agents": "not-a-list"}), cache_path=cache)
+    assert not cache.exists()
+
+
 def test_raises_when_neither_network_nor_cache(tmp_path: Path) -> None:
     with pytest.raises(RegistryError):
         fetch_registry(url=(tmp_path / "missing.json").as_uri(), cache_path=tmp_path / "no-cache.json")

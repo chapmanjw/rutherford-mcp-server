@@ -74,9 +74,16 @@ def fetch_registry(
     """Return the parsed registry agents and a ``source`` tag (``network`` | ``cache``).
 
     Tries the network first (unless the only need is the cache); on any network failure falls back to the
-    on-disk ``cache_path`` if present. A successful network fetch refreshes the cache. ``force_refresh`` is
-    accepted for symmetry but the network is always tried first anyway. Raises :class:`RegistryError` only
-    when BOTH the network and the cache are unavailable, so a caller can surface a clean message.
+    on-disk ``cache_path`` if present. A successful network fetch refreshes the cache, but only AFTER the
+    body parses -- see below. ``force_refresh`` is accepted for symmetry but the network is always tried
+    first anyway. Raises :class:`RegistryError` only when BOTH the network and the cache are unavailable,
+    so a caller can surface a clean message.
+
+    The cache is written after :func:`parse_registry` succeeds, not before. The cache is the trusted
+    fallback replayed on every later network failure, so persisting an unvalidated body would let one
+    malformed or hostile response become sticky: it would be served from disk on each subsequent run,
+    long after the network recovered. Validating first means a bad body fails once and leaves any
+    previously-good cache intact.
     """
     raw: bytes | None = None
     source = "network"
@@ -84,8 +91,7 @@ def fetch_registry(
         raw = _fetch_url(url, timeout_s)
     except (urllib.error.URLError, OSError, ValueError) as exc:
         _log.warning("ACP registry fetch failed (%s); falling back to cache", exc)
-    if raw is not None and cache_path is not None:
-        _write_cache(cache_path, raw)
+    from_network = raw is not None
     if raw is None and cache_path is not None and cache_path.exists():
         raw = cache_path.read_bytes()
         source = "cache"
@@ -95,7 +101,10 @@ def fetch_registry(
             "or set RUTHERFORD_ACP_REGISTRY_URL"
         )
     _ = force_refresh  # network is always tried first; the flag is a no-op kept for a stable signature
-    return parse_registry(raw), source
+    agents = parse_registry(raw)
+    if from_network and cache_path is not None:
+        _write_cache(cache_path, raw)
+    return agents, source
 
 
 class RegistryError(Exception):
