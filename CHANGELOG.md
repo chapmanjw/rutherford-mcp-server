@@ -8,11 +8,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
-- **Subprocess deadlock from the inherited MCP stdio pipe** — `npm install`,
-  the sandbox `git` calls, and workspace fingerprinting now pass
-  `stdin=subprocess.DEVNULL`. On Windows a child inheriting the live MCP stdin
-  deadlocks inside CRT init against the host's pending read: a 0-CPU, kill-immune
-  freeze that only clears when the server exits.
+- **Subprocess deadlock from the inherited MCP stdio pipe** — `npm install`, the sandbox `git` calls,
+  and workspace fingerprinting now pass `stdin=subprocess.DEVNULL`, so a helper child never inherits
+  the live MCP transport. This fixes observed Windows hangs where the child froze at 0% CPU and did not
+  respond to `kill()`, clearing only when the server exited. Contributed by
+  [@Artemonim](https://github.com/Artemonim) in [#22].
+
+[#22]: https://github.com/chapmanjw/rutherford-mcp-server/pull/22
 
 ## [3.1.0] - 2026-07-26
 
