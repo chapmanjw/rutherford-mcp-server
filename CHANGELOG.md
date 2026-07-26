@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **MCP host deadlock during ACP teardown** — session `close` / `cancel` are now bounded and
+  shielded, descendants are snapshotted eagerly on a dedicated thread before the direct adapter
+  is killed, and teardown is reordered — snapshot, kill brokered terminals, reap descendants,
+  then close the transport — so inherited stdio handles no longer hold up EOF-sensitive SDK
+  cleanup. Each stage carries its own deadline, so a stuck stage bounds rather than stalls the
+  host. Agent stderr is detached from the host pipe and structured logs are queued through a
+  non-blocking background writer.
+
 ## [3.1.0] - 2026-07-26
 
 ### Added
