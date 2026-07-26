@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [3.1.0] - 2026-07-26
 
 ### Added
 
@@ -24,6 +24,40 @@ All notable changes to this project are documented in this file. The format is b
   as written, while the block's own managed header is rewritten in place instead of accumulating a copy per
   edit. Path quoting goes through the one shared hardened quoter (`io/tomltext.py`), and the file mode is
   carried across the replace so an owner-only config does not widen to the umask default.
+
+### Fixed
+
+- **`setup` could write a `config.toml` it would then refuse to load.** Its TOML quoter escaped only
+  backslashes and double quotes, but on Linux and macOS a control character is a legal filename byte, so
+  running `setup --write --trust-workspace` from a directory holding one emitted an unparseable file --
+  and because `setup` never clobbers, it could not repair the file it had just written. Quoting is now a
+  single hardened implementation (`io/tomltext.py`) shared by every writer, escaping the full control
+  range and refusing outright a path with no TOML representation at all, before anything is opened.
+
+### Changed
+
+- **`discover`'s registry-directed-execution guard covers program runners, not just interpreters.** It
+  previously refused to launch an agent resolved to a shell or language runtime, but not to `pip`,
+  `cargo`, `go`, `git`, `docker`, `make`, `gh`, `kubectl`, `curl` or `xargs` -- each of which executes
+  attacker-chosen work from its own arguments as directly as `sh -c` does, and those arguments come from
+  the registry. All are now matched by the same leading-family classifier, which leaves longer names
+  alone (`goose`, `ghost` and `atlas` are unaffected). The guard is a denylist and its docstrings now say
+  so: it is defense in depth, and a name it does not match is unrecognized rather than vouched for.
+- **The ACP registry cache is written only after the response parses.** It was previously persisted
+  before validation, so a single malformed or hostile body became the fallback replayed on every later
+  network failure. A bad response now fails once and leaves a previously good cache intact.
+
+### Security
+
+- **Dependency advisories closed** in the development lockfile (`cryptography`, `mcp`,
+  `pydantic-settings`, `python-multipart`, `starlette`). Reported severity overstates the exposure here:
+  these are HTTP-server-stack advisories reached through `fastmcp`'s transitive dependencies, and
+  Rutherford serves over stdio, so none is reachable in a default deployment. `uv.lock` ships in neither
+  the wheel nor the sdist, so this affects contributors and CI rather than installed users.
+- **CI workflows pin an explicit `permissions: contents: read` ceiling.** The repository default is
+  already read-only, so nothing changes today; the block keeps a later settings change, or a job added to
+  those files, from silently gaining write. The code-review workflow now also skips cleanly on pull
+  requests from forks, which never receive repository secrets and so could only ever fail.
 
 ### Documentation
 
