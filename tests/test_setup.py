@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -32,6 +34,18 @@ def _app(config: RutherfordConfig | None = None) -> AppContext:
 def _resolved(path: str) -> str:
     """Resolve a path string in a sync helper, so an async test body never calls a Path method (ASYNC240)."""
     return str(Path(path).resolve())
+
+
+def _make_dir(parent: Path, name: str) -> Path:
+    """Create ``parent/name`` from a sync helper (keeps the blocking mkdir out of an async body)."""
+    target = parent / name
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _load_toml(path: Path) -> dict[str, Any]:
+    """Read and parse a TOML file from a sync helper, for the same reason as :func:`_make_dir`."""
+    return tomllib.loads(path.read_text(encoding="utf-8"))
 
 
 async def test_write_false_returns_content_without_a_file(tmp_path, monkeypatch) -> None:
@@ -96,6 +110,36 @@ async def test_trust_workspace_puts_cwd_into_trusted_workspaces(tmp_path, monkey
     assert isinstance(trusted, list) and len(trusted) == 1
     # The written cwd matches tmp_path; compare resolved forms (a sync helper avoids ASYNC240).
     assert _resolved(trusted[0]) == _resolved(str(tmp_path))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows forbids control characters in a path name")
+async def test_trust_workspace_survives_a_control_char_in_cwd(tmp_path, monkeypatch) -> None:
+    """A cwd holding a control character must still scaffold loadable TOML.
+
+    On Linux and macOS every byte except ``/`` and NUL is a legal filename byte, so a tab or newline
+    can reach the quoter. Emitting it raw would write a config ``tomllib`` then rejects on every later
+    load -- and because setup never clobbers, it could not repair the file it had just written.
+    """
+    workspace = _make_dir(tmp_path, "ws\nwith\tcontrols")
+    monkeypatch.chdir(workspace)
+    await setup_tool(_app(), scope="project", write=True, trust_workspace=True)
+    parsed = _load_toml(workspace / ".rutherford" / "config.toml")
+    assert _resolved(parsed["trusted_workspaces"][0]) == _resolved(str(workspace))
+
+
+async def test_a_non_utf8_cwd_is_refused_before_anything_is_written(tmp_path, monkeypatch) -> None:
+    """A cwd that cannot be encoded must fail with NO file and NO directory left behind.
+
+    ``Path.write_text`` truncates its target before it encodes, so letting the bad character reach the
+    write would leave a zero-byte ``config.toml`` -- and the never-clobber guard would then refuse to
+    regenerate it, making the breakage permanent. The refusal has to happen before the open.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(Path, "cwd", classmethod(lambda cls: Path(f"{tmp_path}\udcff")))
+    with pytest.raises(RutherfordError) as exc:
+        await setup_tool(_app(), scope="project", write=True, trust_workspace=True)
+    assert exc.value.code is ErrorCode.INVALID_INPUT
+    assert not (tmp_path / ".rutherford").exists()  # nothing was created before the refusal
 
 
 async def test_roster_snapshot_reports_registered_agents(tmp_path, monkeypatch) -> None:

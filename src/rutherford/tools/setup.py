@@ -22,6 +22,7 @@ from ..config.schema import RutherfordConfig
 from ..context import AppContext, tool_success
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
+from ..io.tomltext import toml_str
 
 #: A commented, fill-in-the-id Bedrock/Vertex block for the starter config: pin a valid provider model id for
 #: the Claude Code seat. Scaffolded only when a Bedrock/Vertex host is detected. ``ANTHROPIC_CUSTOM_MODEL_OPTION``
@@ -79,7 +80,7 @@ def _starter_config(config: RutherfordConfig, *, trust_workspace: bool, cwd: Pat
         "# Absolute paths under which write/yolo delegations are permitted. Read_only/propose never need this.",
     ]
     if trust_workspace:
-        trusted = _toml_str(str(cwd))
+        trusted = toml_str(str(cwd))
         lines.append(f"trusted_workspaces = [{trusted}]")
     else:
         lines.append('# trusted_workspaces = ["/abs/path/to/a/workspace/you/trust"]')
@@ -105,12 +106,6 @@ def _starter_config(config: RutherfordConfig, *, trust_workspace: bool, cwd: Pat
 def _format_number(value: float) -> str:
     """Render a float without a trailing ``.0`` so the TOML reads as a whole number when it is one."""
     return str(int(value)) if float(value).is_integer() else str(value)
-
-
-def _toml_str(value: str) -> str:
-    """Quote ``value`` as a TOML basic string, escaping backslashes and double quotes (Windows paths)."""
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
 
 
 def _target_path(scope: str, cwd: Path) -> Path:
@@ -148,7 +143,17 @@ async def setup_tool(
     cwd = Path.cwd()
     path = _target_path(scope, cwd)
     bedrock = is_bedrock_or_vertex_host(os.environ)
-    content = _starter_config(app.config, trust_workspace=trust_workspace, cwd=cwd, bedrock=bedrock)
+    try:
+        content = _starter_config(app.config, trust_workspace=trust_workspace, cwd=cwd, bedrock=bedrock)
+    except ValueError as exc:
+        # The scaffold is built BEFORE anything is opened, so a path that cannot be represented in TOML
+        # is refused here with nothing written. Letting it reach the write would truncate the target
+        # first and leave an empty config that the never-clobber guard below would then refuse to fix.
+        raise RutherfordError(
+            ErrorCode.INVALID_INPUT,
+            f"this working directory cannot be recorded in a config file ({exc}); run setup from a "
+            "directory whose path is valid UTF-8, or pass trust_workspace=false",
+        ) from exc
     agent_ids = app.descriptors.ids()
 
     exists = path.exists()

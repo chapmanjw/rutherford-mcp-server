@@ -24,6 +24,7 @@ from ..config.locations import CONFIG_DIRNAME, home_dir
 from ..context import AppContext, tool_success
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
+from ..io.tomltext import toml_str
 
 #: The scopes ``discover --write`` understands (same as ``setup``); project is the default so a write never
 #: silently lands in the shared global config.
@@ -72,8 +73,8 @@ async def discover_tool(
     # agent found on disk (the caller opted out of the trustworthy signal, so we cannot vouch for it). An id
     # that is not a safe bare TOML key is never proposed (it could otherwise corrupt the written config).
     eligible = [d for d in discovered if not d.already_in_roster and (d.status == "ok" or not probe)]
-    unsafe_ids = sorted({d.id for d in eligible if not _SAFE_ID.match(d.id)})
-    proposals = _unique_by_id(d for d in eligible if _SAFE_ID.match(d.id))
+    unsafe_ids = sorted({d.id for d in eligible if not _is_writable_to_config(d)})
+    proposals = _unique_by_id(d for d in eligible if _is_writable_to_config(d))
 
     result: dict[str, Any] = {
         "registry_source": source,
@@ -94,6 +95,29 @@ async def discover_tool(
         result["written"] = False
         result["note"] = "no new agents to write"
     return tool_success(result)
+
+
+def _is_writable_to_config(d: DiscoveredAgent) -> bool:
+    """Whether this agent can be rendered into a config file at all.
+
+    Two ways it cannot. Its id may not be a safe bare TOML key (see ``_SAFE_ID``) -- a hostile id could
+    otherwise open a different table. Or its launch command may carry a lone surrogate, which has no TOML
+    representation (see :func:`rutherford.io.tomltext.toml_str`); JSON permits an unpaired ``\\uD800``
+    escape, so a tampered registry can hold one. Either way the agent is reported as skipped rather than
+    written, because the alternative is raising partway through rendering a config file.
+    """
+    if not _SAFE_ID.match(d.id):
+        return False
+    return all(_is_utf8(part) for part in d.command)
+
+
+def _is_utf8(value: str) -> bool:
+    """Whether ``value`` survives a strict UTF-8 encode (false for a surrogate-escaped byte)."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _unique_by_id(agents: Any) -> list[DiscoveredAgent]:
@@ -134,7 +158,7 @@ def _agent_section(d: DiscoveredAgent) -> str:
     The id is a pre-validated safe bare key (see ``_SAFE_ID``); the comment text (name, path) is collapsed to
     a single line so a newline in a registry name or a weird path cannot escape the ``#`` comment.
     """
-    command = ", ".join(_toml_str(part) for part in d.command)
+    command = ", ".join(toml_str(part) for part in d.command)
     return f"# {_one_line(d.name)} -- found at {_one_line(d.found_at)}\n[agents.{d.id}]\ncommand = [{command}]"
 
 
@@ -219,25 +243,3 @@ def _existing_agent_ids(existing: str) -> tuple[set[str], bool]:
 def _one_line(value: str) -> str:
     """Collapse any whitespace (including newlines) to single spaces so text stays on one comment line."""
     return re.sub(r"\s+", " ", value).strip()
-
-
-#: TOML basic-string named escapes; every other control char (U+0000-001F and U+007F) is emitted as \uXXXX.
-_TOML_ESCAPES = {"\\": "\\\\", '"': '\\"', "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r"}
-
-
-def _toml_str(value: str) -> str:
-    """Quote ``value`` as a VALID TOML basic string, escaping every char that would otherwise break it.
-
-    Command parts come from the registry, so an arg containing a newline / tab / control char (or a backslash
-    or quote) must be escaped or the appended TOML is corrupt. Named escapes for the common controls; any
-    other control char becomes a ``\\uXXXX`` escape, matching the TOML basic-string grammar.
-    """
-    out: list[str] = []
-    for ch in value:
-        if ch in _TOML_ESCAPES:
-            out.append(_TOML_ESCAPES[ch])
-        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
-            out.append(f"\\u{ord(ch):04x}")
-        else:
-            out.append(ch)
-    return '"' + "".join(out) + '"'
