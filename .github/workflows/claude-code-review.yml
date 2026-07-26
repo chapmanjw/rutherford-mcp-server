@@ -6,14 +6,19 @@ on:
 
 jobs:
   claude-review:
-    # Skip Dependabot PRs: they run without repository secrets, so the Claude review
-    # token is unavailable and the job would always fail.
-    if: ${{ github.actor != 'dependabot[bot]' }}
+    # Skip Dependabot PRs and PRs from forks: neither receives repository secrets, so the Claude
+    # review token is unavailable and the job would always fail. Without the fork check every
+    # outside contribution gets a permanent red X on an unrunnable job.
+    if: >-
+      ${{ github.actor != 'dependabot[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
       issues: read
+      # REQUIRED -- see the note in claude.yml. The default GitHub App path exchanges this OIDC token
+      # for the credential that actually posts the review; the grants above are all read.
       id-token: write
 
     steps:

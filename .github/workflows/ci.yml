@@ -9,6 +9,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Pin the GITHUB_TOKEN ceiling in-repo. The repository default is already read-only, so this
+# changes nothing today; it keeps a future settings flip, or a job added to this file later,
+# from silently gaining write. Every job here only reads the checkout and runs the local gate.
+permissions:
+  contents: read
+
 jobs:
   verify:
     name: ${{ matrix.os }} / py${{ matrix.python-version }}
