@@ -14,14 +14,18 @@ its own write allowlist. ``tests/test_trust.py`` pins that.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import tempfile
+import time
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 from ..domain.errors import ConfigError
 from ..io.tomltext import toml_str
@@ -90,18 +94,21 @@ def trust_workspace(
     config file when it does not exist yet.
     """
     workspace = resolve_workspace(path)
-    config_path, current = read_global_trusted_workspaces(env)
     workspace_key = str(workspace)
-    if _already_listed(current, workspace):
-        return TrustResult(
-            action="unchanged",
-            workspace=workspace_key,
-            config_path=str(config_path),
-            trusted_workspaces=tuple(_normalize_list(current)),
-            note="workspace is already on the global trusted_workspaces allowlist",
-        )
-    updated = [*_normalize_list(current), workspace_key]
-    _write_trusted_workspaces(config_path, updated)
+    # * The lock spans the READ as well as the write. Reading outside it would let a concurrent edit
+    # land between the two, and this call would then write an allowlist computed from a stale one.
+    with _config_lock(default_global_config_path(env)):
+        config_path, current = read_global_trusted_workspaces(env)
+        if _already_listed(current, workspace):
+            return TrustResult(
+                action="unchanged",
+                workspace=workspace_key,
+                config_path=str(config_path),
+                trusted_workspaces=tuple(_normalize_list(current)),
+                note="workspace is already on the global trusted_workspaces allowlist",
+            )
+        updated = [*_normalize_list(current), workspace_key]
+        _write_trusted_workspaces(config_path, updated)
     return TrustResult(
         action="added",
         workspace=workspace_key,
@@ -120,30 +127,33 @@ def untrust_workspace(
     Idempotent: a path not on the list leaves the file untouched (or creates nothing when absent).
     """
     workspace = resolve_workspace(path)
-    config_path, current = read_global_trusted_workspaces(env)
     workspace_key = str(workspace)
-    if not current:
-        return TrustResult(
-            action="missing",
-            workspace=workspace_key,
-            config_path=str(config_path),
-            trusted_workspaces=(),
-            note="global trusted_workspaces is empty; nothing to remove",
-        )
-    # * Compare against the NORMALIZED list, not the raw one. _normalize_list also de-duplicates, so
-    # measuring against `current` reports "removed" (and rewrites the file) whenever the config merely
-    # held a duplicate or an alias, for a path that was never on the list.
-    normalized = _normalize_list(current)
-    kept = [entry for entry in normalized if not _same_workspace(entry, workspace)]
-    if len(kept) == len(normalized):
-        return TrustResult(
-            action="unchanged",
-            workspace=workspace_key,
-            config_path=str(config_path),
-            trusted_workspaces=tuple(normalized),
-            note="workspace is not on the global trusted_workspaces allowlist",
-        )
-    _write_trusted_workspaces(config_path, kept)
+    # * Held across read and write: a revocation racing an unrelated trust must not be undone by that
+    # trust writing back a list it read before this removal. That direction fails OPEN.
+    with _config_lock(default_global_config_path(env)):
+        config_path, current = read_global_trusted_workspaces(env)
+        if not current:
+            return TrustResult(
+                action="missing",
+                workspace=workspace_key,
+                config_path=str(config_path),
+                trusted_workspaces=(),
+                note="global trusted_workspaces is empty; nothing to remove",
+            )
+        # * Compare against the NORMALIZED list, not the raw one. _normalize_list also de-duplicates, so
+        # measuring against `current` reports "removed" (and rewrites the file) whenever the config
+        # merely held a duplicate or an alias, for a path that was never on the list.
+        normalized = _normalize_list(current)
+        kept = [entry for entry in normalized if not _same_workspace(entry, workspace)]
+        if len(kept) == len(normalized):
+            return TrustResult(
+                action="unchanged",
+                workspace=workspace_key,
+                config_path=str(config_path),
+                trusted_workspaces=tuple(normalized),
+                note="workspace is not on the global trusted_workspaces allowlist",
+            )
+        _write_trusted_workspaces(config_path, kept)
     return TrustResult(
         action="removed",
         workspace=workspace_key,
@@ -189,6 +199,73 @@ def _normalize_list(entries: Sequence[str]) -> list[str]:
         seen.add(key)
         out.append(key)
     return out
+
+
+#: How long to wait for another process to finish its edit before giving up.
+#:
+#: There is deliberately no automatic stale-lock breaking. Age cannot establish that a lock is abandoned
+#: -- only that its holder is slow -- and breaking on age reintroduces exactly the race the lock exists
+#: to close: two waiters both judge a lock stale, the slower one removes the FRESH lock the faster one
+#: just took, and both enter the critical section. A leftover lock after a crash is recoverable with one
+#: delete, and the timeout message names the file; a silent double-acquire on a security allowlist is not
+#: recoverable at all, because nobody finds out.
+_LOCK_TIMEOUT_S = 10.0
+_LOCK_POLL_S = 0.05
+
+
+@contextmanager
+def _config_lock(path: Path) -> Iterator[None]:
+    """Serialize the whole read-modify-write on ``path`` across processes.
+
+    The atomic replace in :func:`_atomic_write` prevents a torn READ; it does nothing about a lost
+    UPDATE. Two edits that both read the same allowlist and then both write produce whichever ran last,
+    and an interleaved trust + untrust can put back an entry the user just removed -- a security
+    allowlist failing OPEN, which is the half worth closing.
+
+    Uses an ``O_EXCL`` lock file rather than ``fcntl``/``msvcrt`` so one code path covers POSIX and
+    Windows with no dependency. Advisory: it coordinates Rutherford with itself, not with a text editor.
+    """
+    lock = path.with_name(path.name + ".lock")
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ConfigError(f"could not prepare the config directory at {lock.parent}: {exc}") from exc
+
+    token = f"{os.getpid()}:{uuid4().hex}"
+    deadline = time.monotonic() + _LOCK_TIMEOUT_S
+    while True:
+        try:
+            handle = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise ConfigError(
+                    f"another process is editing {path}. If nothing else is running, that edit was "
+                    f"interrupted -- delete {lock} and try again."
+                ) from None
+            time.sleep(_LOCK_POLL_S)
+        except OSError as exc:
+            raise ConfigError(f"could not lock {path} for editing: {exc}") from exc
+
+    try:
+        with contextlib.suppress(OSError):
+            os.write(handle, token.encode("ascii"))
+        os.close(handle)  # * close before yielding so the release path only has to unlink
+        yield
+    finally:
+        _release_lock(lock, token)
+
+
+def _release_lock(lock: Path, token: str) -> None:
+    """Drop the lock only if it is still OURS.
+
+    An unconditional unlink is ownership-blind: an edit that overran the stale timeout would otherwise
+    delete whichever successor now holds the path. Leaving a foreign lock in place is the safe error --
+    it ages out on its own.
+    """
+    with contextlib.suppress(OSError):
+        if lock.read_text(encoding="utf-8") == token:
+            lock.unlink()
 
 
 def _write_trusted_workspaces(path: Path, workspaces: Sequence[str]) -> None:
@@ -266,9 +343,18 @@ def _strip_trusted_assignment(text: str) -> str:
     out: list[str] = []
     i = 0
     in_table = False
+    multiline: str | None = None
     while i < len(lines):
         line = lines[i]
         stripped = line.lstrip()
+        if multiline is not None:
+            # * Still inside a multi-line string opened on an earlier line. Pass the line through and
+            # only advance the string state: its content is not structure, so a line beginning "[" here
+            # is NOT a table header and a bracket in it is NOT array nesting.
+            _, multiline = _scan_brackets(line, multiline)
+            out.append(line)
+            i += 1
+            continue
         if not in_table and stripped.startswith("[") and not stripped.startswith("#"):
             in_table = True
         if not in_table and stripped.startswith(_TRUST_HEADER_PREFIX):
@@ -279,17 +365,21 @@ def _strip_trusted_assignment(text: str) -> str:
             i += 1
             continue
         if in_table or stripped.startswith("#") or not _ASSIGNMENT.match(line):
+            # * Track a multi-line string that OPENS on a passed-through line, so the lines it spans are
+            # recognized as string content rather than structure.
+            _, multiline = _scan_brackets(line)
             out.append(line)
             i += 1
             continue
-        balance = _bracket_delta(line)
+        balance, multiline = _scan_brackets(line)
         i += 1
-        while balance > 0 and i < len(lines):
-            balance += _bracket_delta(lines[i])
+        while (balance > 0 or multiline is not None) and i < len(lines):
+            step, multiline = _scan_brackets(lines[i], multiline)
+            balance += step
             i += 1
-        if balance > 0:
-            # * Fail BEFORE anything is written: running off the end means the array never closed, and
-            # continuing would silently swallow every line below it.
+        if balance > 0 or multiline is not None:
+            # * Fail BEFORE anything is written: running off the end means the array (or a string inside
+            # it) never closed, and continuing would silently swallow every line below it.
             raise ConfigError(
                 "the trusted_workspaces assignment in the global config has an unterminated array; "
                 "fix it by hand, then re-run trust/untrust"
@@ -300,28 +390,72 @@ def _strip_trusted_assignment(text: str) -> str:
     return "".join(out)
 
 
-def _bracket_delta(line: str) -> int:
-    """Net ``[`` minus ``]`` counting only brackets OUTSIDE strings and comments.
+def _find_multiline_close(line: str, delim: str, start: int) -> int:
+    """Index just PAST the closing ``delim``, or ``-1`` when this line does not close it.
 
-    A raw ``line.count("[")`` also counts a bracket inside a quoted path -- and ``[`` / ``]`` are legal
-    directory characters on every platform Rutherford supports -- or inside a trailing comment. Either
-    walks the multiline-array scan past the real end of the assignment, so every following line is
-    dropped: the user's ``[agents.*]`` tables are deleted while the write still reports success and the
-    round-trip check still passes, because ``trusted_workspaces`` itself round-trips perfectly.
+    A plain ``str.find`` is wrong for a multi-line BASIC string, because a backslash-escaped quote is
+    content rather than part of the terminator. Treating one as a terminator ends the string early, and
+    every bracket after it -- still string content -- then counts as array structure. Multi-line LITERAL
+    strings have no escapes, so a direct find is correct for those.
 
-    LIMITATION: this is a per-line scanner with no cross-line string state, so a MULTI-LINE TOML string
-    (``\"\"\"..\"\"\"`` / ``'''..'''``) holding a bracket on a continuation line is miscounted. Rutherford never
-    writes that form -- it would take a hand-edited config with a newline inside a directory name -- and
-    the outcome is fail-safe either way: the balance guard or the in-memory round-trip check refuses the
-    edit and the config is left untouched. Never silent corruption.
+    Known limitation: a backslash as the final character of a line (TOML's line-ending continuation) is
+    not carried into the next line's scan. It cannot arise from anything Rutherford writes, and the
+    in-memory validation refuses the result rather than writing it.
+    """
+    if delim == "'''":
+        found = line.find(delim, start)
+        return -1 if found < 0 else found + 3
+    index = start
+    while index < len(line):
+        if line[index] == "\\":
+            index += 2  # an escaped char, whatever it is, cannot start the terminator
+            continue
+        if line.startswith(delim, index):
+            return index + 3
+        index += 1
+    return -1
+
+
+def _scan_brackets(line: str, in_multiline: str | None = None) -> tuple[int, str | None]:
+    """Net ``[`` minus ``]`` over one line, counting only brackets that are real array structure.
+
+    Returns ``(delta, still_open)``, where ``still_open`` is the delimiter of a multi-line string this
+    line left unterminated (``\"\"\"`` or ``'''``) or ``None``. Feed it back on the next line: string
+    content spans lines, so the state has to as well.
+
+    Everything skipped here is skipped because a raw ``line.count("[")`` gets it wrong:
+
+    * A bracket inside a quoted path. ``[`` and ``]`` are legal directory characters on every platform
+      Rutherford supports, and ``trust`` defaults to the current directory.
+    * A bracket in a trailing comment.
+    * A bracket inside a multi-line string, on any of the lines it spans.
+
+    Miscounting any of them walks the array scan past the real end of the assignment, and every line
+    below it is then dropped -- deleting the user's ``[agents.*]`` tables while the write still reports
+    success, because ``trusted_workspaces`` itself round-trips perfectly and the check only inspects it.
     """
     delta = 0
     index = 0
     length = len(line)
+
+    if in_multiline is not None:
+        close = _find_multiline_close(line, in_multiline, 0)
+        if close < 0:
+            return 0, in_multiline  # the whole line is string content
+        index = close
+        in_multiline = None
+
     while index < length:
         ch = line[index]
         if ch == "#":
-            break  # a comment runs to end of line; brackets in it are not structure
+            break  # a comment runs to end of line
+        if line.startswith('"""', index) or line.startswith("'''", index):
+            delim = line[index : index + 3]
+            close = _find_multiline_close(line, delim, index + 3)
+            if close < 0:
+                return delta, delim  # opens here, continues past this line
+            index = close
+            continue
         if ch == '"':
             index += 1
             while index < length:
@@ -340,20 +474,27 @@ def _bracket_delta(line: str) -> int:
         elif ch == "]":
             delta -= 1
         index += 1
-    return delta
+    return delta, in_multiline
 
 
 def _insert_before_first_table(body: str, assignment: str) -> str:
-    """Insert ``assignment`` before the first TOML table header, or append when none exist."""
+    """Insert ``assignment`` before the first TOML table header, or append when none exist.
+
+    "First table header" has to mean a real one. A line beginning ``[`` inside a multi-line string is
+    string content, and inserting there would splice the assignment INTO that string -- so the key never
+    lands at the top level and the caller's round-trip check refuses the write.
+    """
     if not body.strip():
         return assignment
     lines = body.splitlines(keepends=True)
     insert_at = len(lines)
+    multiline: str | None = None
     for index, line in enumerate(lines):
         stripped = line.lstrip()
-        if stripped.startswith("[") and not stripped.startswith("#"):
+        if multiline is None and stripped.startswith("[") and not stripped.startswith("#"):
             insert_at = index
             break
+        _, multiline = _scan_brackets(line, multiline)
     before = "".join(lines[:insert_at])
     after = "".join(lines[insert_at:])
     if before and not before.endswith("\n"):

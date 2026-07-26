@@ -39,8 +39,11 @@ jobs:
         with:
           enable-cache: true
 
+      # --locked fails on a stale lockfile instead of silently re-resolving. Several pinned versions sit
+      # exactly on their first patched release with no headroom, so a downward resolve would reopen a
+      # closed advisory while the build stayed green.
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --locked
 
       # The unit test step (with the coverage floor in pyproject addopts) is a required
       # gate: a failing test or coverage below the floor fails the build, with no override.

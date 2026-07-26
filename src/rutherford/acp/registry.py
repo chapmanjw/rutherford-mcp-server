@@ -93,8 +93,15 @@ def fetch_registry(
         _log.warning("ACP registry fetch failed (%s); falling back to cache", exc)
     from_network = raw is not None
     if raw is None and cache_path is not None and cache_path.exists():
-        raw = cache_path.read_bytes()
-        source = "cache"
+        try:
+            raw = cache_path.read_bytes()
+            source = "cache"
+        except OSError as exc:
+            # * An unreadable cache is a cache MISS, not a crash. Without this the OSError escapes
+            # `discover`, which catches only RegistryError, and the user gets a raw traceback instead of
+            # the clean "check the network or set RUTHERFORD_ACP_REGISTRY_URL" message below. Reachable
+            # via a permissions change, a directory in the cache's place, or a delete racing exists().
+            _log.warning("ACP registry cache at %s could not be read (%s); treating it as absent", cache_path, exc)
     if raw is None:
         raise RegistryError(
             f"could not fetch the ACP registry from {url} and no cache is available; check the network "

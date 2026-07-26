@@ -18,6 +18,7 @@ from rutherford.config.trust import (
     trust_workspace,
     untrust_workspace,
 )
+from rutherford.config.workspace import breadth_warning
 from rutherford.domain.errors import ConfigError
 
 
@@ -277,23 +278,49 @@ def test_the_scan_refuses_an_unterminated_array_rather_than_swallowing_the_file(
         trust_module._strip_trusted_assignment('trusted_workspaces = [\n    "/tmp/a",\n[agents.x]\n')
 
 
-def test_a_multiline_string_is_refused_fail_safe_not_silently_mangled(tmp_path: Path, monkeypatch: Any) -> None:
-    """A valid-but-exotic config the scanner cannot model must be REFUSED, never partly rewritten.
+def test_a_multiline_string_with_brackets_is_scanned_correctly(tmp_path: Path, monkeypatch: Any) -> None:
+    """A multi-line TOML string spans lines, so the bracket scan has to carry state across them.
 
-    A multi-line TOML string with a bracket on a continuation line is valid TOML that the per-line
-    scanner miscounts. The requirement is not that it succeeds -- it is that the user's config survives.
+    Brackets on a continuation line are string content, not array structure. Miscounting them walks the
+    scan past the end of the assignment and drops the tables below it.
     """
     config_path = _redirect_global(tmp_path, monkeypatch)
     _seed(
         config_path,
         'trusted_workspaces = [\n    """/tmp/a\nseg[ment\nmore""",\n]\n\n[agents.fake]\ncommand = ["fake-acp"]\n',
     )
-    before = config_path.read_bytes()
+    work = tmp_path / "repo"
+    work.mkdir()
 
-    with pytest.raises(ConfigError):
-        trust_workspace(tmp_path / "repo")
+    trust_workspace(work)
 
-    assert config_path.read_bytes() == before  # untouched, not partly rewritten
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert parsed["agents"]["fake"]["command"] == ["fake-acp"]  # the table below survived
+    assert str(work.resolve()) in parsed["trusted_workspaces"]
+    assert len(parsed["trusted_workspaces"]) == 2  # the multi-line entry was kept, not dropped
+
+
+def test_a_top_level_multiline_string_is_not_mistaken_for_a_table(tmp_path: Path, monkeypatch: Any) -> None:
+    """A line beginning "[" INSIDE a multi-line string is not a table header.
+
+    Without cross-line state the scan flips to in-table at that line, stops stripping the real
+    assignment, and the re-inserted one becomes a duplicate key.
+    """
+    config_path = _redirect_global(tmp_path, monkeypatch)
+    _seed(
+        config_path,
+        'note = """\n[not a table]\n"""\ntrusted_workspaces = ["/tmp/old"]\n\n[agents.fake]\ncommand = ["fake-acp"]\n',
+    )
+    work = tmp_path / "repo"
+    work.mkdir()
+
+    trust_workspace(work)
+
+    text = config_path.read_text(encoding="utf-8")
+    parsed = tomllib.loads(text)  # would raise on a duplicate key
+    assert parsed["agents"]["fake"]["command"] == ["fake-acp"]
+    assert parsed["note"] == "[not a table]\n"  # the string survived intact
+    assert text.count("trusted_workspaces") == 1  # exactly one assignment, not two
 
 
 @pytest.mark.parametrize(
@@ -306,10 +333,25 @@ def test_a_multiline_string_is_refused_fail_safe_not_silently_mangled(tmp_path: 
         ("]  # trailing [comment", -1),  # a comment runs to end of line
         ("'literal [no escapes]'", 0),
         ('"escaped \\" quote [x"', 0),  # the \\" must not end the string early
+        ('"""one line [x] here"""', 0),  # a multi-line delimiter opened and closed on one line
     ],
 )
-def test_bracket_delta_ignores_strings_and_comments(line: str, expected: int) -> None:
-    assert trust_module._bracket_delta(line) == expected
+def test_scan_brackets_ignores_strings_and_comments(line: str, expected: int) -> None:
+    delta, still_open = trust_module._scan_brackets(line)
+    assert delta == expected
+    assert still_open is None
+
+
+def test_scan_brackets_carries_multiline_state_across_lines() -> None:
+    """The state returned for one line must suppress structure on the next."""
+    delta, state = trust_module._scan_brackets('trusted_workspaces = ["""')
+    assert delta == 1 and state == '"""'  # array opened, string still open
+
+    delta, state = trust_module._scan_brackets("[still][inside][the][string]", state)
+    assert delta == 0 and state == '"""'  # every bracket here is string content
+
+    delta, state = trust_module._scan_brackets('"""]', state)
+    assert delta == -1 and state is None  # string closes, then the real array bracket counts
 
 
 def test_a_control_character_in_a_path_is_escaped_not_written_raw(tmp_path: Path, monkeypatch: Any) -> None:
@@ -429,10 +471,188 @@ def test_no_mcp_tool_imports_the_trust_helpers() -> None:
     The safety value of the allowlist depends on a model never being able to extend it, so wiring these
     helpers into a tool must be a deliberate act that breaks this test first.
     """
-    tools_dir = Path(server.__file__).parent / "tools"
-    # * Match every spelling that reaches the module, not just the dotted one: `from ..config import
-    # trust` renders as "config import trust" and would otherwise slip straight past this guard. rglob
-    # so a future tools/<subpackage>/ is covered too.
-    spellings = ("config.trust", "config import trust", "import trust")
-    offenders = [p.name for p in tools_dir.rglob("*.py") if any(s in p.read_text(encoding="utf-8") for s in spellings)]
+    # * A TOTAL ban on the module, checked structurally. Two weaker shapes were tried and rejected:
+    # grepping for import spellings misses `from ..config import trust`, and inspecting each module for
+    # forbidden ATTRIBUTE NAMES misses both an alias (`import trust_workspace as _apply`) and the module
+    # form (`from ..config import trust; trust.trust_workspace(...)`). Banning the import outright has no
+    # such gaps -- and it is only possible because the read-only breadth check lives in config.workspace,
+    # so no tool has a legitimate reason to reach config.trust at all.
+    import ast
+
+    import rutherford.tools
+
+    tools_dir = Path(rutherford.tools.__file__).parent
+    offenders: list[str] = []
+    for source in sorted(tools_dir.rglob("*.py")):
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):  # import rutherford.config.trust [as x]
+                offenders += [f"{source.name}: import {a.name}" for a in node.names if a.name.endswith("config.trust")]
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if module.endswith("config.trust"):  # from ..config.trust import anything
+                    offenders.append(f"{source.name}: from {module} import ...")
+                if module.endswith("config") or module == "":  # from ..config import trust
+                    offenders += [f"{source.name}: from {module} import trust" for a in node.names if a.name == "trust"]
+    assert offenders == [], f"a model-callable tool imports the allowlist editor: {offenders}"
+
+
+def test_no_mcp_tool_reaches_the_trust_module_at_runtime() -> None:
+    """Backstop for the one thing the AST ban cannot see: a dynamic ``importlib`` lookup.
+
+    Static analysis covers every ordinary import form; this covers the deliberate evasion by checking
+    what the loaded modules actually hold.
+    """
+    import importlib
+    import pkgutil
+    import sys
+
+    import rutherford.tools
+
+    trust_module_obj = sys.modules["rutherford.config.trust"]
+    mutating = {"trust_workspace", "untrust_workspace", "_write_trusted_workspaces", "_atomic_write"}
+    offenders: list[str] = []
+    for info in pkgutil.walk_packages(rutherford.tools.__path__, prefix="rutherford.tools."):
+        module = importlib.import_module(info.name)
+        for attr_name, value in vars(module).items():
+            if value is trust_module_obj:
+                offenders.append(f"{info.name}.{attr_name} is the trust module itself")
+            elif (
+                getattr(value, "__module__", "") == "rutherford.config.trust"
+                and getattr(value, "__name__", "") in mutating
+            ):
+                # * Keyed on the symbol's OWN name, so rebinding under an alias does not hide it.
+                offenders.append(f"{info.name}.{attr_name} -> {value.__name__}")
     assert offenders == []
+
+
+# --- breadth warning and the write lock -----------------------------------------------------------------
+
+
+def test_breadth_warning_flags_a_filesystem_root() -> None:
+    root = Path(Path.cwd().anchor)
+    warning = breadth_warning(root)
+    assert warning is not None and "root" in warning
+
+
+def test_breadth_warning_flags_the_home_directory() -> None:
+    warning = breadth_warning(Path.home())
+    assert warning is not None and "home directory" in warning
+
+
+def test_breadth_warning_is_silent_for_an_ordinary_project(tmp_path: Path) -> None:
+    """tmp_path is several levels deep, which is what a real repo checkout looks like."""
+    project = tmp_path / "projects" / "myapp"
+    project.mkdir(parents=True)
+    assert breadth_warning(project) is None
+
+
+def test_trust_cli_warns_on_a_broad_workspace(tmp_path: Path, monkeypatch: Any, capsys: Any) -> None:
+    """The caution has to reach the operator, not just exist as a helper."""
+    _redirect_global(tmp_path, monkeypatch)
+    server._trust_cli([str(Path.home())])
+    captured = capsys.readouterr()
+    assert "added" in captured.out
+    assert "warning:" in captured.err and "home directory" in captured.err
+
+
+def test_trust_cli_is_quiet_for_a_normal_workspace(tmp_path: Path, monkeypatch: Any, capsys: Any) -> None:
+    _redirect_global(tmp_path, monkeypatch)
+    work = tmp_path / "projects" / "myapp"
+    work.mkdir(parents=True)
+    server._trust_cli([str(work)])
+    captured = capsys.readouterr()
+    assert "added" in captured.out
+    assert "warning:" not in captured.err
+
+
+def test_a_held_lock_blocks_a_concurrent_edit(tmp_path: Path, monkeypatch: Any) -> None:
+    """A second writer must refuse rather than compute from a stale read.
+
+    The atomic replace stops a torn read; it does nothing about a lost update. An interleaved
+    trust + untrust could otherwise write back an entry the user had just revoked.
+    """
+    config_path = _redirect_global(tmp_path, monkeypatch)
+    monkeypatch.setattr(trust_module, "_LOCK_TIMEOUT_S", 0.15)
+    lock = config_path.with_name(config_path.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("999999", encoding="utf-8")  # a live lock held by someone else
+
+    with pytest.raises(ConfigError, match="another process is editing"):
+        trust_workspace(tmp_path / "repo")
+
+    assert not config_path.exists()  # nothing was written behind the lock
+
+
+def test_the_lock_is_released_even_when_the_edit_fails(tmp_path: Path, monkeypatch: Any) -> None:
+    """A refused write must not strand the lock and wedge every later trust/untrust."""
+    config_path = _redirect_global(tmp_path, monkeypatch)
+    _seed(config_path, "default_timeout_s = 300\n")
+    lock = config_path.with_name(config_path.name + ".lock")
+
+    with pytest.raises(ConfigError):
+        trust_workspace(f"{tmp_path}/ws\udcff")  # unrepresentable path -> refused
+
+    assert not lock.exists()
+    assert trust_workspace(tmp_path / "repo").action == "added"  # still usable
+
+
+# --- hardening found by review of the fixes themselves ---------------------------------------------------
+
+
+def test_an_escaped_quote_does_not_end_a_multiline_basic_string() -> None:
+    """A backslash-escaped quote is content, not a terminator.
+
+    Ending the string early makes every following bracket look like array structure, which is the same
+    failure the scanner exists to prevent -- just reached from a different direction.
+    """
+    escaped = '"""a \\' + '"""' + " still inside [x"
+    delta, still_open = trust_module._scan_brackets(escaped)
+    assert still_open == '"""'  # the escaped quote did NOT close it
+    assert delta == 0  # so the bracket after it is string content
+
+
+def test_a_literal_multiline_string_has_no_escapes() -> None:
+    """''' strings take no escapes, so a backslash before the delimiter is just a backslash."""
+    delta, still_open = trust_module._scan_brackets("'''a \\''' [x]")
+    assert still_open is None  # it DID close, backslash notwithstanding
+    assert delta == 0  # [x] is balanced
+
+
+def test_the_lock_is_not_released_by_a_process_that_no_longer_owns_it(tmp_path: Path, monkeypatch: Any) -> None:
+    """An overrunning writer must not drop a successor's lock.
+
+    Unconditional unlink is ownership-blind: an edit that exceeded the stale timeout would otherwise
+    delete whichever lock now holds the path, putting two writers in the critical section.
+    """
+    config_path = _redirect_global(tmp_path, monkeypatch)
+    lock = config_path.with_name(config_path.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("someone-elses-token", encoding="utf-8")
+
+    trust_module._release_lock(lock, "my-token")
+
+    assert lock.exists()  # left alone: a foreign lock ages out on its own
+    trust_module._release_lock(lock, "someone-elses-token")
+    assert not lock.exists()  # the real owner can release it
+
+
+def test_a_leftover_lock_reports_how_to_recover_rather_than_being_broken(tmp_path: Path, monkeypatch: Any) -> None:
+    """An interrupted edit leaves its lock, and the error must say exactly what to delete.
+
+    Auto-breaking on age was considered and rejected: age proves the holder is slow, not gone, and
+    breaking on it lets two waiters both claim the lock. One manual delete is the cheaper failure.
+    """
+    config_path = _redirect_global(tmp_path, monkeypatch)
+    monkeypatch.setattr(trust_module, "_LOCK_TIMEOUT_S", 0.15)
+    lock = config_path.with_name(config_path.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("interrupted-owner", encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc:
+        trust_workspace(tmp_path / "repo")
+
+    assert str(lock) in str(exc.value)  # names the file to delete
+    assert "delete" in str(exc.value)
+    assert lock.exists()  # and did NOT break it itself
+    assert not config_path.exists()

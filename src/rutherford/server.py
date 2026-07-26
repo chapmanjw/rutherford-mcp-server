@@ -30,6 +30,7 @@ from .config.trust import (
     trust_workspace,
     untrust_workspace,
 )
+from .config.workspace import breadth_warning
 from .context import AppContext, build_app_context, error_payload_from, tool_error
 from .domain.enums import ActivityEventKind
 from .domain.error_codes import ErrorCode
@@ -807,6 +808,11 @@ def _print_trust_result(command: str, result: TrustResult) -> None:
     """Print a one-shot trust/untrust outcome to stdout."""
     print(f"rutherford {command}: {result.action} -- {result.workspace}")
     print(f"global config: {result.config_path}")
+    # * Only on the way IN. Removing a broad entry is the fix, not the hazard.
+    if command == "trust" and result.action in ("added", "unchanged"):
+        caution = breadth_warning(result.workspace)
+        if caution:
+            print(f"warning: {caution}", file=sys.stderr)
     if result.note:
         print(result.note)
     if result.trusted_workspaces:

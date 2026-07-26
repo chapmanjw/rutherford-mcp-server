@@ -257,11 +257,9 @@ _INTERPRETER_STEMS = frozenset(
         "tmux",
     }
 )
-#: Executable / script extensions stripped before the family check, so a shim name (``npx.cmd``,
-#: ``powershell.exe``) is matched on its stem. PATH lookups already honor PATHEXT, so this only affects the
-#: guard, not resolution.
-_EXE_EXT_RE = re.compile(r"\.(?:exe|cmd|bat|com|ps1|vbs|js|wsf|msc|scr)$", re.IGNORECASE)
 #: The leading run of letters in a binary name: its interpreter FAMILY (``python3.12`` -> ``python``).
+#: This also handles shim extensions for free -- the run stops at the first non-letter, which is always at
+#: or before the ``.`` of a ``.cmd`` / ``.exe`` suffix -- so no separate extension strip is needed.
 _LEADING_ALPHA_RE = re.compile(r"^[a-z]+")
 
 
@@ -269,16 +267,18 @@ def _is_interpreter(bin_name: str) -> bool:
     """Whether ``bin_name`` is a shell/interpreter that would execute registry-supplied args as code.
 
     Classifies by the leading-letter family, so a version (``python3.12``), debug/preview suffix
-    (``python3-dbg``), shim extension (``node.cmd``), or ``w``/``m`` variant (``pythonw``, ``pyw``) all reduce
+    (``python3-dbg``), shim extension (``node.cmd``), or ``w`` variant (``pythonw``, ``pyw``) all reduce
     to the family and are caught -- without false-positiving on a longer agent name (``share-cli`` -> family
     ``share``, ``nodecli`` -> ``nodecli``).
     """
-    head = _LEADING_ALPHA_RE.match(_EXE_EXT_RE.sub("", bin_name.lower()))
+    head = _LEADING_ALPHA_RE.match(bin_name.lower())
     if head is None:
         return False
     family = head.group(0)
-    # A window/debug variant attaches a trailing letter to the family (pythonw, pyw, rubyw, javaw).
-    return family in _INTERPRETER_STEMS or (family[-1] in ("w", "m") and family[:-1] in _INTERPRETER_STEMS)
+    # A window variant attaches a trailing "w" to the family (pythonw, pyw, rubyw, javaw). There is no
+    # "m" equivalent: python3.11m already reduces to family "python" via the leading-letter run, so
+    # accepting a trailing "m" only widened the false-block surface without catching anything real.
+    return family in _INTERPRETER_STEMS or (family.endswith("w") and family[:-1] in _INTERPRETER_STEMS)
 
 
 #: Registry ids that name an agent Rutherford already ships as a built-in under a DIFFERENT id, so discovery

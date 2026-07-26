@@ -19,6 +19,7 @@ from ..acp.adapters import install_adapter, installable_adapters
 from ..acp.host_env import is_bedrock_or_vertex_host
 from ..config.loader import default_global_config_path
 from ..config.schema import RutherfordConfig
+from ..config.workspace import breadth_warning
 from ..context import AppContext, tool_success
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
@@ -187,6 +188,14 @@ async def setup_tool(
             "[agents.claude_code.env] block -- uncomment it and set a valid provider model id if the "
             "claude_code agent fails with '400 The provided model identifier is invalid'. See docs/bedrock.md."
         )
+    if trust_workspace:
+        # * This tool is model-callable, unlike the trust CLI, so the caution has to ride the result
+        # rather than a terminal. Trusting a directory trusts everything beneath it (the gate is a
+        # prefix match), and cwd here is whatever the server was launched in -- a home directory in
+        # some setups. Advisory, not a refusal: the caller asked for this working directory.
+        caution = breadth_warning(cwd)
+        if caution:
+            result["trust_warning"] = f"{caution}. write/yolo delegations will be permitted anywhere under it."
     if note is not None:
         result["note"] = note
     result["adapters"] = await _adapters_section(app, install=install_adapters)
