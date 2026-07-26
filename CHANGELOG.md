@@ -13,8 +13,17 @@ All notable changes to this project are documented in this file. The format is b
   the live MCP transport. This fixes observed Windows hangs where the child froze at 0% CPU and did not
   respond to `kill()`, clearing only when the server exited. Contributed by
   [@Artemonim](https://github.com/Artemonim) in [#22].
+- **MCP host deadlock during ACP teardown** — session `close` / `cancel` are bounded and shielded, so
+  cancelling the waiter no longer abandons teardown. Descendants are snapshotted before the adapter is
+  killed, because they reparent away once it exits and are then invisible. Teardown runs snapshot, kill
+  brokered terminals, reap descendants, close transport — closing first left inherited stdio handles
+  held by live descendants while the SDK waited on EOF. Each stage carries its own deadline, so a stuck
+  stage bounds the host's exposure instead of stalling on it. Agent stderr is detached from the host
+  pipe, and structured logs go through a non-blocking writer with a bounded queue that reports any
+  records it drops. Contributed by [@Artemonim](https://github.com/Artemonim) in [#23].
 
 [#22]: https://github.com/chapmanjw/rutherford-mcp-server/pull/22
+[#23]: https://github.com/chapmanjw/rutherford-mcp-server/pull/23
 
 ## [3.1.0] - 2026-07-26
 
