@@ -48,6 +48,11 @@ class _BackgroundStreamHandler(logging.Handler):
         super().__init__()
         self._stream = stream
         self._records: queue.Queue[str | object] = queue.Queue(maxsize=_LOG_QUEUE_SIZE)
+        # * Dropping under saturation is the right call -- the alternative is blocking the event loop --
+        # but dropping SILENTLY is not. Saturation happens when a sink is wedged, which is exactly the
+        # incident someone will later read these logs to understand, so the gap has to be visible.
+        self._dropped = 0
+        self._dropped_lock = threading.Lock()
         self._stop_requested = threading.Event()
         self._worker = threading.Thread(
             target=self._drain,
@@ -69,6 +74,8 @@ class _BackgroundStreamHandler(logging.Handler):
             # * Preserve the latest lifecycle state, especially terminal finish/error records, under saturation.
             with contextlib.suppress(queue.Empty):
                 self._records.get_nowait()
+                with self._dropped_lock:
+                    self._dropped += 1
             with contextlib.suppress(queue.Full):
                 self._records.put_nowait(message)
 
@@ -82,12 +89,39 @@ class _BackgroundStreamHandler(logging.Handler):
             except queue.Empty:
                 continue
             if item is _STOP:
+                self._report_drops()
                 return
             try:
+                # * Announce the gap BEFORE the record that follows it, so the loss is anchored in time
+                # rather than reported at shutdown when nobody is reading.
+                self._report_drops()
                 self._stream.write(f"{item}\n")
                 self._stream.flush()
             except Exception:
                 return
+
+    def _report_drops(self) -> None:
+        """Emit one synthetic record for everything discarded since the last report, if anything was.
+
+        Written as JSON like every other record. This stream is one JSON object per line by contract, and
+        a plain-text line here would make a shipper treat saturation -- the very incident these logs exist
+        to explain -- as malformed input and discard it.
+        """
+        with self._dropped_lock:
+            dropped = self._dropped
+        if not dropped:
+            return
+        payload = json.dumps(
+            {"ts": round(time.time(), 3), "event": "log_records_dropped", "count": dropped},
+            separators=(",", ":"),
+        )
+        try:
+            self._stream.write(f"{payload}\n")
+            self._stream.flush()
+        except Exception:
+            return  # * Keep the count: an unwritten notice must not clear the debt it was reporting.
+        with self._dropped_lock:
+            self._dropped -= dropped  # * Subtract, not reset: drops racing this write are still owed.
 
     def close(self) -> None:
         """Drain a healthy sink briefly, then leave any blocked write isolated on the daemon thread."""

@@ -16,11 +16,35 @@ All notable changes to this project are documented in this file. The format is b
 - **MCP host deadlock during ACP teardown** — session `close` / `cancel` are bounded and shielded, so
   cancelling the waiter no longer abandons teardown. Descendants are snapshotted before the adapter is
   killed, because they reparent away once it exits and are then invisible. Teardown runs snapshot, kill
-  brokered terminals, reap descendants, close transport — closing first left inherited stdio handles
-  held by live descendants while the SDK waited on EOF. Each stage carries its own deadline, so a stuck
-  stage bounds the host's exposure instead of stalling on it. Agent stderr is detached from the host
-  pipe, and structured logs go through a non-blocking writer with a bounded queue that reports any
-  records it drops. Contributed by [@Artemonim](https://github.com/Artemonim) in [#23].
+  the adapter, kill brokered terminals, reap descendants, close transport — closing first left inherited
+  stdio handles held by live descendants while the SDK waited on EOF. Contributed by
+  [@Artemonim](https://github.com/Artemonim) in [#23].
+- **Teardown deadlines bound how long a stage is waited on, not whether it happens.** An unbounded
+  pre-kill snapshot never returns, so the body never reaches its kill and the `finally` never runs —
+  stranding the very process teardown exists to collect. That applied to the session adapter and to
+  brokered terminals; a terminal is a child of the server rather than the adapter, so the session's reap
+  walks a different tree and would never have collected it.
+
+  Where a stage has work that cannot simply be redone, the deadline now stops the waiting and leaves the
+  work running. Cancelling it instead looks equivalent but is not. A `to_thread` still queued on a busy
+  executor has not started, so cancelling it succeeds and the reap never runs at all, discarding a tree
+  that was already captured — and executor pressure is the exact condition these deadlines exist for.
+  Closing the transport is the same class for a different reason: the ACP SDK marks the connection closed
+  *before* awaiting its dispatcher stop, sender close, and task shutdown, so a cancel part-way through
+  strands the rest forever, since every later close returns immediately against the flag already set.
+  Only a genuinely repeatable wait is still cancelled — a `session/cancel` reply, whose payload is handed
+  to the sender's queue fully serialized, so giving up on it cannot truncate a write.
+
+  The session and terminal paths share one implementation of this, including a single owner for work
+  that outran its caller. Previously each kept its own, and the session's stopped backing tasks past a
+  fixed count — so a busy teardown could drop exactly the work its deadline had promised to let finish.
+  A snapshot that lands after its deadline is reaped rather than dropped, and a timeout, a failure, an
+  undispatched reap, or a backlog of cleanups that are not completing is logged rather than passing for
+  an empty tree.
+- **Agent stderr is detached from the host pipe, and structured logs go through a non-blocking writer.**
+  The writer's queue is bounded; when a wedged sink causes it to overflow, the dropped count is reported
+  as a `log_records_dropped` record rather than vanishing — the gap is visible in the same JSON stream,
+  anchored before the next record.
 
 [#22]: https://github.com/chapmanjw/rutherford-mcp-server/pull/22
 [#23]: https://github.com/chapmanjw/rutherford-mcp-server/pull/23

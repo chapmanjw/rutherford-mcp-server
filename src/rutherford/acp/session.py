@@ -55,7 +55,14 @@ from .host_env import claude_bedrock_env
 from .journal import EventJournal, journal_event_from_message
 from .launch import prepare_argv
 from .permission import PermissionPolicy
-from .teardown import count_descendants, reap, snapshot_descendants_eagerly
+from .teardown import (
+    await_without_cancelling,
+    consume_task_result,
+    count_descendants,
+    reap,
+    register_pending_cleanup,
+    snapshot_within_deadline,
+)
 
 #: How often the live observed-agent sampler walks the agent's process tree during a turn (N1, item 3). A
 #: coarse cadence: the sampler exists to catch a peak fan-out, not to track every transient process, and a
@@ -77,6 +84,9 @@ PromptBlock = (
 
 #: Teardown RPCs are best-effort and must not turn a finite request deadline into an infinite wait.
 _CANCEL_TIMEOUT_S = 1.0
+#: The pre-kill descendant enumeration. Bounded because it runs before the adapter kill: a stage that can
+#: hang there strands the adapter, so a partial descendant list is strictly better than no teardown.
+_SNAPSHOT_TIMEOUT_S = 3.0
 _TERMINAL_SHUTDOWN_TIMEOUT_S = 4.0
 _DESCENDANT_REAP_TIMEOUT_S = 3.0
 _DIRECT_PROCESS_KILL_WAIT_S = 2.0
@@ -84,16 +94,7 @@ _DIRECT_PROCESS_KILL_WAIT_S = 2.0
 _TRANSPORT_CLOSE_TIMEOUT_S = 5.0
 #: ``close`` returns after this caller budget while its instance-owned teardown task continues in the background.
 _SESSION_CLOSE_WAIT_S = 15.0
-#: A session retains only a small fixed number of late cleanup tasks; completed entries remove themselves.
-_MAX_RETAINED_CLEANUPS = 8
-
 _T = TypeVar("_T")
-
-
-def _consume_task_result(task: asyncio.Task[Any]) -> None:
-    """Consume a detached task's terminal result so best-effort cleanup never emits an unhandled exception."""
-    with contextlib.suppress(BaseException):
-        task.result()
 
 
 class ACPHandshakeError(Exception):
@@ -209,7 +210,6 @@ class ACPSession:
         self._pid: int | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._close_task: asyncio.Task[None] | None = None
-        self._cleanup_tasks: set[asyncio.Task[Any]] = set()
         #: The model ids the agent advertised at session open (``session.models``), captured so a caller can
         #: see what the agent offered -- the "configure" signal of a handshake-only connection check. ``[]``
         #: when the agent advertises no selectable models (it runs on its own default).
@@ -733,16 +733,6 @@ class ACPSession:
         result.selected_model = self._selected_model
         return result
 
-    def _retain_cleanup_task(self, task: asyncio.Task[Any]) -> None:
-        """Retain a bounded number of late cleanup tasks and consume every task's terminal result."""
-        task.add_done_callback(_consume_task_result)
-        for completed in tuple(self._cleanup_tasks):
-            if completed.done():
-                self._cleanup_tasks.discard(completed)
-        if len(self._cleanup_tasks) < _MAX_RETAINED_CLEANUPS:
-            self._cleanup_tasks.add(task)
-            task.add_done_callback(self._cleanup_tasks.discard)
-
     async def _bounded_cleanup(
         self,
         coro: Coroutine[Any, Any, _T],
@@ -752,19 +742,35 @@ class ACPSession:
         default: _T,
         cancel_on_timeout: bool = True,
     ) -> _T:
-        """Await one cleanup step under a hard deadline while retaining bounded late work on this session."""
+        """Await one cleanup step under a hard deadline; late work keeps the shared owner either way.
+
+        ``cancel_on_timeout`` decides only what the deadline does to the WORK. A step that is pure waiting
+        is cancelled, because abandoning the wait is the whole point and nothing is lost: ``session/cancel``
+        hands a fully serialized line to the sender's own queue task, so giving up on the reply cannot
+        truncate a write or strip the connection of anything.
+
+        Every other step here must NOT be cancelled, and the test is whether the work can be REDONE, not
+        whether it looks like waiting. Reaping a captured process tree obviously cannot -- nothing else
+        knows that tree. Closing the transport looks like it could, and cannot: the SDK latches
+        ``_closed`` before awaiting its own cleanup, so a cancel in the middle makes every later attempt a
+        no-op and strands whatever had not run yet. Such a step defers to
+        :func:`await_without_cancelling`, which bounds the wait and leaves the work to finish.
+
+        Retention is NOT part of that choice, which is where this diverged from the terminal path before:
+        the session used to keep its own capped set and silently stopped backing tasks past the cap, so a
+        busy teardown could drop exactly the work this deadline promised to let finish.
+        """
+        if not cancel_on_timeout:
+            return await await_without_cancelling(coro, timeout_s=timeout_s, task_name=task_name, default=default)
         task = asyncio.create_task(coro, name=task_name)
+        register_pending_cleanup(task)
         try:
             done, _ = await asyncio.wait({task}, timeout=timeout_s)
         except asyncio.CancelledError:
-            if cancel_on_timeout:
-                task.cancel()
-            self._retain_cleanup_task(task)
+            task.cancel()
             raise
         if task not in done:
-            if cancel_on_timeout:
-                task.cancel()
-            self._retain_cleanup_task(task)
+            task.cancel()
             return default
         try:
             return task.result()
@@ -778,12 +784,12 @@ class ACPSession:
         # * The descendant snapshot is complete before this call, so a hard kill freezes the tree before reap.
         with contextlib.suppress(ProcessLookupError, OSError):
             process.kill()
-        wait_task = asyncio.create_task(process.wait(), name="rutherford-acp-direct-process-wait")
-        done, _ = await asyncio.wait({wait_task}, timeout=_DIRECT_PROCESS_KILL_WAIT_S)
-        if wait_task not in done:
-            self._retain_cleanup_task(wait_task)
-            return
-        _consume_task_result(wait_task)
+        await await_without_cancelling(
+            process.wait(),
+            timeout_s=_DIRECT_PROCESS_KILL_WAIT_S,
+            task_name="rutherford-acp-direct-process-wait",
+            default=None,
+        )
 
     async def cancel(self) -> None:
         """Best-effort bounded ``session/cancel`` for an in-flight turn; never raises operational failures."""
@@ -796,13 +802,19 @@ class ACPSession:
             )
 
     async def close(self) -> None:
-        """Wait boundedly for one shared teardown task without letting caller cancellation abort process cleanup."""
+        """Wait boundedly for one shared teardown task without letting caller cancellation abort process cleanup.
+
+        The aggregate goes to the same owner as the stages inside it. The instance attribute alone is not
+        enough: this caller budget is deliberately shorter than the stages it covers can take in the worst
+        case, so ``close`` can return while ``_close_body`` is still running, and a session dropped in that
+        window would leave the loop holding its teardown by a weak reference only.
+        """
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close_body(), name="rutherford-acp-session-close")
-            self._close_task.add_done_callback(_consume_task_result)
+            register_pending_cleanup(self._close_task)
         done, _ = await asyncio.wait({self._close_task}, timeout=_SESSION_CLOSE_WAIT_S)
         if self._close_task in done:
-            _consume_task_result(self._close_task)
+            consume_task_result(self._close_task)
 
     async def _close_body(self) -> None:
         """Snapshot the live tree, kill its spawning parent, reap descendants, then close the ACP transport.
@@ -818,8 +830,11 @@ class ACPSession:
         descendants: list[Any] = []
         try:
             if pid is not None:
-                with contextlib.suppress(Exception):
-                    descendants = await snapshot_descendants_eagerly(pid)
+                # * Bounded like every other stage. The snapshot runs FIRST, so an unbounded one never
+                # returns, the body never reaches the kill below, and the `finally` never runs either --
+                # a `finally` only fires when its block exits. The adapter would then outlive the server
+                # process, which is the exact leak this teardown path exists to prevent.
+                descendants = await snapshot_within_deadline(pid, timeout_s=_SNAPSHOT_TIMEOUT_S, source="session")
             # * Kill the spawning adapter immediately after its tree snapshot so it cannot create replacements.
             await self._kill_direct_process(process)
             # * Brokered commands retain their own shared kill tasks if this bounded aggregate is still running.
@@ -838,11 +853,20 @@ class ACPSession:
                     default=None,
                     cancel_on_timeout=False,
                 )
+            # * NOT cancellable, despite looking like the most cancellable stage here. The stack's exit
+            # runs the SDK's `Connection.close` (acp/connection.py), which sets `_closed = True` and only
+            # THEN awaits its dispatcher stop, sender close, and task shutdown; `MessageSender.close`
+            # (acp/task/sender.py) latches the same way. A cancel landing in the middle leaves the later
+            # steps undone forever, because the flag is already set and every future `close()` returns
+            # immediately -- there is no second chance to finish them. Bounding the wait is all that was
+            # ever needed here: the adapter is hard-killed above and again in the `finally`, so the EOF
+            # this used to block on has already been delivered and the close completes on its own.
             await self._bounded_cleanup(
                 self._stack.aclose(),
                 timeout_s=_TRANSPORT_CLOSE_TIMEOUT_S,
                 task_name="rutherford-acp-transport-close",
                 default=None,
+                cancel_on_timeout=False,
             )
         finally:
             # * Event-loop shutdown can cancel the shared task; the direct adapter still receives a hard kill.

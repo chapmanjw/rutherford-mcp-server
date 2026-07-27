@@ -50,7 +50,7 @@ from acp.schema import (
 
 from .journal import EventJournal, JournalEvent
 from .permission import PermissionPolicy
-from .teardown import reap, snapshot_descendants_eagerly
+from .teardown import await_without_cancelling, reap, snapshot_within_deadline
 
 #: JSON-RPC error code Rutherford returns when it declines an agent callback (an internal-error code; the
 #: protocol has no dedicated "permission denied" callback code, so the message carries the reason).
@@ -66,6 +66,17 @@ _TERMINAL_TIMEOUT_S = 120.0
 _TERMINAL_OUTPUT_CAP = 1 * 1024 * 1024
 #: Maximum wait after a hard kill before terminal teardown proceeds to descendant reap and reader cancellation.
 _TERMINAL_KILL_WAIT_S = 2.0
+#: How long teardown waits for that exit-status collection overall. Larger than the value above on purpose:
+#: ``Popen.wait``'s own timeout does not start until an executor worker picks the job up, so a deadline equal
+#: to it would expire on scheduling delay alone and report a wedge that is really just a queue. The extra
+#: budget is the scheduling slack, not a second wait -- teardown proceeds either way, so this only decides
+#: how long it pauses before moving on.
+_TERMINAL_KILL_WAIT_TOTAL_S = _TERMINAL_KILL_WAIT_S + 2.0
+#: Deadline on the pre-kill descendant enumeration. Mirrors the session teardown bound: losing the
+#: descendant list costs some orphans, while an unbounded snapshot strands the command itself.
+_TERMINAL_SNAPSHOT_TIMEOUT_S = 3.0
+#: Deadline on reaping that tree, matching the session's own reap stage.
+_TERMINAL_REAP_TIMEOUT_S = 3.0
 
 
 def _confine(root: Path, raw_path: str) -> Path:
@@ -149,18 +160,44 @@ class _BrokeredTerminal:
         try:
             if self.process.poll() is None:
                 with contextlib.suppress(Exception):
-                    descendants = await snapshot_descendants_eagerly(self.process.pid)
+                    # * The SAME helper the session teardown uses, not a parallel implementation. Both are
+                    # pre-kill snapshots with the same two requirements -- bound it so the kill below is
+                    # always reached, and reap a late result rather than drop it -- and keeping two copies
+                    # is exactly how the terminal path ended up bounded but still discarding.
+                    #
+                    # The stakes are higher here, not lower: a brokered terminal is a child of the SERVER,
+                    # not the adapter, so the session's reap walks a different tree and never collects it.
+                    # A dropped tree here outlives the run holding the sandbox cwd.
+                    descendants = await snapshot_within_deadline(
+                        self.process.pid,
+                        timeout_s=_TERMINAL_SNAPSHOT_TIMEOUT_S,
+                        source="terminal",
+                    )
         finally:
             # * The direct command is killed even if snapshot enumeration or its waiter is cancelled.
             if self.process.poll() is None:
                 with contextlib.suppress(OSError):  # pragma: no cover - already dead
                     self.process.kill()
         if self.process.poll() is None:
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                await asyncio.to_thread(self.process.wait, _TERMINAL_KILL_WAIT_S)
+            # * `Popen.wait`'s own timeout only starts counting once a worker picks the job up, so on a
+            # saturated executor this can sit queued indefinitely and teardown never reaches the reap.
+            await await_without_cancelling(
+                asyncio.to_thread(self.process.wait, _TERMINAL_KILL_WAIT_S),
+                timeout_s=_TERMINAL_KILL_WAIT_TOTAL_S,
+                task_name=f"rutherford-terminal-wait-{self.process.pid}",
+                default=None,
+            )
         if descendants:
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(reap, descendants)
+            # * Bound the WAIT, not the reap. `wait_for` would cancel it, and a `to_thread` still queued on
+            # a saturated executor has not started -- so the cancel succeeds and the reap never happens,
+            # dropping a tree that was already captured. Saturation is the very condition this deadline is
+            # for, so cancelling there turns "slow" into "never". The session reap already had this right.
+            await await_without_cancelling(
+                asyncio.to_thread(reap, descendants),
+                timeout_s=_TERMINAL_REAP_TIMEOUT_S,
+                task_name=f"rutherford-terminal-reap-{self.process.pid}",
+                default=None,
+            )
         if not self._reader.done():
             self._reader.cancel()
             with contextlib.suppress(asyncio.CancelledError):
