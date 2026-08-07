@@ -1,5 +1,5 @@
 # Rutherford task runner. Run `just` to list tasks.
-# Mirrors the commands documented in CLAUDE.md and CONTRIBUTING.md.
+# Mirrors the commands documented in AGENTS.md and CONTRIBUTING.md.
 
 # Show available tasks.
 default:
