@@ -42,9 +42,13 @@ coverage-per-file:
 test-integration:
     uv run pytest -m integration
 
-# The full pre-push gate: lint, format check, license header, type check, unit tests,
-# the per-file coverage floor, and the entrypoint smoke check.
-check: lint format-check license-check typecheck test coverage-per-file smoke
+# The full pre-push gate. `scripts/gate.py` owns the stage list so there is ONE local definition of what
+# the gate is -- it runs the stages, streams their output, and writes a machine-readable verdict to
+# .tmp/gate-report.toon naming which stage failed and whether the tree was clean. `tests/test_gate.py`
+# asserts those stages match CI's, which is how they stay in step. The individual recipes below still exist
+# for iterating on one stage at a time.
+check:
+    uv run python scripts/gate.py
 
 # Smoke-check the stdio server entrypoint (imports + starts FastMCP).
 smoke:

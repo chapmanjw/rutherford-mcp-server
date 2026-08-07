@@ -23,10 +23,30 @@ uv run pytest                 # unit tests only (integration deselected by defau
 uv run pytest -m integration  # local-only suite that drives real ACP agents
 ```
 
-A `justfile` wraps these. `just check` runs lint + format-check + license-check + typecheck +
-unit tests + the per-file coverage floor + the entrypoint smoke check (the pre-push gate);
+A `justfile` wraps these. `just check` is the pre-push gate: it runs `scripts/gate.py`, which executes
+every stage in order (lint, format-check, license-check, typecheck, tests, the per-file coverage floor,
+the entrypoint smoke check, and the build), streams their output, and stops at the first failure.
 `just test-integration` drives the real agents. Run a single test file with
 `uv run pytest tests/test_session.py`.
+
+**If you are an agent, read the verdict rather than the prose.** The gate writes
+`.tmp/gate-report.toon`, which names the stage that failed instead of leaving you to parse output meant
+for a human:
+
+```
+schema: 1
+head: <sha>
+dirty: false          # true means uncommitted edits were in the tree, so `head` alone does not describe what ran
+verdict: pass         # or fail
+failed_stage: null    # the stage name when verdict is fail
+stages[8,]{name,ok,seconds,exit_code}:
+  lint,true,0.08,0
+  ...
+```
+
+`scripts/gate.py` holds the only local definition of the gate, and `tests/test_gate.py` asserts its stages
+match the CI workflow's, so the two cannot drift. The report is gitignored: it describes one run on one
+machine and is worthless committed.
 
 Recommended pre-push flow: `just check`, then `just test-integration` for whatever agents the
 machine has installed and authenticated.

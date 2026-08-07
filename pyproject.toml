@@ -139,7 +139,10 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 disallow_any_generics = true
 plugins = ["pydantic.mypy"]
-files = ["src", "tests"]
+files = ["src", "tests", "scripts"]
+# scripts/ holds the gate runner, which tests/test_gate.py imports to compare its stage list against
+# the CI workflow. Type-checking it too means that comparison cannot rot behind a bad import.
+mypy_path = "scripts"
 
 [[tool.mypy.overrides]]
 module = ["toon", "toon.*"]
