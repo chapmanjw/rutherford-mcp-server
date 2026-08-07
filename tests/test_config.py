@@ -115,3 +115,28 @@ def test_schema_concurrency_and_dir_resolution(tmp_path: Path) -> None:
     assert config.max_concurrency == 10  # defaults to max_targets when not set
     assert config.trusted_workspaces[0] == str(tmp_path.resolve())
     assert RutherfordConfig(max_targets=10, max_concurrency=3).max_concurrency == 3
+
+
+def test_direct_workspace_mutation_cannot_be_enabled_with_logging_off() -> None:
+    """Permitting unsandboxed writes while silencing their only record is refused as a configuration error.
+
+    A direct mutating run captures no diff and no changed-file list, so the log line is the trace. The
+    durable record exists only when a run persists, and persistence is off by default -- so allowing this
+    pair would make "an agent was given write and shell access to a real tree, and nothing recorded it" the
+    ordinary case rather than an edge one. Rejected at load, because a warning would go to the channel that
+    was just turned off.
+    """
+    with pytest.raises(ValueError, match="audit channel"):
+        RutherfordConfig(allow_direct_workspace_mutation=True, log_format="off")
+
+    # Each on its own is fine; it is only the combination that has no trace.
+    assert RutherfordConfig(allow_direct_workspace_mutation=True).log_format == "json"
+    assert RutherfordConfig(log_format="off").allow_direct_workspace_mutation is False
+
+
+def test_a_config_file_enabling_both_fails_to_load(tmp_path: Path) -> None:
+    """The same guard through the real loader, since that is how an operator would actually hit it."""
+    target = tmp_path / "config.toml"
+    target.write_text('allow_direct_workspace_mutation = true\nlog_format = "off"\n', encoding="utf-8")
+    with pytest.raises((ConfigError, ValueError)):
+        load_config(env=_iso_env(tmp_path), cwd=tmp_path, explicit_path=target)

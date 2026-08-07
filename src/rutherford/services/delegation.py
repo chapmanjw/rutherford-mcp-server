@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import subprocess
 import time
 import uuid
@@ -206,27 +207,17 @@ class DelegationService:
         except RutherfordError as exc:
             return _fail(req, exc.code, exc.message, details=exc.details)
 
-        # propose without a sandbox is meaningless: the diff IS the product and it is computed from the
-        # sandbox tree; without one the policy would deny writes (read_only-equivalent) and there would be
-        # nothing to diff. Fail loud rather than silently degrade.
-        if not req.sandbox and req.safety_mode is SafetyMode.PROPOSE:
-            return _fail(
-                req,
-                ErrorCode.INVALID_INPUT,
-                "propose mode requires the sandbox: its diff is computed from the isolated worktree. "
-                "Use sandbox=true (the default), or write/yolo for an unsandboxed mutating run.",
-            )
-        # An unsandboxed run with no working_dir inherits the server process cwd -- for a stdio MCP server
-        # that is the caller's own workspace. Pin it into the request NOW so the trusted-workspace gate
-        # below evaluates the directory the agent will actually mutate.
-        if not req.sandbox and not req.working_dir:
-            req = req.model_copy(update={"working_dir": str(Path.cwd())})
+        if req.direct_workspace_mutation:
+            vetted = self._vet_direct_mutation(req, base_depth)
+            if isinstance(vetted, DelegationResult):
+                return vetted
+            req = vetted  # carries working_dir pinned to the exact directory that was authorised
 
         # A sandboxed mode (propose / write / yolo) MUST have a working_dir: it is the tree the sandbox is
         # built from. Without one there is nothing to isolate and the turn would fall through to the direct
         # path in the server's own cwd with writes allowed -- an unsandboxed write into Rutherford's directory.
         # So require it up front (this also closes a trust_workspace=true + no-working_dir bypass).
-        if runs_sandboxed(req.safety_mode) and req.sandbox and not req.working_dir:
+        if runs_sandboxed(req.safety_mode) and not req.direct_workspace_mutation and not req.working_dir:
             return _fail(
                 req,
                 ErrorCode.INVALID_INPUT,
@@ -289,15 +280,35 @@ class DelegationService:
         / ``yolo`` apply the diff back. A ``read_only`` (or un-sandboxable) run executes directly in ``cwd``,
         optionally fingerprinted by ``verify_read_only``. Recording health here means each agent the chain
         touches counts its OWN turn toward (or clears) its OWN bench.
+
+        The one exception is a ``direct_workspace_mutation`` run, which the operator has enabled and
+        allowlisted (see :meth:`_vet_direct_mutation`): it takes the direct path WITH a mutating policy, so
+        the agent edits ``cwd`` for real. Nothing is captured to apply back, so the result is stamped
+        ``direct_mutation`` -- otherwise an absent diff would be indistinguishable from a run that wrote
+        nothing at all.
         """
         descriptor = self._descriptors.get(req.target.cli)
         cwd = req.working_dir or str(Path.cwd())
         timeout = req.timeout_s or self._config.timeout_for(req.target.cli) or self._config.default_timeout_s
         prompt = _compose_prompt(req.prompt, req.files)
-        if runs_sandboxed(req.safety_mode) and req.sandbox and req.working_dir:
+        if runs_sandboxed(req.safety_mode) and not req.direct_workspace_mutation and req.working_dir:
             result = await self._run_sandboxed(req, descriptor, prompt, cwd, timeout_s=timeout, base_depth=base_depth)
         else:
             result = await self._run_direct(req, descriptor, prompt, cwd, timeout_s=timeout, base_depth=base_depth)
+            if req.direct_workspace_mutation and is_mutating(req.safety_mode):
+                # Marked whatever the outcome, including a failure: a run that timed out or errored partway
+                # may still have written to the tree, and that is exactly when a reader needs to know the
+                # missing diff means "never captured" rather than "nothing happened".
+                result.direct_mutation = True
+                log_event(
+                    "direct_workspace_mutation_finished",
+                    level=logging.ERROR,  # see the admission record: the audit must outrank any log_level
+                    agent=req.target.cli,
+                    safety_mode=req.safety_mode.value,
+                    working_dir=cwd,
+                    ok=result.ok,
+                    error_code=result.error.code.value if result.error else None,
+                )
         result.delegation_call_count = 1
         self._record_health(req.target.cli, result)
         return result
@@ -314,10 +325,16 @@ class DelegationService:
     ) -> DelegationResult:
         """Run the turn directly in ``cwd`` (no sandbox), with the optional ``verify_read_only`` fingerprint.
 
-        The path for ``read_only`` (and any mutating mode with no ``working_dir`` to isolate, where the policy
-        already denies writes). When ``verify_read_only`` is on and ``cwd`` is a git repo, the tree under it is
-        fingerprinted before and after a SUCCESSFUL turn; a change fails the result with ``READONLY_VIOLATED``
-        -- the agent's read-only promise made a checked invariant rather than a trusted one.
+        Ordinarily the ``read_only`` path, where the policy denies writes and the only question is whether the
+        agent kept its word. It is ALSO the path an approved ``direct_workspace_mutation`` run takes, and there
+        the policy grants writes and terminal in ``cwd`` itself -- so this method is the point past which
+        nothing is isolating anything. Everything that decides whether that is allowed lives in
+        :meth:`_vet_direct_mutation`, upstream; by here the decision has been made.
+
+        When ``verify_read_only`` is on and ``cwd`` is a git repo, the tree under it is fingerprinted before
+        and after the turn; a change fails the result with ``READONLY_VIOLATED`` -- the agent's read-only
+        promise made a checked invariant rather than a trusted one. Skipped for a mutating mode, which is
+        expected to change the tree.
         """
         policy = PermissionPolicy(mode=req.safety_mode, sandboxed=False)
         verify = self._config.verify_read_only and not is_mutating(req.safety_mode)
@@ -544,10 +561,19 @@ class DelegationService:
         """Whether a mutating delegation is permitted for ``req``'s working directory."""
         if req.trust_workspace:
             return True
-        if not req.working_dir:
+        return self._workspace_allowlisted(req.working_dir)
+
+    def _workspace_allowlisted(self, working_dir: str | None) -> bool:
+        """Whether ``working_dir`` sits under a CONFIGURED trusted workspace, ignoring any per-call claim.
+
+        Separate from :meth:`_workspace_trusted` on purpose. That one honours ``trust_workspace``, which the
+        caller supplies and a model can therefore set for itself; this one answers only what the operator
+        wrote in config. A guard that must not be self-granted has to ask this question instead.
+        """
+        if not working_dir:
             return False
         try:
-            target_dir = Path(req.working_dir).resolve()
+            target_dir = Path(working_dir).resolve()
         except OSError:
             return False
         for trusted in self._config.trusted_workspaces:
@@ -558,6 +584,113 @@ class DelegationService:
             if target_dir == root or target_dir.is_relative_to(root):
                 return True
         return False
+
+    def _vet_direct_mutation(self, req: DelegationRequest, base_depth: int) -> DelegationRequest | DelegationResult:
+        """Vet a request to mutate ``working_dir`` directly: a request admits it, a result refuses it.
+
+        Every condition here is one the caller cannot satisfy by asserting it. That is the whole point: the
+        sandbox is what makes a mutating delegation recoverable, and the party asking to remove it is the
+        least able to judge whether that is safe. So the operator enables the capability in a file, names the
+        directory in a file, and the request supplies only which of those named directories it wants.
+
+        An admitted request comes back with ``working_dir`` pinned to the RESOLVED path that was authorised,
+        rather than the string the caller sent. The check has to resolve the path to compare it against the
+        allowlist, so if the run then launched against the original string, the directory that was approved
+        and the directory that gets written to would be two separate lookups with a window between them.
+
+        That closes the LEXICAL gap, not every one. The pinned value is still a pathname, so a directory (or
+        an ancestor) that is replaced with a symlink or junction after this returns and before the agent
+        launches would be followed. Closing that needs an identity check against an open handle at spawn
+        time, which this does not do -- so the guarantee is "approved and launched against the same name",
+        not "the same directory".
+        """
+        mode = req.safety_mode
+        # propose's product IS the sandbox diff. Without one the policy denies writes and there is nothing to
+        # diff, so the run would quietly degrade to something read_only-shaped that still claimed to propose.
+        if mode is SafetyMode.PROPOSE:
+            return _fail(
+                req,
+                ErrorCode.INVALID_INPUT,
+                "propose cannot mutate the workspace directly: its diff is computed from the isolated "
+                "worktree, so there would be nothing to propose. Drop direct_workspace_mutation to propose, "
+                "or use write/yolo to edit the tree for real.",
+            )
+        # read_only already runs in place and writes nothing, so the flag asks for what it already does.
+        if not is_mutating(mode):
+            return req
+        if not self._config.allow_direct_workspace_mutation:
+            return _fail(
+                req,
+                ErrorCode.INVALID_INPUT,
+                "direct_workspace_mutation is disabled: this server has not been configured to let an agent "
+                "edit a workspace without a sandbox. An operator must set allow_direct_workspace_mutation "
+                "= true in config.toml and restart; it cannot be enabled per call.",
+            )
+        # ABSOLUTE, not merely present. A relative path is resolved against the server's own directory, so
+        # working_dir="." asks for exactly the thing this refuses -- and would have passed a not-empty check
+        # while reading, in the audit record, as a directory that identifies nothing.
+        if not req.working_dir or not Path(req.working_dir).is_absolute():
+            return _fail(
+                req,
+                ErrorCode.INVALID_INPUT,
+                "direct_workspace_mutation needs an ABSOLUTE working_dir. A relative one resolves against the "
+                "server's own directory, which for a stdio server is the caller's live workspace; a run that "
+                "edits the real tree has to name the tree.",
+            )
+        try:
+            resolved = Path(req.working_dir).resolve()
+        except OSError as exc:
+            return _fail(
+                req,
+                ErrorCode.INVALID_INPUT,
+                f"direct_workspace_mutation could not resolve working_dir {req.working_dir!r}: {exc}",
+            )
+        # trust_workspace deliberately does NOT satisfy this. It is a per-call assertion, and a caller that
+        # can set it can grant itself the very permission this gate exists to withhold.
+        if not self._workspace_allowlisted(str(resolved)):
+            return _fail(
+                req,
+                ErrorCode.WORKSPACE_NOT_TRUSTED,
+                f"{req.working_dir!r} is not on the configured trusted_workspaces allowlist. Direct mutation "
+                "requires it to be listed there; trust_workspace=true does not qualify, because a caller "
+                "cannot be the one to decide that its own unsandboxed writes are safe.",
+            )
+        # A nested chain is further from whoever authorised the outer call, and the sub-delegation's prompt
+        # was written by a model rather than a person. ``base_depth`` carries the depth this PROCESS is at
+        # (seeded from RUTHERFORD_DEPTH at the tool boundary), so a nested Rutherford is caught too.
+        if base_depth > 0:
+            return _fail(
+                req,
+                ErrorCode.INVALID_INPUT,
+                f"direct_workspace_mutation is refused inside a delegation chain (depth {base_depth}); only a "
+                "top-level call can ask for it.",
+            )
+        # There will be no diff and no changed-file list for this run, so this record is the only trace that
+        # it happened. Emitted before launch, so a run that hangs still leaves the intent on record. The
+        # RESOLVED directory is logged, because that is the one that gets written to.
+        #
+        # Best-effort, and documented as such rather than dressed up. The record goes through the ordinary
+        # structured logger, which hands it to a daemon thread behind a bounded queue -- so it can be dropped
+        # under saturation, or lost if the process dies before the writer runs. Gating the run on a CONFIRMED
+        # write was built and then removed: closing that gap needs the caller to own queue admission,
+        # cancellation and per-handler durability, and every attempt at it introduced a fresh concurrency
+        # defect while still leaving a write already in flight impossible to withdraw. An operator who needs
+        # a guaranteed trail should collect stderr or enable persistence, both of which are outside this
+        # process and actually durable. See docs/security.md.
+        log_event(
+            "direct_workspace_mutation_admitted",
+            # ERROR, not WARNING, and not because this is a failure. It is the level that survives every
+            # log_level an operator can configure -- at log_level="error" a WARNING is discarded, which would
+            # reproduce the no-trace configuration the config validator exists to refuse. Pinning the level
+            # closes that for any future level too, rather than enumerating the ones that happen to filter it.
+            level=logging.ERROR,
+            agent=req.target.cli,
+            safety_mode=mode.value,
+            working_dir=str(resolved),
+            model=req.target.model,
+            role=req.role,
+        )
+        return req.model_copy(update={"working_dir": str(resolved)})
 
     def _should_persist(self, req: DelegationRequest) -> bool:
         """Whether this run should be kept as a durable job (F2); see ``RutherfordConfig.wants_persist``."""
@@ -601,6 +734,9 @@ class DelegationService:
             model=result.selected_model if result.selected_model is not None else result.target.model,
             provenance=result.provenance,
             safety_mode=req.safety_mode,
+            # Durable half of the direct-mutation trail: the log line carrying this fact is silenced by
+            # log_format = "off", and this record is the part that survives that.
+            direct_mutation=result.direct_mutation,
             # F8a: the effort requested for this run and the tier the agent actually applied (post-clamp).
             requested_effort=result.effort,
             effort_applied=result.effort_applied,

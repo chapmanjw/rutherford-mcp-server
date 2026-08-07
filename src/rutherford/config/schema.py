@@ -173,6 +173,19 @@ class RutherfordConfig(BaseModel):
     cooldown_duration_s: float = Field(default=60.0, gt=0)
     #: Absolute paths under which write/yolo delegations are permitted.
     trusted_workspaces: list[str] = Field(default_factory=list)
+    #: Operator opt-in for DIRECT (unsandboxed) mutating delegation: a ``write`` / ``yolo`` agent editing
+    #: ``working_dir`` itself, with live terminal access there, instead of an isolated worktree or temp copy.
+    #:
+    #: This exists as config rather than as a per-call flag alone because everything the sandbox provides is
+    #: forfeited -- the clobber and concurrent-edit guards, symlink-escape containment, the committed-HEAD
+    #: starting point, and the diff that records what changed. A run that mutates the tree directly leaves no
+    #: diff to review and no ledger entry of the files it touched. A caller asking for that is not enough:
+    #: the machine's owner has to have decided it in advance, out of band, in a file no model can reach.
+    #:
+    #: Enabling this alone still grants nothing. A direct run additionally requires an explicit
+    #: ``working_dir`` on :attr:`trusted_workspaces` (a per-call ``trust_workspace`` will not do), and is
+    #: refused inside a nested delegation chain.
+    allow_direct_workspace_mutation: bool = False
     #: Whether consensus synthesizes server-side by default (off by default per the spec).
     synthesize_default: bool = False
     #: No-self-approval default (F4a, 4-A): when true, a consensus/debate refuses a synthesis/closing that
@@ -237,6 +250,26 @@ class RutherfordConfig(BaseModel):
         """
         if "max_concurrency" not in self.model_fields_set:
             self.max_concurrency = self.max_targets
+        return self
+
+    @model_validator(mode="after")
+    def _direct_mutation_needs_an_audit_channel(self) -> RutherfordConfig:
+        """Refuse a configuration that permits unsandboxed writes while silencing the record of them.
+
+        A direct mutating run produces no diff and no changed-file list, so the log line is the trace. With
+        ``log_format = "off"`` the structured logger is disabled entirely, and the durable record is written
+        only when a run persists -- which is off by default. Allowed together, the ordinary case would be an
+        agent given write and shell access to a real tree with nothing recording that it ever ran.
+
+        Rejected at load rather than warned about, because a warning goes to the same channel that has just
+        been turned off. Turning either setting back on resolves it.
+        """
+        if self.allow_direct_workspace_mutation and self.log_format == "off":
+            raise ValueError(
+                "allow_direct_workspace_mutation requires an audit channel, but log_format is 'off'. A direct "
+                "mutating run captures no diff, so the log is the only guaranteed record that it happened. "
+                "Set log_format = 'json', or leave allow_direct_workspace_mutation off."
+            )
         return self
 
     @model_validator(mode="after")

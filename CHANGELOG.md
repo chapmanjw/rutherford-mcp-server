@@ -6,7 +6,59 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **`direct_workspace_mutation` on `delegate`, behind an operator opt-in** — a `write` / `yolo` agent can
+  edit `working_dir` itself, with live terminal access there, instead of the isolated worktree. This is for
+  work whose product is the effect on the tree rather than a diff: installing dependencies, running local
+  tooling, letting an agent see its own side effects. Contributed by
+  [@Artemonim](https://github.com/Artemonim) in [#21].
+
+  It gives up everything the sandbox provides — the clobber and concurrent-edit guards, symlink containment,
+  the committed-`HEAD` starting point, and the diff itself — so the run leaves no record of what it changed
+  and a failure may leave a partial one. The party asking for that is also the party least able to judge it,
+  so a request never suffices on its own. An operator has to enable
+  `allow_direct_workspace_mutation` in config, and the directory has to be on the `trusted_workspaces`
+  allowlist: a per-call `trust_workspace=true` deliberately does NOT qualify, because a caller that can set
+  it could otherwise authorise its own unsandboxed writes and the allowlist would decide nothing.
+  `working_dir` must be named explicitly rather than inherited from the server's own directory, the call
+  must not be nested inside another delegation, and `propose` cannot use it at all.
+
+  Each admitted run logs before launch and again on completion, and the result carries
+  `direct_mutation=true` so a reader can tell the absent diff means "never captured" rather than "nothing
+  was written". That record is **best effort**: it goes through the ordinary structured logger, whose
+  stderr sink is asynchronous so a host that never drains its pipe cannot freeze the event loop, which
+  means the record can be dropped under log saturation or lost if the process dies before it is written.
+  `docs/security.md` says so plainly and points an operator who needs a durable trail at collecting stderr
+  or enabling persistence, both of which live outside this process. Refusing to launch unless the write was
+  confirmed was built and removed; the reasoning is recorded in `docs/security.md` rather than the code.
+
+  The nesting condition is documented as defence in depth rather than a boundary. Depth crosses the process
+  boundary in an environment variable, and anything able to spawn a nested Rutherford controls that child's
+  environment, so it stops an accident rather than a hostile agent — which, per `docs/security.md`, gains
+  nothing here it did not already have, since a `write` / `yolo` agent was never OS-jailed.
+
 ### Fixed
+
+- **An unreadable `RUTHERFORD_DEPTH` is now fatal instead of being read as top level.** `current_depth()`
+  turned a malformed or negative value into `0`, and a unit test asserted that as correct. Depth `0` is the
+  only depth permitted to request `direct_workspace_mutation`, so the failure mode of a garbled environment
+  was to grant the one privilege the depth check exists to withhold. A value that is present but unusable now
+  raises `INVALID_INPUT` naming the variable. Absent still means top level, because absent and "a genuine
+  top-level start" are the same observation and cannot be told apart.
+
+  Upgrading, a process that sets `RUTHERFORD_DEPTH` to a non-integer or negative value will now fail its
+  delegation instead of silently running as top level. Unset the variable for a genuine top-level run.
+
+- **The delegation depth cap now applies across process boundaries, which changes behaviour.** Rutherford
+  writes `RUTHERFORD_DEPTH` into every agent it spawns, but nothing read it back — `current_depth()` had no
+  callers — so depth restarted at zero in each process and `max_depth` only ever counted within one. A chain
+  of nested Rutherfords (an agent that is itself running one of these servers) could recurse without limit.
+  Every tool that spawns an agent now seeds its depth from the environment.
+
+  Upgrading, a nesting chain deeper than `max_depth` (default `3`) that previously ran will now be refused
+  with `MAX_DEPTH_EXCEEDED`. That is the cap doing what it always said it did; raise `max_depth` if the depth
+  was intended.
 
 - **Subprocess deadlock from the inherited MCP stdio pipe** — `npm install`, the sandbox `git` calls,
   and workspace fingerprinting now pass `stdin=subprocess.DEVNULL`, so a helper child never inherits
@@ -46,6 +98,7 @@ All notable changes to this project are documented in this file. The format is b
   as a `log_records_dropped` record rather than vanishing — the gap is visible in the same JSON stream,
   anchored before the next record.
 
+[#21]: https://github.com/chapmanjw/rutherford-mcp-server/pull/21
 [#22]: https://github.com/chapmanjw/rutherford-mcp-server/pull/22
 [#23]: https://github.com/chapmanjw/rutherford-mcp-server/pull/23
 

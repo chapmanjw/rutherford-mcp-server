@@ -8,6 +8,7 @@ from typing import Any
 
 from ..context import AppContext, tool_success
 from ..domain.models import ConsensusRequest, Target
+from ..runtime.depth import current_depth
 from ..services.delegation import ActivityCallback
 from .common import (
     apply_role,
@@ -135,7 +136,9 @@ async def consensus_tool(
         # N1 (item 3): the async path hands the panel the JOB's activity sink (the ``activity`` poll table);
         # the sync path uses ``on_activity`` (the MCP progress push), supplied by server.py. Exactly one is
         # ever set -- a sync call has no job buffer, an async call has no live caller to push to.
-        result = await app.consensus.consensus(request, on_activity=job_activity or on_activity)
+        result = await app.consensus.consensus(
+            request, base_depth=current_depth(), on_activity=job_activity or on_activity
+        )
         # Advisory F2 nudge (suppressed by external_tracking): a consensus panel is a multi-voice run worth
         # keeping as a durable job, plus the one-time first-run setup hint.
         result.notice = app.persistence_notice(

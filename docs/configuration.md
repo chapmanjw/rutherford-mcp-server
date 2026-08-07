@@ -74,6 +74,7 @@ order the fields appear in `config/schema.py`.
 | `cooldown_window_s` | `float` | `120.0` | The sliding window over which `cooldown_threshold` failures are counted (> 0). |
 | `cooldown_duration_s` | `float` | `60.0` | How long a benched agent stays benched before it is tried again (> 0). |
 | `trusted_workspaces` | `list[str]` | `[]` | Absolute paths under which `write` / `yolo` delegations are permitted. Resolved to absolute; a missing directory warns. Edit the global list from a terminal with `rutherford-mcp-server trust` / `untrust` (cwd or an explicit path); `trust --list` prints it. Read once at server start, so restart after a change. |
+| `allow_direct_workspace_mutation` | `bool` | `false` | Lets a `write` / `yolo` delegation edit `working_dir` itself — with live terminal access there — instead of an isolated worktree, when the call passes `direct_workspace_mutation=true`. Forfeits the clobber and concurrent-edit guards, symlink containment, the committed-`HEAD` start, and the diff, so such a run leaves no record of what it changed. Enabling this alone grants nothing: the directory must also be on `trusted_workspaces` (a per-call `trust_workspace=true` does **not** qualify), `working_dir` must be explicit, and the call must not be nested. Rejected at load together with `log_format = "off"`: such a run captures no diff, so silencing the log would leave no trace of it. Read once at server start, so restart after a change. See [security.md](security.md#direct-workspace-mutation-the-opt-out). |
 | `synthesize_default` | `bool` | `false` | Whether consensus synthesizes server-side by default. |
 | `verify_read_only` | `bool` | `false` | Opt-in: after a successful `read_only` delegation whose `working_dir` is a git repo, fingerprint the tree under it (status + the staged and unstaged diffs, scoped to that subtree) before and after the turn and fail the result with `READONLY_VIOLATED` if it changed — catching an agent that touched the disk out of band (its own OS process, outside the ACP file callbacks). Off by default (it adds two git reads per delegation). Soundest for a single delegation; a non-git `working_dir` makes it a no-op (the fingerprint is unavailable). `write` / `yolo` / `propose` runs already execute in an isolated sandbox, so this check applies to `read_only`. |
 | `probe_cache_ttl_s` | `float` | `10.0` | Seconds to cache an agent's metadata probe (≥ 0; `0` disables). |
@@ -161,6 +162,21 @@ These override specific fields after the config files are merged. They do not re
 | `RUTHERFORD_DEFAULT_SAFETY` | string | `default_safety_mode` |
 | `RUTHERFORD_TRUSTED_WORKSPACES` | `os.pathsep`-delimited paths | `trusted_workspaces` |
 | `RUTHERFORD_ROLE_DIRS` | `os.pathsep`-delimited paths | `role_dirs` |
+
+### `RUTHERFORD_DEPTH` is set by Rutherford, not by you
+
+Rutherford writes `RUTHERFORD_DEPTH` into every agent it spawns, and a nested Rutherford reads it back to
+know it is nested. It is not a knob; there is no reason to set it yourself.
+
+If you do set it, note that an **unreadable value is fatal, not ignored**. A non-integer or negative value
+fails the delegation with `INVALID_INPUT` naming the variable, and it fails *every* delegation-capable
+tool, not just the ones asking for direct workspace mutation. That is deliberate. Depth `0` is the only
+depth allowed to request `direct_workspace_mutation`, so reading an unparseable value as `0` — which is what
+Rutherford used to do — turned a corrupt environment into a privilege grant. Failing closed trades
+availability for that, and availability is the cheaper thing to lose.
+
+Leave the variable **unset** for a genuine top-level run. Unset is the top-level signal; empty string is not.
+If a launcher or wrapper script exports it as `""`, remove the export rather than setting it to `0`.
 
 ---
 

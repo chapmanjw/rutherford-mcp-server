@@ -40,6 +40,7 @@ from ..domain.models import (
     Target,
 )
 from ..io.ledger import read_answer, read_record
+from ..runtime.depth import current_depth
 from ..services.delegation import ActivityCallback
 from .common import (
     apply_role,
@@ -136,10 +137,10 @@ async def continue_job_tool(
         async def run(on_activity: ActivityCallback | None = None) -> str:
             if isinstance(request, ConsensusRequest):
                 result: ConsensusResult | StrategyResult | DebateResult = await app.consensus.consensus(
-                    request, on_activity=on_activity
+                    request, base_depth=current_depth(), on_activity=on_activity
                 )
             else:
-                result = await app.debate.debate(request, on_activity=on_activity)
+                result = await app.debate.debate(request, base_depth=current_depth(), on_activity=on_activity)
             resumed = sum(1 for seat in panel.targets if seat.session_id is not None)
             result.notice = f"continued {parent.kind} job {job_id}: resumed {resumed} of {len(panel.targets)} seat(s)."
             return tool_success(result)
@@ -309,7 +310,9 @@ class _ContinuationPlan:
             session_id=session_id,
             continues_run_id=self._job_id,
         )
-        return await self._app.delegation.delegate(request, correlation_id="continue:0", on_activity=on_activity)
+        return await self._app.delegation.delegate(
+            request, correlation_id="continue:0", base_depth=current_depth(), on_activity=on_activity
+        )
 
 
 def _read_parent(app: AppContext, job_id: str) -> RunRecord:

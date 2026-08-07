@@ -919,3 +919,30 @@ async def test_budget_path_handles_a_failed_voice() -> None:
     assert by_cli["fake"].ok and "42" in by_cli["fake"].text
     assert by_cli["dead"].ok is False  # handshake failure, surfaced as a failed voice, not a cut
     assert result.stop_reason is None  # the dead voice finished (failed) before the deadline -- no cut
+
+
+async def test_a_panel_voice_never_asks_for_direct_workspace_mutation(monkeypatch: Any) -> None:
+    """A panel must not be able to reach the unsandboxed write path, whatever the caller sends.
+
+    Two separate things stop it today: a mutating mode is refused at the panel boundary, and
+    ``direct_workspace_mutation`` is not a field on a panel request so nothing forwards it to the voice.
+    The first is tested above; this pins the second, which is the one that could rot quietly -- adding the
+    field to ``ConsensusRequest`` and passing it through would read like plumbing another option, while
+    actually handing a whole fan-out of agents unsandboxed write access to the tree.
+
+    Asserted on the request the voice ACTUALLY receives rather than on the panel model, so it fails for a
+    forwarding mistake as well as for a new field.
+    """
+    seen: list[bool] = []
+    original = DelegationService.delegate
+
+    async def spy(self: DelegationService, req: Any, **kwargs: Any) -> Any:
+        seen.append(req.direct_workspace_mutation)
+        return await original(self, req, **kwargs)
+
+    monkeypatch.setattr(DelegationService, "delegate", spy)
+    await _service().consensus(
+        ConsensusRequest(targets=[Target(cli="fake"), Target(cli="fake")], prompt="x", working_dir=str(REPO_ROOT))
+    )
+    assert seen, "no voice ran, so this proved nothing"
+    assert not any(seen), "a consensus voice carried direct_workspace_mutation into the delegation service"

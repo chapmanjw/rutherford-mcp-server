@@ -11,6 +11,7 @@ from ..domain.enums import SafetyMode
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..domain.models import ConsensusRequest, Target
+from ..runtime.depth import current_depth
 from .common import apply_role, as_target, ensure_known_targets
 from .panels import panel_for_call
 
@@ -62,7 +63,7 @@ async def review_tool(
         synthesize=True if synthesize is None else synthesize,
         timeout_s=timeout_s,
     )
-    result = await app.consensus.consensus(request)
+    result = await app.consensus.consensus(request, base_depth=current_depth())
     return tool_success(result)
 
 

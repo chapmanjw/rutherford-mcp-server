@@ -9,6 +9,7 @@ from typing import Any
 from ..context import AppContext, tool_success
 from ..domain.enums import is_mutating
 from ..domain.models import DelegationRequest, Target
+from ..runtime.depth import current_depth
 from ..services.delegation import ActivityCallback
 from .common import (
     apply_role,
@@ -33,7 +34,7 @@ async def delegate_tool(
     safety_mode: str | None = None,
     timeout_s: float | None = None,
     trust_workspace: bool = False,
-    sandbox: bool = True,
+    direct_workspace_mutation: bool = False,
     role: str | None = None,
     effort: str | None = None,
     fallback: list[Any] | None = None,
@@ -61,10 +62,16 @@ async def delegate_tool(
     default) lets a model-unavailable failure retry the SAME agent on its configured ``fallback_model`` first,
     where it has one (most ACP agents do not -- a clean no-op).
 
-    ``sandbox=False`` runs a ``write`` / ``yolo`` delegation DIRECTLY in ``working_dir`` (inherited from the
-    server process cwd when omitted) instead of an isolated worktree / temp copy: the agent edits the real
-    tree and may run terminal commands there, with no diff capture or apply-back. The trusted-workspace gate
-    still applies. ``propose`` cannot run unsandboxed (``INVALID_INPUT``); ``read_only`` is unaffected.
+    ``direct_workspace_mutation=True`` asks for a ``write`` / ``yolo`` agent to edit ``working_dir`` itself,
+    with live terminal access there, instead of an isolated worktree / temp copy. Nothing is captured and
+    nothing is applied back, so the result carries no diff and no changed-file list -- only
+    ``direct_mutation=True`` to say why they are missing.
+
+    Asking never suffices, because the caller is the party least able to judge the risk. The operator must
+    have set ``allow_direct_workspace_mutation`` in config, ``working_dir`` must be explicit and on the
+    configured ``trusted_workspaces`` allowlist (a per-call ``trust_workspace`` does NOT qualify), and the
+    call must not be nested inside another delegation. ``propose`` cannot use it at all
+    (``INVALID_INPUT`` -- its diff IS the sandbox); ``read_only`` already runs in place, so it is a no-op.
 
     ``persist`` keeps this run as a durable job under ``<jobs_dir>/<run_id>/`` (F2: ``state.json`` plus the
     answer / diff artifacts), so it survives the process. ``None`` follows the configured
@@ -92,7 +99,7 @@ async def delegate_tool(
         safety_mode=safety,
         timeout_s=timeout_s,
         trust_workspace=trust_workspace,
-        sandbox=sandbox,
+        direct_workspace_mutation=direct_workspace_mutation,
         effort=parse_effort(effort),
         fallback=fallback_targets,
         allow_model_fallback=allow_model_fallback,
@@ -103,7 +110,13 @@ async def delegate_tool(
     async def run(on_activity: ActivityCallback | None = None) -> str:
         # A standalone delegation emits one voice_started/voice_finished pair (N1, item 3): on the async path
         # the job buffers them for the ``activity`` poll table; on the sync path there is no sink (None).
-        result = await app.delegation.delegate(request, correlation_id="voice:0", on_activity=on_activity)
+        # Seed the depth from the environment, not from zero. A nested Rutherford -- an agent that is
+        # itself running one of these servers -- inherits RUTHERFORD_DEPTH from its parent, and reading it
+        # back here is what makes the recursion cap and the direct-mutation nesting refusal real across a
+        # process boundary rather than only within one.
+        result = await app.delegation.delegate(
+            request, correlation_id="voice:0", base_depth=current_depth(), on_activity=on_activity
+        )
         # Advisory F2 nudge (suppressed by external_tracking): a mutating or fallback delegation is worth
         # keeping as a durable job, plus the one-time first-run setup hint.
         result.notice = app.persistence_notice(

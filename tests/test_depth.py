@@ -22,14 +22,34 @@ from rutherford.runtime.depth import (
 )
 
 
-def test_current_depth_reads_and_defaults() -> None:
-    assert current_depth({}) == 0  # unset -> 0
+def test_current_depth_reads_absent_as_top_level() -> None:
+    """Absent means nobody nested us, which is the honest reading and the only one that lets a top call run."""
+    assert current_depth({}) == 0
+    assert current_depth({ENV_DEPTH: "0"}) == 0
     assert current_depth({ENV_DEPTH: "3"}) == 3
-    assert current_depth({ENV_DEPTH: "not-a-number"}) == 0  # invalid -> 0
-    assert current_depth({ENV_DEPTH: "-5"}) == 0  # clamped to >= 0
 
 
-def test_current_lineage_count_reads_and_defaults() -> None:
+@pytest.mark.parametrize("bad", ["not-a-number", "-5", "", " ", "1.5", "0x2"])
+def test_an_unreadable_depth_fails_closed_rather_than_reading_as_top_level(bad: str) -> None:
+    """A present-but-unusable depth must REFUSE, not decay to 0.
+
+    Reading it as 0 is the dangerous answer specifically because 0 is the one depth allowed to request an
+    unsandboxed workspace mutation, so the failure mode of a garbled environment would have been to hand out
+    the privilege the depth check exists to withhold. This test exists to stop that being "fixed" back into a
+    default; if it ever fails because someone made this lenient again, the gate below is what they reopened.
+    """
+    with pytest.raises(RutherfordError) as excinfo:
+        current_depth({ENV_DEPTH: bad})
+    assert excinfo.value.code is ErrorCode.INVALID_INPUT
+    assert ENV_DEPTH in str(excinfo.value)
+
+
+def test_current_lineage_count_stays_lenient_because_it_gates_nothing() -> None:
+    """Deliberately unlike ``current_depth``: this feeds an advisory width warning, not a privilege check.
+
+    Kept lenient on purpose. If the two ever need to agree, the question to ask is which one guards a
+    decision -- not which one looks tidier next to the other.
+    """
     assert current_lineage_count({}) == 0
     assert current_lineage_count({ENV_LINEAGE: "2"}) == 2
     assert current_lineage_count({ENV_LINEAGE: "bad"}) == 0

@@ -106,11 +106,14 @@ is no tree to isolate, and the turn must never fall through to running in the se
 
 ## The write sandbox
 
-`delegate` is the **single write path**, and it never lets an agent edit the user's tree directly. A
-mutating (`propose` / `write` / `yolo`) delegation runs in an isolated execution root built by
-`acp/sandbox.py`; only a reviewed diff is ever applied back. (The panels — `consensus`, `debate`,
-`review`, `plan` — are read-only deliberation and refuse a mutating mode at the service boundary: there
-is no coherent merge of edits from several agents into one tree.)
+`delegate` is the **single write path**. A mutating (`propose` / `write` / `yolo`) delegation runs in an
+isolated execution root built by `acp/sandbox.py`; only a reviewed diff is ever applied back. (The panels —
+`consensus`, `debate`, `review`, `plan` — are read-only deliberation and refuse a mutating mode at the
+service boundary: there is no coherent merge of edits from several agents into one tree.)
+
+Out of the box an agent can never edit the real tree directly. An operator can deliberately turn that
+guarantee off for a named directory — see [Direct workspace mutation](#direct-workspace-mutation-the-opt-out)
+below, which is off by default and cannot be enabled by a caller.
 
 The execution root is chosen by what `working_dir` is:
 
@@ -151,6 +154,96 @@ chose to run, not sandboxing adversarial code):
 - **A narrow apply-time TOCTOU.** A user save in the sub-millisecond window between the clobber check and
   the copy is not detected — the same gap any check-then-write filesystem apply (`git apply` / `git stash`)
   has. Eliminating it would require locking the whole working tree for the apply.
+
+### Direct workspace mutation (the opt-out)
+
+Some workflows need an agent to act in the live tree — install dependencies, run local tooling, and see
+the side effects in place — where handing back a diff is the wrong shape. `direct_workspace_mutation=true`
+on `delegate` asks for that: a `write` / `yolo` agent whose cwd, file root, and terminal all point at the
+real `working_dir`.
+
+It forfeits everything the section above describes. No worktree or temp copy, no clobber check, no
+concurrent-edit check, no containment on apply-back (there is no apply-back), no committed-`HEAD` starting
+point, and **no diff** — so the run leaves no record of what it changed, and the durable job record has no
+changed-file list. A failed, timed-out, or cancelled run may have written a partial change with nothing to
+say what.
+
+Because of that, asking is never sufficient. Every one of these must hold. The caller chooses the mode, names
+the directory, and asks for the capability; what it cannot do is grant itself the two conditions the operator
+decides:
+
+| Condition | Who decides |
+|---|---|
+| `allow_direct_workspace_mutation = true` in `config.toml` | the operator, out of band, restart required |
+| `working_dir` is on the configured `trusted_workspaces` allowlist | the operator — a per-call `trust_workspace=true` does **not** qualify |
+| `working_dir` given explicitly | the caller; there is no fallback to the server's own directory |
+| not nested inside another delegation | inherited — a Rutherford running inside an agent reads `RUTHERFORD_DEPTH` from its parent and counts as nested. Defence in depth, **not** a boundary; see below |
+| mode is `write` / `yolo` | `propose` is refused (its diff *is* the sandbox); `read_only` already runs in place |
+
+The separation between the config allowlist and the per-call `trust_workspace` is the load-bearing part.
+`trust_workspace` is supplied by whoever makes the call, so a model driving `delegate` can set it for
+itself; if it also opened this gate, the caller could authorise its own unsandboxed writes and the operator's
+allowlist would decide nothing.
+
+Each admitted run logs `direct_workspace_mutation_admitted` *before* launch and
+`direct_workspace_mutation_finished` after, and its result carries `direct_mutation=true` so a reader can
+tell the missing diff means "never captured" rather than "nothing was written".
+
+The record is **best effort, not a guarantee**, and it is worth being precise about why. Rutherford's
+stderr logger hands records to a daemon thread behind a bounded queue, so that a host which never drains
+its pipe cannot freeze the event loop. That means an admission record can be dropped under log saturation,
+lost if the writer thread dies on a stream error, or discarded at process exit because nothing joins a
+daemon thread. The record is *attempted* before the agent starts, so a run that hangs has usually left it and
+a run killed in the wrong millisecond may not — but "usually" is the honest word here, and nothing in this
+process upgrades it to a guarantee.
+
+Gating the run on a *confirmed* write — refusing to launch unless the sink acknowledged the record — was
+built and then removed. It is recorded here because the reasoning outlives the code. Confirming a write to
+a sink that may be wedged, without blocking indefinitely, requires the caller to take over queue admission,
+cancellation, per-handler durability and the failures `logging` deliberately absorbs. Each attempt at it
+introduced a fresh concurrency defect, and the last one still could not withdraw a write already in flight:
+a refused run could leave an "admitted" record behind it, which is worse than no record, because an audit
+trail that invents an event is one a reader will act on. The machinery also blocked the event loop for
+roughly half a second per admitted run, which a caller could use to degrade the whole server. It cost more
+than it bought.
+
+**If you need a trail that survives, do not rely on this log line.** Collect the server's stderr, or enable
+persistence so the run writes a durable record under its run directory. Both live outside this process,
+which is the only place a real guarantee can come from.
+
+Those log lines go through the same structured logger as everything else, which `log_format = "off"` silences
+entirely — and the durable record is written only when a run persists, which is off by default. Enabled
+together, the ordinary case would be an agent given write and shell access to a real tree with nothing
+recording that it ran, so **`allow_direct_workspace_mutation = true` with `log_format = "off"` is rejected as
+a configuration error** rather than warned about. A warning would go to the channel that was just turned off.
+
+Both audit lines are emitted at ERROR rather than WARNING. Not because they report a failure — it is the
+level that survives every `log_level` an operator can set, so the record cannot be filtered away by a
+setting that looks unrelated to this capability.
+
+A run that also persists carries `direct_mutation` in its durable record, which is worth having on a machine
+that matters: the log is a stream someone has to be collecting, the record is on disk.
+
+Three limits are worth stating rather than leaving to be discovered.
+
+The gate resolves `working_dir` once and the run launches against that same resolved path, so the directory
+that was approved and the one that is written to cannot differ *by name* — but the pinned value is still a
+pathname, and a directory or ancestor swapped for a symlink between the check and the spawn would be
+followed; closing that needs an identity check against an open handle, which Rutherford does not do.
+
+The nesting condition is **not tamper-proof, and is not claimed to be**. Depth crosses the process boundary
+in `RUTHERFORD_DEPTH`, which the parent sets on the child it spawns. A value that is present but unreadable
+— malformed, or negative — is now fatal rather than silently read as zero, so a corrupted environment
+refuses instead of quietly promoting a nested run to top level. But *absent* is indistinguishable from a
+genuine top-level start, because they are the same observation, and anything that can spawn a nested
+Rutherford controls that child's environment. A `write` / `yolo` agent has shell access and can therefore
+launch one with the variable stripped. Treat this condition as defence against an accident and as one layer
+of several, never as the layer that stops a hostile agent — and note that such an agent gains nothing it did
+not already have, per the next paragraph.
+
+The isolation forfeited here was never an OS jail to begin with (see the two deliberate limitations above):
+a `write` / `yolo` agent's own process can write outside the directory regardless. What direct mutation
+removes is the recoverability — the guards, the diff, and the ability to see afterwards what changed.
 
 ---
 

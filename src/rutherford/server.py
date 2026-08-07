@@ -156,7 +156,7 @@ async def delegate(
     safety_mode: str | None = None,
     timeout_s: float | None = None,
     trust_workspace: bool = False,
-    sandbox: bool = True,
+    direct_workspace_mutation: bool = False,
     role: str | None = None,
     effort: str | None = None,
     fallback: list[Any] | None = None,
@@ -171,10 +171,12 @@ async def delegate(
     `cli` is an agent id (see `capabilities`); `model` is optional (the agent's default otherwise).
     `safety_mode` is read_only | propose | write | yolo; when omitted, the configured `default_safety_mode`
     applies (read_only out of the box). write and yolo also need a trusted workspace (`trust_workspace=true`
-    or a configured allowlist). `sandbox=false` runs a write/yolo delegation DIRECTLY in `working_dir`
-    (inherited from the server process cwd when omitted) instead of an isolated worktree/temp copy — the
-    agent edits the real tree and may run terminal commands there, no diff capture or apply-back; the
-    trusted-workspace gate still applies, and propose cannot run unsandboxed (`INVALID_INPUT`).
+    or a configured allowlist). `direct_workspace_mutation=true` asks for a write/yolo agent to edit
+    `working_dir` itself, with live terminal access there, instead of an isolated worktree/temp copy — no
+    diff is captured and nothing is applied back, so the run leaves no record of what it changed. Asking is
+    not enough: the operator must have set `allow_direct_workspace_mutation` in config, `working_dir` must
+    be explicit and on the configured `trusted_workspaces` allowlist (`trust_workspace=true` does NOT
+    qualify), and it is refused inside a delegation chain. propose cannot use it at all (`INVALID_INPUT`).
     `files` lists paths to put in scope. `role` names a persona (see
     `list_roles`) whose system prompt is prepended to `prompt`. `effort` (low | medium | high | xhigh) asks
     the agent to spend more reasoning where it has a knob (codex/cursor via the model id, cline via
@@ -203,7 +205,7 @@ async def delegate(
             safety_mode=safety_mode,
             timeout_s=timeout_s,
             trust_workspace=trust_workspace,
-            sandbox=sandbox,
+            direct_workspace_mutation=direct_workspace_mutation,
             role=role,
             effort=effort,
             fallback=fallback,

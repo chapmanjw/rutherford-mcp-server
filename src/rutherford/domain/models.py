@@ -501,13 +501,19 @@ class DelegationRequest(BaseModel):
     #: Per-call confirmation that a write/yolo delegation may mutate ``working_dir`` even when
     #: it is not on the configured trusted-workspace allowlist.
     trust_workspace: bool = False
-    #: Run the turn inside the isolated worktree / temp-copy sandbox (the default). ``False`` runs a
-    #: ``write`` / ``yolo`` delegation DIRECTLY in ``working_dir`` (inherited from the server process cwd
-    #: when omitted): the agent edits the real tree and may run terminal commands there, with no diff
-    #: capture or apply-back step. The trusted-workspace gate still applies. ``propose`` cannot run
-    #: unsandboxed (its diff is computed from the sandbox) -- ``INVALID_INPUT``; ``read_only`` already
-    #: runs direct, so the flag is a no-op there.
-    sandbox: bool = True
+    #: Ask for a ``write`` / ``yolo`` turn to edit ``working_dir`` ITSELF -- the agent mutates the real tree
+    #: and runs terminal commands in it -- instead of the isolated worktree / temp copy used by default.
+    #: There is no diff capture and no apply-back step, so the run leaves no record of what it changed.
+    #:
+    #: Naming the danger rather than negating the safety is deliberate: a ``sandbox=False`` reads as
+    #: switching off a convenience, and the reader has to already know what is lost to see the risk.
+    #:
+    #: Requesting it is never sufficient. The operator must have set ``allow_direct_workspace_mutation`` in
+    #: config, ``working_dir`` must be given explicitly and be on the configured ``trusted_workspaces``
+    #: allowlist (a per-call ``trust_workspace`` does NOT qualify), and the delegation must not be nested
+    #: inside another one. ``propose`` cannot run this way at all -- its diff IS the sandbox
+    #: (``INVALID_INPUT``) -- and ``read_only`` already runs direct, so the flag is a no-op there.
+    direct_workspace_mutation: bool = False
     #: When the requested model is unavailable, retry once with the adapter's fallback model.
     allow_model_fallback: bool = True
     #: An ordered list of alternate targets to try when the primary delegation fails on a retryable
@@ -567,6 +573,10 @@ class DelegationResult(BaseModel):
     #: ``HEAD``, so this is strictly this run's delta, not the current dirty state of a shared tree. For
     #: ``write`` / ``yolo`` these are the files applied back to the real ``working_dir``; for ``propose`` they
     #: are what the discarded worktree contained (nothing was applied). ``None`` for a read-only run.
+    #: ``True`` when this turn mutated ``working_dir`` directly instead of a sandbox, so a reader of the
+    #: result can tell that :attr:`diff` and :attr:`changed_files` are absent because nothing was captured
+    #: rather than because nothing was written. ``None`` for every ordinary run.
+    direct_mutation: bool | None = None
     changed_files: list[str] | None = None
     #: The unified diff a sandboxed mutating run produced (the worktree's ``git diff --cached --binary``, or a
     #: text diff for a non-git copy). For ``propose`` this is the deliverable -- the patch is returned and the
@@ -1278,6 +1288,11 @@ class RunRecord(BaseModel):
     adapter_version: str | None = None
     provenance: Provenance | None = None
     safety_mode: SafetyMode = SafetyMode.READ_ONLY
+    #: ``True`` when this run edited its ``cwd`` directly instead of a sandbox, so ``changed_files`` is empty
+    #: because nothing captured the change rather than because nothing was written. Recorded here as well as
+    #: logged: a log line is subject to ``log_format``, which an operator can turn off, whereas a persisted
+    #: record is the durable half of the trail.
+    direct_mutation: bool | None = None
     #: The reasoning-effort tier requested for this run, and the tier actually applied after the adapter
     #: clamped to its supported range (F8a, 2-L). ``None`` when no effort was requested or the adapter
     #: has no knob (a no-op).

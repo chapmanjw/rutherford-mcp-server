@@ -296,3 +296,85 @@ def test_init_global_is_not_blocked_by_a_broken_project_config(tmp_path: Path, m
     captured = capsys.readouterr()
     assert "scaffolding from defaults" in captured.err  # the warning, on stderr
     assert "wrote" in captured.out  # it still scaffolded the global config
+
+
+async def test_the_delegate_tool_refuses_direct_mutation_inside_a_nested_rutherford(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The nesting refusal has to survive a PROCESS boundary, which is the only way it is ever reached.
+
+    Rutherford propagates its depth to every agent it spawns via ``RUTHERFORD_DEPTH``, so an agent that is
+    itself running one of these servers is nested even though, inside that second process, nothing on the
+    call stack knows it. Passing ``base_depth=1`` to the service by hand -- which is what an earlier version
+    of this test did -- exercises the predicate while proving nothing about whether the depth ever arrives.
+    This drives the real MCP entrypoint with the environment a nested server actually inherits.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    config = RutherfordConfig(allow_direct_workspace_mutation=True, trusted_workspaces=[str(work)])
+    app = build_app_context(config=config, descriptors=DescriptorRegistry([FAKE]))
+
+    monkeypatch.setenv("RUTHERFORD_DEPTH", "1")
+    out = await delegate_tool(
+        app,
+        cli="fake",
+        prompt="x",
+        working_dir=str(work),
+        safety_mode="write",
+        direct_workspace_mutation=True,
+    )
+    assert "INVALID_INPUT" in out, "a nested server admitted an unsandboxed write"
+    assert "delegation chain" in out
+
+
+async def test_the_delegate_tool_allows_direct_mutation_at_the_top_level(tmp_path: Path, monkeypatch: Any) -> None:
+    """The other half: with no inherited depth the same call is admitted, so the test above is not vacuous."""
+    work = tmp_path / "work"
+    work.mkdir()
+    config = RutherfordConfig(allow_direct_workspace_mutation=True, trusted_workspaces=[str(work)])
+    app = build_app_context(config=config, descriptors=DescriptorRegistry([FAKE]))
+
+    monkeypatch.delenv("RUTHERFORD_DEPTH", raising=False)
+    out = await delegate_tool(
+        app,
+        cli="fake",
+        prompt="what is 17 + 25?",
+        working_dir=str(work),
+        safety_mode="write",
+        direct_workspace_mutation=True,
+    )
+    assert "INVALID_INPUT" not in out and "WORKSPACE_NOT_TRUSTED" not in out
+
+
+@pytest.mark.parametrize("garbled", ["not-a-number", "-1", ""])
+async def test_the_delegate_tool_refuses_direct_mutation_when_the_inherited_depth_is_unreadable(
+    tmp_path: Path, monkeypatch: Any, garbled: str
+) -> None:
+    """A corrupt depth must refuse, not decay to zero and hand out the privilege zero is allowed to request.
+
+    The asymmetry is the whole point. Depth 0 is the ONLY depth permitted to ask for an unsandboxed write, so
+    a reader that turns anything it cannot parse into 0 fails in the single most expensive direction
+    available to it: a garbled environment stops being a configuration problem and becomes a privilege grant.
+    An earlier version of ``current_depth`` did exactly that, and a unit test asserted it as correct.
+
+    Driven through the real MCP entrypoint rather than the helper, because the helper returning the right
+    number proves nothing about whether the tool ever asks it. This is the difference between testing the
+    predicate and testing the wiring.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    config = RutherfordConfig(allow_direct_workspace_mutation=True, trusted_workspaces=[str(work)])
+    app = build_app_context(config=config, descriptors=DescriptorRegistry([FAKE]))
+
+    monkeypatch.setenv("RUTHERFORD_DEPTH", garbled)
+    with pytest.raises(RutherfordError) as excinfo:
+        await delegate_tool(
+            app,
+            cli="fake",
+            prompt="x",
+            working_dir=str(work),
+            safety_mode="write",
+            direct_workspace_mutation=True,
+        )
+    assert excinfo.value.code is ErrorCode.INVALID_INPUT
+    assert "RUTHERFORD_DEPTH" in str(excinfo.value), "the refusal must name the variable an operator has to fix"

@@ -34,19 +34,56 @@ ENV_LINEAGE = "RUTHERFORD_LINEAGE"
 
 
 def current_depth(env: Mapping[str, str] | None = None) -> int:
-    """Read the current delegation depth from the environment (0 when unset or invalid)."""
+    """Read the current delegation depth from the environment; unset is top level, unreadable is fatal.
+
+    ABSENT and UNREADABLE are deliberately not the same answer. Nothing set the variable is the honest
+    description of a server nobody nested, so absent is 0. A value that is PRESENT but not a usable depth is
+    a different situation: something set it and we cannot tell what it meant. Returning 0 there would
+    silently promote a nested run to top level and hand it the one privilege only a top-level call may ask
+    for -- ``direct_workspace_mutation`` refuses at any depth above 0. So an unreadable value fails CLOSED,
+    and a garbled environment surfaces as a refusal instead of a quiet privilege grant.
+
+    What this does NOT do, and cannot: a caller that DELETES the variable is indistinguishable from a
+    top-level start, because the two are the same observation. Anything that spawns a nested Rutherford
+    controls that child's environment, so the depth signal is inherited-when-honest, not tamper-proof. It is
+    defence in depth against an accident, not a boundary against a hostile agent; ``docs/security.md`` says
+    so where it describes the gate, and the sandbox section explains why a mutating agent is not OS-jailed
+    in the first place. Treat this as one layer, never as the layer.
+    """
     environ = os.environ if env is None else env
     raw = environ.get(ENV_DEPTH)
     if raw is None:
         return 0
     try:
-        return max(0, int(raw))
+        depth = int(raw)
     except ValueError:
-        return 0
+        raise RutherfordError(
+            ErrorCode.INVALID_INPUT,
+            f"{ENV_DEPTH}={raw!r} is not an integer, so this run's delegation depth is unknown. Refusing "
+            "rather than assuming top level, because top level is the only depth that may request an "
+            "unsandboxed workspace mutation. Unset the variable for a genuine top-level run.",
+            details={"env_var": ENV_DEPTH, "value": raw},
+        ) from None
+    if depth < 0:
+        raise RutherfordError(
+            ErrorCode.INVALID_INPUT,
+            f"{ENV_DEPTH}={raw!r} is negative, so this run's delegation depth is unknown. Refusing rather "
+            "than clamping to top level, because clamping would turn a corrupt value into the one depth "
+            "that may request an unsandboxed workspace mutation.",
+            details={"env_var": ENV_DEPTH, "value": raw},
+        )
+    return depth
 
 
 def current_lineage_count(env: Mapping[str, str] | None = None) -> int:
-    """Read the Rutherford lineage depth from the environment (0 when unset or invalid)."""
+    """Read the Rutherford lineage depth from the environment (0 when unset or invalid).
+
+    Lenient where :func:`current_depth` is strict, and the difference is intentional rather than an
+    oversight to be tidied away later. This count feeds the ADVISORY aggregate-agent cap: it informs a
+    warning and an optional up-front refusal about panel width. It gates no privilege, so a corrupt value
+    costs an inaccurate warning. Depth gates the unsandboxed-write decision, so a corrupt value there costs
+    the decision itself. Strictness follows the consequence, not the shape of the code.
+    """
     environ = os.environ if env is None else env
     raw = environ.get(ENV_LINEAGE)
     if raw is None:

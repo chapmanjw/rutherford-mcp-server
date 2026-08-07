@@ -7,6 +7,7 @@ from __future__ import annotations
 from ..context import AppContext, tool_success
 from ..domain.enums import SafetyMode
 from ..domain.models import DelegationRequest, Target
+from ..runtime.depth import current_depth
 from .common import apply_role, ensure_known_agent
 
 
@@ -38,5 +39,5 @@ async def plan_tool(
         safety_mode=SafetyMode.READ_ONLY,
         timeout_s=timeout_s,
     )
-    result = await app.delegation.delegate(request, correlation_id=app.new_correlation_id())
+    result = await app.delegation.delegate(request, correlation_id=app.new_correlation_id(), base_depth=current_depth())
     return tool_success(result)
