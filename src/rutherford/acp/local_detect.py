@@ -145,9 +145,9 @@ def _get_json(url: str, timeout_s: float, *, data: bytes | None = None) -> Any:
     an error, so detection degrades to "no agents from here".
     """
     headers = {"Content-Type": "application/json"} if data is not None else {}
-    request = Request(url, data=data, headers=headers)
+    request = Request(url, data=data, headers=headers)  # noqa: S310 - operator-configured local backend URL
     try:
-        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:  # noqa: S310 - same URL, see above
             body = response.read()
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
         # http.client.HTTPException covers malformed-HTTP failures (IncompleteRead / BadStatusLine /

@@ -76,7 +76,7 @@ def _model_names_from_store(db_path: Path) -> list[str]:
             continue
         try:
             text = bytes(data).decode("utf-8", "replace")
-        except Exception:
+        except Exception:  # noqa: S112 - an undecodable blob is expected here; logging each would be noise
             continue
         if "modelName" not in text and "providerOptions" not in text:
             continue

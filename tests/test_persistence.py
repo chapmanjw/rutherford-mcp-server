@@ -138,7 +138,16 @@ async def test_failed_run_is_persisted_with_failed_status(tmp_path: Path) -> Non
 
 
 def _git(path: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=path, capture_output=True, text=True, check=True).stdout
+    # S603/S607: a literal `git` argv0 resolved from PATH, building a fixture repo. Kept live rather than
+    # ignored repo-wide because `just check` runs this suite on a contributor's machine.
+    completed = subprocess.run(  # noqa: S603
+        ["git", *args],  # noqa: S607 - `git` resolved from PATH
+        cwd=path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout
 
 
 def _git_repo(path: Path) -> None:

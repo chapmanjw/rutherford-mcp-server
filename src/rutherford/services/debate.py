@@ -331,7 +331,7 @@ class DebateService:
         captures the resolved roster (each seat + its latest resume handle), the round count, whether a closing
         synthesis ran, and any judge so the debate replays from ``state.json``. Runs off-thread (file I/O).
         """
-        assert self._ledger is not None  # guarded by the caller (persist + ledger present)
+        assert self._ledger is not None  # noqa: S101 - guarded by the caller (persist + ledger present); narrowing for mypy, not a runtime check
         contributions = [c for round_ in rounds for c in round_.contributions]
         clis = sorted({c.target.cli for c in contributions})
         # Each seat's latest resume handle across the rounds, recorded in the parent state.json (F8a, 2-I).

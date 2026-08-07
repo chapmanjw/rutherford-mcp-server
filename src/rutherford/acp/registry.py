@@ -227,8 +227,11 @@ def _str_tuple(value: object) -> tuple[str, ...]:
 
 def _fetch_url(url: str, timeout_s: float) -> bytes:
     """GET ``url`` with a real User-Agent and return the body bytes (raises on failure)."""
-    request = Request(url, headers={"User-Agent": _USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+    # S310: the registry URL comes from config, and `file:` is SUPPORTED on purpose -- the tests point this
+    # at a local fixture rather than the network. A caller cannot set it; an operator naming a local file in
+    # their own config is reading their own disk.
+    request = Request(url, headers={"User-Agent": _USER_AGENT})  # noqa: S310 - config-supplied; file: is intended
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:  # noqa: S310 - same URL, see above
         body: bytes = response.read()
     return body
 

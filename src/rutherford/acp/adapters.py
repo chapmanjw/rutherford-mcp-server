@@ -118,7 +118,7 @@ def _run_npm(cmd: tuple[str, ...]) -> tuple[bool, str]:
     # launch path the agent spawns use, so it cannot inject a shell or an arbitrary command.
     argv = prepare_argv(cmd)
     try:
-        completed = subprocess.run(
+        completed = subprocess.run(  # noqa: S603 - argv is `npm` plus a curated constant, never caller input
             # stdin=DEVNULL: never hand the MCP stdio pipe to a child (Windows CRT-init deadlock; see sandbox._git).
             argv,
             capture_output=True,

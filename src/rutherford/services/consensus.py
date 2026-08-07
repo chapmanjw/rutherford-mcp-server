@@ -107,7 +107,7 @@ class ConsensusService:
         self._config = config
         #: The RNG that anonymizes + shuffles each RANK ballot (F4b, 7-D). Injectable so a test can pin the
         #: shuffle with a seeded ``random.Random``; defaults to an unseeded instance in production.
-        self._rng = rng or random.Random()
+        self._rng = rng or random.Random()  # noqa: S311 - ballot shuffling is fairness, not secrecy
         #: The durable run ledger (F2) for the panel's parent record; ``None`` disables persistence. The
         #: per-voice child records are written by the delegation service as each voice runs.
         self._ledger = ledger
@@ -327,7 +327,7 @@ class ConsensusService:
         from here. Best-effort: a write failure returns ``None`` and the panel keeps its answer. Runs
         off-thread (file I/O) via :meth:`_consensus_impl`.
         """
-        assert self._ledger is not None  # guarded by the caller (parent_run_id set only when ledger present)
+        assert self._ledger is not None  # noqa: S101 - guarded by the caller (parent_run_id set only when ledger present); narrowing for mypy, not a runtime check
         panel_voices = [_panel_voice(voice) for voice in voices]
         skipped_pairs = [(entry.cli, entry.reason) for entry in skipped]
         panel_inputs = PanelInputs(

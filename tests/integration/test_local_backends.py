@@ -47,7 +47,7 @@ _LMSTUDIO_MODEL = "openai/gpt-oss-20b"
 def _runtime_up(url: str) -> bool:
     """Whether a local runtime answers its model-list endpoint within a short probe (else skip its cases)."""
     try:
-        with urllib.request.urlopen(url, timeout=1.5) as response:
+        with urllib.request.urlopen(url, timeout=1.5) as response:  # noqa: S310 - local backend probe
             return bool(response.status == 200)
     except (urllib.error.URLError, OSError):
         return False

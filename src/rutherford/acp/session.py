@@ -442,7 +442,7 @@ class ACPSession:
         the requested one. SAFE re-execution: the resume is pre-prompt, with no side effect or cost.
         """
         resume_id = self._resume_session_id
-        assert resume_id is not None  # guarded by the caller (only taken when a resume id is set)
+        assert resume_id is not None  # noqa: S101 - guarded by the caller (only taken when a resume id is set); narrowing for mypy, not a runtime check
         caps = init.agent_capabilities
         if caps is None or not caps.load_session:
             await self.close()
@@ -521,7 +521,7 @@ class ACPSession:
             return
         # * Prefer the verifiable config-option channel whenever it advertises the target.
         if in_config:
-            assert found is not None  # narrowed by in_config
+            assert found is not None  # noqa: S101 - narrowed by in_config; narrowing for mypy, not a runtime check
             config_id, current, _values = found
             if current == model:
                 self._selected_model = model

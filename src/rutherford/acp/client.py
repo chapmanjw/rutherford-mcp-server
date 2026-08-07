@@ -225,7 +225,10 @@ class TerminalBroker:
         for var in env or []:
             child_env[var.name] = var.value
         try:
-            process = subprocess.Popen(  # noqa: ASYNC220 - long-lived process drained off-thread, not awaited
+            # S603: argv comes from the closed descriptor registry plus operator config, never from the model
+            # driving the tool. An operator who writes a hostile `command` in their own config has already
+            # chosen to run it; nothing here can or should second-guess that.
+            process = subprocess.Popen(  # noqa: S603, ASYNC220 - long-lived process drained off-thread
                 argv,
                 cwd=str(self._root),
                 env=child_env,

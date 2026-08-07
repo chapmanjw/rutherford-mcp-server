@@ -103,13 +103,26 @@ select = [
     "PTH",  # flake8-use-pathlib
     "RUF",  # ruff-specific
     "ASYNC",# flake8-async
+    # flake8-bandit. This package spawns other programs, resolves executables from PATH, and fetches URLs
+    # named in config -- the exact surface these rules watch, and a surface most libraries never have. It
+    # currently reports nothing that is a defect, which is the point: the value is that the NEXT subprocess
+    # call or URL sink cannot be added silently. Each one has to carry a `noqa` with a reason, and that
+    # annotation is a beacon a reviewer sees. Tests are held to the same standard, because `just check` runs
+    # them on a contributor's machine -- a hostile test in a pull request attacks whoever reviews it.
+    # Ruff implements 73 of bandit's rules and runs in the lint pass already here. Standalone bandit adds
+    # dataflow-sensitive analysis on top; that gap is a DELIBERATE deferral, not an oversight. Revisit it
+    # only if something is found that this misses, never speculatively -- a second tool is a second
+    # dependency, config, gate stage and triage stream.
+    "S",
 ]
 ignore = [
     "N818", # exception names need not end in "Error" (RutherfordError already does)
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["B011"]
+# S101 (`assert`) only. A pytest suite IS assertions -- 2,111 of them here -- and `assert` is not an attack
+# vector, so the rule is pure noise in tests. Every other security rule stays live in tests deliberately.
+"tests/**/*.py" = ["B011", "S101"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["rutherford"]

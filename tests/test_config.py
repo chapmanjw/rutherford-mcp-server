@@ -91,7 +91,8 @@ def test_env_overrides(tmp_path: Path) -> None:
 
 def test_global_config_path_and_deep_merge() -> None:
     assert "rutherford" in str(default_global_config_path({"APPDATA": "C:/x"}))
-    assert "rutherford" in str(default_global_config_path({"XDG_CONFIG_HOME": "/tmp"}))
+    # S108: "/tmp" here is DATA -- a fake XDG value fed to the path resolver. Nothing is created there.
+    assert "rutherford" in str(default_global_config_path({"XDG_CONFIG_HOME": "/tmp"}))  # noqa: S108
     merged = deep_merge({"a": {"b": 1}}, {"a": {"c": 2}, "d": 3})
     assert merged == {"a": {"b": 1, "c": 2}, "d": 3}
 

@@ -35,7 +35,16 @@ def _service(config: RutherfordConfig | None = None) -> DelegationService:
 
 def _git(path: Path, *args: str) -> str:
     """Run a git command in ``path`` (a sync helper, so async tests do not trip the blocking-call lint)."""
-    return subprocess.run(["git", *args], cwd=path, capture_output=True, text=True, check=True).stdout
+    # S603/S607: a literal `git` argv0 resolved from PATH, building a fixture repo. Kept live rather than
+    # ignored repo-wide because `just check` runs this suite on a contributor's machine.
+    completed = subprocess.run(  # noqa: S603
+        ["git", *args],  # noqa: S607 - `git` resolved from PATH
+        cwd=path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout
 
 
 def _git_repo(path: Path) -> None:
@@ -304,12 +313,24 @@ def test_sandbox_worktree_is_created_and_cleaned_up(tmp_path: Path) -> None:
         return any(form in stdout or form in stdout.replace("/", "\\") for form in root_forms)
 
     # git knows about the worktree while it is live.
-    listed = subprocess.run(["git", "worktree", "list"], cwd=tmp_path, capture_output=True, text=True, check=True)
+    listed = subprocess.run(
+        ["git", "worktree", "list"],  # noqa: S607 - `git` resolved from PATH
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     assert _listed(listed.stdout), f"git worktree list did not show the sandbox worktree {root}:\n{listed.stdout}"
     sandbox.cleanup()
     assert not root.exists(), "the worktree dir survived cleanup"
     # The repo no longer lists the removed worktree.
-    after = subprocess.run(["git", "worktree", "list"], cwd=tmp_path, capture_output=True, text=True, check=True)
+    after = subprocess.run(
+        ["git", "worktree", "list"],  # noqa: S607 - `git` resolved from PATH
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     assert not _listed(after.stdout), "git still lists the removed worktree"
 
 
@@ -441,7 +462,7 @@ def test_non_git_copy_diff_lists_created_and_edited(tmp_path: Path) -> None:
 
 def test_git_repo_with_no_commit_falls_back_to_copy(tmp_path: Path) -> None:
     """A git repo with no commit yet (no HEAD) cannot host a worktree, so the copy strategy is used."""
-    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S607 - literal git argv
     (tmp_path / "wip.txt").write_text("work in progress\n", encoding="utf-8")
     manager = SandboxManager()
     sandbox = manager.open(str(tmp_path))

@@ -460,7 +460,7 @@ class SandboxManager:
         prefix = ["-c", "core.autocrlf=false"] if force_no_autocrlf else []
         cmd = ["git", *prefix, "-C", str(cwd), *args]
         try:
-            completed = subprocess.run(
+            completed = subprocess.run(  # noqa: S603 - fixed `git` argv0 plus internal subcommands, no shell
                 cmd,
                 capture_output=True,
                 text=True,

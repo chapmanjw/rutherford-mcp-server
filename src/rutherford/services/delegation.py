@@ -870,8 +870,8 @@ def _git_read(working_dir: str, *args: str) -> str | None:
     ``verify_read_only`` fingerprint degrades to "could not check" rather than failing a clean delegation.
     """
     try:
-        completed = subprocess.run(
-            ["git", "-C", working_dir, *args],
+        completed = subprocess.run(  # noqa: S603 - fixed `git` argv0; `args` are internal, `working_dir` is vetted
+            ["git", "-C", working_dir, *args],  # noqa: S607 - `git` from PATH is deliberate; see docs/security.md
             capture_output=True,
             text=True,
             timeout=_FINGERPRINT_TIMEOUT_S,

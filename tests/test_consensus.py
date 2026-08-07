@@ -433,7 +433,13 @@ def _rank_service(seed: int, config: RutherfordConfig | None = None, *, extra_de
 
     resolved = config or RutherfordConfig()
     registry = _registry([DEAD] if extra_dead else None)
-    return ConsensusService(DelegationService(registry, resolved), registry, resolved, rng=random.Random(seed))
+    # S311: a SEEDED RNG is the point -- it pins the ballot shuffle so the test is deterministic.
+    return ConsensusService(
+        DelegationService(registry, resolved),
+        registry,
+        resolved,
+        rng=random.Random(seed),  # noqa: S311
+    )
 
 
 def _rank_request() -> ConsensusRequest:

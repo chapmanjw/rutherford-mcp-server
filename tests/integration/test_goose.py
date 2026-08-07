@@ -414,7 +414,16 @@ async def test_goose_plan_live() -> None:
 
 def _git(path: Path, *args: str) -> str:
     """Run a git command in ``path`` (a sync helper, so async tests do not trip the blocking-call lint)."""
-    return subprocess.run(["git", *args], cwd=path, capture_output=True, text=True, check=True).stdout
+    # S603/S607: a literal `git` argv0 resolved from PATH, building a fixture repo. Kept live rather than
+    # ignored repo-wide because `just check` runs this suite on a contributor's machine.
+    completed = subprocess.run(  # noqa: S603
+        ["git", *args],  # noqa: S607 - `git` resolved from PATH
+        cwd=path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout
 
 
 def _temp_git_repo(path: Path) -> None:
