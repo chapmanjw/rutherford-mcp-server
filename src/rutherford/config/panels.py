@@ -270,7 +270,7 @@ def _parse_panel(
     return panel, []
 
 
-def _parse_target(
+def _parse_target(  # noqa: C901 - one parser for every accepted seat spelling
     panel: str,
     index: int,
     raw: Any,

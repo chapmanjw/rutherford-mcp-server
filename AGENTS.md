@@ -51,6 +51,16 @@ machine and is worthless committed.
 Recommended pre-push flow: `just check`, then `just test-integration` for whatever agents the
 machine has installed and authenticated.
 
+There is an optional pre-push hook that refuses a push whose commits have no fresh, passing report from a
+clean tree. It reads the report rather than running the gate, so it costs milliseconds. Enable it once per
+clone; it is off until you do, because hooks are not version-controlled:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+It is a reminder, not a boundary -- `git push --no-verify` skips it.
+
 ## Architecture
 
 Rutherford is a stdio MCP server that orchestrates other agentic coding agents over the

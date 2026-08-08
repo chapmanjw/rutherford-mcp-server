@@ -14,6 +14,9 @@ concurrency:
 jobs:
   publish-pypi:
     runs-on: ubuntu-latest
+    # Bound a hang. This workflow sets cancel-in-progress: false, so a wedged run holds the release
+    # concurrency group and blocks every later release behind it until a human intervenes.
+    timeout-minutes: 25
     environment:
       name: pypi # must match the PyPI trusted-publisher environment for the OIDC claim to match
       url: https://pypi.org/p/rutherford-mcp-server
@@ -60,6 +63,7 @@ jobs:
   github-release:
     needs: [publish-pypi]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write # create the release
     steps:

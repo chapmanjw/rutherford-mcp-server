@@ -69,6 +69,9 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "types-psutil>=7",
+    # Only the integration suite can hang: it drives real agents over stdio, which is where the
+    # stdin-inheritance deadlock lived. The unit suite is hermetic by design and needs nothing.
+    "pytest-timeout>=2.3",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -114,6 +117,13 @@ select = [
     # only if something is found that this misses, never speculatively -- a second tool is a second
     # dependency, config, gate stage and triage stream.
     "S",
+    # Complexity, judged per FUNCTION rather than per file. A file-length cap was considered and rejected:
+    # it fires on six cohesive core modules the day it lands, and length is a poor proxy anyway -- a long
+    # run of related model definitions reads better than a short function with deep nesting. These target
+    # the thing that actually costs a reader. The functions above the bar today are annotated individually,
+    # so each exception is visible and a NEW one has to be argued for rather than absorbed.
+    "C901",     # mccabe cyclomatic complexity
+    "PLR0915",  # too many statements
 ]
 ignore = [
     "N818", # exception names need not end in "Error" (RutherfordError already does)

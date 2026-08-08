@@ -416,7 +416,7 @@ def _find_multiline_close(line: str, delim: str, start: int) -> int:
     return -1
 
 
-def _scan_brackets(line: str, in_multiline: str | None = None) -> tuple[int, str | None]:
+def _scan_brackets(line: str, in_multiline: str | None = None) -> tuple[int, str | None]:  # noqa: C901 - a scanner
     """Net ``[`` minus ``]`` over one line, counting only brackets that are real array structure.
 
     Returns ``(delta, still_open)``, where ``still_open`` is the delimiter of a multi-line string this

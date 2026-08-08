@@ -170,7 +170,7 @@ class DelegationService:
         """Seconds until ``agent_id``'s cooldown bench lifts (``0.0`` when not benched), for the skip reason."""
         return self._cooldown.remaining_s(agent_id)
 
-    async def delegate(
+    async def delegate(  # noqa: C901 - the guard ladder every delegation passes through, in order
         self,
         req: DelegationRequest,
         *,

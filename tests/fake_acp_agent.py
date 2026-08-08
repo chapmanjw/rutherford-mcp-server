@@ -421,7 +421,7 @@ class FakeAgent:
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         return None
 
-    async def prompt(
+    async def prompt(  # noqa: C901 - the fake agent's scripted-behaviour switch; complexity IS the fixture
         self, prompt: list[Any], session_id: str, message_id: str | None = None, **kwargs: Any
     ) -> PromptResponse:
         text = "\n".join(_block_text(block) for block in prompt)

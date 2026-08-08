@@ -277,7 +277,7 @@ class CompoundModelId:
 _BOOLEAN_PARAM_VALUES = frozenset({"true", "false"})
 
 
-def parse_compound_model_id(model_id: str) -> CompoundModelId | None:
+def parse_compound_model_id(model_id: str) -> CompoundModelId | None:  # noqa: C901 - one parse, many shapes
     """Parse a bare or bracketed compound model id; ``None`` when malformed (fail closed).
 
     Accepts ``base`` or ``base[k=v,k2=v2]``. Rejects empty base, unclosed / nested brackets, empty

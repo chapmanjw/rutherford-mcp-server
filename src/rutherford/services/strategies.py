@@ -98,7 +98,7 @@ def _normalize(token: str) -> str:
     return token.strip().lower()
 
 
-def aggregate(
+def aggregate(  # noqa: C901 - dispatch over every aggregation strategy
     strategy: Strategy,
     voices: list[VoiceVerdict],
     *,

@@ -117,7 +117,7 @@ class DebateService:
             lifecycle.on_cancel()
             raise
 
-    async def _debate_impl(
+    async def _debate_impl(  # noqa: C901, PLR0915 - the round loop, judging and persistence in one flow
         self,
         req: DebateRequest,
         lifecycle: PanelLifecycle,

@@ -19,6 +19,14 @@ jobs:
   verify:
     name: ${{ matrix.os }} / py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
+    # A bound on a HUNG job, not a performance target. The default is six hours, so one wedged run burns
+    # that on every matrix cell before GitHub reclaims it -- and shows a spinner the whole time, which reads
+    # as "still working" rather than "already dead". This project has form here: tests/conftest.py documents
+    # a Windows ProactorEventLoop teardown that hangs forever on 3.11/3.12, and the subprocess deadlock in
+    # the stdin-inheritance fix was the same shape. The slowest cell is around five minutes, so this is
+    # roughly five times headroom: late enough never to fire on a slow runner, early enough that a hang
+    # costs minutes.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:

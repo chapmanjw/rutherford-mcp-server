@@ -1,0 +1,71 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 John Chapman
+#
+# Refuse a push whose commits have no fresh, passing gate report.
+#
+# This CHECKS that the gate ran; it does not run it. The gate takes about five minutes, dominated by the
+# test suite, and a hook that costs five minutes per push is a hook people disable. Reading the report the
+# gate already wrote costs milliseconds, and answers the only question worth asking at push time: did this
+# exact commit pass, from a clean tree?
+#
+# Pre-push rather than pre-commit, deliberately. During pre-commit HEAD is still the PREVIOUS commit and the
+# content being committed lives in the index, so a report keyed to HEAD would prove the parent passed, not
+# the thing being committed. At push time the commits exist and the SHA being sent is a real thing to
+# compare against. It also keeps commits cheap: checkpoint often, verify once, at the boundary where work
+# leaves the machine.
+#
+# Not a security control. `git push --no-verify` skips it, and that is fine -- it is a reminder for the
+# times you meant to run the gate and forgot, not a boundary against someone who did not want to.
+#
+# ENABLE (once per clone; hooks are not version-controlled by default):
+#     git config core.hooksPath .githooks
+
+set -eu
+
+REPORT=".tmp/gate-report.toon"
+RED=""
+RESET=""
+if [ -t 2 ]; then RED="$(printf '\033[31m')"; RESET="$(printf '\033[0m')"; fi
+
+refuse() {
+    printf '%spre-push: %s%s\n' "$RED" "$1" "$RESET" >&2
+    printf 'Run `just check` (or `uv run python scripts/gate.py`), then push again.\n' >&2
+    printf 'To push anyway: git push --no-verify\n' >&2
+    exit 1
+}
+
+[ -f "$REPORT" ] || refuse "no gate report at $REPORT."
+
+# The report is one key per line plus a CSV-ish stage table; these three keys are all this needs.
+report_value() { sed -n "s/^$1: //p" "$REPORT" | head -1; }
+
+verdict="$(report_value verdict)"
+dirty="$(report_value dirty)"
+reported_head="$(report_value head)"
+
+[ "$verdict" = "pass" ] || refuse "the last gate run reported '${verdict:-nothing}', not 'pass'."
+[ "$dirty" = "false" ] || refuse "the last gate ran against a dirty tree, so it does not describe any commit."
+
+# stdin gives "<local ref> <local sha> <remote ref> <remote sha>" per ref being pushed. Every commit being
+# sent has to be one the report covers; in practice that means the report's head must be among them.
+matched=0
+commits=0
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+    # An all-zero local sha is a branch DELETION. It sends no commits, so there is nothing for a gate to
+    # have verified, and refusing it would block ordinary branch cleanup for no benefit.
+    [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue
+    commits=$((commits + 1))
+    [ "$local_sha" = "$reported_head" ] && matched=1
+done
+
+if [ "$commits" -eq 0 ]; then
+    exit 0
+fi
+
+if [ "$matched" -ne 1 ]; then
+    refuse "the gate report is for ${reported_head:-an unknown commit}, which is not what is being pushed."
+fi
+
+printf 'pre-push: gate report is fresh and passing for %s.\n' "$(echo "$reported_head" | cut -c1-7)" >&2
+exit 0

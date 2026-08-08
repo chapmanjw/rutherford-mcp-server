@@ -467,7 +467,7 @@ class ACPSession:
         self._session_id = resume_id
         return session
 
-    async def _select_model(
+    async def _select_model(  # noqa: C901 - two model channels plus their fallbacks, enumerated once
         self, conn: ClientSideConnection, session: NewSessionResponse | LoadSessionResponse
     ) -> None:
         """Select or validate the effective model across ACP channels.

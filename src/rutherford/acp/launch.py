@@ -25,7 +25,7 @@ _POWERSHELL = ("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-F
 _QUOTED = re.compile(r'"([^"]+)"')
 
 
-def prepare_argv(argv: tuple[str, ...]) -> list[str]:
+def prepare_argv(argv: tuple[str, ...]) -> list[str]:  # noqa: C901 - per-platform launch cases, each distinct
     """Resolve ``argv`` to a launchable command list for the current platform."""
     if not argv:
         return []
@@ -63,7 +63,7 @@ def prepare_argv(argv: tuple[str, ...]) -> list[str]:
     return [resolved, *rest]
 
 
-def _resolve_npm_shim(shim: Path) -> list[str] | None:
+def _resolve_npm_shim(shim: Path) -> list[str] | None:  # noqa: C901 - Windows shim shapes, enumerated
     """Parse an npm ``.cmd`` / ``.ps1`` shim for its real target: ``[exe]`` or ``[node, script.js]``.
 
     Returns ``None`` for a non-npm shim (no ``node_modules`` reference) so a JetBrains-style ``.bat`` etc.
