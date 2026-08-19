@@ -387,7 +387,22 @@ class RutherfordACPClient:
             Path(target).parent.mkdir(parents=True, exist_ok=True)
             Path(target).write_text(content, encoding="utf-8")
 
-        await asyncio.to_thread(_write)
+        # * Wrap the OSError exactly as read_text_file does above, for a reason that only became
+        # load-bearing with ACP SDK 0.12. Its request dispatch catches RequestError first and re-raises it
+        # WITHOUT logging; anything else falls to a branch that now calls logging.exception (0.11 converted
+        # it to a JSON-RPC internal error silently). So a bare OSError here became a traceback -- and the SDK
+        # logs through the ROOT logger, whose first record installs a synchronous stderr handler via
+        # basicConfig, so it is written from the event loop thread. Worse, an OSError's str() carries the
+        # filename it failed on, which is `target`: the RESOLVED absolute sandbox path, not the relative one
+        # the agent asked for. A path component that exists as a regular file is enough to trigger it --
+        # mkdir(exist_ok=True) re-raises when the entry is not a directory. Raising RequestError keeps the
+        # failure a clean protocol error the agent can act on and keeps the absolute path out of the log
+        # entirely. Deliberately NOT journaled: fs_write_denied means the policy refused, and a failed write
+        # is not a refusal -- read_text_file draws the same line.
+        try:
+            await asyncio.to_thread(_write)
+        except OSError as exc:
+            raise RequestError(_DECLINED, f"could not write {path}: {exc}") from exc
         self.journal.append(JournalEvent(kind="fs_write", detail=path))
         return None
 

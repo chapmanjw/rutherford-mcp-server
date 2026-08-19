@@ -384,29 +384,40 @@ class ACPSession:
                     f"ACP handshake with {self._descriptor.id} failed: {exc}",
                     ReexecutionSafety.SAFE,
                 ) from exc
-            # Resume a prior session (session/load) when asked, else create a fresh one (session/new). The
-            # resume path is gated on the agent's advertised loadSession capability and fails RESUME_FAILED if
-            # unsupported.
-            session: NewSessionResponse | LoadSessionResponse
-            if self._resume_session_id is not None:
-                session = await self._resume(conn, init)
-            else:
-                session = await self._new_session(conn)
-            # * Legacy SessionModelState (session.models) is optional: ACP SDK 0.11+ removes the field; access
-            # only via defensive helpers so a config-only response never AttributeErrors before launch validation.
-            self._available_models = _models_of(session)
-            self._config_options = list(getattr(session, "config_options", None) or [])
-            # Capture the SECOND model channel (a configOptions "model" select option) so available_models can
-            # report the union -- claude_code's adapter advertises its models here, not in SessionModelState.
-            model_option = _model_config_option(self._config_options)
-            self._config_model_values = list(model_option[2]) if model_option is not None else []
-            # Model / effort selection runs AFTER the agent process is spawned and can raise ACPHandshakeError
-            # (e.g. MODEL_UNAVAILABLE for an unadvertised model). open() is entered via ``async with`` in
-            # run_acp_turn, so Python skips ``__aexit__`` when open() raises -- tear the agent down here before
-            # propagating, or the spawned process leaks just as an unguarded handshake read would. The earlier
-            # initialize / _new_session / _resume steps already close on their own faults; this guards the
-            # post-session-open steps, which under the confirmed-selection contract are no longer best-effort.
+            # Everything below runs with the agent process ALREADY spawned and registered on the exit stack,
+            # and open() is entered via ``async with`` in run_acp_turn -- Python skips ``__aexit__`` when
+            # ``__aenter__`` raises, so ANY exception escaping here without a teardown orphans that process tree
+            # with nothing left holding a reference to it. The guard is therefore structural rather than
+            # per-call-site: it covers the session RPC, the plain reads of what that RPC returned, and model /
+            # effort selection, so a post-handshake step added here later inherits the teardown instead of
+            # having to remember it. ``_new_session`` / ``_resume`` still close on the faults they RAISE and
+            # that stays as the first line of defence -- ``close`` is idempotent (it awaits one instance-owned
+            # teardown task), so the redundancy costs nothing -- but a helper can only guard the failures it
+            # raises, never the ones that happen while READING what it returned. That gap is exactly what let a
+            # capability blob the ACP SDK had salvaged into a raw dict AttributeError straight out of open()
+            # with the adapter still running.
             try:
+                # Resume a prior session (session/load) when asked, else create a fresh one (session/new). The
+                # resume path is gated on the agent's advertised loadSession capability and fails RESUME_FAILED
+                # if unsupported.
+                session: NewSessionResponse | LoadSessionResponse
+                if self._resume_session_id is not None:
+                    session = await self._resume(conn, init)
+                else:
+                    session = await self._new_session(conn)
+                # * Legacy SessionModelState (session.models) is optional: ACP SDK 0.11+ removes the field;
+                # access only via defensive helpers so a config-only response never AttributeErrors before
+                # launch validation.
+                self._available_models = _models_of(session)
+                self._config_options = list(getattr(session, "config_options", None) or [])
+                # Capture the SECOND model channel (a configOptions "model" select option) so available_models
+                # can report the union -- claude_code's adapter advertises its models here, not in
+                # SessionModelState.
+                model_option = _model_config_option(self._config_options)
+                self._config_model_values = list(model_option[2]) if model_option is not None else []
+                # Model / effort selection can raise ACPHandshakeError (e.g. MODEL_UNAVAILABLE for a model the
+                # agent advertises on no channel); under the confirmed-selection contract those fail the open
+                # rather than degrading it quietly.
                 await self._select_model(conn, session)
                 await self._select_effort(conn)
             except Exception:
@@ -440,16 +451,31 @@ class ACPSession:
         persist and reload its own sessions cannot resume, so a resume against it is a clean ``RESUME_FAILED``
         rather than a silent fresh session. ``session/load`` does not mint a new id -- the loaded session keeps
         the requested one. SAFE re-execution: the resume is pre-prompt, with no side effect or cost.
+
+        The capability is read through :func:`_load_session_capability`, never off the response attribute: ACP
+        0.12 salvages a malformed ``agentCapabilities`` into a raw dict instead of failing the payload, so the
+        attribute's declared type no longer describes what is there. An unreadable blob refuses the resume with
+        its own wording -- it is not the same fact as an agent that answered and said it cannot reload, and an
+        operator debugging one should not be told the other.
         """
         resume_id = self._resume_session_id
         assert resume_id is not None  # noqa: S101 - guarded by the caller (only taken when a resume id is set); narrowing for mypy, not a runtime check
-        caps = init.agent_capabilities
-        if caps is None or not caps.load_session:
+        advertised = _load_session_capability(init)
+        if advertised is not True:
             await self.close()
+            if advertised is False:
+                detail = (
+                    "it does not advertise the ACP loadSession capability (it does not persist sessions for reload)"
+                )
+            else:
+                detail = (
+                    "its initialize response carried a malformed agentCapabilities blob (ACP 0.12 salvages one "
+                    "into all-false defaults instead of failing the handshake), so no loadSession "
+                    "advertisement could be read"
+                )
             raise ACPHandshakeError(
                 ErrorCode.RESUME_FAILED,
-                f"{self._descriptor.id} cannot resume a session: it does not advertise the ACP loadSession "
-                "capability (it does not persist sessions for reload)",
+                f"{self._descriptor.id} cannot resume a session: {detail}",
                 ReexecutionSafety.SAFE,
             )
         try:
@@ -1045,6 +1071,44 @@ def _launch_model_advertised(model: str, advertised: list[str]) -> bool:
     return any(launch_advertisement_compatible(model, item) for item in advertised)
 
 
+def _load_session_capability(init: object) -> bool | None:
+    """Whether the agent advertised the ACP ``loadSession`` capability, or ``None`` when that cannot be read.
+
+    Never touch ``InitializeResponse.agent_capabilities`` directly. Its ``AgentCapabilities | None`` annotation
+    stopped being a guarantee in ACP SDK 0.12, which made deserialization lenient: the field carries a
+    salvage-on-error wrap validator whose fallback substitutes a RAW DICT of all-false capability defaults when
+    an agent sends a blob that fails validation, where 0.11 rejected the whole payload. A wrap validator's
+    return value is not re-validated, so at runtime the attribute really is a ``dict`` while a type checker
+    still reads the annotation and sees a model -- it cannot catch the ``caps.load_session`` AttributeError
+    that follows, and neither can a test whose fake agent only ever builds a well-formed response.
+
+    That AttributeError is not merely an ugly error. It is raised after the agent subprocess is spawned and
+    from inside ``__aenter__``, which Python answers by skipping ``__aexit__`` -- the orphaned-process class
+    this module's teardown exists to prevent. So the capability gets the same discipline :func:`_models_of`
+    applies to the legacy ``session.models`` channel, for the same reason: an SDK-typed field whose value an
+    agent controls is untrusted input, and this codebase reads untrusted input through a helper.
+
+    Three outcomes, kept distinct so the caller can say WHY a resume was refused. ``True``: advertised.
+    ``False``: the agent answered and the answer was no (including a well-formed response that omits
+    capabilities entirely -- omitting an advertisement is a plain "no"). ``None``: nothing could be read.
+
+    A ``dict`` is reported unreadable rather than mined for a ``loadSession`` key, and that is deliberate
+    rather than lazy. Measured against the 0.12.0 wheel, the attribute is only ever a ``dict`` when the whole
+    field failed validation, and the fallback the SDK substitutes is a hard-coded literal -- so its
+    ``loadSession`` is always ``False`` no matter what the agent sent. A mapping the agent actually supplied
+    still coerces to a real ``AgentCapabilities``, salvaging per-field. Reading the dict would therefore report
+    the SDK's placeholder as the agent's own answer, telling an operator their agent cannot reload sessions
+    when the truth is that it is emitting invalid protocol.
+    """
+    caps = getattr(init, "agent_capabilities", None)
+    if caps is None:
+        return False
+    if isinstance(caps, dict):
+        return None
+    advertised = getattr(caps, "load_session", None)
+    return advertised if isinstance(advertised, bool) else None
+
+
 def _config_option_current_equals(response: object, config_id: str, model: str) -> bool:
     """Whether a ``set_config_option`` response confirms ``config_id``'s ``current_value`` equals ``model``."""
     options = getattr(response, "config_options", None)
@@ -1127,6 +1191,29 @@ def _parse_model_option(option: object) -> tuple[str, str | None, list[str]] | N
     return config_id, (current if isinstance(current, str) else None), selectable
 
 
+_NON_MODEL_CATEGORIES = frozenset({"mode", "model_config", "thought_level"})
+
+
+def _option_category(option: object) -> str | None:
+    """This config option's semantic ACP category as a plain string, or ``None`` when it carries none we can read.
+
+    ACP's own ``SessionConfigOptionCategory`` is a closed-ish set of STRINGS -- ``mode`` / ``model`` /
+    ``model_config`` / ``thought_level``, plus any other string (names not starting with ``_`` are reserved
+    for the spec, ``_``-prefixed ones are free for vendor use). There is no object form of a category on the
+    wire in any published schema version. The ACP SDK 0.12.0 nonetheless generates the field as
+    ``Optional[Union[str, Dict[str, Any]]]`` -- a code-generation artifact of that multi-variant ``anyOf``,
+    not a protocol change -- so from 0.12.0 on, a malformed object-valued ``category`` PARSES into a raw dict
+    where 0.11.0's ``Optional[str]`` rejected the whole payload and raised it as a loud ACP_HANDSHAKE_FAILED.
+    Comparing that dict against a category name would just evaluate False, which is the silent-mismatch shape
+    this codebase refuses: the reader cannot tell a deliberate "no match" from an unhandled type. So narrow to
+    ``str`` here, once, and report anything else as UNTAGGED -- which is also what the spec demands of us, in
+    its own words: a category "MUST NOT be required for correctness. Clients MUST handle missing or unknown
+    categories gracefully."
+    """
+    category = getattr(option, "category", None)
+    return category if isinstance(category, str) else None
+
+
 def _model_config_option(options: list[object]) -> tuple[str, str | None, list[str]] | None:
     """The advertised model SELECT config option as ``(config_id, current_value, selectable_values)``, or ``None``.
 
@@ -1136,16 +1223,24 @@ def _model_config_option(options: list[object]) -> tuple[str, str | None, list[s
     like ``default`` / ``sonnet`` / ``haiku``). A semantic ``category == "model"`` option is AUTHORITATIVE; only
     when none is advertised does a literal ``id == "model"`` option serve as the fallback -- two passes so the
     advertised ORDER cannot let the id fallback win over a category-tagged option (a UX category is optional, so
-    the id is the fallback, not a co-equal match).
+    the id is the fallback, not a co-equal match). The category is authoritative in BOTH directions: an option
+    the agent explicitly tagged with a spec-reserved category naming a *different* channel (``mode``,
+    ``model_config``, ``thought_level``) is disqualified from the id fallback, so a mode selector that happens
+    to be keyed ``model`` cannot be driven as the model channel. Unknown and ``_``-prefixed vendor categories
+    are deliberately NOT disqualifying -- the spec reserves those for custom use, and an agent is free to put
+    one on its genuine model selector, so those still reach the id fallback.
     """
     for option in options:
-        if getattr(option, "category", None) == "model":
+        if _option_category(option) == "model":
             parsed = _parse_model_option(option)
             if parsed is not None:
                 return parsed
     for option in options:
-        if getattr(option, "id", None) == "model":
-            parsed = _parse_model_option(option)
-            if parsed is not None:
-                return parsed
+        if getattr(option, "id", None) != "model":
+            continue
+        if _option_category(option) in _NON_MODEL_CATEGORIES:
+            continue  # a spec-reserved category naming a DIFFERENT channel outranks a coincidental id
+        parsed = _parse_model_option(option)
+        if parsed is not None:
+            return parsed
     return None

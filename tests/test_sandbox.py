@@ -905,3 +905,63 @@ def test_copy_tree_does_not_leak_a_temp_dir_on_a_build_failure(tmp_path: Path, m
     assert created, "expected the sandbox build to create a temp dir before failing"
     leaked = [path for path in created if path.exists()]
     assert not leaked, f"a temp sandbox dir leaked on a build failure: {leaked}"
+
+
+async def test_a_failed_write_is_a_protocol_error_not_a_bare_oserror(tmp_path: Path) -> None:
+    """A write that fails on disk must surface as RequestError, so no absolute sandbox path reaches a log.
+
+    From ACP SDK 0.12, the SDK's request dispatch calls ``logging.exception`` on anything that is not a
+    ``RequestError`` (0.11 converted it to a JSON-RPC internal error and logged nothing), and it logs through
+    the root logger. An ``OSError`` escaping here would therefore be formatted as a traceback whose message
+    carries the CONFINED path -- resolved and absolute, not the relative path the agent asked for -- and
+    written synchronously from the event loop thread. ``RequestError`` is caught first by the SDK and
+    re-raised without logging, so the wrap is what keeps both properties.
+
+    The failure is provoked without any permission games: a path component that already exists as a regular
+    file makes ``mkdir(parents=True, exist_ok=True)`` re-raise, identically on Windows and POSIX.
+    """
+    from acp import RequestError
+
+    from rutherford.acp.client import RutherfordACPClient
+    from rutherford.acp.journal import EventJournal
+
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "blocker").write_text("a regular file where a directory would have to go", encoding="utf-8")
+    journal = EventJournal()
+    client = RutherfordACPClient(
+        journal=journal,
+        policy=PermissionPolicy(SafetyMode.WRITE, sandboxed=True),
+        cwd=str(root),
+        sandbox_root=str(root),
+    )
+
+    with pytest.raises(RequestError) as excinfo:
+        await client.write_text_file(session_id="s", path="blocker/child.txt", content="never lands")
+
+    assert "could not write blocker/child.txt" in str(excinfo.value)
+    # The resolved sandbox root must not appear in what the SDK would have turned into a logged traceback.
+    assert str(root) not in str(excinfo.value.data or "")
+    # A failed write is not a refusal: fs_write_denied stays reserved for the policy declining.
+    assert journal.kinds() == []
+
+
+async def test_a_successful_sandboxed_write_still_journals_fs_write(tmp_path: Path) -> None:
+    """The OSError wrap must not disturb the happy path: the file lands and the journal records one write."""
+    from rutherford.acp.client import RutherfordACPClient
+    from rutherford.acp.journal import EventJournal
+
+    root = tmp_path / "root"
+    root.mkdir()
+    journal = EventJournal()
+    client = RutherfordACPClient(
+        journal=journal,
+        policy=PermissionPolicy(SafetyMode.WRITE, sandboxed=True),
+        cwd=str(root),
+        sandbox_root=str(root),
+    )
+
+    await client.write_text_file(session_id="s", path="sub/dir/ok.txt", content="hello")
+
+    assert (root / "sub" / "dir" / "ok.txt").read_text(encoding="utf-8") == "hello"
+    assert journal.kinds() == ["fs_write"]

@@ -40,6 +40,10 @@ _LOG_QUEUE_SIZE = 1024
 _LOG_CLOSE_TIMEOUT_S = 0.05
 _STOP = object()
 
+#: The handler this module owns on the ROOT logger, tracked by identity so a reconfigure retires exactly
+#: the one we installed and never a handler some other component put there.
+_root_handler: logging.Handler | None = None
+
 
 class _BackgroundStreamHandler(logging.Handler):
     """Write formatted records from a daemon thread without blocking the caller on stderr backpressure."""
@@ -134,25 +138,108 @@ class _BackgroundStreamHandler(logging.Handler):
         super().close()
 
 
+class _StreamFormatter(logging.Formatter):
+    """Render every record as exactly one JSON object, whoever emitted it.
+
+    :func:`log_event` hands this formatter a message that is already a serialized JSON object, so a record
+    on exactly :data:`LOGGER_NAME` with no exception attached passes through untouched -- that is the
+    stream's normal case and its shape must not change. The pass-through is keyed on the exact name and
+    nothing wider on purpose: ``log_event`` is the only emitter there, so an exact match is the same thing as
+    "already serialized", and waving through anything else would put a bare unescaped message on a stream
+    that is one JSON object per line by contract.
+
+    Everything else is wrapped in an envelope. Two populations arrive here, and the envelope's event name is
+    the only place a reader can tell them apart, so it must not lie about either. Records from this package's
+    own sub-loggers -- ``rutherford.server``, ``rutherford.services.consensus``, ``rutherford.acp.sandbox``
+    and every other ``getLogger(__name__)`` in the tree -- are first-party diagnostics that simply did not go
+    through ``log_event``, and are labelled ``log``. Records from anywhere else are labelled ``foreign_log``,
+    which is a real diagnostic claim: it tells whoever is reading that the incident happened outside this
+    project, and mislabelling a sub-logger sends them to search a dependency for a failure that is ours. The
+    dot in the prefix test is load-bearing -- ``rutherford.`` is this package's namespace, whereas a
+    third-party logger merely beginning with the same letters is not ours to adopt.
+
+    The ACP SDK is the reason the foreign case exists at all: from 0.12 it reports handler failures with
+    ``logging.exception`` -- where 0.11 respectively converted the error to a JSON-RPC internal error and
+    suppressed it outright. Those records carry a multi-line traceback and a ``levelname:name:message``
+    header, and emitting them raw would make a log shipper treat an SDK failure -- and every surrounding
+    lifecycle record in the same batch -- as malformed input and discard it (see
+    :meth:`_BackgroundStreamHandler._report_drops`, which keeps the same contract for its own notice).
+    Wrapping them here holds the line, and ``json.dumps`` escapes the traceback's newlines so the whole
+    thing stays on one physical line.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Pass a ``log_event`` payload through verbatim; wrap any other record in a JSON envelope."""
+        first_party = record.name == LOGGER_NAME or record.name.startswith(f"{LOGGER_NAME}.")
+        if record.name == LOGGER_NAME and record.exc_info is None:
+            return record.getMessage()
+        payload: dict[str, Any] = {
+            "ts": round(record.created, 3),
+            "event": "log" if first_party else "foreign_log",
+            "logger": record.name,
+            "level": record.levelname,
+            "message": record.getMessage(),
+        }
+        if record.exc_info is not None:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str, separators=(",", ":"))
+
+
 def configure_logging(level: str = "info", fmt: str = "json", *, stream: Any | None = None) -> None:
     """Configure structured logging, using a non-blocking background writer for the default stderr sink.
 
-    Idempotent: existing handlers on the logger are closed and cleared first. ``stream`` is injectable for
-    deterministic tests and uses a regular synchronous handler; the production ``sys.stderr`` path is queued
-    so an MCP host that does not drain its stderr pipe cannot freeze Rutherford's asyncio event loop.
+    Idempotent: handlers this module previously installed -- on the package logger AND on root -- are removed
+    and closed first. ``stream`` is injectable for deterministic tests and uses a regular synchronous handler;
+    the production ``sys.stderr`` path is queued so an MCP host that does not drain its stderr pipe cannot
+    freeze Rutherford's asyncio event loop.
+
+    The same handler is installed on the ROOT logger, which is not tidiness but the whole point. The ACP SDK
+    defines no logger of its own -- there is not one ``getLogger`` call in the package -- and reports handler
+    failures with module-level ``logging.exception``, so its records land on root. Module-level
+    ``logging.error`` runs ``basicConfig()`` whenever root has no handlers, which installs a plain synchronous
+    ``StreamHandler(sys.stderr)`` at NOTSET and leaves it there for the life of the process. From that moment
+    every SDK traceback -- and every WARNING from every other library -- is written synchronously from the
+    event loop thread, which is precisely the stall :class:`_BackgroundStreamHandler` exists to prevent. Root
+    having a handler of ours pre-empts that ``basicConfig`` call entirely.
+
+    Two deliberate restraints. Root's LEVEL is left alone at its WARNING default: raising Rutherford's own
+    verbosity must not drag every dependency's debug traffic onto the wire. And foreign root handlers are
+    left in place rather than evicted -- they are not ours to remove, and in the shipped stdio entrypoint
+    there are none, because Rutherford owns its process.
+
+    ``_logger.propagate`` stays ``False`` for a second reason now: the package logger and root share one
+    handler INSTANCE, so propagation would push each Rutherford record through the same handler twice.
     """
-    for old_handler in list(_logger.handlers):
+    global _root_handler
+    retired: list[logging.Handler] = list(_logger.handlers)
+    for old_handler in retired:
         _logger.removeHandler(old_handler)
+    if _root_handler is not None:
+        logging.root.removeHandler(_root_handler)
+        # * Dedupe by identity, not equality: the package logger and root normally share one handler, and
+        # closing a _BackgroundStreamHandler twice would join its writer thread twice for no reason.
+        if not any(old_handler is _root_handler for old_handler in retired):
+            retired.append(_root_handler)
+        _root_handler = None
+    for old_handler in retired:
         old_handler.close()
+
     _logger.propagate = False
     if fmt == "off":
         _logger.addHandler(logging.NullHandler())
         _logger.setLevel(logging.CRITICAL + 1)
+        # * Silenced still needs a root handler. "off" means Rutherford emits nothing, not that the SDK is
+        # free to install a synchronous stderr writer behind our back -- and with no handler here that is
+        # exactly what its first logging.exception would do.
+        _root_handler = logging.NullHandler()
+        logging.root.addHandler(_root_handler)
         return
     handler: logging.Handler = _BackgroundStreamHandler(sys.stderr) if stream is None else logging.StreamHandler(stream)
-    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setFormatter(_StreamFormatter())
     _logger.addHandler(handler)
     _logger.setLevel(_LEVELS.get(level, logging.INFO))
+    logging.root.addHandler(handler)
+    _root_handler = handler
 
 
 def log_event(event: str, *, level: int = logging.INFO, **fields: Any) -> None:

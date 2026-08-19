@@ -38,7 +38,80 @@ All notable changes to this project are documented in this file. The format is b
   environment, so it stops an accident rather than a hostile agent — which, per `docs/security.md`, gains
   nothing here it did not already have, since a `write` / `yolo` agent was never OS-jailed.
 
+### Changed
+
+- **The ACP SDK is now pinned to 0.12, and read as an untrusted source rather than a validating one.** The
+  0.11 pin was raised after checking what actually changed: the protocol version is unchanged, both model
+  channels are intact, and one unused public name went away. What did change is deserialization, and it
+  changes what the library promises rather than what it exposes. A field the SDK cannot parse is no longer
+  rejected — it is salvaged into a raw dictionary and returned through an attribute still annotated as a
+  model — and an unparseable item in a list is now skipped so the rest of the list can parse, where the whole
+  response used to fail.
+
+  Both behaviours are reasonable for a protocol library and neither is announced at a call site, which is the
+  problem: they silently retire validation this client was leaning on. Nothing here reads an agent-controlled
+  response field off its annotation any more. The pin is one exact release rather than a range or a minor
+  wildcard, because the lock file is not shipped and the published install command carries no constraint of
+  its own, so this is the only bound that reaches a user. A minor wildcard would not have helped: `==0.12.*`
+  and `<0.13` admit the same unreleased 0.12.z patches, and the lesson of this very bump is that a
+  compatible-looking release can retire validation without touching a signature. Only the release actually
+  run through the malformed-payload suite is claimed.
+
 ### Fixed
+
+- **A malformed `agentCapabilities` from an agent no longer crashes a resume and orphans its process.** Under
+  the new lenient deserialization, an `initialize` response whose capability blob fails validation arrives as
+  a plain dictionary instead of raising. The resume gate read `load_session` straight off it and raised
+  `AttributeError` — after the agent was spawned, outside every handshake guard, and from inside the context
+  manager's entry, which Python answers by skipping its exit. The subprocess was left running with nothing
+  holding a reference to it. The capability is now read through a helper that reports advertised, not
+  advertised, or unreadable, and an unreadable blob is a clean `RESUME_FAILED` that says so rather than
+  claiming the agent does not support resume. The two are different facts and an operator debugging one
+  should not be handed the other.
+
+  The teardown fix is deliberately wider than the read that exposed it. Every step in session open that runs
+  after the agent is spawned — creating or loading the session, reading what came back, and model and effort
+  selection — now sits inside one guard that closes on any exception, so a step added there later inherits
+  the teardown instead of having to remember it. Only the capability read was defective; the guard is
+  structural so the next one cannot be.
+
+- **A config option tagged with a foreign category is no longer driven as the model channel.** The SDK now
+  generates a config option's `category` as either a string or an object, an artifact of how the schema
+  describes it — every category the protocol actually defines is a string. An object-valued category
+  therefore parses where it used to be rejected, and comparing it against a category name quietly evaluated
+  false. It is now narrowed to a string once and reported as untagged otherwise, which is what the protocol
+  asks of clients: an unknown category must be handled gracefully, never required for correctness.
+
+  Completing that discriminator exposed a second defect and fixed it. The category was already documented as
+  authoritative over the fallback that matches an option whose id is literally `model`, but that was only
+  honoured in one direction. An option the agent explicitly tagged as a mode, a model parameter, or a thought
+  level is now disqualified from the id fallback, so a mode selector that happens to be keyed `model` can no
+  longer be driven as the model channel and have the mode it returns recorded as a confirmed model. Unknown
+  and vendor-prefixed categories still reach the fallback, because the protocol reserves those for custom use
+  and an agent may legitimately put one on its genuine model selector.
+
+- **Log records from libraries no longer bypass the non-blocking stderr writer.** The ACP SDK defines no
+  logger of its own and reports handler failures through the root logger, which it did not do before 0.12.
+  Python installs a plain synchronous stderr handler on the root logger the first time anything logs through
+  it without one configured, and leaves it there for the life of the process — so the first such record would
+  wire every later traceback, from any library, to a synchronous write on the event loop thread. That is
+  exactly the stall the background writer exists to prevent for this project's own records. Logging setup now
+  owns a handler on the root logger, which both routes those records through the queue and pre-empts that
+  installation outright; silencing logs installs a null handler there for the same reason.
+
+  Foreign root handlers are left alone and the root level is untouched, so raising this server's verbosity
+  does not drag every dependency's debug traffic onto the wire. Records that did not originate here are
+  wrapped as a `foreign_log` event with the traceback escaped into a single field, because this stream is one
+  JSON object per line by contract and a raw traceback would make a log shipper treat the incident as
+  malformed input and discard it.
+
+- **A sandboxed write that fails on disk now returns a clean protocol error.** Writing a file let an `OSError`
+  escape unwrapped, where every other client callback already converts one into a protocol error. Under 0.12
+  that difference began to matter: the SDK re-raises a protocol error without logging but formats anything
+  else as a traceback, and an `OSError` message carries the filename it failed on — the resolved absolute
+  sandbox path, not the relative one the agent asked for. The write now fails the way a read already did, and
+  the path stays out of the log. A failed write is still not journalled as a denial, which is reserved for the
+  policy refusing.
 
 - **An unreadable `RUTHERFORD_DEPTH` is now fatal instead of being read as top level.** `current_depth()`
   turned a malformed or negative value into `0`, and a unit test asserted that as correct. Depth `0` is the

@@ -705,6 +705,82 @@ def test_model_config_option_matches_by_category_and_keeps_only_string_values() 
     assert _model_config_option([id_first, cat_second]) == ("ai_model", "default", ["default"])
 
 
+def test_model_config_option_treats_a_non_string_category_as_untagged() -> None:
+    from acp.schema import NewSessionResponse
+
+    from rutherford.acp.session import _model_config_option, _option_category
+
+    def _payload(category: object) -> NewSessionResponse:
+        # Go through the real deserializer rather than model_construct: the whole point is that ACP SDK
+        # 0.12.0's lenient generated model ACCEPTS this payload, so the test has to prove that acceptance and
+        # not merely assume it. 0.11.0's Optional[str] raised here and Rutherford reported ACP_HANDSHAKE_FAILED.
+        return NewSessionResponse.model_validate(
+            {
+                "sessionId": "s1",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "name": "Model",
+                        "type": "select",
+                        "category": category,
+                        "options": [{"name": "Sonnet", "value": "sonnet"}],
+                        "currentValue": "sonnet",
+                    }
+                ],
+            }
+        )
+
+    # Every category the ACP wire schema allows is a STRING (`mode` / `model` / `model_config` /
+    # `thought_level`, plus any other string). The 0.12.0 SDK nonetheless generates the field as
+    # Optional[Union[str, Dict[str, Any]]], so an object-valued category now survives deserialization as a raw
+    # dict. Comparing that dict to a category name would quietly evaluate False; the discriminator must narrow
+    # to str and report the option as UNTAGGED, leaving it eligible for the literal id fallback instead of
+    # being disqualified by a tag nobody can read.
+    objecty: list[object] = list(_payload({"id": "model"}).config_options or [])
+    assert len(objecty) == 1, "0.12.0 is expected to salvage an object-form category, not drop the option"
+    assert isinstance(getattr(objecty[0], "category", None), dict)
+    assert _option_category(objecty[0]) is None
+    assert _model_config_option(objecty) == ("model", "sonnet", ["sonnet"])
+    # A category that is neither a string nor an object is salvaged to None by the SDK itself; the helper
+    # agrees, so it stays total over anything a lenient deserializer can hand us.
+    for junk in (12345, ["model"], None):
+        options: list[object] = list(_payload(junk).config_options or [])
+        assert _option_category(options[0]) is None
+        assert _model_config_option(options) == ("model", "sonnet", ["sonnet"])
+    # ... and total over a duck-typed object with no `category` attribute at all.
+    assert _option_category(object()) is None
+
+
+def test_model_config_option_id_fallback_yields_to_a_reserved_foreign_category() -> None:
+    from acp.schema import SessionConfigOptionSelect, SessionConfigSelectOption
+
+    from rutherford.acp.session import _model_config_option
+
+    # The category is authoritative in BOTH directions. An option the agent explicitly tagged `mode` is its
+    # session-mode selector no matter what its id says, so a coincidental id="model" must not let Rutherford
+    # drive it as the model channel and then report a mode name as the confirmed model.
+    mode_selector = SessionConfigOptionSelect(
+        id="model",
+        name="Mode",
+        type="select",
+        current_value="ask",
+        options=[SessionConfigSelectOption(name="Ask", value="ask")],
+        category="mode",
+    )
+    assert _model_config_option([mode_selector]) is None
+    # ... and the same for the other spec-reserved non-model categories.
+    for foreign in ("model_config", "thought_level"):
+        assert _model_config_option([mode_selector.model_copy(update={"category": foreign})]) is None
+    # But an UNKNOWN or `_`-prefixed vendor category is not disqualifying: the spec reserves `_` names for
+    # custom use, so an agent may tag its genuine model selector with one and must still be reachable.
+    for custom in ("_acme_model_picker", "totally-unknown"):
+        assert _model_config_option([mode_selector.model_copy(update={"category": custom})]) == (
+            "model",
+            "ask",
+            ["ask"],
+        )
+
+
 # --- Bedrock/Vertex model-env normalization (host_env.claude_bedrock_env) ------
 
 
