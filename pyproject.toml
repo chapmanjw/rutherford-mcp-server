@@ -69,7 +69,7 @@ dependencies = [
     # release claimed here is the one actually put through the malformed-payload suite. Raise it
     # deliberately: re-read the deserialization behaviour, run tests/test_acp_wire.py against the new
     # release, then move the pin.
-    "agent-client-protocol==0.12.0",
+    "agent-client-protocol==0.12.1",
 ]
 
 [project.urls]
