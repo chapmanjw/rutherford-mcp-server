@@ -21,15 +21,19 @@ Launch-time channels (this table):
   ``high``). Needs a concrete model; a no-op when none. The rewritten id is passed on the launch
   ``--model`` flag (:attr:`~rutherford.acp.descriptors.AgentDescriptor.model_launch_flag`), not via
   in-session ``set_model`` / ``set_config_option``.
-* ``codex`` (``codex-acp``) WITH a concrete model -- effort rides the ACP **model id** as ``model[effort]``
-  (the bracket syntax codex-acp advertises and parses; tops out at ``xhigh``), so one ``set_model`` selects
-  both the model and the tier.
+* ``codex`` (``codex-acp``) WITH a concrete model -- prefer the ACP **model id** ``model[effort]`` when
+  that id is advertised (historical codex-acp catalog, tops out at ``xhigh``). Codex ACP 1.8 advertises
+  **bare** ids instead, so the session capability-gates the bracket: unadvertised ``base[tier]`` falls back
+  to selecting the advertised bare model and applying confirmed ``reasoning_effort``. A matching base id is
+  never treated as proof the bracket effort applied.
 
 Session config-option channel (``via_config_option=True``; applied at open, not here):
 
 * ``claude_code`` (``claude-agent-acp``) -- the ACP ``effort`` config option (values ``low..max``).
 * ``codex`` WITHOUT a model -- the ACP ``reasoning_effort`` config option (values ``low..xhigh``), so a
   codex seat that pins no model still gets its tier on codex's default model.
+* ``codex`` WITH a model whose ``base[tier]`` id is not advertised -- the same ``reasoning_effort`` option,
+  after the session selects the advertised bare model (see above).
 
 Every other agent (including ``pi``, whose ``--thinking`` is an in-session RPC selector with no launch knob)
 is an honest no-op.
@@ -71,6 +75,11 @@ class EffortOverride:
     #: sets it, and reports the actually-applied tier. A no-op (``applied`` stays ``None``) if the agent
     #: advertises no such option after all.
     via_config_option: bool = False
+    #: When True, ``model`` is a *preferred* Codex ``base[tier]`` rewrite. If that id is not advertised at
+    #: session open, the session may select the advertised bare/base id and apply ``reasoning_effort`` --
+    #: reporting ``effort_applied`` only after that option is confirmed. Never treat a matching base id as
+    #: proof the bracket effort applied.
+    config_option_fallback: bool = False
 
     @property
     def env_dict(self) -> dict[str, str]:
@@ -120,15 +129,16 @@ def effort_overrides(descriptor: AgentDescriptor, effort: Effort | None, *, mode
 
 
 def _codex(model: str | None, effort: Effort) -> EffortOverride:
-    """Codex: encode effort in the ACP model id as ``model[effort]`` when a model is pinned, else the
-    ``reasoning_effort`` config option.
+    """Codex: prefer ``model[effort]`` when a model is pinned; else the ``reasoning_effort`` config option.
 
-    codex-acp advertises ``base[effort]`` model ids (live-confirmed: ``gpt-5.5[low|medium|high|xhigh]``), so
-    with a concrete model one ``set_model`` selects both the model and the tier. With NO model the bare id is
-    not advertised (so ``set_model`` would be skipped); codex-acp also exposes a ``reasoning_effort`` config
-    option, so this routes the no-model case there instead of dropping the tier (the old behavior). Codex tops
-    out at ``xhigh``, so ``max`` clamps down -- reported on the model-id note; the config-option path clamps to
-    the option's advertised values at open.
+    Historical codex-acp advertised ``base[effort]`` ids (live-confirmed: ``gpt-5.5[low|medium|high|xhigh]``),
+    so with a concrete model one ``set_model`` selected both. Codex ACP 1.8 advertises **bare** ids and a
+    ``reasoning_effort`` config option instead: the rewrite here is the preferred candidate
+    (``config_option_fallback=True``), and :class:`~rutherford.acp.session.ACPSession` uses the bracket id
+    only when it is advertised, otherwise selecting the bare model and confirming ``reasoning_effort``. With
+    NO model the bare id is not a selection target; this routes straight to the config-option channel.
+    Codex tops out at ``xhigh``, so ``max`` clamps down -- reported on the model-id note; the config-option
+    path clamps to the option's advertised values at open.
     """
     if not model:
         return EffortOverride(
@@ -139,7 +149,12 @@ def _codex(model: str | None, effort: Effort) -> EffortOverride:
     note = f"reasoning effort via the codex model id '[{applied.value}]'"
     if applied is not effort:
         note += f" (clamped from {effort.value})"
-    return EffortOverride(model=_codex_model(model, applied), applied=applied, note=note)
+    return EffortOverride(
+        model=_codex_model(model, applied),
+        applied=applied,
+        note=note,
+        config_option_fallback=True,
+    )
 
 
 def _claude_code(model: str | None, effort: Effort) -> EffortOverride:

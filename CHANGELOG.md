@@ -59,6 +59,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Codex `model` + `effort` no longer fails as `MODEL_UNAVAILABLE` on Codex ACP 1.8.** Codex 1.8
+  advertises bare model ids (e.g. `gpt-5.6-terra`), not `base[xhigh]`. Rutherford was rewriting
+  `effort=max` into `gpt-5.6-terra[xhigh]` before advertisement checks, then rejecting a model the
+  agent actually offered. The bracket id is used only when advertised; otherwise the advertised bare
+  model is selected and `reasoning_effort` is applied with `current_value` confirmation (`max` still
+  clamps to `xhigh`). A matching base id is never treated as proof the bracket effort applied: missing
+  `reasoning_effort` after that fallback is `ACP_HANDSHAKE_FAILED` naming the effort. MCP tool
+  descriptions now list `max` alongside `low|medium|high|xhigh`.
+
 - **A malformed `agentCapabilities` from an agent no longer crashes a resume and orphans its process.** Under
   the new lenient deserialization, an `initialize` response whose capability blob fails validation arrives as
   a plain dictionary instead of raising. The resume gate read `load_session` straight off it and raised

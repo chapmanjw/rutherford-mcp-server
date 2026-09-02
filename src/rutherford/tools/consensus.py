@@ -68,8 +68,9 @@ async def consensus_tool(
     (optionally with a ``verdict_schema``), the voices are aggregated into a :class:`StrategyResult`
     outcome instead of returned individually. ``synthesize`` (tri-state; defaults to ``synthesize_default``,
     off out of the box) adds a server-side combined answer (``all-voices`` only); ``judge`` names the seat
-    that writes it. ``effort`` (low|medium|high|xhigh) asks every voice to spend more reasoning where it has
-    a knob. ``time_budget_s`` is a wall-clock deadline for the WHOLE panel (distinct from each voice's
+    that writes it. ``effort`` (low|medium|high|xhigh|max) asks every voice to spend more reasoning where it has
+    a knob; ``max`` is accepted and clamped to each agent's ceiling. ``time_budget_s`` is a wall-clock deadline
+    for the WHOLE panel (distinct from each voice's
     ``timeout_s``): at the deadline answered voices are kept, in-flight ones are cut, and the panel
     aggregates over the harvest if ``min_quorum`` usable remain (``stop_reason="budget"``) -- fewer than
     ``min_quorum`` is ``BUDGET_EXHAUSTED``. ``on_budget`` (harvest|continue|resume, default

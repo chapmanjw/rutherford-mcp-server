@@ -51,8 +51,9 @@ async def delegate_tool(
     Validation (known agent, safety mode, run mode, role, effort, fallback targets) always runs
     synchronously, so a bad request fails on the request path rather than inside a job. A named ``role`` has
     its persona prepended to ``prompt`` before the request is built; ``UNKNOWN_ROLE`` if the id is not a known
-    role. ``effort`` (low|medium|high|xhigh) asks the agent to spend more reasoning where it has a knob (a
-    reported no-op otherwise); omitted, the per-agent or global ``default_effort`` applies.
+    role. ``effort`` (low|medium|high|xhigh|max) asks the agent to spend more reasoning where it has a knob (a
+    reported no-op otherwise); ``max`` is accepted and clamped to the agent's ceiling. Omitted, the per-agent
+    or global ``default_effort`` applies.
 
     ``fallback`` is an ordered list of alternate targets (``cli`` / ``cli:model`` strings, or ``{cli, model}``
     objects) to try when the primary delegation fails on a re-execution-SAFE failure (a spawn/handshake

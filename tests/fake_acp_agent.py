@@ -284,7 +284,7 @@ def _advertised_config_options() -> list[SessionConfigOptionSelect | SessionConf
     ``RUTHERFORD_FAKE_MODELS`` is surfaced here so the fake still advertises selectable models on the stable
     channel. The first value of each is its advertised current value. Optional
     ``RUTHERFORD_FAKE_MODEL_MISMATCH=1`` makes ``set_config_option`` echo a non-matching ``current_value``
-    (confirmation failure path).
+    (confirmation failure path). ``RUTHERFORD_FAKE_EFFORT_MISMATCH=1`` does the same for the effort option.
     """
     advertised: list[SessionConfigOptionSelect | SessionConfigOptionBoolean] = []
     effort_raw = os.environ.get("RUTHERFORD_FAKE_EFFORT_OPTION")
@@ -406,14 +406,17 @@ class FakeAgent:
         # The response REQUIRES the full set of options with their updated current values (a real agent echoes
         # them back), so reflect the new current_value on the matching option rather than returning an empty set.
         # RUTHERFORD_FAKE_MODEL_MISMATCH=1 leaves model current_value stale so confirmation fails.
+        # RUTHERFORD_FAKE_EFFORT_MISMATCH=1 does the same for effort / reasoning_effort.
         options = _advertised_config_options() or []
         mismatch = os.environ.get("RUTHERFORD_FAKE_MODEL_MISMATCH") == "1"
+        effort_mismatch = os.environ.get("RUTHERFORD_FAKE_EFFORT_MISMATCH") == "1"
         for option in options:
             if (
                 isinstance(option, SessionConfigOptionSelect)
                 and option.id == config_id
                 and isinstance(value, str)
                 and not (mismatch and config_id == "model")
+                and not (effort_mismatch and config_id in {"effort", "reasoning_effort"})
             ):
                 option.current_value = value
         return SetSessionConfigOptionResponse(config_options=options)
