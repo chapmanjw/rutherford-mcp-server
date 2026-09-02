@@ -48,6 +48,7 @@ from .client import RutherfordACPClient
 from .descriptors import AgentDescriptor
 from .effort import (
     EFFORT_CONFIG_OPTION_IDS,
+    EffortOverride,
     clamp_to_supported,
     effort_overrides,
     launch_advertisement_compatible,
@@ -338,9 +339,14 @@ class ACPSession:
         self._effort = effort
         self._override = effort_overrides(descriptor, effort, model=resolved_model)
         #: The tier this session actually applied. Seeded from the launch-time override (cline/kiro/junie/
-        #: cursor/codex-with-model know it statically); the config-option path (claude_code, codex-no-model)
-        #: updates it at open once the agent's advertised effort options are known. ``None`` for a no-op.
+        #: cursor/codex-with-model know it statically); the config-option path (claude_code, codex-no-model,
+        #: and Codex 1.8's unadvertised-bracket fallback) updates it at open once the agent's advertised
+        #: effort options are known. ``None`` for a no-op.
         self._effort_applied = self._override.applied
+        #: When True, :meth:`_select_effort` must confirm the config-option ``current_value`` (Codex
+        #: bracket-id not advertised). Missing option / unconfirmed set is a handshake error, never a claim
+        #: that a matching bare model id applied the requested effort.
+        self._effort_requires_confirmation = False
         self._target = Target(cli=descriptor.id, model=self._override.model or resolved_model)
         #: The effective model ACP in-session selection confirmed (config current_value after a set, or
         #: set_model success). ``None`` until :meth:`_select_model` confirms; never set from launch argv alone
@@ -400,7 +406,8 @@ class ACPSession:
         """The effort tier this session actually applied (clamped), or ``None`` for a no-op (F8a, 2-L).
 
         For a launch-time channel this is known before open; for the config-option channel (claude_code,
-        codex-no-model) it is set during :meth:`open` once the agent's advertised effort options are read.
+        codex-no-model, Codex unadvertised-bracket fallback) it is set during :meth:`open` once the agent's
+        advertised effort options are read.
         """
         return self._effort_applied
 
@@ -749,6 +756,11 @@ class ACPSession:
         ``current_value`` is already the target (still confirmed for that channel). Only when no suitable
         config option exists, use ``session/set_model`` for a model advertised in ``SessionModelState``; a
         successful ACP response is confirmation for set_model-only agents.
+
+        Codex effort rewrite is capability-gated: ``base[tier]`` is selected only when advertised. An
+        unadvertised rewrite with an advertised bare/base id falls back to that id plus confirmed
+        ``reasoning_effort`` -- never a ``MODEL_UNAVAILABLE`` for a model the agent actually offers, and
+        never ``effort_applied`` from a matching base id alone.
         """
         model = self._target.model
         if not model or self._session_id is None:
@@ -760,22 +772,13 @@ class ACPSession:
         in_config = found is not None and model in found[2]
         in_session = _advertises_model(session, model)
         if not in_config and not in_session:
-            # Hard-fail only a model Rutherford is ACTIVELY selecting over ACP: an explicit caller model, or an
-            # effort-rewritten id, that the agent advertises on no channel -- never silently report it as
-            # selected. A descriptor-DEFAULT the agent does not advertise is a soft-skip, even when the agent
-            # advertises OTHER models on a channel: it may be applied out-of-band -- the agent's own default, or
-            # an injected ANTHROPIC_MODEL on a Bedrock/Vertex seat whose provider id is deliberately absent from
-            # the alias config option. Hard-failing that would break every turn of a config-advertising seat
-            # like claude_code on Bedrock (the shipped remediation sets default_model to a provider id).
-            explicit = self._caller_model is not None
-            rewritten = self._override.model is not None
-            if explicit or rewritten:
-                raise ACPHandshakeError(
-                    ErrorCode.MODEL_UNAVAILABLE,
-                    f"model {model!r} is not available on {self._descriptor.id}: "
-                    "not advertised by session.models or a model config option",
-                    ReexecutionSafety.SAFE,
-                )
+            fallback = self._fallback_unadvertised_effort_model(session, found)
+            if fallback is not None:
+                model = fallback
+                in_config = found is not None and model in found[2]
+                in_session = _advertises_model(session, model)
+        if not in_config and not in_session:
+            self._reject_or_skip_unadvertised_model(model)
             return
         # * Prefer the verifiable config-option channel whenever it advertises the target.
         if in_config:
@@ -861,32 +864,132 @@ class ACPSession:
         _advertised = _launch_model_advertised(model, config_values) or _launch_model_advertised(model, session_values)
         return
 
+    def _reject_or_skip_unadvertised_model(self, model: str) -> None:
+        """Hard-fail an actively selected unadvertised model, or soft-skip a descriptor default.
+
+        Hard-fail only a model Rutherford is ACTIVELY selecting over ACP: an explicit caller model, or an
+        effort-rewritten id, that the agent advertises on no channel -- never silently report it as
+        selected. A descriptor-DEFAULT the agent does not advertise is a soft-skip, even when the agent
+        advertises OTHER models on a channel: it may be applied out-of-band -- the agent's own default, or
+        an injected ANTHROPIC_MODEL on a Bedrock/Vertex seat whose provider id is deliberately absent from
+        the alias config option. Hard-failing that would break every turn of a config-advertising seat
+        like claude_code on Bedrock (the shipped remediation sets default_model to a provider id). An
+        effort rewrite that was never selected does not keep ``effort_applied``.
+        """
+        explicit = self._caller_model is not None
+        rewritten = self._override.model is not None
+        if explicit or rewritten:
+            if rewritten:
+                self._effort_applied = None
+            raise ACPHandshakeError(
+                ErrorCode.MODEL_UNAVAILABLE,
+                f"model {model!r} is not available on {self._descriptor.id}: "
+                "not advertised by session.models or a model config option",
+                ReexecutionSafety.SAFE,
+            )
+        return
+
+    def _fallback_unadvertised_effort_model(
+        self, session: NewSessionResponse | LoadSessionResponse, found: tuple[str, str | None, list[str]] | None
+    ) -> str | None:
+        """If an effort-rewritten model id is unadvertised, return an advertised bare/base id to select instead.
+
+        Codex historically advertised ``base[tier]``; Codex ACP 1.8 advertises bare ids and a
+        ``reasoning_effort`` config option. Falling back switches the target to the advertised base and
+        routes effort through that option with confirmation required. A matching base id is never treated
+        as proof the bracket effort applied.
+        """
+        rewritten = self._override.model
+        if not self._override.config_option_fallback or rewritten is None:
+            return None
+        if self._target.model != rewritten:
+            return None
+        candidates: list[str] = []
+        requested = self._requested_model
+        if requested is not None and requested != rewritten:
+            candidates.append(requested)
+        base = rewritten.split("[", 1)[0]
+        if base and base != rewritten and base not in candidates:
+            candidates.append(base)
+        for candidate in candidates:
+            if _model_on_any_channel(session, candidate, found):
+                self._switch_effort_to_config_option(candidate, rewritten)
+                return candidate
+        return None
+
+    def _switch_effort_to_config_option(self, model: str, rewritten: str) -> None:
+        """Drop the unadvertised bracket rewrite and require a confirmed ``reasoning_effort`` set."""
+        self._override = EffortOverride(
+            extra_args=self._override.extra_args,
+            extra_env=self._override.extra_env,
+            via_config_option=True,
+            note=(
+                f"reasoning effort via the 'reasoning_effort' config option "
+                f"(bracket model id {rewritten!r} was not advertised)"
+            ),
+        )
+        self._effort_applied = None
+        self._effort_requires_confirmation = True
+        self._target = Target(cli=self._descriptor.id, model=model)
+
+    def _effort_unavailable(self, detail: str) -> ACPHandshakeError:
+        """Handshake failure naming the requested effort, not a missing model."""
+        requested = self._effort.value if self._effort is not None else "unknown"
+        return ACPHandshakeError(
+            ErrorCode.ACP_HANDSHAKE_FAILED,
+            f"effort {requested!r} is not available on {self._descriptor.id}: {detail}",
+            ReexecutionSafety.SAFE,
+        )
+
     async def _select_effort(self, conn: ClientSideConnection) -> None:
-        """Best-effort ``session/set_config_option`` for an agent that carries effort via a config option.
+        """Apply a config-option effort tier when the override routed here.
 
         The config-option effort channel (F8a): when the override routed this agent here
         (``via_config_option`` -- claude_code's ``effort`` option, codex's ``reasoning_effort`` option), find
         the advertised option among ``session.configOptions`` and set it to the requested tier, clamped to the
         option's own advertised values (so ``max`` on a codex option topping out at ``xhigh`` becomes
-        ``xhigh``). ``effort_applied`` is updated to the tier actually set. Never fatal: like model selection,
-        effort is an enhancement, not a handshake requirement, so any failure (or an agent that turns out to
-        advertise no such option) leaves the turn on the agent's default tier -- a reported no-op, not a crash.
+        ``xhigh``). ``effort_applied`` is updated to the tier actually set.
+
+        When the Codex bracket-id channel was not advertised and this session fell back to the config
+        option (``_effort_requires_confirmation``), a missing option or unconfirmed ``current_value`` is a
+        hard :class:`ACPHandshakeError` -- never report ``effort_applied`` from a matching bare model id.
+        Otherwise this remains non-fatal: an agent that advertises no such option is an honest no-op.
         """
         if self._effort is None or not self._override.via_config_option or self._session_id is None:
             return
+        required = self._effort_requires_confirmation
         found = _effort_config_option(self._config_options)
         if found is None:
+            if required:
+                raise self._effort_unavailable(
+                    f"not advertised by a reasoning_effort or effort config option ({self._override.note})"
+                )
             return  # the agent advertised no effort option after all -- honest no-op (effort_applied stays None)
         config_id, supported = found
         applied = clamp_to_supported(self._effort, supported)
         if applied is None:
+            if required:
+                raise self._effort_unavailable(f"config option {config_id!r} advertises no reasoning-effort tiers")
             return
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(
+        try:
+            response = await asyncio.wait_for(
                 conn.set_config_option(config_id=config_id, value=applied.value, session_id=self._session_id),
                 timeout=self._handshake_timeout,
             )
-            self._effort_applied = applied
+        except Exception as exc:
+            if required:
+                raise self._effort_unavailable(
+                    f"set_config_option {config_id!r}={applied.value!r} failed: {exc}"
+                ) from exc
+            return
+        if required and not _config_option_current_equals(response, config_id, applied.value):
+            raise self._effort_unavailable(
+                f"set_config_option {config_id!r}={applied.value!r} was not confirmed by current_value"
+            )
+        options = list(getattr(response, "config_options", None) or [])
+        if options:
+            self._config_options = options
+        self._effort_applied = applied
 
     async def prompt(self, text: str, *, timeout_s: float) -> DelegationResult:
         """Run one prompt turn on the live session and return its normalized result.
@@ -1317,6 +1420,12 @@ def _legacy_model_state(session: object) -> object | None:
 def _advertises_model(session: object, model_id: str) -> bool:
     """Whether the legacy SessionModelState channel advertised ``model_id`` (so set_model is safe)."""
     return model_id in _models_of(session)
+
+
+def _model_on_any_channel(session: object, model_id: str, found: tuple[str, str | None, list[str]] | None) -> bool:
+    """Whether ``model_id`` is advertised on the config-option channel or legacy ``session.models``."""
+    in_config = found is not None and model_id in found[2]
+    return in_config or _advertises_model(session, model_id)
 
 
 def _launch_model_advertised(model: str, advertised: list[str]) -> bool:

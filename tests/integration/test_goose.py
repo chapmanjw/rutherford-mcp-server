@@ -325,11 +325,9 @@ async def test_goose_consensus_time_budget_harvest() -> None:
 async def test_codex_delegate_effort_high_applies() -> None:
     """A real ``delegate`` to codex with ``effort="high"`` records ``effort_applied`` (F8a).
 
-    codex encodes effort in the ACP model id, so the high tier rides a concrete base model as ``gpt-5.5[high]``
-    -- an id the ``codex-acp`` adapter advertises at ``new_session`` and that the client's best-effort
-    ``set_model`` then selects. A model is required for the encoding (codex's descriptor carries none by
-    default), so the call names ``gpt-5.5`` explicitly. The successful turn echoes ``effort=high`` and a
-    non-None ``effort_applied=high``.
+    Older ``codex-acp`` advertised ``gpt-5.5[high]`` so one ``set_model`` selected both the model and the
+    tier. Codex ACP 1.8 advertises the bare id and a ``reasoning_effort`` config option instead; Rutherford
+    then selects ``gpt-5.5`` and confirms the option. Either path must report ``effort_applied=high``.
     """
     registry = default_registry()
     service = DelegationService(registry, RutherfordConfig())
@@ -344,7 +342,7 @@ async def test_codex_delegate_effort_high_applies() -> None:
     assert result.ok is True, f"codex failed: {result.error}"
     assert result.effort is Effort.HIGH
     assert result.effort_applied is Effort.HIGH, f"effort_applied not set: {result.effort_applied!r}"
-    assert result.target.model == "gpt-5.5[high]"  # the effort-rewritten id the agent was switched to
+    assert result.target.model in {"gpt-5.5", "gpt-5.5[high]"}
 
 
 # --- review / plan: read-only role-driven tools against real goose -----------

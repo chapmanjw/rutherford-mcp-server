@@ -58,7 +58,7 @@ order the fields appear in `config/schema.py`.
 | `auto_detect_local_models` | `bool` | `true` | Probe a running Ollama (`:11434`) and LM Studio (`:1234`) at startup and register each tool-capable model as a `goose`-based agent. A built-in or explicit `[agents.<id>]` of the same id always wins; a down backend is skipped. |
 | `default_safety_mode` | `string` | `"read_only"` | Safety posture when a call omits `safety_mode`. One of `read_only`, `propose`, `write`, `yolo`. |
 | `default_timeout_s` | `float` | `300.0` | Per-run timeout in seconds (> 0). |
-| `default_effort` | `string` or omitted | none | Default reasoning-effort tier when a call names none (`low` / `medium` / `high` / `xhigh`); `None` lets the agent decide. |
+| `default_effort` | `string` or omitted | none | Default reasoning-effort tier when a call names none (`low` / `medium` / `high` / `xhigh` / `max`); `None` lets the agent decide. Agents clamp `max` to their own ceiling (codex: `xhigh`). |
 | `default_time_budget_s` | `float` or omitted | none | Default wall-clock budget for a panel / job; `None` means no budget (runs to completion). |
 | `default_on_budget` | `string` | `"harvest"` | Disposition at a time-budget deadline when a call names none. |
 | `role_dirs` | `list[str]` | `[]` | Extra directories to search for role markdown files. Built-in roles always load. Resolved to absolute paths; a missing directory warns, it does not fail. |

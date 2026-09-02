@@ -57,8 +57,9 @@ async def debate_tool(
     immediately; ``mode="sync"`` (the default) awaits and returns the full transcript. Target/judge/safety/mode/role/
     effort/on_budget validation always runs synchronously, so a bad panel fails on the request path rather
     than in a job. A named ``role`` has its persona prepended to the opening prompt every voice argues from;
-    ``UNKNOWN_ROLE`` if the id is not a known role. ``effort`` (low|medium|high|xhigh) asks every voice to
-    spend more reasoning where it has a knob. ``time_budget_s`` is a wall-clock deadline for the WHOLE debate
+    ``UNKNOWN_ROLE`` if the id is not a known role. ``effort`` (low|medium|high|xhigh|max) asks every voice to
+    spend more reasoning where it has a knob; ``max`` is accepted and clamped to each agent's ceiling.
+    ``time_budget_s`` is a wall-clock deadline for the WHOLE debate
     enforced at round boundaries: a round still in flight at the deadline is cut, the transcript so far is
     finalized (``stop_reason="budget"``), and ``on_budget`` (harvest|continue|resume, default
     ``default_on_budget``) chooses the behavior -- ``continue`` runs every round to completion. ``persist``

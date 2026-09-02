@@ -14,6 +14,7 @@ from rutherford.acp.effort import EffortOverride, clamp_to_supported, effort_ove
 from rutherford.acp.roster import build_registry
 from rutherford.config.schema import AgentConfig, RutherfordConfig
 from rutherford.domain.enums import Effort
+from rutherford.domain.error_codes import ErrorCode
 from rutherford.domain.models import DelegationRequest, Target
 from rutherford.services.delegation import DelegationService
 
@@ -47,6 +48,7 @@ def test_codex_encodes_effort_in_the_model_id() -> None:
     override = effort_overrides(_descriptor("codex"), Effort.HIGH, model="gpt-5.2")
     assert override.model == "gpt-5.2[high]"
     assert override.applied is Effort.HIGH
+    assert override.config_option_fallback is True
     assert override.extra_args == () and override.extra_env == ()
 
 
@@ -368,6 +370,116 @@ async def test_codex_effort_selects_the_rewritten_model_over_acp(monkeypatch: py
     result = await service.delegate(request)
     assert result.ok and result.effort is Effort.HIGH and result.effort_applied is Effort.HIGH
     assert result.target.model == "gpt-5.2[high]"
+
+
+async def test_codex_effort_prefers_advertised_bracket_over_config_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    # When the bracket id IS advertised, do not fall back to reasoning_effort even if that option exists.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "gpt-5.2[high],gpt-5.2")
+    monkeypatch.setenv("RUTHERFORD_FAKE_EFFORT_OPTION", "reasoning_effort:low,medium,high,xhigh")
+    service = _delegation(RutherfordConfig(), _descriptor("codex", model="gpt-5.2"))
+    request = DelegationRequest(
+        target=Target(cli="codex"), prompt="EFFORT?", working_dir=str(REPO_ROOT), effort=Effort.HIGH
+    )
+    result = await service.delegate(request)
+    assert result.ok and result.target.model == "gpt-5.2[high]"
+    assert result.effort is Effort.HIGH and result.effort_applied is Effort.HIGH
+    assert "effort=(unset)" in result.text  # set_model path; config option was not used
+
+
+async def test_codex_effort_falls_back_to_config_option_when_bracket_unadvertised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Codex ACP 1.8 advertises bare ids, not base[xhigh]. Select gpt-5.6-terra and confirm reasoning_effort.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "gpt-5.6-terra")
+    monkeypatch.setenv("RUTHERFORD_FAKE_EFFORT_OPTION", "reasoning_effort:low,medium,high,xhigh")
+    service = _delegation(RutherfordConfig(), _descriptor("codex"))
+    request = DelegationRequest(
+        target=Target(cli="codex", model="gpt-5.6-terra"),
+        prompt="EFFORT?",
+        working_dir=str(REPO_ROOT),
+        effort=Effort.MAX,
+    )
+    result = await service.delegate(request)
+    assert result.ok, f"expected success, got {result.error}"
+    assert result.target.model == "gpt-5.6-terra"
+    assert result.selected_model == "gpt-5.6-terra"
+    assert result.effort is Effort.MAX and result.effort_applied is Effort.XHIGH
+    assert "effort=xhigh" in result.text
+
+
+async def test_codex_effort_does_not_treat_bare_id_as_applied_effort(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Bare model advertised, bracket not, no reasoning_effort option: fail as unsupported effort, not
+    # MODEL_UNAVAILABLE, and never claim effort_applied from the matching base id.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "gpt-5.6-terra")
+    service = _delegation(RutherfordConfig(), _descriptor("codex"))
+    request = DelegationRequest(
+        target=Target(cli="codex", model="gpt-5.6-terra"),
+        prompt="EFFORT?",
+        working_dir=str(REPO_ROOT),
+        effort=Effort.MAX,
+    )
+    result = await service.delegate(request)
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.code is ErrorCode.ACP_HANDSHAKE_FAILED
+    assert "effort" in result.error.message
+    assert "gpt-5.6-terra" in result.error.message or "not advertised" in result.error.message
+    assert result.effort_applied is None
+
+
+async def test_codex_effort_unadvertised_base_is_still_model_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "gpt-5.2")
+    monkeypatch.setenv("RUTHERFORD_FAKE_EFFORT_OPTION", "reasoning_effort:low,medium,high,xhigh")
+    service = _delegation(RutherfordConfig(), _descriptor("codex"))
+    request = DelegationRequest(
+        target=Target(cli="codex", model="gpt-5.6-terra"),
+        prompt="EFFORT?",
+        working_dir=str(REPO_ROOT),
+        effort=Effort.MAX,
+    )
+    result = await service.delegate(request)
+    assert result.ok is False
+    assert result.error is not None and result.error.code is ErrorCode.MODEL_UNAVAILABLE
+    assert "gpt-5.6-terra[xhigh]" in result.error.message
+    assert result.effort_applied is None
+
+
+async def test_codex_effort_fallback_requires_confirmed_config_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Bracket unadvertised, option present, but current_value does not echo the tier: do not claim applied.
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "gpt-5.6-terra")
+    monkeypatch.setenv("RUTHERFORD_FAKE_EFFORT_OPTION", "reasoning_effort:low,medium,high,xhigh")
+    monkeypatch.setenv("RUTHERFORD_FAKE_EFFORT_MISMATCH", "1")
+    service = _delegation(RutherfordConfig(), _descriptor("codex"))
+    request = DelegationRequest(
+        target=Target(cli="codex", model="gpt-5.6-terra"),
+        prompt="EFFORT?",
+        working_dir=str(REPO_ROOT),
+        effort=Effort.MAX,
+    )
+    result = await service.delegate(request)
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.code is ErrorCode.ACP_HANDSHAKE_FAILED
+    assert "not confirmed" in result.error.message
+    assert result.effort_applied is None
+
+
+async def test_codex_effort_fallback_fails_when_option_has_no_tiers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RUTHERFORD_FAKE_MODELS", "gpt-5.6-terra")
+    monkeypatch.setenv("RUTHERFORD_FAKE_EFFORT_OPTION", "reasoning_effort:default,off")
+    service = _delegation(RutherfordConfig(), _descriptor("codex"))
+    request = DelegationRequest(
+        target=Target(cli="codex", model="gpt-5.6-terra"),
+        prompt="EFFORT?",
+        working_dir=str(REPO_ROOT),
+        effort=Effort.MAX,
+    )
+    result = await service.delegate(request)
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.code is ErrorCode.ACP_HANDSHAKE_FAILED
+    assert "no reasoning-effort tiers" in result.error.message
+    assert result.effort_applied is None
 
 
 # --- the config-option effort channel (claude_code, codex-no-model) end to end over the fake ----------------

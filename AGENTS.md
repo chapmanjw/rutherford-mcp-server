@@ -138,3 +138,7 @@ domain + config            domain/, config/, io/   models, enums, errors, error 
 - Docstrings on the public API of the core layers (acp, services, domain).
 - Tool payloads are serialized as TOON behind the `io/serialize.py` seam (`python-toon`).
 - No emojis in source files unless a user-visible string clearly benefits.
+
+## Known issues
+
+- **Codex ACP 1.8 model+effort:** Codex 1.8 advertises bare model ids, not `base[xhigh]`. Rutherford uses the bracket id only when advertised; otherwise it selects the bare model and applies confirmed `reasoning_effort`. `max` clamps to `xhigh`. A matching base id is never treated as proof that bracket effort applied. An unadvertised base is still `MODEL_UNAVAILABLE`; a missing `reasoning_effort` option after that fallback is `ACP_HANDSHAKE_FAILED` naming the effort, not the model.

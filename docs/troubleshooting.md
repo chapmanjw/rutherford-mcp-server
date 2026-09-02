@@ -201,7 +201,7 @@ reported as a `ConfigError`, not a raw decode error.
 | Code | Immediate diagnostic |
 | --- | --- |
 | `ACP_SPAWN_FAILED` | Run `doctor`; install the agent (and its ACP shim); confirm it is on PATH. |
-| `ACP_HANDSHAKE_FAILED` | Confirm the ACP launch command; raise `handshake_timeout_s`; check the agent's auth. |
+| `ACP_HANDSHAKE_FAILED` | Confirm the ACP launch command; raise `handshake_timeout_s`; check the agent's auth. On Codex with `model` + `effort`, this can mean the bare model was advertised but `reasoning_effort` was not confirmed (Codex ACP 1.8); it is not `MODEL_UNAVAILABLE`. |
 | `ACP_REFUSED` / `ACP_EMPTY_ANSWER` | The agent answered nothing; check auth, or a local model's tool-calling support. |
 | `model_unavailable` (doctor) | The provider rejected the model id; on Bedrock/Vertex/an enterprise wrapper pin one via `[agents.claude_code.env]` — see [bedrock.md](bedrock.md). |
 | `ACP_TURN_TIMEOUT` | Raise `timeout_s` or `default_timeout_s`; use `mode="async"` for long tasks. |
