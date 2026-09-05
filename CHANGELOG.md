@@ -144,9 +144,13 @@ All notable changes to this project are documented in this file. The format is b
 
 - **The entrypoint check could not detect a server that fails to boot.** `--smoke` builds the app and
   returns before `mcp.run`, so the gate stage named for the entrypoint proved config loading and registry
-  construction and nothing about the transport. A new `server-boot` stage starts the stdio server for real,
-  completes `initialize`, registers and calls a tool, and asserts that nothing but JSON-RPC reaches stdout —
-  a stray write there corrupts the protocol for every client.
+  construction and nothing about the transport. A new `server-boot` stage starts the stdio server for real
+  and asserts what only a live exchange can: that `serverInfo.version` on the wire is this distribution's,
+  that every tool registers and a real call returns a non-error result, and that nothing but JSON-RPC
+  reaches stdout — a stray write there corrupts the protocol for every client. The child runs unbuffered,
+  because a piped stdout is block-buffered and a stray write would otherwise sit in it unseen, and both
+  streams are read on threads so a server that boots and then says nothing fails on a deadline instead of
+  hanging.
 
 - **A handshake that timed out reported an empty reason.** `asyncio.TimeoutError` stringifies to nothing, so
   the detail read "ACP handshake with <agent> failed: " and stopped. It now names the fault type, keeping a

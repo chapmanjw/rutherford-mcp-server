@@ -155,11 +155,15 @@ def test_server_boot_check_expects_every_registered_tool() -> None:
     )
 
 
-def test_server_reports_the_package_version_not_the_frameworks() -> None:
-    """`serverInfo.version` must be this distribution's version.
+def test_the_version_helper_reads_this_distribution_not_the_framework() -> None:
+    """The helper behind ``serverInfo.version`` resolves to THIS package, not FastMCP.
 
-    FastMCP fills this with ITS OWN version when the argument is omitted, which is how an MCP client
-    connecting to 3.2.0 came to be shown "3.3.1" -- a string matching no release of this package.
+    Scope, stated honestly: this covers the helper and nothing else. It cannot see whether the value
+    actually reaches ``serverInfo.version`` on the wire, which is where the bug lived -- FastMCP fills
+    that field with its own version when the argument is omitted, and a client connecting to 3.2.0 was
+    shown "3.3.1". A test asserting only this would pass while the field stayed wrong, so the wire
+    assertion belongs to ``scripts/check_server_boot.py`` and runs as the ``server-boot`` gate stage.
+    Named for what it checks so the two are not confused for one another.
     """
     from importlib.metadata import version
 
