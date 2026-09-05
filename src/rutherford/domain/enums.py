@@ -150,9 +150,11 @@ class Effort(StrEnum):
     reported as ``effort_applied``. Ordered least to most. The ``-fast`` serving-latency variants are
     deliberately excluded -- they are orthogonal to thinking depth, not an effort tier.
 
-    ``max`` is the top tier: claude_code (``effort`` config option) and kiro (``--effort``) advertise it
-    live; codex (``reasoning_effort`` tops out at ``xhigh``) and cursor (``-high`` suffix) clamp ``max``
-    down to their own ceiling, reported honestly as ``effort_applied``.
+    ``max`` is the top tier: claude_code (``effort`` config option), kiro (``--effort``) and codex (the
+    ``reasoning_effort`` config option, which advertises ``low|medium|high|xhigh|max``) apply it live.
+    Cursor (``-high`` suffix) and codex's legacy ``base[tier]`` model-id channel cannot encode it and clamp
+    down to their own ceiling, reported honestly as ``effort_applied`` -- so on codex the tier that lands
+    depends on which channel the seat resolved to, not on the request alone.
     """
 
     LOW = "low"

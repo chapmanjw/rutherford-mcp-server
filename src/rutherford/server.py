@@ -181,7 +181,7 @@ async def delegate(
     `list_roles`) whose system prompt is prepended to `prompt`. `effort` (low | medium | high | xhigh | max)
     asks the agent to spend more reasoning where it has a knob (codex via an advertised `model[tier]` id or a
     confirmed `reasoning_effort` config option; cursor via the model id; cline via --thinking; junie via env).
-    `max` is accepted and clamped to the agent's ceiling (codex: xhigh). A reported no-op for an agent with
+    `max` is accepted and clamped to the agent's ceiling where it has one. A reported no-op for an agent with
     none. Omitted, the configured `default_effort` (per-agent or global) applies. `fallback` is an ordered
     list of alternate targets
     (`cli` / `cli:model` strings or `{cli, model}` objects) tried when the primary fails on a

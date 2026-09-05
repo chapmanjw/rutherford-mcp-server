@@ -47,7 +47,10 @@ from dataclasses import dataclass
 from ..domain.enums import EFFORT_ORDER, Effort
 from .descriptors import AgentDescriptor
 
-#: Codex's reasoning-effort vocabulary tops out at ``xhigh`` (richer than the others), so no clamp applies.
+#: Ceiling for the codex BRACKET rewrite only -- the historical ``base[tier]`` catalog stopped at ``xhigh``,
+#: so a requested ``max`` cannot be encoded in that id. It does NOT bound the ``reasoning_effort`` config
+#: option, which is clamped at open to whatever the agent advertises: current codex offers
+#: ``low|medium|high|xhigh|max`` there, so a seat on that channel applies ``max`` as ``max``.
 _CODEX_CEILING = Effort.XHIGH
 
 
@@ -137,8 +140,10 @@ def _codex(model: str | None, effort: Effort) -> EffortOverride:
     (``config_option_fallback=True``), and :class:`~rutherford.acp.session.ACPSession` uses the bracket id
     only when it is advertised, otherwise selecting the bare model and confirming ``reasoning_effort``. With
     NO model the bare id is not a selection target; this routes straight to the config-option channel.
-    Codex tops out at ``xhigh``, so ``max`` clamps down -- reported on the model-id note; the config-option
-    path clamps to the option's advertised values at open.
+    The two channels have DIFFERENT ceilings, and only the bracket one is static. A ``base[tier]`` id cannot
+    encode ``max`` (the historical catalog stopped at ``xhigh``), so the rewrite clamps and says so in its
+    note. The ``reasoning_effort`` option is clamped at open to the values the agent actually advertises --
+    current codex lists ``max`` there -- so the fallback path can apply a tier the bracket path could not.
     """
     if not model:
         return EffortOverride(
@@ -381,9 +386,11 @@ def clamp_to_supported(effort: Effort, supported: list[Effort]) -> Effort | None
     """Clamp ``effort`` to the nearest tier at-or-below it within ``supported`` (the config-option path).
 
     ``supported`` is the agent's advertised effort options parsed to :class:`Effort` (order-agnostic). The
-    requested tier wins if offered; otherwise the highest supported tier below it (so ``max`` on a codex
+    requested tier wins if offered; otherwise the highest supported tier below it (so ``max`` against an
     option topping out at ``xhigh`` becomes ``xhigh``); if the request is below every supported tier, the
-    lowest supported one. ``None`` only when nothing is supported (the caller then leaves effort a no-op).
+    lowest supported one. The ceiling is whatever the AGENT advertises, not a constant per agent: codex's
+    ``reasoning_effort`` currently offers ``max``, so a codex seat on that channel keeps ``max``.
+    ``None`` only when nothing is supported (the caller then leaves effort a no-op).
     """
     if not supported:
         return None

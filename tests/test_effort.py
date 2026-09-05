@@ -92,6 +92,22 @@ def test_kiro_uses_the_effort_launch_flag_for_every_tier() -> None:
         assert not override.via_config_option and override.extra_env == () and override.model is None
 
 
+def test_clamp_to_supported_keeps_max_when_the_option_advertises_it() -> None:
+    """The config-option ceiling is the AGENT's advertised list, not a constant for the agent.
+
+    Codex's ``reasoning_effort`` option advertises ``low|medium|high|xhigh|max`` (verified live), so a codex
+    seat that resolves to that channel applies ``max`` as ``max``. Only the legacy ``base[tier]`` model-id
+    rewrite is bounded at ``xhigh``, because that catalog had no ``max`` id to select. Pinning it here so the
+    two ceilings cannot be conflated back into one claim.
+    """
+    with_max = [Effort.LOW, Effort.MEDIUM, Effort.HIGH, Effort.XHIGH, Effort.MAX]
+    assert clamp_to_supported(Effort.MAX, with_max) is Effort.MAX
+    assert clamp_to_supported(Effort.XHIGH, with_max) is Effort.XHIGH
+    # ...and the bracket rewrite, on the same request, still cannot go above xhigh.
+    bracket = effort_overrides(_descriptor("codex"), Effort.MAX, model="gpt-5.5")
+    assert bracket.applied is Effort.XHIGH
+
+
 def test_clamp_to_supported_picks_the_request_or_the_nearest_below() -> None:
     codex = [Effort.LOW, Effort.MEDIUM, Effort.HIGH, Effort.XHIGH]
     assert clamp_to_supported(Effort.HIGH, codex) is Effort.HIGH  # offered -> exact

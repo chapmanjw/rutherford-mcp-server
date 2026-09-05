@@ -129,8 +129,10 @@ All notable changes to this project are documented in this file. The format is b
   advertises bare model ids (e.g. `gpt-5.6-terra`), not `base[xhigh]`. Rutherford was rewriting
   `effort=max` into `gpt-5.6-terra[xhigh]` before advertisement checks, then rejecting a model the
   agent actually offered. The bracket id is used only when advertised; otherwise the advertised bare
-  model is selected and `reasoning_effort` is applied with `current_value` confirmation (`max` still
-  clamps to `xhigh`). A matching base id is never treated as proof the bracket effort applied: missing
+  model is selected and `reasoning_effort` is applied with `current_value` confirmation. The two channels
+  have different ceilings: a `base[tier]` id cannot encode `max`, but the config option is clamped to what
+  the agent advertises and current codex lists `max` there, so the fallback applies a tier the bracket path
+  could not. A matching base id is never treated as proof the bracket effort applied: missing
   `reasoning_effort` after that fallback is `ACP_HANDSHAKE_FAILED` naming the effort. MCP tool
   descriptions now list `max` alongside `low|medium|high|xhigh`.
 
