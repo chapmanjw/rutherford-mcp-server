@@ -243,7 +243,7 @@ All notable changes to this project are documented in this file. The format is b
   A snapshot that lands after its deadline is reaped rather than dropped, and a timeout, a failure, an
   undispatched reap, or a backlog of cleanups that are not completing is logged rather than passing for
   an empty tree.
-- **Agent stderr is detached from the host pipe, and structured logs go through a non-blocking writer.**
+- **Structured logs go through a non-blocking writer.**
   The writer's queue is bounded; when a wedged sink causes it to overflow, the dropped count is reported
   as a `log_records_dropped` record rather than vanishing — the gap is visible in the same JSON stream,
   anchored before the next record.
