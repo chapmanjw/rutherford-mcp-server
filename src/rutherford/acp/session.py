@@ -116,6 +116,13 @@ _STDERR_DETAIL_LINES = 20
 _ANSI_ESCAPE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\x1b\[[0-?]*[ -/]*[@-~]")
 #: Remaining C0/C1 controls except tab and newline, plus the bidi overrides/isolates that can visually reorder
 #: text so a rendered line reads differently from the bytes it came from.
+#:
+#: CodeQL flags the ``\x0b-\x1f`` span as ``py/overly-large-range`` (alert #8, dismissed). The range is
+#: deliberate, and the rule's risk runs the other way here. ``\x00-\x08`` plus ``\x0b-\x1f`` is
+#: precisely "every C0 control except tab and newline"; the class matches 72 code points in all, every one
+#: of category Cc or Cf and not one of them printable. More to the point it is used as a substitution to the
+#: empty string below, so a WIDER class removes MORE -- breadth cannot produce the sanitizer bypass that
+#: rule exists to catch, and only a class that were too NARROW could. Do not tighten it to quiet the alert.
 _CONTROL_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
 #: Credential shapes masked out of captured stderr before it is surfaced.
 #:
