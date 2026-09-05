@@ -54,7 +54,7 @@ model.
 - For a local-model agent, confirm the model supports tool-calling — a model without it handshakes but
   fails the agentic turn. See [local-models.md](local-models.md).
 
-### `model_unavailable` in doctor — `claude_code` 400 invalid model on Bedrock / Amazon Toolbox
+### `model_unavailable` in doctor — `claude_code` 400 invalid model on Bedrock / enterprise wrappers
 
 The seat spawned and handshook (it shows `reachable` under `doctor connect_only`), but the turn failed
 because the provider rejected the model id:
@@ -63,8 +63,8 @@ because the provider rejected the model id:
 API Error (claude-opus-4-8): 400 The provided model identifier is invalid.
 ```
 
-This is a Claude Code configured for **AWS Bedrock** / **Google Vertex**, or an enterprise wrapper such
-as **Amazon's Toolbox** build, where the third-party `claude-agent-acp` adapter resolves the model down
+This is a Claude Code configured for **AWS Bedrock** / **Google Vertex**, or a **managed enterprise
+wrapper**, where the third-party `claude-agent-acp` adapter resolves the model down
 to a bare cloud alias (`claude-opus-4-8`) that the provider rejects — it needs an inference-profile id
 like `us.anthropic.claude-opus-4-1-20250805-v1:0`. The standalone `claude` CLI works because it resolves
 the Bedrock model itself; the SDK/adapter path that Rutherford drives does not. `doctor` attaches a
@@ -203,7 +203,7 @@ reported as a `ConfigError`, not a raw decode error.
 | `ACP_SPAWN_FAILED` | Run `doctor`; install the agent (and its ACP shim); confirm it is on PATH. |
 | `ACP_HANDSHAKE_FAILED` | Confirm the ACP launch command; raise `handshake_timeout_s`; check the agent's auth. |
 | `ACP_REFUSED` / `ACP_EMPTY_ANSWER` | The agent answered nothing; check auth, or a local model's tool-calling support. |
-| `model_unavailable` (doctor) | The provider rejected the model id; on Bedrock/Vertex/Toolbox pin one via `[agents.claude_code.env]` — see [bedrock.md](bedrock.md). |
+| `model_unavailable` (doctor) | The provider rejected the model id; on Bedrock/Vertex/an enterprise wrapper pin one via `[agents.claude_code.env]` — see [bedrock.md](bedrock.md). |
 | `ACP_TURN_TIMEOUT` | Raise `timeout_s` or `default_timeout_s`; use `mode="async"` for long tasks. |
 | `ACP_TURN_ERROR` | A transport/protocol error mid-turn; re-run, and check `doctor`. |
 | `WORKSPACE_NOT_TRUSTED` | Pass `trust_workspace=true` or add the path to `trusted_workspaces`. |

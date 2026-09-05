@@ -257,7 +257,7 @@ reuse the session. `codex` (`codex-acp`) and `claude_code` (`claude-agent-acp`) 
 Codex and Claude Code CLI logins over ACP and need no API key. Confirm what actually drives on this
 machine with `doctor`.
 
-**On AWS Bedrock / Google Vertex (or an enterprise wrapper such as Amazon Toolbox)** a `claude_code`
+**On AWS Bedrock / Google Vertex (or a managed enterprise wrapper)** a `claude_code`
 turn can fail with `400 The provided model identifier is invalid` even though `doctor connect_only`
 reports the seat reachable. The fix is a per-agent `[agents.claude_code.env]` block pinning a valid
 provider model id — see **[Claude Code on Bedrock / enterprise wrappers](bedrock.md)** for the full

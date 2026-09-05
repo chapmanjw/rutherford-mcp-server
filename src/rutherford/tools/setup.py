@@ -31,7 +31,7 @@ from ..io.tomltext import toml_str
 #: Rutherford's config (outside the .claude tree) means an org wrapper that rewrites settings.json cannot revert
 #: it. The example id is a placeholder -- replace it with your real inference-profile id. See docs/bedrock.md.
 _BEDROCK_BLOCK = [
-    "# AWS Bedrock / Vertex (or an enterprise wrapper like Amazon Toolbox) detected. Claude Code can reject the",
+    "# AWS Bedrock / Vertex (or a managed enterprise wrapper) detected. Claude Code can reject the",
     '# default model id here ("400 The provided model identifier is invalid"). Pin a valid provider model id',
     "# for the claude_code seat below (replace the placeholder), then uncomment. This lives outside the .claude",
     "# tree so an org wrapper that rewrites settings.json cannot revert it. See docs/bedrock.md.",

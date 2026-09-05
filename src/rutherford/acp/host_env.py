@@ -16,7 +16,7 @@ So when the host is on Bedrock/Vertex, Rutherford resolves a valid provider mode
 This is gated to the Claude Code adapter seat and to a Bedrock/Vertex host, so every other seat -- and a
 normal API-key Claude Code -- is left exactly as it is.
 
-CAVEAT (enterprise / Amazon Toolbox builds): an ENFORCED model allowlist (``enforceAvailableModels: true`` in
+CAVEAT (managed enterprise builds): an ENFORCED model allowlist (``enforceAvailableModels: true`` in
 ``settings.json``, which an org wrapper may rewrite on every launch) makes the adapter rewrite every model to a
 BARE ALIAS and substring-match the injected ``ANTHROPIC_MODEL`` back DOWN to that alias before calling
 ``set_model`` -- so ``ANTHROPIC_MODEL`` alone is NOT enough there, and the rejected bare alias still reaches
@@ -229,7 +229,7 @@ def bedrock_remediation_hint(descriptor: AgentDescriptor, env: Mapping[str, str]
         return None
     model = _hint_model_id(descriptor, env) or "<your provider model id, e.g. global.anthropic.claude-opus-4-8[1m]>"
     return (
-        "Claude Code rejected the model id, which a Bedrock/Vertex (or enterprise-wrapped, e.g. Amazon Toolbox) "
+        "Claude Code rejected the model id, which a Bedrock/Vertex (or managed enterprise-wrapped) "
         "build does when handed a bare cloud alias instead of a provider inference-profile id. Pin a valid id "
         f"for this seat in Rutherford's OWN config (outside the .claude tree, so an org wrapper that rewrites "
         f"settings.json cannot revert it):\n"

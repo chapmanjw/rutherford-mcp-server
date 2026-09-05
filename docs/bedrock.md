@@ -1,8 +1,8 @@
 # Claude Code on AWS Bedrock / Google Vertex / enterprise wrappers
 
 If your Claude Code is configured for **AWS Bedrock** (`CLAUDE_CODE_USE_BEDROCK=1`), **Google Vertex**
-(`CLAUDE_CODE_USE_VERTEX=1`), or an enterprise distribution that wraps it (for example Amazon's internal
-"Toolbox" build), a `claude_code` turn through Rutherford can fail with:
+(`CLAUDE_CODE_USE_VERTEX=1`), or a managed enterprise distribution that wraps it, a `claude_code` turn
+through Rutherford can fail with:
 
 ```
 ACP turn for claude_code failed: Internal error: API Error (claude-opus-4-8): 400 The provided model
@@ -47,7 +47,7 @@ path, not the `claude` CLI binary**. On the affected builds (observed in adapter
 The standalone `claude` CLI works because it applies the `env` block of `settings.json` to *itself* and
 resolves the Bedrock model on its own; the SDK/adapter path does not.
 
-**The enterprise-wrapper twist.** A managed distribution (e.g. Amazon Toolbox) may rewrite
+**The enterprise-wrapper twist.** A managed distribution may rewrite
 `availableModels` back to the approved bare aliases on *every* `claude` launch, in *any* `CLAUDE_CONFIG_DIR`
 — so editing `settings.json` on disk is futile; the wrapper reverts it. What survives the wrapper is the
 **subprocess environment** and files **outside the `.claude` tree** — which is exactly where Rutherford's
