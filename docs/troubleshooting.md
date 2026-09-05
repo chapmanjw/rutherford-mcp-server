@@ -87,6 +87,30 @@ Reconnect the MCP server (config is read once at start) and re-run `doctor agent
 **[Claude Code on Bedrock / enterprise wrappers](bedrock.md)** for the full mechanism and the approaches
 that do *not* work.
 
+### `codex` with both `model` and `effort` — bare vs bracketed model ids
+
+Codex has carried its reasoning effort two different ways, and which one a seat gets decides both the
+error you see when it goes wrong and the tier you actually get.
+
+Historically `codex-acp` advertised a catalog of `base[tier]` ids (`gpt-5.5[xhigh]`), so one selection
+set the model and the tier together. Newer Codex advertises **bare** ids plus a separate
+`reasoning_effort` config option. Rutherford therefore uses the bracket id **only when the agent
+advertises it**, and otherwise selects the advertised bare model and applies `reasoning_effort`,
+confirming the option's `current_value` before reporting the tier.
+
+What that means when reading a failure:
+
+- A bare model the agent does offer is never reported as `MODEL_UNAVAILABLE`. That code now means the
+  base id genuinely is not advertised on any channel.
+- If the fallback selects the bare model but the agent advertises no `reasoning_effort` option, or the
+  set is not confirmed, the turn fails `ACP_HANDSHAKE_FAILED` naming the **effort**, not the model. The
+  effort was requested and could not be proven applied, so it is refused rather than silently dropped.
+- A matching bare model id is never taken as evidence the bracket tier applied.
+
+The two channels also have different ceilings. A `base[tier]` id cannot encode `max`, so the rewrite
+clamps to `xhigh`; the `reasoning_effort` option is clamped to what the agent advertises, and current
+Codex lists `max` there. `effort_applied` always reports the tier that actually landed.
+
 ### `ACP_TURN_TIMEOUT` — the turn exceeded its limit
 
 `ACPSession.prompt` wraps the turn in a timeout; on expiry it issues `session/cancel`, preserves any
