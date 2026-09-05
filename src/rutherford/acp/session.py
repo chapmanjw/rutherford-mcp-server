@@ -1128,12 +1128,17 @@ class ACPSession:
                 )
             # * NOT cancellable, despite looking like the most cancellable stage here. The stack's exit
             # runs the SDK's `Connection.close` (acp/connection.py), which sets `_closed = True` and only
-            # THEN awaits its dispatcher stop, sender close, and task shutdown; `MessageSender.close`
-            # (acp/task/sender.py) latches the same way. A cancel landing in the middle leaves the later
-            # steps undone forever, because the flag is already set and every future `close()` returns
-            # immediately -- there is no second chance to finish them. Bounding the wait is all that was
-            # ever needed here: the adapter is hard-killed above and again in the `finally`, so the EOF
-            # this used to block on has already been delivered and the close completes on its own.
+            # THEN rejects the pending outgoing requests and awaits the transport close and task shutdown;
+            # `MessageSender.close` (acp/task/sender.py) latches the same way. A cancel landing in the
+            # middle leaves the later steps undone forever, because the flag is already set and every
+            # future `close()` returns immediately -- there is no second chance to finish them. Bounding
+            # the wait is all that was ever needed here: the adapter is hard-killed above and again in the
+            # `finally`, so the EOF this used to block on has already been delivered and the close
+            # completes on its own.
+            #
+            # The LATCH is the load-bearing fact, not the list of steps inside it. ACP 0.12.1 deleted the
+            # pluggable dispatcher/queue/state-store layer this comment used to enumerate, and the argument
+            # survived unchanged because both `close` methods still return early on an already-set flag.
             await self._bounded_cleanup(
                 self._stack.aclose(),
                 timeout_s=_TRANSPORT_CLOSE_TIMEOUT_S,

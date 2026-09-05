@@ -60,6 +60,25 @@ dependencies = [
     # unreadable category narrows to untagged instead of comparing unequal, and every post-spawn step in
     # ACPSession.open runs inside one teardown guard so a read that raises cannot orphan the agent process.
     #
+    # 0.12.1 is validated and is a far larger release than its patch number suggests. It DELETED the pluggable
+    # dispatcher / queue / state-store layer outright (acp/task/dispatcher.py, queue.py and state.py are gone)
+    # and dropped four keyword arguments from Connection.__init__ along with them. None of that reaches here:
+    # nothing in this package names a removed symbol or passes a removed argument, because the SDK is driven
+    # through spawn_agent_process rather than assembled by hand.
+    #
+    # What was checked, and why each mattered:
+    #   * _deserialize.py is BYTE-IDENTICAL to 0.12.0, so the salvage-instead-of-reject behaviour described
+    #     above -- the actual hazard of this dependency -- is unchanged and the guards written for it still
+    #     apply. That single fact is most of the confidence here.
+    #   * Connection.close now rejects pending outgoing requests FIRST and moves the task shutdown into a
+    #     `finally`, which is strictly safer, and both it and MessageSender.close still latch on an
+    #     already-closed flag -- the property session.py's non-cancellable teardown stage depends on.
+    #   * schema.py is regenerated, not merely restyled: four response/error `id` fields became REQUIRED, the
+    #     content-block and configOption unions gained `type` / `kind` discriminators, and several open `str`
+    #     fields narrowed to Literal unions -- including SessionConfigOptionSelect.category, which the model
+    #     and effort channels read. The full suite and mypy strict both pass against it, so no narrowing bites
+    #     a path this client takes, but that is the surface to re-check next time.
+    #
     # Hence an exact pin rather than a range or a minor wildcard. Note which distinction is NOT doing the
     # work here: `<0.13` and `==0.12.*` both admit 0.12.z releases that do not exist yet, so neither one
     # protects against an unreleased patch -- `==0.12.*` merely also excludes falling back to 0.11. What
@@ -69,7 +88,7 @@ dependencies = [
     # release claimed here is the one actually put through the malformed-payload suite. Raise it
     # deliberately: re-read the deserialization behaviour, run tests/test_acp_wire.py against the new
     # release, then move the pin.
-    "agent-client-protocol==0.12.0",
+    "agent-client-protocol==0.12.1",
 ]
 
 [project.urls]

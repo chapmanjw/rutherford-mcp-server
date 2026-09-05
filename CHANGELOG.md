@@ -40,6 +40,25 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **The ACP SDK pin moves to 0.12.1, and Dependabot now tracks it through the `uv` ecosystem.** The
+  release is a much larger change than its patch number suggests: it deletes the pluggable dispatcher,
+  queue and state-store layer outright and drops four keyword arguments from `Connection.__init__`.
+  None of that reaches this package, which drives the SDK through `spawn_agent_process` rather than
+  assembling a connection by hand, so no removed symbol is named here.
+
+  What made the bump acceptable is that `_deserialize.py` is byte-identical to 0.12.0 — the
+  salvage-instead-of-reject behaviour that is the real hazard of this dependency, and the reason the pin
+  exists, is unchanged, so the guards written against it still hold. `Connection.close` also got safer:
+  it rejects pending requests first and moves the task shutdown into a `finally`, while still latching on
+  an already-closed flag, which is the property the non-cancellable teardown stage depends on. The
+  regenerated schema is the part to watch next time — four `id` fields became required, the content-block
+  and config-option unions gained discriminators, and several open `str` fields narrowed to `Literal`
+  unions, including the config-option category that the model and effort channels read.
+
+  The Dependabot ecosystem changes from `pip` to `uv` because the `pip` ecosystem updates the manifest
+  without regenerating `uv.lock`, and CI installs with `--locked`. Every dependency PR therefore failed
+  all nine matrix cells on a stale lockfile rather than on anything about the dependency.
+
 - **The ACP SDK is now pinned to 0.12, and read as an untrusted source rather than a validating one.** The
   0.11 pin was raised after checking what actually changed: the protocol version is unchanged, both model
   channels are intact, and one unused public name went away. What did change is deserialization, and it
