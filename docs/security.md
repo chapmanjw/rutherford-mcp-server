@@ -291,16 +291,20 @@ existing CLI login, with no API key. Other agents use whatever auth their own lo
 
 ## Secrets handling
 
-Rutherford never sources, mints, or deliberately copies a credential value. The agent
-subprocess inherits the environment so its own credential discovery works; Rutherford layers only the
-descriptor's `env_overrides` on top (a local-runtime provider env, never a credential it minted). Keep
-API keys and session tokens in environment variables or each agent's own credential store. Do not put
-them in a config file, a role file, or anywhere else in the repository.
+Rutherford never obtains or mints a credential of its own. The agent subprocess inherits the
+environment so its own credential discovery works, and Rutherford layers the descriptor's
+`env_overrides` on top of it.
 
-That is a statement about what Rutherford does, not a guarantee about what a result can contain. The
-difference is load-bearing, because there is exactly one path by which a credential could nonetheless
-reach one, and it belongs to the agent rather than to Rutherford. Do not quote the paragraph above
-without this one.
+That layer is the one place it will hand a credential onward, and it does so verbatim without
+recognising it as one: an `[agents.<id>.env]` block is copied straight into the child's environment.
+The intended use is a non-secret pin such as a provider model id. Keep API keys and session tokens in
+your environment or each agent's own credential store, and out of a config file, a role file, or
+anywhere else in the repository -- a value placed there is one Rutherford will copy, and one that sits
+in plain text wherever that file lives.
+
+All of that describes what Rutherford does with a credential on the way IN. It is not a guarantee
+about what comes back out: a result can contain one by a separate route, which belongs to the agent
+rather than to Rutherford. The two halves are not quotable apart.
 
 Note also where such a result can come to rest. A persisted run (`persist=true`, or a `job` default)
 writes each voice's answer or error to `artifacts/voices/` under the jobs directory, so anything the

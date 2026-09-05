@@ -58,7 +58,9 @@ command  = ["my-agent", "--acp"]
 provider = "openai"        # optional: the fixed model vendor, recorded as provenance
 default_model = "gpt-5"    # optional: the model used when a call names none
 handshake_timeout_s = 30   # optional: raise it for a heavyweight agent
-env = { MY_AGENT_TOKEN = "..." }   # optional: env set for the subprocess
+env = { MY_AGENT_REGION = "us-west-2" }   # optional: env set for the subprocess. Non-secret values
+                                          # only -- this file is plain text and Rutherford copies it
+                                          # verbatim; leave credentials to the agent's own store.
 ```
 
 The id (`my-agent`) is the name you delegate to: `delegate(cli="my-agent", ...)`, or use it in
@@ -80,7 +82,7 @@ automatically. Only the launch `command` and `env` are imported.
     "my-agent": {
       "command": "my-agent",
       "args": ["--acp"],
-      "env": { "MY_AGENT_TOKEN": "..." }
+      "env": { "MY_AGENT_REGION": "us-west-2" }
     }
   }
 }

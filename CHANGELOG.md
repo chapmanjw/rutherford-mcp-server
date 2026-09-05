@@ -278,7 +278,7 @@ All notable changes to this project are documented in this file. The format is b
 
 - **Every GitHub Action is pinned to an immutable commit SHA.** The workflows referenced floating tags
   (`actions/checkout@v7`), which a tag move can repoint at new code without any change here. They now
-  name a SHA with the human-readable version beside it. This matters most on the release workflow, which
+  name a SHA with the human-readable ref beside it. This matters most on the release workflow, which
   holds `id-token: write` for PyPI trusted publishing and `contents: write` to create the release: a
   compromised action there would run inside a job able to publish.
 
