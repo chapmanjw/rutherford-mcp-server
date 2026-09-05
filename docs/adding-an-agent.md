@@ -156,5 +156,6 @@ The merge bar for a new built-in:
 - The unit suite stays green using the fake ACP agent in `tests/fake_acp_agent.py` — no new test
   requires a real subprocess.
 
-If an agent only drives with config (a non-default launch, an env token), it belongs in config or an
-`acp.json`, not in the built-in roster.
+If an agent only drives with extra configuration (a non-default launch command, an extra environment
+setting), it belongs in config or an `acp.json`, not in the built-in roster. Credentials are not part
+of that: leave those to the agent's own credential store or your environment, never a config file.

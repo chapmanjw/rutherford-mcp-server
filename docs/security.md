@@ -291,25 +291,29 @@ existing CLI login, with no API key. Other agents use whatever auth their own lo
 
 ## Secrets handling
 
-Rutherford never obtains or mints a credential of its own. The agent subprocess inherits the
-environment so its own credential discovery works, and Rutherford layers the descriptor's
-`env_overrides` on top of it.
+Rutherford never obtains or mints a credential of its own. Credentials reach an agent by two routes,
+and it is worth being exact about which is which.
 
-That layer is the one place it will hand a credential onward, and it does so verbatim without
-recognising it as one: an `[agents.<id>.env]` block is copied straight into the child's environment.
-The intended use is a non-secret pin such as a provider model id. Keep API keys and session tokens in
-your environment or each agent's own credential store, and out of a config file, a role file, or
-anywhere else in the repository -- a value placed there is one Rutherford will copy, and one that sits
-in plain text wherever that file lives.
+The first is inheritance, and it is the main one: the subprocess inherits Rutherford's environment, so
+the agent's own credential discovery works the way it would if you had launched it yourself. Rutherford
+neither reads nor filters what is in there.
 
-All of that describes what Rutherford does with a credential on the way IN. It is not a guarantee
-about what comes back out: a result can contain one by a separate route, which belongs to the agent
-rather than to Rutherford. The two halves are not quotable apart.
+The second is the only place Rutherford ADDS anything, and it adds it verbatim without recognising
+what it is: an `[agents.<id>.env]` block is copied straight into the child's environment. The intended
+use is a non-secret pin such as a provider model id. Keep API keys and session tokens in your
+environment or the agent's own credential store, and out of a config file, a role file, or anywhere
+else in the repository -- a value placed there is one Rutherford will copy, and one that sits in plain
+text wherever that file lives.
 
-Note also where such a result can come to rest. A persisted run (`persist=true`, or a `job` default)
-writes each voice's answer or error to `artifacts/voices/` under the jobs directory, so anything the
-masking below did not recognize is written to disk rather than only returned to the caller. Treat the
-jobs directory with the same care as any other diagnostic output.
+Both of those describe the way IN. Neither is a guarantee about what comes back OUT: a result can
+carry a credential by a separate route, described below, which belongs to the agent rather than to
+Rutherford. Do not quote either half without the other.
+
+Such a result can also come to rest on disk. A persisted run (`persist=true`, or a `job` default)
+writes its output under the job's `artifacts/` directory -- a delegation's `answer.md`, a consensus's
+`voices/voice-N.md`, a debate's `transcript.md` -- so anything the masking below did not recognize is
+written there rather than only returned to the caller. Treat the jobs directory with the same care as
+any other diagnostic output.
 
 When a session fails to open, a bounded excerpt of the agent's own stderr is attached to the failure
 detail -- the FIRST bytes it wrote, not the last, because a launcher that rejects its arguments
