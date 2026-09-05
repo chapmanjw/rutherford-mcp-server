@@ -25,6 +25,67 @@ _POWERSHELL = ("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-F
 _QUOTED = re.compile(r'"([^"]+)"')
 
 
+def _on_disk_case(resolved: str) -> str:
+    """Return ``resolved`` with its file name spelled the way the directory entry spells it.
+
+    ``shutil.which`` never reads the dirent. It returns ``os.path.join(dir, thefile)`` where ``thefile`` is
+    built from the CALLER's string, plus -- on Windows only -- each ``PATHEXT`` entry appended VERBATIM. So an
+    uppercase ``PATHEXT`` hands back ``kiro-cli.EXE`` for a file whose dirent is ``kiro-cli.exe``. Windows opens
+    either spelling, so the process starts; but a launcher that looks its own module name up in a table finds
+    no entry for the uppercase form and exits before reading a byte of stdin, which an ACP client can only
+    report as an instant "Connection closed". A managed bin directory whose every entry is the same dispatcher
+    stub, distinguished only by the name it is invoked under, is exactly that shape.
+
+    NOT guarded on ``os.name == "nt"``, and that is a correctness choice rather than a cosmetic one. The
+    ``PATHEXT`` mechanism is Windows-only, but the DEFECT is not: macOS ships a case-insensitive APFS/HFS+ by
+    default, where ``which("Kiro-CLI")`` likewise resolves a dirent named ``kiro-cli`` and returns the caller's
+    spelling, and POSIX ``execve`` passes that spelling straight through as ``argv[0]``. On a case-SENSITIVE
+    filesystem the exact-match branch below returns the input untouched, so this is self-neutralizing there --
+    one ``scandir`` (0.35 ms against a 5,111-entry System32) against a process spawn that costs orders more.
+
+    Case is normalized WITHOUT ``Path.resolve()`` / ``os.path.realpath`` on purpose: those also dereference
+    links, and measured against a real ``mklink /J`` junction that rewrote ``...\\nodejs\\NODE.EXE`` to
+    ``...\\node-v20.11.0\\node.exe`` -- pinning a version-managed shim to one concrete install so a later
+    ``nvm use`` silently would not take effect. A leaf-level ``is_symlink`` guard does not rescue that, because
+    nvm-style layouts put the junction on the PARENT directory.
+
+    An ``exists()`` probe cannot shortcut this either: it is case-INSENSITIVE on exactly the platforms carrying
+    the bug (measured ``True`` for ``KIRO-CLI.EXE`` against a dirent spelled ``Kiro-Cli.exe``), so it would
+    always report the corrupted spelling as fine and make the whole fix a silent no-op.
+
+    ``lower()`` rather than ``casefold()``: casefold is deliberately more aggressive than filesystem
+    case-insensitivity (it folds ``ß`` to ``ss``), so it can equate two names NTFS considers DIFFERENT files --
+    and rewriting to a different file is a worse failure than the one being fixed.
+    """
+    path = Path(resolved)
+    name = path.name
+    folded = name.lower()
+    candidate: str | None = None
+    ambiguous = False
+    try:
+        with os.scandir(path.parent) as entries:
+            for entry in entries:
+                if entry.name == name:
+                    # An exact dirent exists: nothing to correct. Returned from INSIDE the loop so a
+                    # case-variant enumerated earlier can never win over it -- scandir order is unspecified,
+                    # and "first case-insensitive hit" would resolve the same input differently per machine.
+                    return resolved
+                if entry.name.lower() == folded:
+                    if candidate is None:
+                        candidate = entry.name
+                    else:
+                        # Two dirents differing only in case, on a case-SENSITIVE filesystem. Either could be
+                        # the intended target, so keep scanning for an exact match but never guess between them.
+                        ambiguous = True
+    except OSError:
+        # A PATH directory that vanished, denied enumeration, or raced. shutil.which already found the file by
+        # name, so the honest fallback is the spelling we have -- never a crash in a previously working spawn.
+        return resolved
+    if candidate is None or ambiguous:
+        return resolved
+    return str(path.with_name(candidate))
+
+
 def prepare_argv(argv: tuple[str, ...]) -> list[str]:  # noqa: C901 - per-platform launch cases, each distinct
     """Resolve ``argv`` to a launchable command list for the current platform."""
     if not argv:
@@ -33,6 +94,11 @@ def prepare_argv(argv: tuple[str, ...]) -> list[str]:  # noqa: C901 - per-platfo
     rest = list(argv[1:])
     if resolved is None:
         return list(argv)
+    # Normalize ONCE at the single resolution point, before any branching, so every return path below inherits
+    # it: the direct ``.exe`` (where the diagnosed failure lands), the shell-wrapper fallbacks (which pass the
+    # path to cmd.exe / PowerShell, so a ``.BAT`` dispatcher inspecting ``%0`` sees the real spelling), and the
+    # sibling lookups, whose stems are derived from this name.
+    resolved = _on_disk_case(resolved)
     if os.name == "nt":
         path = Path(resolved)
         suffix = path.suffix.lower()
@@ -94,7 +160,16 @@ def _resolve_npm_shim(shim: Path) -> list[str] | None:  # noqa: C901 - Windows s
             return [str(exes[0])]
         scripts = [item for item in candidates if item.name.lower() != "node.exe"]
         if scripts:
-            node = next((str(item) for item in candidates if item.name.lower() == "node.exe"), shutil.which("node"))
+            # A node path parsed OUT of the shim text already carries the real spelling (it is a literal in the
+            # file). The PATH fallback does not: this is a SECOND ``shutil.which`` and reproduces the uppercase
+            # -PATHEXT defect verbatim -- measured on this machine, ``which("node")`` returns ``node.EXE`` for a
+            # dirent spelled ``node.exe``. Normalizing only the top-level resolution would leave the bug alive
+            # at this nested boundary, so it is applied here too.
+            fallback = shutil.which("node")
+            node = next(
+                (str(item) for item in candidates if item.name.lower() == "node.exe"),
+                None if fallback is None else _on_disk_case(fallback),
+            )
             if node is not None:
                 return [node, str(scripts[0])]
     return None

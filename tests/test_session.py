@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import statistics
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -12,7 +14,17 @@ import pytest
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.acp.journal import EventJournal, JournalEvent
 from rutherford.acp.permission import PermissionPolicy
-from rutherford.acp.session import ACPHandshakeError, ACPSession, _post_prompt_safety, run_acp_turn
+from rutherford.acp.session import (
+    _SECRET_PATTERNS,
+    _STDERR_DETAIL_BYTES,
+    _STDERR_DETAIL_LINES,
+    ACPHandshakeError,
+    ACPSession,
+    _fault_reason,
+    _post_prompt_safety,
+    _sanitize_stderr,
+    run_acp_turn,
+)
 from rutherford.config.schema import RutherfordConfig
 from rutherford.domain.enums import ReexecutionSafety, SafetyMode
 from rutherford.domain.error_codes import ErrorCode
@@ -842,3 +854,393 @@ async def test_acp_session_open_raises_on_bad_agent() -> None:
         await session.open()
     assert exc.value.code is ErrorCode.ACP_SPAWN_FAILED
     assert exc.value.safety is ReexecutionSafety.SAFE
+
+
+# --- agent stderr sanitization ----------------------------------------------
+#
+# Pure-function tests for the text that reaches an operator's terminal from an agent's stderr. They are here,
+# and not in test_killpath.py with the pipe-lifecycle tests, because `_sanitize_stderr` is a pure transform of
+# this module and needs no subprocess -- so these run on every platform in milliseconds and pin the properties
+# the lifecycle tests would only exercise incidentally.
+#
+# The threat is terminal rendering, not the wire: TOON/JSON encoding already escapes quotes and newlines, so
+# there is no protocol injection. What survives encoding is what a terminal INTERPRETS.
+
+ESC = b"\x1b"
+
+
+def test_sanitize_strips_a_bel_terminated_osc_clipboard_write() -> None:
+    # OSC 52 writes the operator's clipboard. It is the sharpest of these because it leaves the terminal.
+    assert _sanitize_stderr(ESC + b"]52;c;cGF5bG9hZA==\x07" + b"real line") == "real line"
+
+
+def test_sanitize_strips_an_st_terminated_osc() -> None:
+    # The other OSC terminator (ESC backslash). Missing this alternative would leave the sequence intact.
+    assert _sanitize_stderr(ESC + b"]0;title" + ESC + b"\\" + b"real line") == "real line"
+
+
+def test_sanitize_strips_an_osc8_forged_hyperlink() -> None:
+    # OSC 8 renders arbitrary text as a link to somewhere else -- a phishing primitive in a failure message.
+    payload = ESC + b"]8;;http://evil.example\x07click here" + ESC + b"]8;;\x07"
+    assert _sanitize_stderr(payload) == "click here"
+
+
+def test_sanitize_strips_a_csi_colour_run() -> None:
+    assert _sanitize_stderr(ESC + b"[31mreal line" + ESC + b"[0m") == "real line"
+
+
+def test_sanitize_strips_bidi_overrides() -> None:
+    # A bidi override reorders rendered text, so the line an operator READS can differ from its bytes.
+    assert _sanitize_stderr(b"real" + "\u202e".encode() + b"line") == "realline"
+
+
+def test_sanitize_neutralizes_an_escape_truncated_by_the_capture_cap() -> None:
+    """A sequence cut in half by the retention cap must not leave a live escape behind.
+
+    This is the case the escape regex CANNOT match -- it requires a terminator, and the cap may land before
+    one. The control-character pass is what covers it: the orphaned ESC is removed and the remainder degrades
+    to inert literal text rather than staying interpretable.
+    """
+    for truncated in (b"real line" + ESC + b"]52;c;cGF5bG9h", b"real line" + ESC + b"[3"):
+        out = _sanitize_stderr(truncated)
+        assert "\x1b" not in out and "\x07" not in out
+        assert out.startswith("real line")
+
+
+def test_sanitize_replaces_a_utf8_character_split_by_the_cap() -> None:
+    # The buffer is filled from fixed-size reads and clipped at a byte cap, so a multi-byte character can be
+    # cut in half. Decoding must degrade it, never raise into the failure path being reported.
+    assert _sanitize_stderr(b"real line\xe2\x9c") == "real line\ufffd"
+
+
+def test_sanitize_caps_lines_and_marks_the_truncation() -> None:
+    out = _sanitize_stderr(b"\n".join(b"line%d" % i for i in range(60)))
+    assert out.count(" | ") == _STDERR_DETAIL_LINES - 1
+    assert out.endswith("[truncated]")
+    assert "line59" not in out
+
+
+def test_sanitize_caps_bytes_and_marks_the_truncation() -> None:
+    out = _sanitize_stderr(b"A" * 9000)
+    assert len(out.encode("utf-8")) <= _STDERR_DETAIL_BYTES + len(" [truncated]")
+    assert out.endswith("[truncated]")
+
+
+def test_sanitize_of_blank_output_is_empty_so_no_empty_clause_is_appended() -> None:
+    # Whitespace-only stderr must yield "", so a failure message does not gain a hollow `(agent stderr: "")`.
+    assert _sanitize_stderr(b"   \n\t\r\n  ") == ""
+    assert _sanitize_stderr(b"") == ""
+
+
+def test_fault_reason_never_renders_empty() -> None:
+    """asyncio.TimeoutError stringifies to "", which produced a detail that stopped after the colon."""
+    assert _fault_reason(TimeoutError()) == "TimeoutError"
+    assert _fault_reason(RuntimeError("boom")) == "boom"
+
+
+# --- credential redaction in captured stderr ---------------------------------
+#
+# `docs/security.md` describes this as a MITIGATION, not a guarantee: it masks known shapes, and an
+# unrecognized credential format passes through. Rutherford handles no credential value itself, but the agent
+# subprocess inherits an environment full of them, so a misconfigured adapter printing a token on the way out
+# would otherwise carry it into a result the MCP client reads and a durable job persists on disk.
+
+
+def test_redaction_masks_a_full_authorization_header_value() -> None:
+    r"""The header value runs to end of line, so a `\S+` match would mask only the scheme.
+
+    Regression: an earlier pattern stopped at the first whitespace and produced
+    "Authorization: [redacted] abcdef0123456789abcdef" -- masking the word "Bearer" and publishing the token.
+    """
+    out = _sanitize_stderr(b"Authorization: Bearer abcdef0123456789abcdef")
+    assert out == "Authorization: [redacted]"
+    assert "abcdef0123456789abcdef" not in out
+
+
+def test_redaction_is_confined_to_the_offending_line() -> None:
+    out = _sanitize_stderr(b"line1\nAuthorization: Bearer secrettoken123456\nline3")
+    assert "secrettoken123456" not in out
+    assert "line1" in out and "line3" in out
+
+
+@pytest.mark.parametrize(
+    ("raw", "secret"),
+    [
+        (b"error: ANTHROPIC_API_KEY=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAA rejected", "sk-ant-api03"),
+        (b"OPENAI_API_KEY=sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", "sk-proj"),
+        (b"token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", "ghp_"),
+        (b"aws id AKIAIOSFODNN7EXAMPLE failed", "AKIAIOSFODNN7EXAMPLE"),
+        (b"slack xoxb-123456789012-abcdefghijkl", "xoxb-"),
+        (b"jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk", "eyJhbGci"),
+        (b"GET https://s3/x?X-Amz-Signature=deadbeefcafe1234&other=keep", "deadbeefcafe1234"),
+    ],
+)
+def test_redaction_masks_known_credential_shapes(raw: bytes, secret: str) -> None:
+    out = _sanitize_stderr(raw)
+    assert secret not in out
+    assert "[redacted]" in out
+
+
+def test_redaction_survives_an_escape_embedded_inside_a_token() -> None:
+    """Escapes are stripped BEFORE masking, so a sequence spliced into a token cannot evade the pattern.
+
+    Reversing those two stages would let the value slip past the regex and then reassemble on screen.
+    """
+    out = _sanitize_stderr(b"OPENAI_API_KEY=sk-proj-\x1b[0mABCDEFGHIJKLMNOPQRSTUVWXYZ012345")
+    assert "sk-proj" not in out
+    assert "[redacted]" in out
+
+
+def test_redaction_leaves_an_ordinary_diagnostic_intact() -> None:
+    """The negative control. Over-redaction destroys the diagnostic this whole capture exists to deliver.
+
+    The first line is the exact message the change was built to surface; the second carries a long hex digest
+    and a model id, both of which an entropy-based heuristic would have eaten.
+    """
+    launcher = b"launcher: Unable to run kiro-cli.EXE: Command not associated with any tool"
+    assert _sanitize_stderr(launcher) == launcher.decode()
+    noisy = b"model gpt-5.6-sol unavailable; sha256 a3f5c9d2e8b17460a3f5c9d2e8b17460"
+    assert _sanitize_stderr(noisy) == noisy.decode()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # Token COUNTS are among the most common things an agent prints. An earlier, wider pattern masked all
+        # three of these, which destroyed the diagnostic the capture exists to deliver.
+        b"tokens: 1500",
+        b"total_tokens=4096",
+        b"prompt_tokens: 812, completion_tokens: 44",
+        # A short status word is not a credential.
+        b"token: expired",
+        # The keyword must END the name: "secret" inside "secretariat" is not a secret.
+        b"secretariat: fine",
+        b"password required",
+        # The launcher diagnostic this whole change exists to surface, and a line of high-entropy-looking but
+        # entirely public text -- the two things an entropy heuristic would have eaten.
+        b"launcher: Unable to run kiro-cli.EXE: Command not associated with any tool",
+        b"model gpt-5.6-sol unavailable; sha256 a3f5c9d2e8b17460a3f5c9d2e8b17460",
+    ],
+)
+def test_redaction_does_not_mask_ordinary_diagnostics(raw: bytes) -> None:
+    assert "[redacted]" not in _sanitize_stderr(raw)
+
+
+def test_redaction_still_masks_a_named_secret_with_a_credential_shaped_value() -> None:
+    # The guard that rejects short and numeric values must not open a hole for a real assigned credential.
+    out = _sanitize_stderr(b"my_secret_value = Zm9vYmFyYmF6cXV4MTIzNDU2")
+    assert "Zm9vYmFyYmF6cXV4" not in out
+    assert "[redacted]" in out
+
+
+def test_redaction_is_linear_on_a_full_capture_buffer() -> None:
+    """These patterns run over attacker-influenced text, so a backtracking blowup would be a DoS.
+
+    The payload must be SPACE-FREE and underscore-delimited. An earlier version of this test used
+    ``b"TOKEN_ " * 1170`` and claimed to be the adversarial shape; it was not. The space terminates the
+    greedy run every seven characters, so the engine never repartitions and the test measured 2.6 ms
+    against a pattern that genuinely took 177 ms on the real shape. It named the DoS and exercised none of
+    it -- and would have stayed green against the unfixed pattern.
+
+    The bound is tight for the same reason. The atomic group runs this in about 0.2 ms; the unfixed pattern
+    takes ~177 ms at the 8 KiB cap and quadruples with each doubling, so 0.1 s separates them decisively
+    while leaving ample headroom for a slow machine.
+    """
+    payload = b"A_TOKEN_" * 1024  # 8 KiB, the production capture cap
+    # perf_counter, NOT monotonic: monotonic ticks at ~15.6 ms on Windows, which is a sixth of this bound.
+    start = time.perf_counter()
+    _sanitize_stderr(payload)
+    assert time.perf_counter() - start < 0.1
+
+
+def test_redaction_masks_url_embedded_basic_auth_but_keeps_the_host() -> None:
+    """In practice this is the likeliest way a credential reaches stderr at all.
+
+    git, npm, pip and curl all echo the URL back on an auth failure, so an agent that shells out to git
+    prints exactly this. Which host rejected the login IS the diagnostic, so scheme, user and host stay.
+    """
+    out = _sanitize_stderr(b"fatal: Authentication failed for 'https://alice:s3cr3tpassw0rd123@github.com/x/y'")
+    assert "s3cr3tpassw0rd123" not in out
+    assert "alice" in out and "github.com/x/y" in out
+
+
+def test_redaction_masks_a_pem_private_key_block() -> None:
+    pem = b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKC\nAQEA\n-----END RSA PRIVATE KEY-----"
+    out = _sanitize_stderr(pem)
+    assert "MIIEowIBAAKC" not in out
+    assert out == "[redacted]"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # A URL with no credentials in it must not be touched...
+        b"cloning https://github.com/chapmanjw/x.git failed",
+        # ...and a host:PORT is not a user:password, because the pattern requires the trailing "@".
+        b"connect to http://localhost:1234/v1 refused",
+    ],
+)
+def test_url_redaction_does_not_touch_a_credential_free_url(raw: bytes) -> None:
+    assert _sanitize_stderr(raw) == raw.decode()
+
+
+def test_a_lone_carriage_return_separates_lines_rather_than_joining_them() -> None:
+    """A progress writer uses a bare CR to rewrite one line, so the two halves are distinct messages.
+
+    Regression: line endings were normalized AFTER the control strip, which had already deleted the CR --
+    making the normalization dead code and silently gluing "Downloading..." to "Done".
+    """
+    assert _sanitize_stderr(b"Downloading...\rDone") == "Downloading... | Done"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"git@github.com:chapmanjw/x.git",  # an SSH remote has no "://" authority
+        b"ssh://git@github.com/chapmanjw/x.git",  # a user with no password has no ":" before the "@"
+        b"GET https://api.example.com/users/bob@example.com/profile",  # the "@" is past a "/"
+        b"docker.io/library/python:3.12@sha256:abcd1234",  # a digest ref, not an authority
+        b"connect http://[::1]:8080/v1 refused",  # an IPv6 literal and a port
+        b"contact mailto:ops@example.com for help",
+    ],
+)
+def test_url_redaction_does_not_mangle_authority_lookalikes(raw: bytes) -> None:
+    """Only a `scheme://user:password@` authority is a credential. These all resemble one and are not."""
+    assert _sanitize_stderr(raw) == raw.decode()
+
+
+def test_url_redaction_handles_an_ipv6_authority_with_credentials() -> None:
+    out = _sanitize_stderr(b"https://u:p4ssw0rd@[::1]:8080/v1")
+    assert "p4ssw0rd" not in out
+    assert "[::1]:8080/v1" in out
+
+
+def test_secret_patterns_group_shape_matches_the_substitution_contract() -> None:
+    """The substitution keeps `group(1)` when a pattern has one, so every pattern must have 0 or 1.
+
+    A second capture group would make `lastindex == 2` while `group(1)` is still only the name half, so the
+    URL pattern uses a LOOKAHEAD for its trailing "@" rather than a second group. This pins that contract
+    for any pattern added later.
+    """
+    assert all(p.groups in (0, 1) for p in _SECRET_PATTERNS)
+
+
+def test_pem_pattern_masks_an_encrypted_key_with_proc_type_headers() -> None:
+    """An ENCRYPTED traditional-format key must be masked too, headers and all.
+
+    Regression: a first attempt at the performance fix restricted the body to base64-and-whitespace, which
+    was linear but silently stopped matching this shape -- an encrypted key opens with ``Proc-Type:`` and
+    ``DEK-Info:`` headers containing ":", "," and "-". Missing a private key is the one outcome this pattern
+    exists to prevent, so the fast body must still admit them.
+    """
+    encrypted = (
+        b"-----BEGIN RSA PRIVATE KEY-----\n"
+        b"Proc-Type: 4,ENCRYPTED\n"
+        b"DEK-Info: AES-128-CBC,7A9B3C4D5E6F7081\n\n"
+        b"MIIEowIBAAKCAQEA7x9k+2/mn\n"
+        b"-----END RSA PRIVATE KEY-----"
+    )
+    out = _sanitize_stderr(encrypted)
+    assert out == "[redacted]"
+    assert "DEK-Info" not in out and "MIIEowIBAAKCAQEA" not in out
+
+
+def test_pem_pattern_masks_an_ec_key() -> None:
+    ec = b"-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIBjK\n-----END EC PRIVATE KEY-----"
+    assert _sanitize_stderr(ec) == "[redacted]"
+
+
+@pytest.mark.parametrize(
+    ("label", "block"),
+    [
+        (
+            "pgp",
+            b"-----BEGIN PGP PRIVATE KEY BLOCK-----\nVersion: GnuPG v2\n\nQUJD\n-----END PGP PRIVATE KEY BLOCK-----",
+        ),
+        (
+            "ssh2",
+            b"---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----\nComment: key\nQUJD\n---- END SSH2 ENCRYPTED PRIVATE KEY ----",
+        ),
+        ("pkcs8", b"-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----"),
+        ("pkcs8-encrypted", b"-----BEGIN ENCRYPTED PRIVATE KEY-----\nQUJD\n-----END ENCRYPTED PRIVATE KEY-----"),
+        ("openssh", b"-----BEGIN OPENSSH PRIVATE KEY-----\nQUJD\n-----END OPENSSH PRIVATE KEY-----"),
+    ],
+)
+def test_private_key_marker_covers_non_pem_armor(label: str, block: bytes) -> None:
+    """Not every armored private key wears the five-dash PEM marker.
+
+    PGP appends a word after "PRIVATE KEY" and RFC 4716 uses four dashes with inner spaces, so a marker
+    pinned to the PEM spelling surfaced both in full. This change introduces the stderr capture path, so an
+    unmasked key format here is a NEW exposure rather than an inherited one.
+    """
+    assert _sanitize_stderr(block) == "[redacted]", label
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        # A PUBLIC key is not a secret, and neither is a certificate. The literal "PRIVATE KEY" is what
+        # separates them -- without it the marker would redact ordinary, useful diagnostic output.
+        b"-----BEGIN PGP PUBLIC KEY BLOCK-----\nQUJD\n-----END PGP PUBLIC KEY BLOCK-----",
+        b"-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----",
+        b"ssh-rsa AAAAB3NzaC1yc2E user@host",
+        b"--------------------------------",
+        # The bare phrase in ordinary prose. It cannot match by construction -- the marker needs dashes and a
+        # matching END -- but this is the exact false-positive class the widened marker had to be checked
+        # against, so it is pinned here rather than left as an argument.
+        b"error: could not read PRIVATE KEY from foo.pem",
+    ],
+)
+def test_private_key_marker_does_not_mask_public_material(block: bytes) -> None:
+    assert "[redacted]" not in _sanitize_stderr(block)
+
+
+def test_pem_pattern_scales_linearly_on_unterminated_blocks() -> None:
+    """A BEGIN marker with no matching END must fail fast rather than rescanning the rest of the input.
+
+    This asserts the SHAPE of the growth curve, not a wall-clock number. The version this replaces checked
+    only that one 8 KiB payload finished within 1.0s -- which it did, in 15 ms, while the pattern underneath
+    was quadratic (55 ms at 16 KiB, 213 ms at 32 KiB). A loose absolute bound cannot see that, because the
+    production input is capped long before the number grows enough to trip it. Comparing two sizes can.
+
+    Quadratic growth puts the 4x-size run at roughly 16x the time; linear puts it near 4x. The 8x threshold
+    sits between them with wide margin, so timer noise on a loaded CI machine cannot flip the result.
+    """
+
+    def elapsed(marker_count: int) -> float:
+        # perf_counter, NOT monotonic: monotonic's tick is ~15.6 ms on Windows, which quantizes both
+        # measurements to 0 or one tick and makes the ratio swing between 0 and 160 at random.
+        #
+        # MEDIAN of repeats, not the mean: one preempted run drags a mean upward, and if that lands on the
+        # small sample it deflates the ratio and hides the very regression this guards. A median discards
+        # the outlier in either direction.
+        payload = b"-----BEGIN X PRIVATE KEY-----" * marker_count
+        runs = []
+        for _ in range(7):
+            start = time.perf_counter()
+            _sanitize_stderr(payload)
+            runs.append(time.perf_counter() - start)
+        return statistics.median(runs)
+
+    # The floor is only a divide-by-zero guard. At these sizes the small sample runs ~40 us, some 40x above
+    # it, so it never binds -- but shrinking the payloads could bring it into play and turn a linear result
+    # into a false failure. Keep the sizes if you touch this.
+    small = max(elapsed(280), 1e-6)
+    large = elapsed(1120)  # 4x the input
+
+    assert large / small < 8.0, f"PEM scan looks superlinear: {small:.4f}s -> {large:.4f}s for 4x input"
+
+
+def test_pem_pattern_still_matches_a_real_block_and_does_not_merge_two() -> None:
+    """The performance fix narrowed the body alphabet, so pin what it must still match.
+
+    A genuine PEM body is base64 plus line breaks; excluding the hyphen is what lets an unmatched BEGIN fail
+    immediately. Two separate blocks must stay two matches, with the text between them intact.
+    """
+    pem = b"-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7x9k+2/mn\nQm5s0dGVuZG9y\n-----END RSA PRIVATE KEY-----"
+    assert _sanitize_stderr(pem) == "[redacted]"
+
+    out = _sanitize_stderr(pem + b"\ntext between\n" + pem)
+    assert out.count("[redacted]") == 2
+    assert "text between" in out
+    assert "MIIEowIBAAKCAQEA" not in out

@@ -43,7 +43,7 @@ from rutherford.acp import teardown
 from rutherford.acp.client import TerminalBroker
 from rutherford.acp.descriptors import AgentDescriptor, DescriptorRegistry
 from rutherford.acp.permission import PermissionPolicy
-from rutherford.acp.session import ACPSession
+from rutherford.acp.session import ACPHandshakeError, ACPSession
 from rutherford.config.schema import RutherfordConfig
 from rutherford.domain.enums import ActivityEventKind, JobStatus, SafetyMode
 from rutherford.domain.error_codes import ErrorCode
@@ -470,7 +470,17 @@ async def test_cancel_returns_when_agent_ignores_session_cancel(monkeypatch: Any
         await session.close()
 
 
-async def test_agent_stderr_is_detached_from_the_mcp_host_pipe(monkeypatch: Any) -> None:
+async def test_agent_stderr_is_owned_not_inherited_from_the_mcp_host(monkeypatch: Any) -> None:
+    """The agent's stderr must be a pipe Rutherford owns -- never the MCP host's inherited fd 2.
+
+    This replaces an assertion that pinned ``DEVNULL``. The invariant it was really protecting is "the child
+    cannot write into a descriptor the host owns and nobody drains", which is what ``stderr=None`` (inherit)
+    would do and what once deadlocked the host. ``DEVNULL`` satisfied that by discarding -- including the one
+    line a launch failure explains itself with -- so the pipe is now owned and drained instead.
+
+    The flag alone is a weak invariant: ``PIPE`` with no reader would pass it. The companion test below is the
+    half that proves the capture actually happens, so change them as a pair.
+    """
     captured: list[dict[str, Any]] = []
 
     def spawn_spy(*args: Any, **kwargs: Any) -> Any:
@@ -483,7 +493,80 @@ async def test_agent_stderr_is_detached_from_the_mcp_host_pipe(monkeypatch: Any)
     await session.close()
 
     assert captured
-    assert captured[0]["transport_kwargs"]["stderr"] == subprocess.DEVNULL
+    stderr_arg = captured[0]["transport_kwargs"]["stderr"]
+    assert stderr_arg == subprocess.PIPE
+    # The regression that matters: None means "inherit the parent's fd 2".
+    assert stderr_arg is not None
+
+
+async def test_agent_stderr_reaches_the_handshake_failure_detail() -> None:
+    """A child that explains itself on stderr and dies must have said so in the error an operator reads.
+
+    This is the whole point of the change. The diagnosed failure -- a launcher shim handed a name it does not
+    recognize -- prints one exact line and exits before reading a byte of stdin, which ACP can otherwise only
+    surface as an instant "Connection closed": a description of the socket, not of the cause.
+    """
+    marker = "STDERR-MARKER-launcher-rejected-the-name"
+    loud = AgentDescriptor(
+        "loud",
+        "Loud",
+        (sys.executable, "-c", f"import sys; sys.stderr.write({marker!r}); sys.stderr.flush(); sys.exit(1)"),
+    )
+    session = ACPSession(loud, policy=_READ_ONLY, cwd=str(REPO_ROOT), handshake_timeout_s=10.0)
+
+    with pytest.raises(ACPHandshakeError) as excinfo:
+        await session.open()
+
+    assert excinfo.value.code is ErrorCode.ACP_HANDSHAKE_FAILED
+    assert marker in excinfo.value.message
+    assert "agent stderr:" in excinfo.value.message
+
+
+async def test_agent_stderr_detail_strips_terminal_escape_sequences() -> None:
+    """Agent-authored stderr is rendered in the operator's terminal, so escapes must not survive.
+
+    OSC in particular can retitle a window, forge a hyperlink (OSC 8), or write the clipboard (OSC 52). The
+    payload here carries an OSC clipboard write and a CSI colour run around the text worth keeping.
+    """
+    payload = "\\x1b]52;c;cGF5bG9hZA==\\x07\\x1b[31mreal failure line\\x1b[0m"
+    hostile = AgentDescriptor(
+        "hostile",
+        "Hostile",
+        (sys.executable, "-c", f'import sys; sys.stderr.write("{payload}"); sys.stderr.flush(); sys.exit(1)'),
+    )
+    session = ACPSession(hostile, policy=_READ_ONLY, cwd=str(REPO_ROOT), handshake_timeout_s=10.0)
+
+    with pytest.raises(ACPHandshakeError) as excinfo:
+        await session.open()
+
+    message = excinfo.value.message
+    assert "real failure line" in message
+    assert "\x1b" not in message and "\x07" not in message
+    assert "52;c;" not in message
+
+
+async def test_agent_stderr_capture_is_bounded_and_does_not_stall_the_handshake() -> None:
+    """A flood on stderr must neither wedge the handshake nor be retained without bound.
+
+    The child writes far past the retention cap with no newlines -- the shape that breaks a ``readline``-based
+    reader -- then dies. The drain has to keep consuming past the cap, or the child blocks on a full pipe and
+    the failure that should take milliseconds takes the whole handshake budget.
+    """
+    flood = AgentDescriptor(
+        "flood",
+        "Flood",
+        (sys.executable, "-c", "import sys; sys.stderr.write('x' * 2_000_000); sys.stderr.flush(); sys.exit(1)"),
+    )
+    session = ACPSession(flood, policy=_READ_ONLY, cwd=str(REPO_ROOT), handshake_timeout_s=30.0)
+
+    start = time.monotonic()
+    with pytest.raises(ACPHandshakeError) as excinfo:
+        await session.open()
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 20.0, "the drain did not keep the pipe clear"
+    # Surfaced text stays bounded even though 2 MB was written.
+    assert len(excinfo.value.message) < 8000
 
 
 # --- 2b. a LIVE brokered terminal is actually killed on shutdown -------------

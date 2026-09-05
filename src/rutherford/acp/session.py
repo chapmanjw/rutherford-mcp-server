@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import subprocess
 import time
 from collections.abc import Coroutine
@@ -94,7 +95,171 @@ _DIRECT_PROCESS_KILL_WAIT_S = 2.0
 _TRANSPORT_CLOSE_TIMEOUT_S = 5.0
 #: ``close`` returns after this caller budget while its instance-owned teardown task continues in the background.
 _SESSION_CLOSE_WAIT_S = 15.0
+#: Bounds the wait for the stderr drain to observe EOF during teardown. The adapter is already hard-killed by
+#: then, so the pipe closes on its own; this is only the backstop that stops a wedged reader stranding cleanup.
+_STDERR_DRAIN_TIMEOUT_S = 2.0
+#: Bytes of agent stderr retained for diagnostics. HEAD-bounded, not a tail ring: the failure this exists to
+#: explain prints its one useful line FIRST and exits, and a ring would let a chatty agent evict exactly that
+#: line. Draining CONTINUES past the cap (discarding), so the child never blocks on a full pipe.
+_STDERR_CAPTURE_CAP = 8 * 1024
+#: Chunk size for each stderr read. ``read(n)`` and never ``readline``/``readuntil``: those raise
+#: ``LimitOverrunError`` on a newline-free run longer than the stream limit, so a binary-spewing agent would
+#: kill the reader that exists to diagnose it.
+_STDERR_CHUNK = 4096
+#: Caps on what is SURFACED (separate from what is retained), so a blob cannot bloat an error envelope.
+_STDERR_DETAIL_BYTES = 2048
+_STDERR_DETAIL_LINES = 20
+#: ANSI CSI / OSC escape sequences. Stripped because this text is agent-controlled and gets rendered in the
+#: operator's terminal by the MCP host: OSC in particular can retitle a window, write the clipboard (OSC 52),
+#: or forge a hyperlink (OSC 8). This is the one non-negotiable sanitizer.
+_ANSI_ESCAPE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\x1b\[[0-?]*[ -/]*[@-~]")
+#: Remaining C0/C1 controls except tab and newline, plus the bidi overrides/isolates that can visually reorder
+#: text so a rendered line reads differently from the bytes it came from.
+_CONTROL_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+#: Credential shapes masked out of captured stderr before it is surfaced.
+#:
+#: ``docs/security.md`` describes this as a MITIGATION, not a guarantee -- an unrecognized credential shape
+#: passes through, so do not read this tuple as a security boundary. Rutherford handles no credential value
+#: itself, but the agent subprocess inherits an
+#: environment full of them, so a misconfigured adapter, proxy, or SDK printing a token on the way out would
+#: otherwise carry it straight into a result the MCP client reads and a durable job persists.
+#:
+#: DELIBERATELY conservative -- shapes with a fixed, recognizable prefix, plus the assignment and header forms
+#: that name a secret rather than guessing at one. There is no entropy heuristic: a long base64-ish run is far
+#: more often a hash, a path, or a model id than a key, and redacting those would corrode the diagnostic this
+#: exists to deliver. This is a mitigation, not a guarantee -- an unrecognized credential shape survives it,
+#: which is why the byte cap and the diagnostic-only contract remain the primary controls.
+_SECRET_PATTERNS = (
+    # To END OF LINE, not ``\S+``: a header value is space-separated ("Bearer <token>"), so stopping at the
+    # first whitespace masks the scheme and leaves the credential itself in the clear.
+    re.compile(r"(?i)\b((?:proxy-)?authorization\s*:\s*).*"),
+    re.compile(r"(?i)\b((?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]{8,}"),
+    # A key named as a secret, in the shapes an env dump or a config echo produces. Two guards keep this --
+    # the widest pattern here -- from eating the diagnostic it is embedded in:
+    #
+    # * The keyword must END the name, give or take a plural and further ``_``-delimited components. Allowing
+    #   arbitrary trailing letters made "secretariat: fine" a match.
+    # * The VALUE must look like a credential: at least 12 characters and not a bare number. Without that,
+    #   "tokens: 1500" and "total_tokens=4096" both redacted -- and a token COUNT is one of the most common
+    #   things an agent prints, so the pass was destroying exactly the diagnostics it exists to preserve.
+    #
+    # The floor means a short weak secret ("password: hunter2") survives. That is the accepted trade: this is
+    # a shape-matching mitigation, the vendor-prefix patterns below catch real issued credentials on their own
+    # regardless of the variable they are assigned to, and a pass that cries wolf on every token count would
+    # be turned off or ignored.
+    # The name half is an ATOMIC group. Without it this is quadratic: on an underscore-delimited run that
+    # never reaches a separator (``A_TOKEN_A_TOKEN_...``), the leading ``[A-Z0-9_]*`` and the trailing
+    # ``(?:_[A-Z0-9]+)*`` repartition the same span at every start position. Measured on the 8 KiB capture
+    # cap: 177 ms, and doubling the input quadrupled it. Atomic, the same input is 0.2 ms.
+    #
+    # That matters because ``_sanitize_stderr`` runs synchronously on the event loop, and a panel opens one
+    # session per voice concurrently -- so one failed open with crafted stderr would stall every other turn
+    # in flight. The input is agent-controlled, which is the whole premise of sanitizing it.
+    #
+    # Atomic grouping never changes WHICH strings match here, only how fast a non-match is rejected: the name
+    # half is followed by a mandatory separator, so any backtracking into it could only ever produce a shorter
+    # name that still has to find the same separator. Group 1 is still the name-plus-separator.
+    re.compile(
+        r"(?i)\b((?>[A-Z0-9_]*(?:api[_-]?key|secret|token|password|passwd|credential)s?(?:_[A-Z0-9]+)*)"
+        r"\s*[=:]\s*)(?!\d+(?:\s|$))[^\s,;]{12,}"
+    ),
+    # Vendor-prefixed keys: OpenAI/Anthropic, GitHub, AWS, Slack, Google.
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{16,}"),
+    # Credentials embedded in a URL. In practice this is the LIKELIEST way one reaches stderr at all: git,
+    # npm, pip and curl all echo the URL back on an auth failure, and an agent that shells out to git prints
+    # exactly this. The scheme, user and host are kept, because which host rejected the login is the
+    # diagnostic; only the password is dropped.
+    re.compile(r"(://[^/\s:@]+:)[^/\s@]+(?=@)"),
+    # A PEM block -- the highest-impact shape here, and a fixed marker rather than an entropy guess.
+    #
+    # The body is "anything that is not the start of another BEGIN marker", which satisfies two requirements
+    # at once that a simpler form does not.
+    #
+    # PERFORMANCE. A plain ``.*?`` under DOTALL matches the hyphen, so a BEGIN with no matching END rescanned
+    # the whole remaining input and every later BEGIN did it again: measured 15 ms at the 8 KiB cap, 55 ms at
+    # 16 KiB, 213 ms at 32 KiB -- doubling quadrupled it. The lookahead stops the body dead at the next
+    # marker, so a start position that cannot complete fails in constant time. Now 0.04 ms at 8 KiB, linear.
+    #
+    # CORRECTNESS. Restricting the body to base64-and-whitespace also fixes the performance, and was tried
+    # first -- but it silently stopped matching an ENCRYPTED traditional-format key, whose body opens with
+    # ``Proc-Type: 4,ENCRYPTED`` and ``DEK-Info: AES-128-CBC,...`` headers full of ``:``, ``,`` and ``-``.
+    # Missing a private key is the one outcome this pattern exists to prevent, so the body has to admit those
+    # characters while still refusing to swallow a following marker.
+    #
+    # MARKER SHAPE. Not every armored private key uses the five-dash PEM marker. PGP appends a word
+    # (``BEGIN PGP PRIVATE KEY BLOCK``) and RFC 4716 uses four dashes with inner spaces
+    # (``---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----``), so a marker pinned to the PEM spelling silently
+    # surfaced both in full. Requiring the literal "PRIVATE KEY" is what keeps this from matching a public
+    # key, a certificate, or a rule of dashes.
+    #
+    # Non-greedy, and the lookahead keeps two real blocks from merging into one match.
+    re.compile(
+        r"-{4,5} ?BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)? ?-{4,5}"
+        r"(?:(?!-{4,5} ?BEGIN)[\s\S])*?"
+        r"-{4,5} ?END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)? ?-{4,5}"
+    ),
+    # A JWT, and the signature parameters of a presigned URL.
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+    re.compile(r"(?i)([?&](?:x-amz-signature|sig|signature|access_token|token)=)[^&\s]+"),
+)
+_REDACTED = "[redacted]"
 _T = TypeVar("_T")
+
+
+def _fault_reason(exc: BaseException) -> str:
+    """Render ``exc`` for an operator, never as an empty string.
+
+    ``asyncio.TimeoutError`` stringifies to ``""``, so interpolating ``{exc}`` alone produced the literally
+    useless "ACP handshake with kiro failed: " -- observed live against a child that wrote to stderr and then
+    hung. Falling back to the type name keeps a timeout distinguishable from a closed pipe.
+    """
+    return str(exc) or type(exc).__name__
+
+
+def _sanitize_stderr(raw: bytes) -> str:
+    """Decode and neutralize captured agent stderr for inclusion in a failure detail.
+
+    The bytes are produced by a spawned agent, so they are untrusted in the terminal-rendering sense even
+    though Rutherford chose the binary: strip escape sequences and controls, mask credential shapes, then cap
+    lines and bytes. This is a DIAGNOSTIC breadcrumb, not a log sink, and it is fenced by the caller so the
+    boundary of agent-authored text is unambiguous to whoever (or whatever) reads the error.
+
+    The three stages are ORDERED, and the order carries weight:
+
+    1. Escapes and controls go first, so a credential cannot be split by an embedded escape sequence to slip
+       past the masking below -- stripping after redaction would let ``sk-\\x1b[0mABC...`` evade the pattern
+       and then reassemble on screen.
+    2. Masking runs on the full text, BEFORE the caps, so a secret is never half-clipped into an unmatched
+       fragment that the patterns no longer recognize.
+    3. The caps are last, bounding what a blob can do to an error envelope.
+    """
+    # Line endings are normalized BEFORE the control strip, not after. `\r` is itself a control character, so
+    # stripping first deleted it and made the normalization dead code -- and worse, silently joined the two
+    # halves of a progress line ("Downloading...\rDone" became "Downloading...Done") instead of separating
+    # them. A lone CR is a line break here because that is how a progress writer uses it.
+    text = _ANSI_ESCAPE.sub("", raw.decode("utf-8", errors="replace"))
+    text = _CONTROL_CHARS.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+    for pattern in _SECRET_PATTERNS:
+        # Group 1, where a pattern has one, is the NAME half (the header, the variable, the query key). Keeping
+        # it is the difference between "a token leaked here" and an unreadable line -- the diagnostic survives
+        # while the value does not.
+        text = pattern.sub(lambda m: f"{m.group(1)}{_REDACTED}" if m.lastindex else _REDACTED, text)
+    lines = [line.rstrip() for line in text.split("\n") if line.strip()]
+    if not lines:
+        return ""
+    clipped = lines[:_STDERR_DETAIL_LINES]
+    truncated = len(lines) > _STDERR_DETAIL_LINES
+    joined = " | ".join(clipped)
+    if len(joined.encode("utf-8")) > _STDERR_DETAIL_BYTES:
+        joined = joined.encode("utf-8")[:_STDERR_DETAIL_BYTES].decode("utf-8", errors="ignore")
+        truncated = True
+    return f"{joined} [truncated]" if truncated else joined
 
 
 class ACPHandshakeError(Exception):
@@ -210,6 +375,12 @@ class ACPSession:
         self._pid: int | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._close_task: asyncio.Task[None] | None = None
+        #: Head-bounded capture of the agent's own stderr, for a failure detail. An agent that dies at launch
+        #: often explains itself there and nowhere else -- a launcher stub handed a name it does not
+        #: recognize prints one exact line and exits, which ACP can otherwise only report as "Connection lost".
+        self._stderr_buffer = bytearray()
+        self._stderr_truncated = False
+        self._stderr_task: asyncio.Task[None] | None = None
         #: The model ids the agent advertised at session open (``session.models``), captured so a caller can
         #: see what the agent offered -- the "configure" signal of a handshake-only connection check. ``[]``
         #: when the agent advertises no selectable models (it runs on its own default).
@@ -301,6 +472,55 @@ class ACPSession:
         """
         return self._journal.message_text()
 
+    async def _drain_stderr(self, stream: asyncio.StreamReader) -> None:
+        """Read the agent's stderr to EOF, retaining a head-bounded prefix and discarding the rest.
+
+        Reading CONTINUES after the cap is reached. That is the whole safety property: the retained bytes are
+        bounded for memory, but the PIPE is drained for as long as the child holds it open, so the child can
+        never block on a write and stall the handshake or teardown.
+
+        ``read(n)`` rather than ``readline`` / ``readuntil``: those raise ``LimitOverrunError`` on a
+        newline-free run longer than the stream limit, so an agent emitting binary or a very long unbroken
+        line would kill the reader whose only job is to explain such an agent.
+        """
+        while True:
+            try:
+                chunk = await stream.read(_STDERR_CHUNK)
+            except (OSError, ValueError):  # pragma: no cover - a torn-down transport races EOF
+                return
+            if not chunk:
+                return
+            room = _STDERR_CAPTURE_CAP - len(self._stderr_buffer)
+            if room <= 0:
+                self._stderr_truncated = True
+                continue
+            if len(chunk) > room:
+                self._stderr_buffer.extend(chunk[:room])
+                self._stderr_truncated = True
+            else:
+                self._stderr_buffer.extend(chunk)
+
+    def _stderr_detail(self) -> str:
+        """The captured stderr as a fenced clause to append to a failure message, or ``""`` when there is none.
+
+        Read from the buffer SNAPSHOT rather than by awaiting the drain, because the two failure shapes want
+        opposite things: on a died-at-launch failure the child is already gone and the buffer is complete,
+        while on a handshake TIMEOUT the child is still running and the partial buffer is exactly the evidence
+        wanted. Awaiting would return nothing useful in the second case and would add a wait to the first.
+
+        The text is agent-authored, so it is sanitized and fenced -- the label is what tells a reader (or a
+        model) where Rutherford's own words stop.
+        """
+        detail = _sanitize_stderr(bytes(self._stderr_buffer))
+        if not detail:
+            return ""
+        suffix = " [truncated]" if self._stderr_truncated and "[truncated]" not in detail else ""
+        return f' (agent stderr: "{detail}"{suffix})'
+
+    def _handshake_failure(self, code: ErrorCode, message: str) -> ACPHandshakeError:
+        """Build a handshake failure carrying whatever the agent said on stderr before it died."""
+        return ACPHandshakeError(code, f"{message}{self._stderr_detail()}", ReexecutionSafety.SAFE)
+
     async def __aenter__(self) -> ACPSession:
         await self.open()
         return self
@@ -347,8 +567,13 @@ class ACPSession:
                     *args,
                     env=env,
                     cwd=self._cwd,
-                    # * Raw agent diagnostics are untrusted and must not inherit the MCP host's bounded stderr pipe.
-                    transport_kwargs={"stderr": subprocess.DEVNULL, "limit": _STREAM_LIMIT},
+                    # * Raw agent diagnostics are untrusted and must not inherit the MCP host's bounded stderr
+                    # pipe. That is what ``None`` would mean here, and it is the deadlock this once caused:
+                    # the host had no reader, so a chatty agent could wedge on a full pipe. DEVNULL fixed it by
+                    # discarding -- which also discarded the one line a launch failure explains itself with.
+                    # An OWNED pipe keeps both properties, but ONLY while something drains it, so the drain
+                    # task below is part of this decision rather than an optimization on top of it.
+                    transport_kwargs={"stderr": subprocess.PIPE, "limit": _STREAM_LIMIT},
                     observers=[_observe],
                 )
             )
@@ -365,6 +590,16 @@ class ACPSession:
         self._conn = conn
         self._process = process
         self._pid = process.pid
+        # Started BEFORE the handshake, not after: the failure this captures happens during ``initialize``, and
+        # a reader attached afterwards would be racing the very window it exists to observe. It also keeps the
+        # pipe clear for the whole handshake, so a noisy agent cannot stall it.
+        if process.stderr is not None:
+            self._stderr_task = asyncio.create_task(
+                self._drain_stderr(process.stderr), name=f"rutherford-acp-stderr-{process.pid}"
+            )
+            # Same durable-owner treatment every other detached cleanup task here gets: the loop holds tasks
+            # weakly, and a reader dropped mid-flight is how a pipe stops being drained without anyone noticing.
+            register_pending_cleanup(self._stderr_task)
         # A cancellation ANYWHERE in the handshake (initialize / new_session / load / set_model) is a
         # BaseException, so the per-stage ``except Exception`` guards below do NOT catch it. Without this outer
         # guard the just-spawned agent would be left registered on the exit stack but never torn down -- a
@@ -379,10 +614,9 @@ class ACPSession:
                 )
             except Exception as exc:
                 await self.close()
-                raise ACPHandshakeError(
+                raise self._handshake_failure(
                     ErrorCode.ACP_HANDSHAKE_FAILED,
-                    f"ACP handshake with {self._descriptor.id} failed: {exc}",
-                    ReexecutionSafety.SAFE,
+                    f"ACP handshake with {self._descriptor.id} failed: {_fault_reason(exc)}",
                 ) from exc
             # Everything below runs with the agent process ALREADY spawned and registered on the exit stack,
             # and open() is entered via ``async with`` in run_acp_turn -- Python skips ``__aexit__`` when
@@ -436,10 +670,9 @@ class ACPSession:
             )
         except Exception as exc:
             await self.close()
-            raise ACPHandshakeError(
+            raise self._handshake_failure(
                 ErrorCode.ACP_HANDSHAKE_FAILED,
-                f"ACP handshake with {self._descriptor.id} failed: {exc}",
-                ReexecutionSafety.SAFE,
+                f"ACP handshake with {self._descriptor.id} failed: {_fault_reason(exc)}",
             ) from exc
         self._session_id = session.session_id
         return session
@@ -485,10 +718,9 @@ class ACPSession:
             )
         except Exception as exc:
             await self.close()
-            raise ACPHandshakeError(
+            raise self._handshake_failure(
                 ErrorCode.RESUME_FAILED,
-                f"resuming session {resume_id!r} on {self._descriptor.id} failed: {exc}",
-                ReexecutionSafety.SAFE,
+                f"resuming session {resume_id!r} on {self._descriptor.id} failed: {_fault_reason(exc)}",
             ) from exc
         self._session_id = resume_id
         return session
@@ -803,6 +1035,21 @@ class ACPSession:
         except (Exception, asyncio.CancelledError):
             return default
 
+    async def _await_stderr_drain(self) -> None:
+        """Let the stderr reader finish on its own, then cancel it if it does not; never raise.
+
+        The buffer is NOT cleared here. The handshake failure paths call ``close`` and only then build their
+        message, so this is what makes the captured excerpt complete at the moment it is read.
+        """
+        task = self._stderr_task
+        if task is None:
+            return
+        self._stderr_task = None
+        done, _ = await asyncio.wait({task}, timeout=_STDERR_DRAIN_TIMEOUT_S)
+        if task not in done:
+            task.cancel()
+        consume_task_result(task)
+
     async def _kill_direct_process(self, process: asyncio.subprocess.Process | None) -> None:
         """Hard-kill the direct ACP adapter and bound the wait for its process handle to signal exit."""
         if process is None or process.returncode is not None:
@@ -894,6 +1141,12 @@ class ACPSession:
                 default=None,
                 cancel_on_timeout=False,
             )
+            # * LAST, and deliberately so. The reader must stay live through every stage above: the adapter is
+            # killed early, and anything it writes on the way out is exactly the diagnostic worth keeping, so
+            # cancelling sooner would trade the evidence for nothing. By this point the child is dead and the
+            # transport is closed, so stderr has EOF'd and the task ends on its own -- this awaits that rather
+            # than forcing it, and the bound is only the backstop against a reader that somehow does not end.
+            await self._await_stderr_drain()
         finally:
             # * Event-loop shutdown can cancel the shared task; the direct adapter still receives a hard kill.
             if process is not None and process.returncode is None:

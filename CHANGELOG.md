@@ -59,6 +59,54 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **An agent's launch path now resolves to its real on-disk filename case.** `shutil.which` never reads the
+  directory entry: it returns the caller's own spelling joined to the directory, plus — on Windows — each
+  `PATHEXT` entry appended verbatim. An uppercase `PATHEXT` therefore names `kiro-cli.EXE` for a file whose
+  dirent is `kiro-cli.exe`. Windows opens either spelling, so the process starts and nothing looks wrong;
+  but a launcher shim that looks its own `argv[0]` basename up in a case-sensitive table finds no entry,
+  prints one line, and exits before reading a byte of stdin. Every seat behind such a shim failed in under
+  0.15s, and `connect_only` failed identically, because the death is at spawn and never reaches `initialize`.
+
+  The normalization runs on every platform rather than under a Windows guard. The `PATHEXT` mechanism is
+  Windows-only but the defect is not: macOS ships a case-insensitive filesystem by default, where `which`
+  likewise returns the caller's spelling for a differently-spelled dirent and `execve` passes it through
+  unchanged. On a case-sensitive filesystem the exact-match branch returns the input untouched, so it is
+  self-neutralizing there. It deliberately does not use `Path.resolve()` / `realpath`, which would also
+  follow links and pin a version-managed `node` shim to one concrete install directory, and it cannot use an
+  `exists()` probe, which is case-insensitive on exactly the platforms carrying the bug. Where two entries
+  differ only in case and neither matches exactly, the input is returned rather than guessing at a different
+  binary. The same normalization is applied to the `node` fallback inside npm-shim resolution, which was a
+  second `which` call with the same exposure.
+
+- **An agent's stderr is captured and a bounded excerpt included in handshake failure details.** It was previously
+  discarded, so a child that explained itself precisely and died surfaced only as "Connection lost" — a
+  description of the socket, not of the cause — and diagnosing one meant reproducing it by hand outside
+  Rutherford. The pipe is owned by Rutherford and drained continuously from spawn to EOF, which is what makes
+  it safe: inheriting the host's stderr is what once let an undrained pipe wedge the MCP host, and discarding
+  it was the previous fix. Retention is head-bounded, because the failure this exists to explain prints its
+  one useful line first, and draining continues past the cap so the child can never block on a write. The
+  text is agent-authored, so it is stripped of ANSI/OSC escape sequences and control characters — which can
+  retitle a terminal, forge a hyperlink, or write the clipboard — then masked for credential shapes, then
+  capped by line and byte count and fenced, so where Rutherford's own words stop is unambiguous. It is
+  attached only where a process actually existed; `ACP_SPAWN_FAILED` means the spawn itself failed, so there
+  is no child and never a tail.
+
+  The masking exists because the subprocess inherits a credential-bearing environment, so an agent that
+  prints a token on the way out would otherwise put it in a result the caller reads and a durable job keeps.
+  Stripping runs before masking, so a sequence spliced into a token cannot evade it. It matches known shapes
+  and is not a guarantee — an unrecognized credential format survives it — and it is deliberately
+  conservative, because an entropy heuristic would eat the hashes, paths, and model ids that make the
+  diagnostic worth having. `docs/security.md` now describes this path rather than implying it cannot exist.
+  Covered shapes include credentials embedded in a URL (`https://user:pass@host`) — in practice the likeliest
+  way one reaches stderr at all, since git, npm, pip and curl all echo the URL back on an auth failure — and
+  armored private-key blocks across PEM (including the encrypted traditional format, whose `Proc-Type` and
+  `DEK-Info` headers a base64-only matcher misses), PGP, and RFC 4716 SSH2 armor. The host and user survive that masking, because which host rejected the login is
+  the diagnostic.
+
+- **A handshake that timed out reported an empty reason.** `asyncio.TimeoutError` stringifies to nothing, so
+  the detail read "ACP handshake with <agent> failed: " and stopped. It now names the fault type, keeping a
+  timeout distinguishable from a closed pipe.
+
 - **A malformed `agentCapabilities` from an agent no longer crashes a resume and orphans its process.** Under
   the new lenient deserialization, an `initialize` response whose capability blob fails validation arrives as
   a plain dictionary instead of raising. The resume gate read `load_session` straight off it and raised
