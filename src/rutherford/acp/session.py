@@ -906,7 +906,11 @@ class ACPSession:
             return None
         candidates: list[str] = []
         requested = self._requested_model
-        if requested is not None and requested != rewritten:
+        # A caller id that ALREADY carries a bracket is not a bare-model candidate. Selecting it would encode
+        # one tier in the model id while `reasoning_effort` sets another, and the agent may honour the id --
+        # so Rutherford would be attesting a tier it cannot know landed. That is the exact dishonesty this
+        # fallback exists to avoid, so a bracketed request contributes only its parsed base below.
+        if requested is not None and requested != rewritten and "[" not in requested:
             candidates.append(requested)
         base = rewritten.split("[", 1)[0]
         if base and base != rewritten and base not in candidates:

@@ -30,8 +30,9 @@ Launch-time channels (this table):
 Session config-option channel (``via_config_option=True``; applied at open, not here):
 
 * ``claude_code`` (``claude-agent-acp``) -- the ACP ``effort`` config option (values ``low..max``).
-* ``codex`` WITHOUT a model -- the ACP ``reasoning_effort`` config option (values ``low..xhigh``), so a
-  codex seat that pins no model still gets its tier on codex's default model.
+* ``codex`` WITHOUT a model -- the ACP ``reasoning_effort`` config option (clamped at open to the values the
+  agent advertises; current codex offers ``low..max``), so a codex seat that pins no model still gets its
+  tier on codex's default model.
 * ``codex`` WITH a model whose ``base[tier]`` id is not advertised -- the same ``reasoning_effort`` option,
   after the session selects the advertised bare model (see above).
 
