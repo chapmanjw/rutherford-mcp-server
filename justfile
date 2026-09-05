@@ -50,6 +50,17 @@ test-integration:
 check:
     uv run python scripts/gate.py
 
-# Smoke-check the stdio server entrypoint (imports + starts FastMCP).
+# Smoke-check the stdio server entrypoint (imports + builds the app; does NOT start the transport).
 smoke:
     uv run python -m rutherford --smoke
+
+# Boot the server for real and speak JSON-RPC to it -- the check `smoke` cannot do, because `--smoke`
+# returns before `mcp.run`. Asserts initialize, tool registration, one real call, and that nothing but
+# JSON-RPC reaches stdout.
+server-boot:
+    uv run python scripts/check_server_boot.py
+
+# The same check against a FRESH, UNLOCKED resolve of the built wheel -- the dependency set a
+# `uvx rutherford-mcp-server` user actually gets, which `uv sync --locked` never exercises.
+server-boot-release:
+    uv run python scripts/check_server_boot.py --wheel

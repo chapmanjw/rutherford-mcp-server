@@ -34,7 +34,26 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "fastmcp>=3.3",
+    # Bounded at the MAJOR, and the bound is the whole point. CI installs with `uv sync --locked`, but the
+    # lock is not shipped (see the sdist include list below) and the published install instructions invoke
+    # this package with no constraint of their own -- so what CI proves and what a user resolves are two
+    # different dependency sets, and only this string constrains the second one.
+    #
+    # Measured 2026-09-05: an unbounded `>=3.3` resolved a fresh install to fastmcp 4.0.3 / mcp 2.1.1 while
+    # the lock held 3.3.1 / 1.28.1. Every published release so far has therefore run on a dependency MAJOR
+    # its own CI never executed. It happens to work, with one observed regression: under 4.0.3 a tool error
+    # writes a rich-formatted, non-JSON line to stderr, which breaks the one-JSON-object-per-line contract
+    # `runtime/logging.py` maintains deliberately and that `_report_drops` goes out of its way to preserve.
+    #
+    # The forward risk is worse than that. `server.py` calls `mcp.run(transport=..., show_banner=...)` with
+    # keywords a major release is free to rename or drop; that failure lands at BOOT, on every `uvx` install,
+    # with a fully green build. The same reasoning already written below for the ACP SDK applies here without
+    # modification -- a framework can retire behaviour this server leans on without touching a signature --
+    # and this dependency had been the one left open.
+    #
+    # `<4` claims only the major that has actually been run. Raising it means running the release-resolve
+    # check (`scripts/check_server_boot.py --wheel`) against the new major, not editing this line.
+    "fastmcp>=3.3,<4",
     "pydantic>=2.13",
     "psutil>=7",
     "python-toon>=0.1.3",

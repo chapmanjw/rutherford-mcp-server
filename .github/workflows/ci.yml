@@ -81,5 +81,38 @@ jobs:
       - name: Entrypoint smoke check
         run: uv run python -m rutherford --smoke
 
+      # `--smoke` returns before `mcp.run`, so it proves the app builds and nothing about the server.
+      # This starts the stdio transport, completes initialize, registers and calls a tool, and asserts
+      # that nothing but JSON-RPC reaches stdout -- the failures that otherwise reach users with a
+      # green build.
+      - name: Server boot check
+        run: uv run python scripts/check_server_boot.py
+
       - name: Build sdist and wheel
         run: uv build
+
+  # What the matrix above CANNOT see. Every job there installs with `uv sync --locked`, but the lock is
+  # not shipped in the sdist and the published install instructions carry no constraint of their own, so
+  # a `uvx rutherford-mcp-server` user resolves dependencies fresh from the index. Those are two different
+  # dependency sets: measured 2026-09-05, the lock held fastmcp 3.3.1 while a fresh resolve took 4.0.3 --
+  # every release so far had run on a MAJOR its own CI never executed.
+  #
+  # This job resolves unlocked, exactly as a user does, and boots the built wheel over stdio. It is the
+  # only thing here that tests what actually ships. It is allowed to fail the build: a dependency release
+  # that breaks the server should turn this red BEFORE a user finds it at boot.
+  release-resolve:
+    name: fresh resolve / built wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      # No `uv sync --locked` here on purpose -- the lock is the thing this job exists to bypass.
+      - name: Boot the built wheel on a fresh dependency resolve
+        run: uv run --no-project python scripts/check_server_boot.py --wheel

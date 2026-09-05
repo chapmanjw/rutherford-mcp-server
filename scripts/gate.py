@@ -49,6 +49,7 @@ STAGES: tuple[tuple[str, str], ...] = (
     ("test", "uv run pytest"),
     ("coverage-per-file", "uv run python scripts/check_per_file_coverage.py"),
     ("smoke", "uv run python -m rutherford --smoke"),
+    ("server-boot", "uv run python scripts/check_server_boot.py"),
     ("build", "uv build"),
 )
 

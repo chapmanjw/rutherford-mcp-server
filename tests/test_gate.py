@@ -18,9 +18,11 @@ has.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import sys
+from importlib.metadata import version as metadata_version
 from pathlib import Path
 
 import pytest
@@ -37,12 +39,19 @@ CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 #: because running the gate at all presupposes it.
 _SETUP_COMMANDS = frozenset({"uv sync --locked"})
 
+#: Deliberately CI-only, and deliberately NOT a gate stage. The release-resolve job exists precisely to
+#: bypass the lock that every gate stage installs from, so it cannot be one of them: it builds the wheel
+#: and resolves its dependencies fresh from the index, which needs network and takes minutes. There IS a
+#: local counterpart -- `just server-boot-release` -- kept out of `just check` for the same reasons.
+#: Excluded by command rather than by job so a NEW step added to the gate job still has to match.
+_CI_ONLY_COMMANDS = frozenset({"uv run --no-project python scripts/check_server_boot.py --wheel"})
+
 
 def _ci_gate_commands() -> list[str]:
     """Every ``run:`` command in the CI workflow that is a gate stage rather than setup."""
     text = CI_WORKFLOW.read_text(encoding="utf-8")
     commands = [line.strip() for line in re.findall(r"^\s*run:\s*(.+)$", text, re.MULTILINE)]
-    return [c for c in commands if c not in _SETUP_COMMANDS]
+    return [c for c in commands if c not in _SETUP_COMMANDS and c not in _CI_ONLY_COMMANDS]
 
 
 def test_the_local_gate_runs_exactly_what_ci_runs() -> None:
@@ -123,3 +132,38 @@ def test_a_broken_package_downgrades_the_report_instead_of_losing_it(monkeypatch
     assert encoding == "json", "a failed import must still yield a verdict"
     assert payload["format_fallback"], "the downgrade must be visible in the payload, not silent"
     assert json.loads(text)["verdict"] == "pass"
+
+
+def test_server_boot_check_expects_every_registered_tool() -> None:
+    """The boot check's tool list must match what the server actually registers.
+
+    The check asserts that a fixed set of tools appears over the wire. If a tool is added and the list is
+    not, the check keeps passing while covering less than it claims -- and if one is REMOVED, the check is
+    the thing that should fail. Comparing against the live registration keeps the list honest without
+    starting a server here.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from check_server_boot import EXPECTED_TOOLS
+
+    from rutherford.server import mcp
+
+    registered: set[str] = {str(getattr(tool, "name", tool)) for tool in asyncio.run(mcp.list_tools())}
+    assert registered == EXPECTED_TOOLS, (
+        "scripts/check_server_boot.py EXPECTED_TOOLS has drifted from the server.\n"
+        f"  only in the check : {sorted(EXPECTED_TOOLS - registered)}\n"
+        f"  only in the server: {sorted(registered - EXPECTED_TOOLS)}"
+    )
+
+
+def test_server_reports_the_package_version_not_the_frameworks() -> None:
+    """`serverInfo.version` must be this distribution's version.
+
+    FastMCP fills this with ITS OWN version when the argument is omitted, which is how an MCP client
+    connecting to 3.2.0 came to be shown "3.3.1" -- a string matching no release of this package.
+    """
+    from importlib.metadata import version
+
+    from rutherford.server import _package_version
+
+    assert _package_version() == version("rutherford-mcp-server")
+    assert _package_version() != metadata_version("fastmcp")

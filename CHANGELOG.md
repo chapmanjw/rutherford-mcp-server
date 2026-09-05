@@ -40,6 +40,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **FastMCP is bounded at the major, and the dependency set users actually resolve is now tested.** The
+  pin was `fastmcp>=3.3` with no ceiling. CI installs with `uv sync --locked`, but the lock is not shipped
+  and the published install instructions carry no constraint, so a fresh `uvx rutherford-mcp-server`
+  resolved fastmcp 4.0.3 while the lock held 3.3.1 — every release so far ran on a dependency **major its
+  own CI never executed**. It worked, with one observed regression: under 4.0.3 a tool error writes a
+  rich-formatted, non-JSON line to stderr, breaking the one-JSON-object-per-line contract the structured
+  logger maintains deliberately. The forward risk is larger, because the server calls
+  `mcp.run(transport=…, show_banner=…)` with keywords a major is free to rename — a failure that lands at
+  boot, on every install, with a green build.
+
+  The bound claims only the major that has been run, and the lock now matches what a fresh resolve picks,
+  so the two are no longer describing different software. A new CI job resolves unlocked and boots the
+  built wheel over stdio, which is the only check here that exercises what ships.
+
 - **The ACP SDK pin moves to 0.12.1, and Dependabot now tracks it through the `uv` ecosystem.** The
   release is a much larger change than its patch number suggests: it deletes the pluggable dispatcher,
   queue and state-store layer outright and drops four keyword arguments from `Connection.__init__`.
@@ -121,6 +135,18 @@ All notable changes to this project are documented in this file. The format is b
   armored private-key blocks across PEM (including the encrypted traditional format, whose `Proc-Type` and
   `DEK-Info` headers a base64-only matcher misses), PGP, and RFC 4716 SSH2 armor. The host and user survive that masking, because which host rejected the login is
   the diagnostic.
+
+- **The server reported FastMCP's version as its own.** `serverInfo.version`, which every MCP client reads
+  at `initialize`, was filled by FastMCP with its own version because the argument was omitted: a client
+  connecting to 3.2.0 was shown `3.3.1` — a string matching no release of this package, that moved whenever
+  FastMCP updated, and that read as newer than the release it was describing. It now reports the
+  distribution version.
+
+- **The entrypoint check could not detect a server that fails to boot.** `--smoke` builds the app and
+  returns before `mcp.run`, so the gate stage named for the entrypoint proved config loading and registry
+  construction and nothing about the transport. A new `server-boot` stage starts the stdio server for real,
+  completes `initialize`, registers and calls a tool, and asserts that nothing but JSON-RPC reaches stdout —
+  a stray write there corrupts the protocol for every client.
 
 - **A handshake that timed out reported an empty reason.** `asyncio.TimeoutError` stringifies to nothing, so
   the detail read "ACP handshake with <agent> failed: " and stopped. It now names the fault type, keeping a
