@@ -291,19 +291,22 @@ existing CLI login, with no API key. Other agents use whatever auth their own lo
 
 ## Secrets handling
 
-Rutherford does not handle a credential value. The agent subprocess inherits the environment so its
-own credential discovery works; Rutherford layers only the descriptor's `env_overrides` on top (a
-local-runtime provider env, never a credential it minted). Rutherford never reads, mints, stores, or
-copies a credential into a result. Keep API keys and session tokens in environment variables or each
-agent's own credential store. Do not put them in a config file, a role file, or anywhere else in the
-repository.
+Rutherford never sources, mints, stores, or deliberately copies a credential value. The agent
+subprocess inherits the environment so its own credential discovery works; Rutherford layers only the
+descriptor's `env_overrides` on top (a local-runtime provider env, never a credential it minted). Keep
+API keys and session tokens in environment variables or each agent's own credential store. Do not put
+them in a config file, a role file, or anywhere else in the repository.
 
-There is one path by which a credential could nonetheless reach a result, and it belongs to the
-agent rather than to Rutherford. When a session fails to open, a bounded excerpt of the agent's own
-stderr is attached to the failure detail -- the FIRST bytes it wrote, not the last, because a launcher
-that rejects its arguments explains itself immediately and then exits. It explains itself there
-and nowhere else. The subprocess inherits a credential-bearing environment, so a misconfigured
-adapter, proxy, or SDK that prints a token on the way out would put that token in front of Rutherford.
+That is a statement about what Rutherford does, not a guarantee about what a result can contain. The
+difference is load-bearing, because there is exactly one path by which a credential could nonetheless
+reach one, and it belongs to the agent rather than to Rutherford. Do not quote the paragraph above
+without this one.
+
+When a session fails to open, a bounded excerpt of the agent's own stderr is attached to the failure
+detail -- the FIRST bytes it wrote, not the last, because a launcher that rejects its arguments
+explains itself immediately, then exits, and says it nowhere else. The subprocess inherits a
+credential-bearing environment, so a misconfigured adapter, proxy, or SDK that prints a token on the
+way out would put that token in front of Rutherford.
 
 Captured stderr is therefore masked for known credential shapes before it is surfaced — authorization
 headers, `*_KEY` / `*_TOKEN` / `*_SECRET` assignments, vendor-prefixed keys (`sk-`, `ghp_`, `AKIA`,

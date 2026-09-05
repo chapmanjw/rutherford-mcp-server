@@ -248,6 +248,41 @@ All notable changes to this project are documented in this file. The format is b
   as a `log_records_dropped` record rather than vanishing — the gap is visible in the same JSON stream,
   anchored before the next record.
 
+- **A bracket inside a multi-line TOML string is no longer read as array structure.** The config bracket
+  scanner carries multi-line string state across lines now, in both the strip and the insert paths, and
+  honors backslash-escaped delimiters. Without it a line beginning `[` inside such a string read as a table
+  header.
+
+- **An unreadable agent-registry cache is a cache miss rather than a traceback.**
+
+### Security
+
+- **The trusted-workspace allowlist can no longer fail open under an interleaved edit.** The
+  read-modify-write on the global config is serialized by a lock file now, held across the read as well as
+  the write. A `trust` racing an `untrust` could otherwise put back an entry the user had just revoked —
+  an allowlist that fails open, which is the one direction this gate must never fail. There is deliberately
+  no automatic stale-lock breaking: age proves the holder is slow, not that it is gone, and breaking on it
+  lets two waiters both believe they hold the lock. A leftover lock times out with a message naming the file
+  to delete, and release verifies the lock is still ours before unlinking it.
+
+- **The allowlist editor is unreachable from model-callable code by construction.** The read-only breadth
+  check moved to `config/workspace.py`, so no tool has any reason to import `config.trust` at all, and an
+  AST check enforces that as a total ban rather than a name grep — which had missed both an alias and
+  `from ..config import trust`. A runtime namespace check backs it up against a dynamic import.
+
+- **Trusting a very broad path now says so.** The gate is a prefix match, so trusting a directory trusts
+  everything beneath it; trusting a filesystem root, a home directory, or the parent of all homes warns.
+  It warns rather than refuses, because the CLI is an explicit human act and a checkout really can live at
+  `/opt`. The warning also rides the `setup` tool's result, since that path is model-callable and has no
+  terminal to print to.
+
+- **The stdio transport is pinned rather than inherited.** FastMCP resolves an omitted transport through a
+  pydantic-settings field with an `FASTMCP_` env prefix and `.env` support, so `FASTMCP_TRANSPORT=http` in
+  the environment would have started a Starlette HTTP server with no code change. Rutherford is an ACP
+  orchestrator spoken to over stdio by an MCP client; that HTTP stack arrives only as a transitive
+  dependency and is neither used nor tested here. Naming the transport makes stdio an invariant instead of
+  a default, which is what keeps the stack unreachable.
+
 [#21]: https://github.com/chapmanjw/rutherford-mcp-server/pull/21
 [#22]: https://github.com/chapmanjw/rutherford-mcp-server/pull/22
 [#23]: https://github.com/chapmanjw/rutherford-mcp-server/pull/23
