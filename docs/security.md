@@ -291,7 +291,7 @@ existing CLI login, with no API key. Other agents use whatever auth their own lo
 
 ## Secrets handling
 
-Rutherford never sources, mints, stores, or deliberately copies a credential value. The agent
+Rutherford never sources, mints, or deliberately copies a credential value. The agent
 subprocess inherits the environment so its own credential discovery works; Rutherford layers only the
 descriptor's `env_overrides` on top (a local-runtime provider env, never a credential it minted). Keep
 API keys and session tokens in environment variables or each agent's own credential store. Do not put
@@ -301,6 +301,11 @@ That is a statement about what Rutherford does, not a guarantee about what a res
 difference is load-bearing, because there is exactly one path by which a credential could nonetheless
 reach one, and it belongs to the agent rather than to Rutherford. Do not quote the paragraph above
 without this one.
+
+Note also where such a result can come to rest. A persisted run (`persist=true`, or a `job` default)
+writes each voice's answer or error to `artifacts/voices/` under the jobs directory, so anything the
+masking below did not recognize is written to disk rather than only returned to the caller. Treat the
+jobs directory with the same care as any other diagnostic output.
 
 When a session fails to open, a bounded excerpt of the agent's own stderr is attached to the failure
 detail -- the FIRST bytes it wrote, not the last, because a launcher that rejects its arguments

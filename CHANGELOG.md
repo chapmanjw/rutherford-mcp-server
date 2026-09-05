@@ -276,6 +276,12 @@ All notable changes to this project are documented in this file. The format is b
   `/opt`. The warning also rides the `setup` tool's result, since that path is model-callable and has no
   terminal to print to.
 
+- **Every GitHub Action is pinned to an immutable commit SHA.** The workflows referenced floating tags
+  (`actions/checkout@v7`), which a tag move can repoint at new code without any change here. They now
+  name a SHA with the human-readable version beside it. This matters most on the release workflow, which
+  holds `id-token: write` for PyPI trusted publishing and `contents: write` to create the release: a
+  compromised action there would run inside a job able to publish.
+
 - **The stdio transport is pinned rather than inherited.** FastMCP resolves an omitted transport through a
   pydantic-settings field with an `FASTMCP_` env prefix and `.env` support, so `FASTMCP_TRANSPORT=http` in
   the environment would have started a Starlette HTTP server with no code change. Rutherford is an ACP
