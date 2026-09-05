@@ -311,9 +311,10 @@ Rutherford. Do not quote either half without the other.
 
 Such a result can also come to rest on disk. A persisted run (`persist=true`, or a `job` default)
 writes its output under the job's `artifacts/` directory -- a delegation's `answer.md`, a consensus's
-`voices/voice-N.md`, a debate's `transcript.md` -- so anything the masking below did not recognize is
-written there rather than only returned to the caller. Treat the jobs directory with the same care as
-any other diagnostic output.
+`voices/voice-N.md`, a debate's `transcript.md`. An agent's ANSWER is written there verbatim: the
+masking described below runs only on stderr captured from a failed session open, never on the text of
+a successful turn. If an agent quotes a credential back at you, that is what lands on disk. Treat the
+jobs directory with the same care as any other diagnostic output.
 
 When a session fails to open, a bounded excerpt of the agent's own stderr is attached to the failure
 detail -- the FIRST bytes it wrote, not the last, because a launcher that rejects its arguments
