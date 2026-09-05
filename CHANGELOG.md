@@ -131,10 +131,10 @@ All notable changes to this project are documented in this file. The format is b
   conservative, because an entropy heuristic would eat the hashes, paths, and model ids that make the
   diagnostic worth having. `docs/security.md` now describes this path rather than implying it cannot exist.
   Covered shapes include credentials embedded in a URL (`https://user:pass@host`) — in practice the likeliest
-  way one reaches stderr at all, since git, npm, pip and curl all echo the URL back on an auth failure — and
-  armored private-key blocks across PEM (including the encrypted traditional format, whose `Proc-Type` and
-  `DEK-Info` headers a base64-only matcher misses), PGP, and RFC 4716 SSH2 armor. The host and user survive that masking, because which host rejected the login is
-  the diagnostic.
+  way one reaches stderr at all, since git, npm, pip and curl all echo the URL back on an auth failure, and
+  there only the password is dropped, because which host rejected the login is the diagnostic. Armored
+  private-key blocks are covered too, across PEM (including the encrypted traditional format, whose
+  `Proc-Type` and `DEK-Info` headers a base64-only matcher misses), PGP, and RFC 4716 SSH2 armor.
 
 - **The server reported FastMCP's version as its own.** `serverInfo.version`, which every MCP client reads
   at `initialize`, was filled by FastMCP with its own version because the argument was omitted: a client
