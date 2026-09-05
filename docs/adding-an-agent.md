@@ -134,7 +134,10 @@ npm-shim resolution, a per-agent handshake budget, a fixed provider. To add one,
 `AgentDescriptor` to `HIGH_FIDELITY` in `src/rutherford/acp/descriptors.py`:
 
 ```python
-AgentDescriptor("my-agent", "My Agent", ("my-agent", "--acp"), provider="openai"),
+HIGH_FIDELITY = (
+    # ... the existing descriptors ...
+    AgentDescriptor("my-agent", "My Agent", ("my-agent", "--acp"), provider="openai"),
+)
 ```
 
 The fields are documented in [architecture.md](architecture.md#the-agent-descriptor-and-registry).
