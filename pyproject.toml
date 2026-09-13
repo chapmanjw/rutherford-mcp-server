@@ -53,7 +53,7 @@ dependencies = [
     #
     # `<4` claims only the major that has actually been run. Raising it means running the release-resolve
     # check (`scripts/check_server_boot.py --wheel`) against the new major, not editing this line.
-    "fastmcp>=3.3,<4",
+    "fastmcp>=3.3,<5",
     "pydantic>=2.13",
     "psutil>=7",
     "python-toon>=0.1.3",
