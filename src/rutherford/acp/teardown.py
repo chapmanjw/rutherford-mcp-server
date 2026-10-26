@@ -221,13 +221,27 @@ async def _reap_late_tracked(snapshot: asyncio.Task[list[psutil.Process]], *, so
     :func:`_reap_late_snapshot`, for a caller that must know when the tree is gone. Never raises."""
     try:
         late = await asyncio.shield(snapshot)
-    except (Exception, asyncio.CancelledError):
-        return
+    except Exception:
+        return  # the snapshot itself failed: there is no tree to reap
+    except asyncio.CancelledError:
+        log_event("acp_teardown_late_snapshot_dropped", level=logging.WARNING, source=source, reason="cancelled")
+        raise
     if not late:
         return
     log_event("acp_teardown_late_snapshot_scheduled", level=logging.WARNING, source=source, descendants=len(late))
-    with contextlib.suppress(Exception):
-        await asyncio.to_thread(reap, late)
+    try:
+        await asyncio.to_thread(reap, late)  # the shared executor: when saturated, this holds the slot longer
+    except asyncio.CancelledError:
+        log_event("acp_teardown_late_snapshot_dropped", level=logging.WARNING, source=source, reason="cancelled")
+        raise
+    except Exception as exc:
+        log_event(
+            "acp_teardown_late_snapshot_dropped",
+            level=logging.WARNING,
+            source=source,
+            descendants=len(late),
+            reason=str(exc) or type(exc).__name__,
+        )
 
 
 def _reap_late_snapshot(task: asyncio.Task[list[psutil.Process]], *, source: str) -> None:
