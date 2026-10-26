@@ -49,6 +49,8 @@ from tests.conftest import DrainAsyncJob
 
 _FAKE_CMD = (sys.executable, str(Path(__file__).resolve().parent / "fake_acp_agent.py"))
 _SIGNIN_URL = "https://example.test/oauth?state=abc&code_challenge=xyz"
+#: A JWT-shaped value for the masking tests: three dot-joined segments, assembled so no token literal is committed.
+_FAKE_JWT = ".".join(["eyJ" + "hbGciOiJub25lIn0", "eyJ" + "zdWIiOiJmYWtlIn0", "ZmFrZXNpZ25hdHVyZQ"])
 
 
 def _descriptor(marker: Path, **env: str) -> AgentDescriptor:
