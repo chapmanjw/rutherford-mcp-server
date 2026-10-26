@@ -245,6 +245,18 @@ def _fault_reason(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
 
+def _strip_stderr_controls(raw: bytes) -> str:
+    """Decode agent stderr and strip escape sequences and controls -- stage 1 of :func:`_neutralize_stderr`.
+
+    Line endings are normalized BEFORE the control strip, not after. `\\r` is itself a control character, so
+    stripping first deleted it and made the normalization dead code -- and worse, silently joined the two
+    halves of a progress line ("Downloading...\\rDone" became "Downloading...Done") instead of separating
+    them. A lone CR is a line break here because that is how a progress writer uses it.
+    """
+    text = _ANSI_ESCAPE.sub("", raw.decode("utf-8", errors="replace"))
+    return _CONTROL_CHARS.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+
+
 def _neutralize_stderr(raw: bytes) -> str:
     """Decode agent stderr, strip escapes and controls, and mask credential shapes -- with NO length cap.
 
@@ -262,12 +274,7 @@ def _neutralize_stderr(raw: bytes) -> str:
     2. Masking runs on the full text, BEFORE any cap, so a secret is never half-clipped into an unmatched
        fragment that the patterns no longer recognize.
     """
-    # Line endings are normalized BEFORE the control strip, not after. `\r` is itself a control character, so
-    # stripping first deleted it and made the normalization dead code -- and worse, silently joined the two
-    # halves of a progress line ("Downloading...\rDone" became "Downloading...Done") instead of separating
-    # them. A lone CR is a line break here because that is how a progress writer uses it.
-    text = _ANSI_ESCAPE.sub("", raw.decode("utf-8", errors="replace"))
-    text = _CONTROL_CHARS.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+    text = _strip_stderr_controls(raw)
     for pattern in _SECRET_PATTERNS:
         # Group 1, where a pattern has one, is the NAME half (the header, the variable, the query key). Keeping
         # it is the difference between "a token leaked here" and an unreadable line -- the diagnostic survives
@@ -584,11 +591,12 @@ class ACPSession:
         """
         if len(self._signin_urls) >= MAX_SIGNIN_URLS:
             return
-        for url in extract_urls(_neutralize_stderr(raw)):
-            # Credential masking can land inside a link (a JWT ``id_token_hint=``, a ``key=AIza...``); a masked
-            # link no longer works, so it is dropped rather than handed over broken.
-            if _REDACTED.rstrip("]") in url:  # the closing bracket may be trimmed off as trailing punctuation
-                continue
+        # Scanned with escapes and controls stripped but WITHOUT the credential masking: masking is shaped for
+        # free-form log text and can mangle a link (a random PKCE value that merely contains ``-sk-...``), and
+        # a mangled link would be dropped for no reason. Every link that comes out has already passed
+        # ``carries_credential`` inside ``extract_urls``, which is the check that decides whether a link may
+        # be surfaced; one carrying a credential (a JWT ``id_token_hint=``, a ``key=AIza...``) is dropped there.
+        for url in extract_urls(_strip_stderr_controls(raw)):
             if url not in self._signin_urls:
                 self._signin_urls.append(url)
                 if len(self._signin_urls) >= MAX_SIGNIN_URLS:

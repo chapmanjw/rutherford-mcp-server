@@ -419,6 +419,15 @@ async def test_a_prompt_with_no_trailing_newline_is_scanned_at_eof(tmp_path: Pat
     assert session.signin_urls == ["https://login.test/oauth?state=s"]
 
 
+def test_a_pkce_value_the_stderr_masker_would_mangle_keeps_its_link(tmp_path: Path) -> None:
+    # "-sk-" + 16 chars inside a random code_challenge: the free-form stderr masker treats "-" as a word
+    # boundary and would redact it, which used to drop the real sign-in link. The link scan does not mask.
+    session = _session(_descriptor(tmp_path / "marker"), tmp_path, auth_method="fake-oauth")
+    link = "https://login.test/auth?response_type=code&code_challenge=QI2p-sk-AbCdEfGhIjKlMnOpQr&state=s"
+    session._scan_chunk_for_urls(f"Open this link to sign in: {link}\n".encode())
+    assert session.signin_urls == [link]
+
+
 def test_a_link_mangled_by_credential_masking_is_dropped(tmp_path: Path) -> None:
     session = _session(_descriptor(tmp_path / "marker"), tmp_path, auth_method="fake-oauth")
     jwt = _FAKE_JWT
