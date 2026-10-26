@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -679,25 +680,36 @@ async def test_a_late_descendant_snapshot_and_its_reap_are_tracked(monkeypatch: 
     # which when_closed waits on) must still hold a task -- or a login slot could be freed with the tree alive.
     from rutherford.acp import teardown
 
-    release, reaped = asyncio.Event(), asyncio.Event()
+    release = asyncio.Event()
+    reaped: list[list[Any]] = []  # appended from the reap thread; list.append is atomic
 
     async def _slow_snapshot(_pid: int) -> list[Any]:
         await release.wait()
         return ["fake-descendant"]
 
     def _reap(procs: list[Any], **_kwargs: Any) -> None:
-        assert procs == ["fake-descendant"]
+        time.sleep(0.2)  # a reap that takes a moment, so a callback that fires early is caught
+        reaped.append(procs)
 
     monkeypatch.setattr(teardown, "snapshot_descendants_eagerly", _slow_snapshot)
     monkeypatch.setattr(teardown, "reap", _reap)
-    owner: set[asyncio.Task[Any]] = set()
-    assert await teardown.snapshot_within_deadline(1234, timeout_s=0.05, source="test", owner=owner) == []
-    assert owner  # the snapshot and the late reap are both tracked
+    session = ACPSession(
+        AgentDescriptor("fake", "Fake", _FAKE_CMD), policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd="."
+    )
+    assert (
+        await teardown.snapshot_within_deadline(1234, timeout_s=0.05, source="test", owner=session._teardown_tasks)
+        == []
+    )
+    assert session._teardown_tasks  # the snapshot and the late reap are both tracked
+    fired: list[bool] = []
+    session.when_closed(lambda: fired.append(bool(reaped)))  # records whether the reap had run when it fired
     release.set()
-    pending = set(owner)
-    await asyncio.wait(pending, timeout=5.0)
-    reaped.set()
-    assert all(task.done() for task in pending) and not owner
+    for _ in range(100):
+        if fired:
+            break
+        await asyncio.sleep(0.05)
+    assert reaped == [["fake-descendant"]]  # the late result was actually reaped ...
+    assert fired == [True]  # ... and when_closed fired only after that, never before
 
 
 async def test_when_closed_also_waits_for_stages_that_outlived_the_close_task(tmp_path: Path) -> None:
