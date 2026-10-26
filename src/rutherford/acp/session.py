@@ -1349,8 +1349,11 @@ class ACPSession:
 
         :meth:`close` returns after its caller budget even while that teardown continues in the background, so
         "close returned" is not "the agent is gone". A caller that must not start a second agent until the
-        first is gone waits on this instead. Runs at once when no teardown was ever started (nothing was
-        spawned, or :meth:`close` was never called) or it has already finished.
+        first is gone waits on this instead.
+
+        Call it only after :meth:`close` (or after :meth:`open` raised, which closes the session itself): it
+        runs at once when no teardown task exists, which on a session that is still open would mean "now",
+        with the agent alive. It also runs at once when the teardown has already finished.
         """
         task = self._close_task
         if task is None or task.done():

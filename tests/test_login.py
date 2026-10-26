@@ -494,6 +494,11 @@ async def test_a_repeated_login_joins_the_running_signin(tmp_path: Path, drain_a
     jobs = [record for record in await app.jobs.list() if record.tool == "login"]
     assert len(jobs) == 1
     await drain_async_job(app.jobs, first["job_id"])
+    for _ in range(100):  # the slot is released by the teardown callback, once the agent has really exited
+        if "fake" not in login_module._ACTIVE.get(app.jobs, {}):
+            break
+        await asyncio.sleep(0.05)
+    assert "fake" not in login_module._ACTIVE.get(app.jobs, {})  # a finished sign-in keeps no session alive
     after = decode(await login_tool(app, agent="fake", method="fake-oauth"))
     assert after["status"] == "authenticated"  # the finished job no longer blocks a fresh state check
 

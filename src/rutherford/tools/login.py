@@ -27,6 +27,7 @@ import tempfile
 import time
 import uuid
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,7 +75,8 @@ async def login_tool(
     sign-in link or finish, and returns ``status=pending`` (``job_id`` + ``signin_urls``) or the finished
     outcome. ``timeout_s`` bounds the ``authenticate`` step (the wait on the person signing in); the launch and
     the confirming ``session/new`` keep the agent's own handshake budget. While a sign-in is running for an
-    agent, a further ``login`` for it returns that job as ``pending`` rather than starting a second one.
+    agent, a further ``login`` for it joins that job rather than starting a second one (``pending``, or the
+    job's outcome if it ends within ``wait_s``).
     ``env_var`` / ``terminal`` methods return what the user has to set or run instead
     (``status=configure_env`` / ``run_in_terminal``).
     """
@@ -197,7 +199,8 @@ def _env_var_answer(agent: str, method: AuthMethodInfo) -> dict[str, Any]:
     if method.link:
         answer["link"] = method.link
         answer["link_note"] = (
-            "the link was advertised by the agent and passed Rutherford's https-only check; Rutherford did not open it"
+            "the link was advertised by the agent and passed Rutherford's https and no-credential checks; "
+            "Rutherford did not open it"
         )
     return answer
 
@@ -304,12 +307,14 @@ def _pending(agent: str, entry: _ActiveSignin, *, wait_s: float, joined: bool) -
     )
 
 
-def _finish_teardown(cwd: Path, torn_down: asyncio.Event) -> None:
-    """Remove the sign-in's working directory, then mark the sign-in torn down (once its agent is gone)."""
+def _finish_teardown(cwd: Path, torn_down: asyncio.Event, *, release: Callable[[], None] | None = None) -> None:
+    """Remove the sign-in's working directory, mark the sign-in torn down, then free its slot (agent gone)."""
     try:
         shutil.rmtree(cwd, ignore_errors=True)
     finally:
         torn_down.set()
+        if release is not None:
+            release()
 
 
 async def _submit_signin(
@@ -353,7 +358,7 @@ async def _submit_signin(
                 # its own budget while the kill and reap carry on. Before that, Windows refuses to delete a live
                 # process's working directory, and a second sign-in must not start. Registered in a `finally`, so
                 # a second cancel landing inside close() cannot skip them.
-                session.when_closed(lambda: _finish_teardown(cwd, torn_down))
+                session.when_closed(lambda: _finish_teardown(cwd, torn_down, release=_release_slot))
         # A seat benched for being signed out would otherwise sit out panels until its bench timed out.
         app.delegation.clear_cooldown(descriptor.id)
         return tool_success(
@@ -366,6 +371,14 @@ async def _submit_signin(
         )
 
     torn_down, started = asyncio.Event(), asyncio.Event()
+    registered: list[_ActiveSignin] = []  # filled right after submit, before the job body can run
+
+    def _release_slot() -> None:
+        """Drop this sign-in's entry once it is fully torn down, unless a newer sign-in has replaced it."""
+        active = _ACTIVE.get(app.jobs, {})
+        if registered and active.get(descriptor.id) is registered[0]:
+            del active[descriptor.id]
+
     job_id = await app.jobs.submit(
         "login", _signin, summary=make_summary("login", target=f"{descriptor.id} ({method.id})")
     )
@@ -373,6 +386,7 @@ async def _submit_signin(
         job_id=job_id, method=method.id, timeout_s=timeout_s, session=session, torn_down=torn_down, started=started
     )
     _ACTIVE.setdefault(app.jobs, {})[descriptor.id] = entry
+    registered.append(entry)
     return entry
 
 
