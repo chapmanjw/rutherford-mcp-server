@@ -627,8 +627,11 @@ async def test_a_signin_still_closing_past_the_bound_keeps_the_slot(
     login_module._ACTIVE.setdefault(app.jobs, {})["fake"] = _entry(
         "evicted-job", descriptor, tmp_path, torn_down=torn_down, ran=True
     )
+    logged: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(login_module, "log_event", lambda event, **fields: logged.append((event, fields)))
     closing = decode(await login_tool(app, agent="fake", method="fake-oauth"))
     assert closing["status"] == "closing" and closing["job_id"] == "evicted-job"
+    assert [(event, fields["job_id"]) for event, fields in logged] == [("login_teardown_overdue", "evicted-job")]
     assert _pids(pid_file) == []  # nothing launched while the old agent may still be alive
     torn_down.set()  # it finally exits: the next call proceeds
     after = decode(await login_tool(app, agent="fake", method="fake-oauth", wait_s=10.0))

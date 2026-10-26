@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import shutil
 import tempfile
 import time
@@ -40,6 +41,7 @@ from ..context import AppContext, tool_success
 from ..domain.enums import JobStatus, SafetyMode
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
+from ..runtime.logging import log_event
 from ..services.jobs import JobRecord, JobStore
 from .common import ensure_known_agent
 from .jobs import make_summary
@@ -76,7 +78,9 @@ async def login_tool(
     outcome. ``timeout_s`` bounds the ``authenticate`` step (the wait on the person signing in); the launch and
     the confirming ``session/new`` keep the agent's own handshake budget. While a sign-in is running for an
     agent, a further ``login`` for it joins that job rather than starting a second one (``pending``, or the
-    job's outcome if it ends within ``wait_s``).
+    job's outcome if it ends within ``wait_s``). Right after a sign-in ends, a call can wait up to 20 s more
+    for its agent to finish closing, and answers ``status=closing`` (logged as ``login_teardown_overdue``) if
+    it still has not.
     ``env_var`` / ``terminal`` methods return what the user has to set or run instead
     (``status=configure_env`` / ``run_in_terminal``).
     """
@@ -301,6 +305,14 @@ async def _active_signin(app: AppContext, agent: str) -> _ActiveSignin | None:
         if not entry.torn_down.is_set():
             # Still closing after the bound: keep holding the slot. Freeing it here would let a second agent
             # start against the same credential store while the first is alive -- the race this exists to stop.
+            # Logged, because a teardown this slow is a wedged agent and the caller only sees status=closing.
+            log_event(
+                "login_teardown_overdue",
+                level=logging.WARNING,
+                agent_id=agent,
+                job_id=entry.job_id,
+                waited_s=_TEARDOWN_WAIT_S,
+            )
             return entry
     active.pop(agent, None)
     return None
