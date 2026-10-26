@@ -263,9 +263,14 @@ _CREDENTIAL_NAME_PARTS = (
 )
 #: Short names that are credentials only as the WHOLE name (as a fragment they would match ``keyword`` etc.).
 _CREDENTIAL_NAMES_EXACT = frozenset({"key", "sig", "auth", "pwd", "jwt"})
+#: Anchored on the LEFT to a non-token character (or the start), like the stderr masker's ``\b``: a PKCE
+#: ``code_challenge`` or ``state`` is a random base64url string, and unanchored, one that merely contains
+#: ``...Xsk-`` followed by 16 more characters would drop the real sign-in link.
 _CREDENTIAL_SHAPE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:"
     r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{35}|sk-[A-Za-z0-9_-]{16,}"
     r"|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}"
+    r")"
 )
 
 

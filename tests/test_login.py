@@ -193,6 +193,14 @@ def test_carries_credential_catches_name_variants_and_decoded_values(url: str) -
     assert carries_credential(url)
 
 
+def test_a_random_pkce_value_containing_a_key_like_run_is_not_a_credential() -> None:
+    # Random base64url: by chance it contains "sk-" + 16 characters, mid-token. Only a shape that STARTS a
+    # token counts, or about one sign-in in five thousand would lose its link for no reason.
+    url = "https://login.test/auth?code_challenge=QI2pXsk-AbCdEfGhIjKlMnOpQr&state=zzAKIA" + "ABCDEFGHIJKLMNOP"
+    assert not carries_credential(url)
+    assert carries_credential("https://login.test/auth?hint=sk-AbCdEfGhIjKlMnOpQr")  # a key that starts a value
+
+
 def test_carries_credential_keeps_an_oauth_authorization_request() -> None:
     url = (
         "https://accounts.example.com/o/oauth2/v2/auth?response_type=code&client_id=abc.apps.example.com"
