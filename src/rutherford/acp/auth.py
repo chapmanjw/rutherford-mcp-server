@@ -307,7 +307,9 @@ def extract_urls(text: str) -> list[str]:
             continue  # the wording must be outside the URL, or every query string saying "auth" would pass
         for match in _HTTPS_URL.finditer(line):
             url = match.group(0).rstrip(_URL_TRAILERS)
-            if is_safe_link(url) and url not in urls:
+            # The same two checks every agent-supplied link gets: safe to hand over, and carrying no credential
+            # (stderr masking only catches some shapes; an opaque ``#access_token=`` passes it).
+            if is_safe_link(url) and not carries_credential(url) and url not in urls:
                 urls.append(url)
                 if len(urls) >= MAX_SIGNIN_URLS:
                     return urls

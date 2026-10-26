@@ -211,6 +211,27 @@ def test_extract_urls_is_https_only_deduped_trimmed_and_capped() -> None:
     assert extract_urls(spoofed) == ["https://ok.test/y"]
 
 
+def test_extract_urls_drops_credential_bearing_links_but_keeps_a_real_oauth_link() -> None:
+    text = (
+        "Open this link to sign in: https://login.test/#access_token=opaque\n"
+        "Open this link to sign in: https://login.test/cb#state=s&id_token=opaque\n"
+        "Open this link to sign in: https://login.test/cb?token=opaque\n"
+        # The shape of the real Antigravity prompt: a PKCE authorization request carries no credential.
+        "Open the following link to authenticate the ACP server: https://accounts.example.com/o/oauth2/v2/auth"
+        "?response_type=code&client_id=1071-abc.apps.example.com&redirect_uri=http%3A%2F%2F127.0.0.1%3A50684%2F"
+        "&scope=openid+email&state=PAsZLPBe8c&code_challenge=QI2pa-U2r1&code_challenge_method=S256"
+        "&access_type=offline&prompt=consent\n"
+    )
+    urls = extract_urls(text)
+    assert len(urls) == 1 and urls[0].startswith("https://accounts.example.com/o/oauth2/v2/auth?response_type=code")
+
+
+async def test_a_session_drops_a_fragment_credential_link(tmp_path: Path) -> None:
+    session = _session(_descriptor(tmp_path / "marker"), tmp_path, auth_method="fake-oauth")
+    session._scan_chunk_for_urls(b"Open this link to sign in: https://login.test/#access_token=opaque\n")
+    assert session.signin_urls == []
+
+
 def test_extract_urls_only_reads_sign_in_prompt_lines() -> None:
     text = (
         "I0000 connecting to https://endpoint.test/v1?auth=token\n"  # "auth" only inside the URL: not a prompt
