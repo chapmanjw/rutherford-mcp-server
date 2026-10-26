@@ -183,13 +183,13 @@ async def snapshot_within_deadline(
       tree is empty; a snapshot that lands just after it captured a real tree, and nothing sweeps that
       tree later because the next run enumerates from a different pid.
 
-    ``source`` labels the log events. Retention is this function's own business, not a caller-supplied
-    hook: an argument only one of two call sites passed is a difference between the paths waiting to become
-    a divergence, and the shared owner already keeps a late snapshot alive until it can be reaped.
+    ``source`` labels the log events. RETENTION stays this function's own business: the shared owner keeps a
+    late snapshot alive until it can be reaped, whatever the caller passes.
 
-    ``owner`` is OBSERVATION, not retention: when given, it also tracks the snapshot and, on a timeout, the
-    late reap as a task, so a caller can learn when the whole tree is really gone (``ACPSession.when_closed``).
-    The reap itself is the same either way.
+    ``owner`` is the one deliberate per-caller difference, and it is OBSERVATION, not retention. Only the
+    session passes it: it tracks the snapshot and, on a timeout, runs the late reap as a task in that set, so
+    the session can learn when the whole tree is really gone (``ACPSession.when_closed``). The terminal path
+    passes none and keeps the fire-and-forget reap thread. Either way the late tree is reaped.
     """
     task = asyncio.create_task(snapshot_descendants_eagerly(pid), name=f"rutherford-snapshot-{source}")
     register_pending_cleanup(task)
