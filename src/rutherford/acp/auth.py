@@ -326,9 +326,10 @@ def extract_urls(text: str) -> list[str]:
     """The distinct https URLs on sign-in prompt lines of ``text``, in order, at most a few.
 
     Only a line carrying sign-in wording ("open the following link to authenticate") contributes, so a URL
-    the agent logs for another reason is not mistaken for the link to open. ``text`` must already be the
-    SANITIZED stderr (controls stripped, credential shapes masked); this only finds links in it. The result is
-    agent-authored and is surfaced as such, never opened by Rutherford.
+    the agent logs for another reason is not mistaken for the link to open. ``text`` must already have escapes
+    and control characters stripped; it is deliberately NOT credential-masked (masking shaped for free-form log
+    text can mangle a link), and :func:`carries_credential` is the credential gate every returned link passes.
+    The result is agent-authored and is surfaced as such, never opened by Rutherford.
     """
     urls: list[str] = []
     for line in text.split("\n"):
