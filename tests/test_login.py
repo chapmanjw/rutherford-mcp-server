@@ -677,6 +677,32 @@ async def test_a_signin_job_evicted_mid_wait_is_a_clean_job_not_found(
     await drain_async_job(app.jobs, submitted[0])
 
 
+async def test_a_signin_cancelled_while_a_caller_waits_is_reported_as_cancelled(
+    tmp_path: Path, drain_async_job: DrainAsyncJob
+) -> None:
+    # Silent: no link is printed, so the caller keeps waiting until the job ends -- here, by cancellation.
+    app = _app(_descriptor(tmp_path / "marker", RUTHERFORD_FAKE_AUTH_DELAY="30", RUTHERFORD_FAKE_AUTH_SILENT="1"))
+    waiting = asyncio.create_task(login_tool(app, agent="fake", method="fake-oauth", wait_s=20.0))
+    while not [r for r in await app.jobs.list() if r.tool == "login" and r.started_at is not None]:  # noqa: ASYNC110
+        await asyncio.sleep(0.05)
+    job_id = next(r.job_id for r in await app.jobs.list() if r.tool == "login")
+    await cancel_job_tool(app, job_id=job_id)
+    data = decode(await waiting)
+    assert data["status"] == "cancelled" and data["job_id"] == job_id and "login agent=fake" in data["next"]
+    await drain_async_job(app.jobs, job_id)
+
+
+async def test_the_state_check_dir_is_removed_after_its_agent_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+    for descriptor in (_descriptor(tmp_path / "marker"), AgentDescriptor("fake", "Fake", _FAKE_CMD)):
+        await login_tool(_app(descriptor), agent="fake")  # auth_required, then authenticated
+    await asyncio.sleep(0.1)  # when_closed callbacks run on the loop once teardown finishes
+    assert list((tmp_path / "tmp").glob("rutherford-acp-login-*")) == []
+
+
 async def test_a_signin_that_does_not_take_is_auth_failed(tmp_path: Path) -> None:
     app = _app(_descriptor(tmp_path / "marker", RUTHERFORD_FAKE_AUTH_NOSTICK="1", RUTHERFORD_FAKE_AUTH_SILENT="1"))
     with pytest.raises(RutherfordError) as caught:

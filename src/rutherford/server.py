@@ -656,7 +656,8 @@ async def login(agent: str, method: str | None = None, wait_s: float = 20.0, tim
     which bounds the authenticate step), or with the agent's own handshake error if the confirming session
     fails for another reason. `status=authenticated` without `method` means a session opens and no ACP
     sign-in is needed; a turn may still need a provider key, which `doctor` checks. A repeated `login` while
-    one is running returns that job (`joined=true`) instead of starting another; a different `method` then is
+    one is running returns that job (`joined=true`) instead of starting another (and `status=cancelled` if
+    `cancel_job` ends it while the call waits); a different `method` then is
     refused with `INVALID_INPUT` until it finishes or is cancelled. The links are agent-authored, taken only
     from sign-in prompt lines, and never opened by Rutherford. An `env_var`
     method returns the variables to set (`status=configure_env`) and a `terminal` method returns the command to

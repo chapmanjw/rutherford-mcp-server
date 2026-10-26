@@ -36,7 +36,7 @@ from ..acp.descriptors import AgentDescriptor
 from ..acp.permission import PermissionPolicy
 from ..acp.session import ACPHandshakeError, ACPSession
 from ..context import AppContext, tool_success
-from ..domain.enums import SafetyMode
+from ..domain.enums import JobStatus, SafetyMode
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
 from ..services.jobs import JobRecord, JobStore
@@ -150,11 +150,14 @@ async def _current_state(descriptor: AgentDescriptor) -> tuple[str, list[AuthMet
     ``state`` is ``authenticated`` / ``auth_required`` / ``not_installed`` / ``handshake_failed``. The
     advertised methods are read off the session even when it failed, since that is the case they matter in.
     """
-    with tempfile.TemporaryDirectory(prefix="rutherford-acp-login-", ignore_cleanup_errors=True) as cwd:
-        session = ACPSession(descriptor, policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd=cwd)
+    # Not a TemporaryDirectory: its cleanup would run when close() returns, which can be before the agent is
+    # gone, and Windows refuses to delete a live process's working directory. Removed once it really is gone.
+    cwd = Path(tempfile.mkdtemp(prefix="rutherford-acp-login-"))
+    session = ACPSession(descriptor, policy=PermissionPolicy(SafetyMode.READ_ONLY), cwd=str(cwd))
+    try:
         try:
             await session.open()
-        except ACPHandshakeError as exc:
+        except ACPHandshakeError as exc:  # open() has already closed the session on this path
             if exc.code is ErrorCode.AUTH_REQUIRED:
                 return "auth_required", session.auth_methods, exc.message
             if exc.code is ErrorCode.ACP_SPAWN_FAILED:
@@ -162,6 +165,8 @@ async def _current_state(descriptor: AgentDescriptor) -> tuple[str, list[AuthMet
             return "handshake_failed", session.auth_methods, exc.message
         with contextlib.suppress(Exception):
             await session.close()
+    finally:
+        session.when_closed(lambda: shutil.rmtree(cwd, ignore_errors=True))
     return (
         "authenticated",
         session.auth_methods,
@@ -390,6 +395,17 @@ async def _await_link(app: AppContext, agent: str, entry: _ActiveSignin, *, wait
     if record.is_finished:
         if record.result is not None:
             return record.result  # signed in before the wait ran out (e.g. the agent had a cached credential)
+        if record.status is JobStatus.CANCELLED:
+            # A normal user action (cancel_job while this call waited), not a fault: answer it as an outcome.
+            return tool_success(
+                {
+                    "agent": agent,
+                    "status": "cancelled",
+                    "method": entry.method,
+                    "job_id": entry.job_id,
+                    "next": f"the sign-in was cancelled; call login agent={agent} method=<id> to start a new one",
+                }
+            )
         error = record.error
         raise RutherfordError(
             error.code if error is not None else ErrorCode.INTERNAL,

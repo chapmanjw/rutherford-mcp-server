@@ -52,8 +52,9 @@ it holds no credential yet. Some agents (Google Antigravity is one) only sign in
 which no ordinary Rutherford call makes, so this is a one-time setup step rather than a broken install.
 
 - Run `login agent=<id>` to see the sign-in methods the agent offers. It changes nothing.
-- Run `login agent=<id> method=<id>` with a method of kind `agent`. It returns `status=pending`, a `job_id`,
-  and `signin_urls`. Open the first link and finish the sign-in in the browser (the agent may also open one
+- Run `login agent=<id> method=<id>` with a method of kind `agent`. It usually returns `status=pending`, a
+  `job_id`, and `signin_urls`; a sign-in that finishes within `wait_s` returns its outcome directly, and one
+  cancelled while the call waits returns `status=cancelled`. Open the first link and finish the sign-in in the browser (the agent may also open one
   itself), then poll `job_status` / `job_result`. The job ends `authenticated` once a session opens with the
   new credential (and lifts any cooldown bench the seat picked up while signed out), fails with the agent's
   own handshake error if that confirming session fails for an unrelated reason, or fails `AUTH_FAILED` if
