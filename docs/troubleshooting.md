@@ -44,6 +44,23 @@ failure surfacing at session creation, or a slow setup that blew the handshake b
   handshake/turn when configured for a ChatGPT subscription or OpenRouter in the desktop app — its
   headless `--acp` path needs Cline's own service auth.
 
+### `auth_required` in doctor / `AUTH_REQUIRED`
+
+The agent spawned and answered `initialize`, then refused `session/new` with ACP's "Authentication required":
+it holds no credential yet. Some agents (Google Antigravity is one) only sign in through ACP `authenticate`,
+which no ordinary Rutherford call makes, so this is a one-time setup step rather than a broken install.
+
+- Run `login agent=<id>` to see the sign-in methods the agent offers. It changes nothing.
+- Run `login agent=<id> method=<id>` with a method of kind `agent`. It returns `status=pending`, a `job_id`,
+  and `signin_urls`. Open the first link and finish the sign-in in the browser (the agent may also open one
+  itself), then poll `job_status` / `job_result`. The job ends `authenticated` once a session opens with the
+  new credential, or fails `AUTH_FAILED` if the sign-in was declined or did not finish within `timeout_s`
+  (300 seconds by default). `cancel_job` stops it.
+- An `env_var` method answers with the variables to set (`[agents.<id>.env]` or the server's environment),
+  and a `terminal` method answers with the command to run yourself. Rutherford never asks for or stores a
+  credential value.
+- The agent caches the credential in its own store, so later sessions open without signing in again.
+
 ### `no_answer` in doctor / `ACP_REFUSED` / `ACP_EMPTY_ANSWER`
 
 The agent spawned and handshook but ended the turn without an answer — it refused, or produced no

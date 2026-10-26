@@ -168,11 +168,13 @@ class DescriptorRegistry:
 #: individual accounts: Gemini CLI now refuses those with "no longer supported for Gemini Code Assist for
 #: individuals". The archive is not installed onto PATH, so add its directory to PATH or point
 #: ``[agents.antigravity] command`` at the full path. Auth is one-time: the server advertises
-#: ``oauth-personal`` / ``oauth-business`` / ``gemini-api-key`` / ``agent-platform`` and, until a client has
-#: called ACP ``authenticate`` once, ``session/new`` fails with ``Authentication required``. Rutherford never
-#: calls ``authenticate`` (it would open a browser from a headless server); after one sign-in the server
-#: caches its token under ``~/.gemini/antigravity-acp/`` and every later session opens without it.
-#: Live-verified on Windows 2026-10-25 with 1.4.3: handshake, session, and a read-only turn (status=ok). The
+#: ``oauth-personal`` / ``oauth-business`` / ``gemini-api-key`` / ``agent-platform`` (all agent-kind) and,
+#: until a client has called ACP ``authenticate`` once, ``session/new`` fails with ``Authentication
+#: required`` -- surfaced as ``AUTH_REQUIRED`` and fixed with the ``login`` tool. After one sign-in the server
+#: caches its credential under ``~/.gemini/antigravity-acp/`` (``$GEMINI_HOME`` relocates it) and every
+#: later session opens without it.
+#: Live-verified on Windows 2026-10-25 with 1.4.3: handshake, session, a read-only turn (status=ok), and, from
+#: a signed-out ``GEMINI_HOME``, ``auth_required`` -> ``login`` returning the Google sign-in link. The
 #: Linux ``--uid=`` argument is copied from the registry entry and is not verified here.
 def antigravity_command(platform: str) -> tuple[str, ...]:
     """The Antigravity ACP server's launch argv for ``platform`` (a :data:`sys.platform` value)."""

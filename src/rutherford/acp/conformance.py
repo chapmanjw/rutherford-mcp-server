@@ -32,6 +32,14 @@ from .session import ACPHandshakeError, ACPSession, run_acp_turn
 _PROBE_PROMPT = "Respond with exactly the word: OK"
 
 
+def signin_hint(agent_id: str) -> str:
+    """The next step for an ``auth_required`` agent: list its sign-in methods, then sign in with one."""
+    return (
+        f"run `login agent={agent_id}` to list its sign-in methods, then `login agent={agent_id} method=<id>` "
+        "to sign in once"
+    )
+
+
 class ConformanceReport(BaseModel):
     """The outcome of probing one agent's ACP server with a real round trip."""
 
@@ -39,7 +47,8 @@ class ConformanceReport(BaseModel):
     #: ``ok`` (handshake + answered) | ``no_answer`` (answered empty / refused) | ``model_unavailable`` (spawn +
     #: handshake succeeded, but the turn failed because the harness/provider rejected the model -- a model/
     #: provider config issue, e.g. a Bedrock/Vertex Claude Code, NOT a broken seat) | ``handshake_failed``
-    #: (installed, but initialize/new_session failed) | ``not_installed`` (the launch command was not found)
+    #: (installed, but initialize/new_session failed) | ``auth_required`` (installed and speaking ACP, but it
+    #: holds no credential until a one-time sign-in) | ``not_installed`` (the launch command was not found)
     #: | ``error`` (some other failure).
     status: str
     installed: bool
@@ -85,6 +94,16 @@ def classify(agent_id: str, result: DelegationResult) -> ConformanceReport:
             answered=False,
             detail=message,
             duration_s=result.duration_s,
+        )
+    if code is ErrorCode.AUTH_REQUIRED:
+        return ConformanceReport(
+            agent_id=agent_id,
+            status="auth_required",
+            installed=True,
+            answered=False,
+            detail=message,
+            duration_s=result.duration_s,
+            remediation_hint=signin_hint(agent_id),
         )
     if code in (ErrorCode.ACP_EMPTY_ANSWER, ErrorCode.ACP_REFUSED):
         return ConformanceReport(
@@ -166,8 +185,8 @@ class ConnectionReport(BaseModel):
 
     agent_id: str
     #: ``reachable`` (spawned, handshook, and opened a session) | ``handshake_failed`` (installed, but
-    #: initialize/new_session failed) | ``not_installed`` (the launch command was not found) | ``error`` (an
-    #: unexpected fault while opening).
+    #: initialize/new_session failed) | ``auth_required`` (installed, but not signed in) | ``not_installed``
+    #: (the launch command was not found) | ``error`` (an unexpected fault while opening).
     status: str
     installed: bool
     #: Whether the handshake completed and a session was opened (the "communicate + configure" signal).
@@ -181,6 +200,8 @@ class ConnectionReport(BaseModel):
     #: As on :class:`ConformanceReport`: the ``npm i -g`` instruction when a ``not_installed`` agent's
     #: underlying CLI is present and only its ACP adapter shim is missing; ``None`` otherwise.
     install_hint: str | None = None
+    #: For an ``auth_required`` agent, the next step (:func:`signin_hint`); ``None`` otherwise.
+    remediation_hint: str | None = None
 
 
 async def probe_connection(
@@ -217,12 +238,14 @@ async def _connect_in(descriptor: AgentDescriptor, cwd: str, timeout_s: float) -
     try:
         await session.open()
     except ACPHandshakeError as exc:
-        # open() already tore the session down on failure. SPAWN_FAILED = not installed; anything else
-        # (handshake / new_session) = installed but the handshake did not complete.
+        # open() already tore the session down on failure. SPAWN_FAILED = not installed; AUTH_REQUIRED =
+        # installed and speaking ACP but not signed in; anything else = the handshake did not complete.
         installed = exc.code is not ErrorCode.ACP_SPAWN_FAILED
-        return _connect_failure(
-            descriptor, "not_installed" if not installed else "handshake_failed", installed, exc.message, start
-        )
+        if exc.code is ErrorCode.AUTH_REQUIRED:
+            status = "auth_required"
+        else:
+            status = "handshake_failed" if installed else "not_installed"
+        return _connect_failure(descriptor, status, installed, exc.message, start)
     except asyncio.CancelledError:
         # An OUTER cancel (e.g. the MCP client cancelling the doctor call) injected mid-open: open() may have
         # spawned the agent already, so tear it down before propagating -- never leak on cancellation.
@@ -265,4 +288,5 @@ def _connect_failure(
         detail=f"{detail} ({hint})" if hint is not None else detail,
         duration_s=round(time.monotonic() - start, 3),
         install_hint=hint,
+        remediation_hint=signin_hint(descriptor.id) if status == "auth_required" else None,
     )

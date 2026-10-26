@@ -48,6 +48,10 @@ from acp import PROTOCOL_VERSION, RequestError, run_agent  # noqa: E402
 from acp.helpers import update_agent_message_text, update_agent_thought_text  # noqa: E402
 from acp.schema import (  # noqa: E402
     AgentCapabilities,
+    AuthenticateResponse,
+    AuthEnvVar,
+    AuthMethodAgent,
+    EnvVarAuthMethod,
     InitializeResponse,
     LoadSessionResponse,
     NewSessionResponse,
@@ -56,7 +60,39 @@ from acp.schema import (  # noqa: E402
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
     SetSessionConfigOptionResponse,
+    TerminalAuthMethod,
 )
+
+#: Sign-in simulation. ``RUTHERFORD_FAKE_AUTH_MARKER=<path>`` makes the fake require ACP authentication: it
+#: advertises one method of each kind, refuses ``session/new`` with "Authentication required" until the marker
+#: file exists, and ``authenticate`` with the agent-kind method prints a sign-in link to stderr and creates the
+#: marker. ``RUTHERFORD_FAKE_AUTH_DELAY`` (seconds) holds ``authenticate`` open like a user mid-sign-in,
+#: ``RUTHERFORD_FAKE_AUTH_NOISE`` (bytes) logs that much stderr BEFORE the link, and ``RUTHERFORD_FAKE_AUTH_FAIL=1``
+#: makes the sign-in fail the way a declined or timed-out browser flow does. ``RUTHERFORD_FAKE_AUTH_SILENT=1``
+#: signs in without printing a link, like an agent reusing a credential it already has.
+_FAKE_SIGNIN_URL = "https://example.test/oauth?state=abc&code_challenge=xyz"
+
+
+def _auth_marker() -> Path | None:
+    raw = os.environ.get("RUTHERFORD_FAKE_AUTH_MARKER")
+    return Path(raw) if raw else None
+
+
+def _advertised_auth_methods() -> list[Any]:
+    if _auth_marker() is None:
+        return []
+    return [
+        AuthMethodAgent(id="fake-oauth", name="Log in with Fake", description="Browser sign-in"),
+        EnvVarAuthMethod(
+            id="fake-key",
+            name="Fake API key",
+            type="env_var",
+            vars=[AuthEnvVar(name="FAKE_API_KEY", label="Fake key")],
+            link="https://example.test/keys",
+        ),
+        TerminalAuthMethod(id="fake-term", name="Terminal login", type="terminal", args=["--login"]),
+    ]
+
 
 # * Legacy SessionModelState / ModelInfo exist only on ACP 0.10.x; 0.11+ removes them. Never copy protocol
 # classes -- optional getattr keeps this module importable on both SDKs.
@@ -371,12 +407,32 @@ class FakeAgent:
         return InitializeResponse(
             protocol_version=PROTOCOL_VERSION,
             agent_capabilities=AgentCapabilities(load_session=supports_load),
+            auth_methods=_advertised_auth_methods(),
         )
 
     async def new_session(
         self, cwd: str, additional_directories: Any = None, mcp_servers: Any = None, **kwargs: Any
     ) -> NewSessionResponse:
+        marker = _auth_marker()
+        if marker is not None and not marker.exists():
+            raise RequestError.auth_required({"message": "No authentication method selected."})
         return _new_session_response(session_id="fake-session-1")
+
+    async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse:
+        marker = _auth_marker()
+        if marker is None or method_id != "fake-oauth":
+            raise RequestError.invalid_params({"method_id": method_id})
+        noise = int(os.environ.get("RUTHERFORD_FAKE_AUTH_NOISE", "0"))
+        if noise:
+            sys.stderr.write(("I0000 harness log line padding the head of stderr\n" * (noise // 50 + 1))[:noise])
+        if os.environ.get("RUTHERFORD_FAKE_AUTH_SILENT") != "1":  # silent = signs in with no link to open
+            sys.stderr.write(f"Open the following link to authenticate the ACP server: {_FAKE_SIGNIN_URL}\n")
+            sys.stderr.flush()
+        await asyncio.sleep(float(os.environ.get("RUTHERFORD_FAKE_AUTH_DELAY", "0")))
+        if os.environ.get("RUTHERFORD_FAKE_AUTH_FAIL") == "1":
+            raise RequestError(-32000, "Onboarding failed: Timed out waiting for the authentication flow.")
+        marker.write_text("signed-in", encoding="utf-8")
+        return AuthenticateResponse()
 
     async def load_session(
         self, cwd: str, session_id: str, additional_directories: Any = None, mcp_servers: Any = None, **kwargs: Any

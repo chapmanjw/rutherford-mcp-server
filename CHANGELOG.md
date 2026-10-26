@@ -13,8 +13,21 @@ All notable changes to this project are documented in this file. The format is b
   "no longer supported for Gemini Code Assist for individuals". The server is a standalone Google-signed binary
   from the ACP registry (`agy_acp_server.exe` on Windows, `agy_acp_server.par` on macOS and Linux), separate
   from the `agy` CLI, and it is not installed onto PATH: add its directory to PATH or set
-  `[agents.antigravity] command` to the full path. It needs one Google sign-in through ACP `authenticate`;
-  after that the server caches its token and Rutherford's sessions open without further prompts.
+  `[agents.antigravity] command` to the full path. It needs one Google sign-in with the new `login` tool;
+  after that the server caches its credential and Rutherford's sessions open without further prompts.
+- **New tool: `login`** signs an agent in once through ACP `authenticate`, for agents that open no session
+  until a client has done so. Called with only `agent`, it is read-only and lists the sign-in methods the
+  agent advertises. With `method`, it starts the sign-in as a background job and returns the sign-in link the
+  agent printed, plus a `job_id` to poll; the job finishes `authenticated` once a session opens with the new
+  credential, or `AUTH_FAILED` if the sign-in is declined or times out. `env_var` and `terminal` methods are
+  answered with the variables to set or the command to run, and Rutherford never handles a credential value.
+  No other call signs in, so a delegation never opens a browser as a side effect.
+
+### Changed
+
+- An agent that refuses `session/new` with ACP's "Authentication required" now fails with `AUTH_REQUIRED`
+  instead of `ACP_HANDSHAKE_FAILED`, naming the sign-in methods it offers. `doctor` reports it as
+  `auth_required` with a pointer to `login`, rather than as a broken handshake.
 
 ## [3.2.0] - 2026-09-05
 

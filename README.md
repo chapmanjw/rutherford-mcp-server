@@ -168,7 +168,8 @@ confirm the crew actually drives before your first real task:
 
 `doctor` probes each agent with a real read-only ACP round trip — the only trustworthy health signal,
 since there is no cheap non-interactive auth check. Each report is `ok`, `no_answer`,
-`handshake_failed`, `not_installed`, or `error`. Two or more `ok` agents means you are ready.
+`handshake_failed`, `auth_required`, `not_installed`, or `error`. An `auth_required` agent is installed but
+not yet signed in; sign it in once with `login`. Two or more `ok` agents means you are ready.
 
 **No paid agent subscription?** Run your first consensus for free against a local model. With
 [Ollama](https://ollama.com) or [LM Studio](https://lmstudio.ai) running, Rutherford auto-detects
@@ -191,6 +192,7 @@ read-only.
 | `analyze` | Run an offline report over the kept run corpus (e.g. `historical_agreement` cross-lineage agreement). |
 | `capabilities` | List the registered agents (id, display name, launch command, provider) — the cheap snapshot. |
 | `doctor` | Probe each agent with a real read-only ACP round trip and report conformance. |
+| `login` | Sign an agent in once through ACP `authenticate`, for one `doctor` reports as `auth_required`; returns the sign-in link and a job to poll. |
 | `discover` | Detect installed ACP agents from the community registry and propose reviewable config blocks. |
 | `list_roles` | List the role personas you can pass as `role="<id>"`. |
 | `setup` | Show where config lives, scaffold a starter `config.toml`, and install missing npm ACP adapter shims; the first-run helper. |
@@ -233,7 +235,7 @@ they work with zero config:
 | `qoder` | Qoder | `qodercli --acp` | Qoder login |
 | `grok` | Grok | `grok agent stdio` | xAI login + SuperGrok subscription |
 | `fast_agent` | fast-agent | `uvx fast-agent-acp==0.8.3` | provider API key (env or `fast-agent.secrets.yaml`) |
-| `antigravity` | Google Antigravity | `agy_acp_server` (`.par` on macOS / Linux) | Google login, once, through ACP `authenticate` |
+| `antigravity` | Google Antigravity | `agy_acp_server` (`.par` on macOS / Linux) | Google sign-in, once, with the `login` tool |
 
 `codex` and `claude_code` launch through the official Zed adapters (`codex-acp` and
 `claude-agent-acp`, npm `@agentclientprotocol/*`), which front the Codex and Claude Code CLIs as ACP
@@ -250,9 +252,9 @@ entitlement. `antigravity` is Google Antigravity's ACP server, which Google now 
 accounts to (Gemini CLI refuses them). It is a standalone binary from the
 [ACP registry](https://agentclientprotocol.com/get-started/registry), separate from the `agy` CLI, and is
 not installed onto PATH, so add its directory to PATH or set `[agents.antigravity] command` to the full path.
-Until it has been signed in once through ACP `authenticate` (for example from an ACP editor that offers the
-Google login), `doctor` reports `Authentication required`; the server caches the token under
-`~/.gemini/antigravity-acp/` and later sessions open without it. Not every agent drives cleanly on every machine — run `doctor` to see which actually answer
+Until it has been signed in once, `doctor` reports it as `auth_required`: run `login agent=antigravity
+method=oauth-personal`, open the returned sign-in link, and poll the returned job. The server caches the
+credential under `~/.gemini/antigravity-acp/`, so later sessions open without it. Not every agent drives cleanly on every machine — run `doctor` to see which actually answer
 here.
 
 **Config-driven agents.** Under ACP an agent is just how to launch it plus a few quirks, so the roster
