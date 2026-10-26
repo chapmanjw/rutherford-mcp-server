@@ -430,6 +430,10 @@ class ACPSession:
         self._pid: int | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._close_task: asyncio.Task[None] | None = None
+        #: Teardown stages still running for this session -- the direct-process wait, terminal shutdown,
+        #: descendant reap, transport close. Each is bounded only in how long the close body WAITS for it, so
+        #: one can outlive the close task; :meth:`when_closed` waits for these too.
+        self._teardown_tasks: set[asyncio.Task[Any]] = set()
         #: Head-bounded capture of the agent's own stderr, for a failure detail. An agent that dies at launch
         #: often explains itself there and nowhere else -- a launcher stub handed a name it does not
         #: recognize prints one exact line and exits, which ACP can otherwise only report as "Connection lost".
@@ -1274,9 +1278,13 @@ class ACPSession:
         busy teardown could drop exactly the work this deadline promised to let finish.
         """
         if not cancel_on_timeout:
-            return await await_without_cancelling(coro, timeout_s=timeout_s, task_name=task_name, default=default)
+            return await await_without_cancelling(
+                coro, timeout_s=timeout_s, task_name=task_name, default=default, owner=self._teardown_tasks
+            )
         task = asyncio.create_task(coro, name=task_name)
         register_pending_cleanup(task)
+        self._teardown_tasks.add(task)
+        task.add_done_callback(self._teardown_tasks.discard)
         try:
             done, _ = await asyncio.wait({task}, timeout=timeout_s)
         except asyncio.CancelledError:
@@ -1317,6 +1325,7 @@ class ACPSession:
             timeout_s=_DIRECT_PROCESS_KILL_WAIT_S,
             task_name="rutherford-acp-direct-process-wait",
             default=None,
+            owner=self._teardown_tasks,
         )
 
     async def cancel(self) -> None:
@@ -1348,18 +1357,30 @@ class ACPSession:
         """Run ``callback`` once this session's teardown has really finished -- the agent killed and reaped.
 
         :meth:`close` returns after its caller budget even while that teardown continues in the background, so
-        "close returned" is not "the agent is gone". A caller that must not start a second agent until the
-        first is gone waits on this instead.
+        "close returned" is not "the agent is gone". Nor is "the close task finished": it bounds how long it
+        waits for each stage (process wait, terminal shutdown, descendant reap, transport close), and a stage
+        past its deadline keeps running. This fires only once the close task AND every such stage are done. A
+        caller that must not start a second agent until the first is gone waits on this instead.
 
         Call it only after :meth:`close` (or after :meth:`open` raised, which closes the session itself): it
         runs at once when no teardown task exists, which on a session that is still open would mean "now",
         with the agent alive. It also runs at once when the teardown has already finished.
         """
-        task = self._close_task
-        if task is None or task.done():
+        close_task = self._close_task
+        if (close_task is None or close_task.done()) and all(task.done() for task in self._teardown_tasks):
             callback()
-        else:
-            task.add_done_callback(lambda _task: callback())
+            return
+
+        async def _after_teardown() -> None:
+            if close_task is not None:
+                await asyncio.wait({close_task})
+            # The close body bounds how long it WAITS for each stage, not the stage: a reap or transport close
+            # that outran its deadline is still running here, so wait for every stage this session started.
+            while pending := {task for task in self._teardown_tasks if not task.done()}:
+                await asyncio.wait(pending)
+            callback()
+
+        register_pending_cleanup(asyncio.create_task(_after_teardown(), name="rutherford-acp-when-closed"))
 
     async def _close_body(self) -> None:
         """Snapshot the live tree, kill its spawning parent, reap descendants, then close the ACP transport.

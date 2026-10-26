@@ -93,6 +93,19 @@ async def login_tool(
         active = await _active_signin(app, agent)
         if active is None:
             outcome: str | _ActiveSignin = await _decide(app, agent, method, timeout_s=timeout_s)
+        elif _ended(await _job_or_none(app, active.job_id)):
+            # The job is over but its agent has not finished closing: report that instead of starting another.
+            return tool_success(
+                {
+                    "agent": agent,
+                    "status": "closing",
+                    "job_id": active.job_id,
+                    "next": (
+                        f"the previous sign-in's agent is still shutting down; call login agent={agent} again in "
+                        "a few seconds"
+                    ),
+                }
+            )
         elif method is not None and method != active.method:
             raise RutherfordError(
                 ErrorCode.INVALID_INPUT,
@@ -246,6 +259,11 @@ _LOCKS: weakref.WeakKeyDictionary[JobStore, dict[str, asyncio.Lock]] = weakref.W
 _TEARDOWN_WAIT_S = 20.0
 
 
+def _ended(record: JobRecord | None) -> bool:
+    """Whether a sign-in job is over: finished, or evicted from the store."""
+    return record is None or record.is_finished
+
+
 async def _job_or_none(app: AppContext, job_id: str) -> JobRecord | None:
     """The job record, or ``None`` once the store no longer holds it (evicted after its TTL)."""
     try:
@@ -259,7 +277,10 @@ def _agent_lock(app: AppContext, agent: str) -> asyncio.Lock:
 
 
 async def _active_signin(app: AppContext, agent: str) -> _ActiveSignin | None:
-    """The unfinished sign-in job for ``agent``, or ``None``. Call with the agent's lock held.
+    """The sign-in still holding ``agent``'s slot, or ``None``. Call with the agent's lock held.
+
+    Returned while its job runs, and also after the job ended if its agent is still closing past the teardown
+    bound (the caller answers that with ``status=closing``).
 
     A finished entry is dropped, but only after its job has finished tearing down -- a sign-in cancelled a
     moment ago may still be closing its agent, and launching another then would put two sign-ins in flight.
@@ -277,6 +298,10 @@ async def _active_signin(app: AppContext, agent: str) -> _ActiveSignin | None:
     if entry.started.is_set():
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(entry.torn_down.wait(), timeout=_TEARDOWN_WAIT_S)
+        if not entry.torn_down.is_set():
+            # Still closing after the bound: keep holding the slot. Freeing it here would let a second agent
+            # start against the same credential store while the first is alive -- the race this exists to stop.
+            return entry
     active.pop(agent, None)
     return None
 

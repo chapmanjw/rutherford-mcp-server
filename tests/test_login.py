@@ -587,6 +587,55 @@ async def test_an_evicted_signin_holds_off_a_new_login_launch(tmp_path: Path, dr
     await drain_async_job(app.jobs, data["job_id"])
 
 
+async def test_a_signin_still_closing_past_the_bound_keeps_the_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drain_async_job: DrainAsyncJob
+) -> None:
+    pid_file = tmp_path / "agent.pid"
+    descriptor = _descriptor(tmp_path / "marker", RUTHERFORD_FAKE_PID_FILE=str(pid_file))
+    app = _app(descriptor)
+    monkeypatch.setattr(login_module, "_TEARDOWN_WAIT_S", 0.2)
+    torn_down = asyncio.Event()  # a wedged teardown: never set during the first call
+    login_module._ACTIVE.setdefault(app.jobs, {})["fake"] = _entry(
+        "evicted-job", descriptor, tmp_path, torn_down=torn_down, ran=True
+    )
+    closing = decode(await login_tool(app, agent="fake", method="fake-oauth"))
+    assert closing["status"] == "closing" and closing["job_id"] == "evicted-job"
+    assert _pids(pid_file) == []  # nothing launched while the old agent may still be alive
+    torn_down.set()  # it finally exits: the next call proceeds
+    after = decode(await login_tool(app, agent="fake", method="fake-oauth", wait_s=10.0))
+    assert after["status"] != "closing"
+    if after.get("job_id"):
+        await drain_async_job(app.jobs, after["job_id"])
+
+
+async def test_when_closed_also_waits_for_stages_that_outlived_the_close_task(tmp_path: Path) -> None:
+    session = _session(_descriptor(tmp_path / "marker"), tmp_path)
+    release = asyncio.Event()
+
+    async def _done() -> None:
+        return None
+
+    async def _late_reap() -> None:
+        await release.wait()
+
+    session._close_task = asyncio.create_task(_done())
+    await session._close_task  # the close body finished ...
+    late = asyncio.create_task(_late_reap())
+    session._teardown_tasks.add(late)  # ... but a reap it stopped waiting for is still running
+    late.add_done_callback(session._teardown_tasks.discard)
+    calls: list[str] = []
+    session.when_closed(lambda: calls.append("gone"))
+    await asyncio.sleep(0.05)
+    assert calls == []
+    release.set()
+    await late
+    for _ in range(20):
+        if calls:
+            break
+        await asyncio.sleep(0.01)
+    assert calls == ["gone"]
+
+
 async def test_a_signin_cancelled_before_it_ran_frees_the_slot_at_once(tmp_path: Path) -> None:
     descriptor = _descriptor(tmp_path / "marker")
     app = _app(descriptor)

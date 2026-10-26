@@ -133,7 +133,12 @@ def _release_pending_cleanup(task: asyncio.Task[Any]) -> None:
 
 
 async def await_without_cancelling(
-    coro: Coroutine[Any, Any, _T], *, timeout_s: float, task_name: str, default: _T
+    coro: Coroutine[Any, Any, _T],
+    *,
+    timeout_s: float,
+    task_name: str,
+    default: _T,
+    owner: set[asyncio.Task[Any]] | None = None,
 ) -> _T:
     """Wait up to ``timeout_s`` for ``coro``, then abandon the WAIT -- never the work. ``default`` on expiry.
 
@@ -145,9 +150,15 @@ async def await_without_cancelling(
 
     The deadline is here to stop teardown BLOCKING its caller, not to stop it happening. So the task is
     retained and left to finish in the background, and only the waiting is bounded.
+
+    ``owner``, when given, also tracks the task until it completes, so a caller can learn when work that
+    outran this deadline has really finished (``ACPSession.when_closed``).
     """
     task = asyncio.create_task(coro, name=task_name)
     register_pending_cleanup(task)
+    if owner is not None:
+        owner.add(task)
+        task.add_done_callback(owner.discard)
     done, _ = await asyncio.wait({task}, timeout=timeout_s)
     if task not in done:
         return default
