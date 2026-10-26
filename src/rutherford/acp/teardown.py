@@ -264,7 +264,15 @@ async def _reap_late_tracked(snapshot: asyncio.Task[list[psutil.Process]], *, so
     try:
         await _reap_on_own_thread(late, source=source)
     except asyncio.CancelledError:
-        log_event("acp_teardown_late_snapshot_dropped", level=logging.WARNING, source=source, reason="cancelled")
+        # Not "dropped": the reap thread is already running and finishes on its own; only the wait for it ends,
+        # so whoever was waiting can no longer tell when the tree is gone.
+        log_event(
+            "acp_teardown_late_reap_detached",
+            level=logging.WARNING,
+            source=source,
+            descendants=len(late),
+            reason="cancelled",
+        )
         raise
     except Exception as exc:
         log_event(

@@ -741,10 +741,51 @@ async def test_a_cancelled_late_reap_is_logged_and_the_reap_still_runs(monkeypat
     late_reap.cancel()  # e.g. loop shutdown cancelling the awaiting task
     with pytest.raises(asyncio.CancelledError):
         await late_reap
-    assert ("acp_teardown_late_snapshot_dropped", "cancelled") in [
-        (event, fields.get("reason")) for event, fields in logged
-    ]
+    events = [event for event, _fields in logged]
+    assert "acp_teardown_late_reap_detached" in events  # the wait ended; the tree was NOT dropped
+    assert "acp_teardown_late_snapshot_dropped" not in events
     assert await asyncio.to_thread(reap_done.wait, 5.0)  # cancelling the await did not stop the reap
+
+
+async def test_the_late_reap_starts_even_with_the_default_executor_saturated(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A snapshot times out because the host is busy, so the shared executor is likely full too. The reap must
+    # not queue behind it: with the default executor's only worker blocked, the reap still starts at once.
+    from concurrent.futures import ThreadPoolExecutor
+
+    from rutherford.acp import teardown
+
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(executor)
+    worker_blocked, release_worker = asyncio.Event(), threading.Event()
+    reap_started = asyncio.Event()
+
+    async def _instant_late_snapshot(_pid: int) -> list[Any]:
+        await asyncio.sleep(0.1)  # just past the deadline below
+        return ["fake-descendant"]
+
+    def _reap(procs: list[Any], **_kwargs: Any) -> None:
+        loop.call_soon_threadsafe(reap_started.set)
+
+    def _hog() -> None:
+        loop.call_soon_threadsafe(worker_blocked.set)
+        release_worker.wait(10.0)
+
+    monkeypatch.setattr(teardown, "snapshot_descendants_eagerly", _instant_late_snapshot)
+    monkeypatch.setattr(teardown, "reap", _reap)
+    hog = loop.run_in_executor(None, _hog)
+    try:
+        await asyncio.wait_for(worker_blocked.wait(), timeout=5.0)  # the executor's only worker is now busy
+        owner: set[asyncio.Task[Any]] = set()
+        await teardown.snapshot_within_deadline(1234, timeout_s=0.05, source="test", owner=owner)
+        try:
+            await asyncio.wait_for(reap_started.wait(), timeout=2.0)
+        except TimeoutError:
+            pytest.fail("the late reap queued behind the saturated default executor")
+    finally:
+        release_worker.set()
+        await hog
+        executor.shutdown(wait=False)
 
 
 async def test_when_closed_also_waits_for_stages_that_outlived_the_close_task(tmp_path: Path) -> None:
