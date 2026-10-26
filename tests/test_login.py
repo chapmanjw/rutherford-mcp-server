@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, ClassVar
@@ -710,6 +711,40 @@ async def test_a_late_descendant_snapshot_and_its_reap_are_tracked(monkeypatch: 
         await asyncio.sleep(0.05)
     assert reaped == [["fake-descendant"]]  # the late result was actually reaped ...
     assert fired == [True]  # ... and when_closed fired only after that, never before
+
+
+async def test_a_cancelled_late_reap_is_logged_and_the_reap_still_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from rutherford.acp import teardown
+
+    release, started = asyncio.Event(), asyncio.Event()
+    reap_done = threading.Event()
+    logged: list[tuple[str, dict[str, Any]]] = []
+
+    async def _slow_snapshot(_pid: int) -> list[Any]:
+        await release.wait()
+        return ["fake-descendant"]
+
+    def _reap(procs: list[Any], **_kwargs: Any) -> None:
+        loop.call_soon_threadsafe(started.set)
+        time.sleep(0.3)
+        reap_done.set()
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(teardown, "snapshot_descendants_eagerly", _slow_snapshot)
+    monkeypatch.setattr(teardown, "reap", _reap)
+    monkeypatch.setattr(teardown, "log_event", lambda event, **fields: logged.append((event, fields)))
+    owner: set[asyncio.Task[Any]] = set()
+    await teardown.snapshot_within_deadline(1234, timeout_s=0.05, source="test", owner=owner)
+    late_reap = next(task for task in owner if task.get_name() == "rutherford-late-reap-test")
+    release.set()
+    await asyncio.wait_for(started.wait(), timeout=5.0)  # the reap thread is running
+    late_reap.cancel()  # e.g. loop shutdown cancelling the awaiting task
+    with pytest.raises(asyncio.CancelledError):
+        await late_reap
+    assert ("acp_teardown_late_snapshot_dropped", "cancelled") in [
+        (event, fields.get("reason")) for event, fields in logged
+    ]
+    assert await asyncio.to_thread(reap_done.wait, 5.0)  # cancelling the await did not stop the reap
 
 
 async def test_when_closed_also_waits_for_stages_that_outlived_the_close_task(tmp_path: Path) -> None:

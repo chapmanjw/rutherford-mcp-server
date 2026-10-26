@@ -216,6 +216,38 @@ async def snapshot_within_deadline(
     return []
 
 
+async def _reap_on_own_thread(procs: list[psutil.Process], *, source: str) -> None:
+    """Reap ``procs`` on a dedicated daemon thread and await its completion.
+
+    Not ``asyncio.to_thread``: a snapshot usually times out because the host is busy, and then the shared
+    executor is likely saturated too, so a queued reap could wait -- or be cancelled at loop shutdown before it
+    ever started. A dedicated thread starts at once, like :func:`_reap_late_snapshot`'s; only the AWAIT is
+    cancellable, and cancelling it leaves the reap running to completion.
+    """
+    loop = asyncio.get_running_loop()
+    finished: asyncio.Future[None] = loop.create_future()
+
+    def _signal(error: BaseException | None) -> None:
+        if finished.done():
+            return
+        if error is None:
+            finished.set_result(None)
+        else:
+            finished.set_exception(error)
+
+    def _run() -> None:
+        error: BaseException | None = None
+        try:
+            reap(procs)
+        except BaseException as exc:  # pragma: no cover - reap is best-effort and does not raise
+            error = exc
+        with contextlib.suppress(RuntimeError):  # the loop may already be closed at shutdown
+            loop.call_soon_threadsafe(_signal, error)
+
+    threading.Thread(target=_run, name=f"rutherford-late-reap-{source}", daemon=True).start()
+    await finished
+
+
 async def _reap_late_tracked(snapshot: asyncio.Task[list[psutil.Process]], *, source: str) -> None:
     """Await a snapshot that missed its deadline, then reap what it found -- the observable twin of
     :func:`_reap_late_snapshot`, for a caller that must know when the tree is gone. Never raises."""
@@ -230,7 +262,7 @@ async def _reap_late_tracked(snapshot: asyncio.Task[list[psutil.Process]], *, so
         return
     log_event("acp_teardown_late_snapshot_scheduled", level=logging.WARNING, source=source, descendants=len(late))
     try:
-        await asyncio.to_thread(reap, late)  # the shared executor: when saturated, this holds the slot longer
+        await _reap_on_own_thread(late, source=source)
     except asyncio.CancelledError:
         log_event("acp_teardown_late_snapshot_dropped", level=logging.WARNING, source=source, reason="cancelled")
         raise
