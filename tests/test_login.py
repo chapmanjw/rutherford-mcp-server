@@ -69,6 +69,21 @@ def _pids(pid_file: Path) -> list[int]:
     return [int(line) for line in pid_file.read_text(encoding="utf-8").split()]
 
 
+def _entry(job_id: str, descriptor: AgentDescriptor, cwd: Path, *, torn_down: asyncio.Event, ran: bool) -> Any:
+    """A hand-built in-flight sign-in entry; ``ran`` says whether its job body ever started (spawned an agent)."""
+    started = asyncio.Event()
+    if ran:
+        started.set()
+    return login_module._ActiveSignin(
+        job_id=job_id,
+        method="fake-oauth",
+        timeout_s=1.0,
+        session=_session(descriptor, cwd),
+        torn_down=torn_down,
+        started=started,
+    )
+
+
 def _alive(process: psutil.Process) -> bool:
     try:
         return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
@@ -152,6 +167,10 @@ def test_carries_credential_spots_named_parameters_and_shapes() -> None:
     fake_key_id = "AKIA" + "ABCDEFGHIJKLMNOP"  # assembled so a secret scanner never sees a key-shaped literal
     assert carries_credential(f"https://k.test/path/{fake_key_id}")  # a shape outside the query
     assert not carries_credential("https://k.test/settings/api-keys?tab=new&state=s")  # mentions keys, holds none
+    # Implicit-flow fragments: an opaque token matches no shape, so its parameter name must catch it.
+    assert carries_credential("https://login.test/#access_token=opaque-value")
+    assert carries_credential("https://login.test/cb#state=s&id_token=opaque")
+    assert not carries_credential("https://k.test/docs#getting-a-key")  # an ordinary page anchor
 
 
 def test_method_payload_only_carries_fields_its_kind_uses() -> None:
@@ -498,9 +517,7 @@ async def test_a_finished_signin_blocks_a_new_one_until_its_teardown_completes(
     job_id = await app.jobs.submit("login", _finished)
     await drain_async_job(app.jobs, job_id)
     torn_down = asyncio.Event()
-    entry = login_module._ActiveSignin(
-        job_id=job_id, method="fake-oauth", timeout_s=1.0, session=_session(descriptor, tmp_path), torn_down=torn_down
-    )
+    entry = _entry(job_id, descriptor, tmp_path, torn_down=torn_down, ran=True)
     login_module._ACTIVE.setdefault(app.jobs, {})["fake"] = entry
     loop = asyncio.get_running_loop()
     loop.call_later(0.5, torn_down.set)  # the job has ended, but its agent is still being closed
@@ -508,6 +525,40 @@ async def test_a_finished_signin_blocks_a_new_one_until_its_teardown_completes(
     assert await login_module._active_signin(app, "fake") is None
     assert loop.time() - started >= 0.45  # it waited for the teardown rather than clearing the slot at once
     assert "fake" not in login_module._ACTIVE[app.jobs]
+
+
+async def test_an_evicted_signin_still_waits_for_its_agent_to_close(tmp_path: Path) -> None:
+    # The job record is gone from the store (evicted), but the job ran and its agent is still being closed:
+    # the slot must stay held until teardown, or a new login could launch a second agent first.
+    descriptor = _descriptor(tmp_path / "marker")
+    app = _app(descriptor)
+    torn_down = asyncio.Event()
+    entry = _entry("evicted-job", descriptor, tmp_path, torn_down=torn_down, ran=True)
+    login_module._ACTIVE.setdefault(app.jobs, {})["fake"] = entry
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.5, torn_down.set)
+    started = loop.time()
+    assert await login_module._active_signin(app, "fake") is None
+    assert loop.time() - started >= 0.45
+
+
+async def test_an_evicted_signin_holds_off_a_new_login_launch(tmp_path: Path, drain_async_job: DrainAsyncJob) -> None:
+    pid_file = tmp_path / "agent.pid"
+    descriptor = _descriptor(
+        tmp_path / "marker", RUTHERFORD_FAKE_AUTH_DELAY="2", RUTHERFORD_FAKE_PID_FILE=str(pid_file)
+    )
+    app = _app(descriptor)
+    torn_down = asyncio.Event()
+    login_module._ACTIVE.setdefault(app.jobs, {})["fake"] = _entry(
+        "evicted-job", descriptor, tmp_path, torn_down=torn_down, ran=True
+    )
+    task = asyncio.create_task(login_tool(app, agent="fake", method="fake-oauth", wait_s=10.0))
+    await asyncio.sleep(3.0)  # long enough for an unblocked login to have launched its state-check agent
+    assert not task.done() and _pids(pid_file) == []  # no agent launched while the old one is still closing
+    torn_down.set()
+    data = decode(await task)
+    assert data["status"] == "pending" and data["joined"] is False
+    await drain_async_job(app.jobs, data["job_id"])
 
 
 async def test_a_signin_cancelled_before_it_ran_frees_the_slot_at_once(tmp_path: Path) -> None:
@@ -523,13 +574,8 @@ async def test_a_signin_cancelled_before_it_ran_frees_the_slot_at_once(tmp_path:
     await app.jobs.cancel(job_id)  # synchronously, before the task has had a chance to start
     record = await app.jobs.get(job_id)
     assert record.started_at is None
-    entry = login_module._ActiveSignin(
-        job_id=job_id,
-        method="fake-oauth",
-        timeout_s=1.0,
-        session=_session(descriptor, tmp_path),
-        torn_down=asyncio.Event(),  # never set: the job never ran, so there is no teardown to wait for
-    )
+    # torn_down is never set: the job never ran, so there is no teardown to wait for.
+    entry = _entry(job_id, descriptor, tmp_path, torn_down=asyncio.Event(), ran=False)
     login_module._ACTIVE.setdefault(app.jobs, {})["fake"] = entry
     loop = asyncio.get_running_loop()
     started = loop.time()

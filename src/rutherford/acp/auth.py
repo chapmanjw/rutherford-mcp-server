@@ -261,11 +261,15 @@ _CREDENTIAL_SHAPE = re.compile(
 def carries_credential(url: str) -> bool:
     """Whether ``url`` carries a credential: a credential-named query parameter, or a known credential shape."""
     try:
-        query = urlsplit(url).query
+        parts = urlsplit(url)
     except ValueError:
         return True  # unparseable: never surfaced anyway, and refusing is the safe answer
-    if any(name.lower() in _CREDENTIAL_QUERY_KEYS for name, _value in parse_qsl(query, keep_blank_values=True)):
-        return True
+    # The fragment too: OAuth implicit-style flows put the token there (``#access_token=...``), and an opaque
+    # value there matches no credential shape, so only its parameter name gives it away.
+    for component in (parts.query, parts.fragment):
+        params = parse_qsl(component, keep_blank_values=True)
+        if any(name.lower() in _CREDENTIAL_QUERY_KEYS for name, _value in params):
+            return True
     return _CREDENTIAL_SHAPE.search(url) is not None
 
 

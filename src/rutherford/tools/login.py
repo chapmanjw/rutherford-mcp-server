@@ -222,6 +222,9 @@ class _ActiveSignin:
     #: Set once the job's agent has been killed and reaped (not merely once ``close`` returned), whatever way the
     #: job ended.
     torn_down: asyncio.Event
+    #: Set when the job body begins, i.e. once an agent may exist. Owned by the entry rather than read off the
+    #: job record, because the record can be evicted from the store while the agent is still closing.
+    started: asyncio.Event
 
 
 #: The sign-in in flight per agent, per job store. Keyed weakly on the store so a discarded app context (every
@@ -260,7 +263,10 @@ async def _active_signin(app: AppContext, agent: str) -> _ActiveSignin | None:
     record = await _job_or_none(app, entry.job_id)
     if record is not None and not record.is_finished:
         return entry
-    if record is not None and record.started_at is not None:  # it ran, so its teardown is pending or done
+    # Finished, or evicted from the store: the record's lifecycle is not the agent's. If the job ever ran, an
+    # agent may still be closing, so wait (bounded) for its teardown before freeing the slot. A job cancelled
+    # before it ran never spawned anything and frees the slot at once.
+    if entry.started.is_set():
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(entry.torn_down.wait(), timeout=_TEARDOWN_WAIT_S)
     active.pop(agent, None)
@@ -320,6 +326,7 @@ async def _submit_signin(
     )
 
     async def _signin(_on_activity: object) -> str:
+        started.set()  # before the try: from here on, the finally always arranges torn_down
         try:
             cwd.mkdir(parents=True, exist_ok=True)
             await session.open()  # authenticate, then session/new proves the credential actually works
@@ -353,11 +360,13 @@ async def _submit_signin(
             }
         )
 
-    torn_down = asyncio.Event()
+    torn_down, started = asyncio.Event(), asyncio.Event()
     job_id = await app.jobs.submit(
         "login", _signin, summary=make_summary("login", target=f"{descriptor.id} ({method.id})")
     )
-    entry = _ActiveSignin(job_id=job_id, method=method.id, timeout_s=timeout_s, session=session, torn_down=torn_down)
+    entry = _ActiveSignin(
+        job_id=job_id, method=method.id, timeout_s=timeout_s, session=session, torn_down=torn_down, started=started
+    )
     _ACTIVE.setdefault(app.jobs, {})[descriptor.id] = entry
     return entry
 
