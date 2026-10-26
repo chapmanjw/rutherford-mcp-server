@@ -622,14 +622,12 @@ async def doctor(agent: str | None = None, timeout_s: float = 60.0, connect_only
     The trustworthy health check for ACP agents: whether each spawns, handshakes, and answers. Each report
     is ok / no_answer / model_unavailable / handshake_failed / auth_required / not_installed / error.
     `auth_required` means the agent is installed but holds no credential yet; sign it in once with `login`.
-    `model_unavailable`
-    means spawn + handshake succeeded (the agent is reachable) but the harness/provider rejected the model on
-    the turn (a model/provider config issue, e.g. a Claude Code on AWS Bedrock / Vertex), so it is NOT reported
-    as a broken agent. Slower
-    than `capabilities` (it makes a real call per agent); run it to see which of the roster actually drive on
-    this machine. `connect_only`
-    runs the lighter handshake-only check (spawn + handshake, no prompt) and reports reachable /
-    handshake_failed / not_installed plus each agent's advertised models -- it shows whether Rutherford can
+    `model_unavailable` means spawn + handshake succeeded (the agent is reachable) but the harness/provider
+    rejected the model on the turn (a model/provider config issue, e.g. a Claude Code on AWS Bedrock / Vertex),
+    so it is NOT reported as a broken agent. Slower than `capabilities` (it makes a real call per agent); run it
+    to see which of the roster actually drive on this machine. `connect_only` runs the lighter handshake-only
+    check (spawn + handshake, no prompt) and reports reachable / handshake_failed / auth_required /
+    not_installed plus each agent's advertised models -- it shows whether Rutherford can
     talk to and configure an agent even when a model call would fail for a reason outside ACP (an auth /
     entitlement / quota issue, e.g. Grok without a SuperGrok subscription).
 
@@ -653,8 +651,14 @@ async def login(agent: str, method: str | None = None, wait_s: float = 20.0, tim
     `agent`-kind id) it starts the sign-in as a background job, waits up to `wait_s` for the agent to print its
     sign-in link, and returns `status=pending` with `job_id` and `signin_urls` -- give the first link to the
     user, who completes the sign-in in a browser, then poll `job_status` / `job_result`. The job finishes
-    `authenticated` once a session opens with the new credential, or fails with `AUTH_FAILED` (declined, or no
-    sign-in within `timeout_s`). The links are agent-authored and are never opened by Rutherford. An `env_var`
+    `authenticated` once a session opens with the new credential (lifting any cooldown bench), fails with
+    `AUTH_FAILED` (declined, the agent still refused a session afterwards, or no sign-in within `timeout_s`,
+    which bounds the authenticate step), or with the agent's own handshake error if the confirming session
+    fails for another reason. `status=authenticated` without `method` means a session opens and no ACP
+    sign-in is needed; a turn may still need a provider key, which `doctor` checks. A repeated `login` while
+    one is running returns that job (`joined=true`) instead of starting another; a different `method` then is
+    refused with `INVALID_INPUT` until it finishes or is cancelled. The links are agent-authored, taken only
+    from sign-in prompt lines, and never opened by Rutherford. An `env_var`
     method returns the variables to set (`status=configure_env`) and a `terminal` method returns the command to
     run (`status=run_in_terminal`); Rutherford never asks for or stores a credential value.
     """

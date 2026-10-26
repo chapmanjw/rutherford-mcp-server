@@ -25,6 +25,10 @@ import contextlib
 import shutil
 import tempfile
 import time
+import uuid
+import weakref
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ..acp.auth import AuthMethodInfo
@@ -35,6 +39,7 @@ from ..context import AppContext, tool_success
 from ..domain.enums import SafetyMode
 from ..domain.error_codes import ErrorCode
 from ..domain.errors import RutherfordError
+from ..services.jobs import JobRecord, JobStore
 from .common import ensure_known_agent
 from .jobs import make_summary
 
@@ -62,20 +67,47 @@ async def login_tool(
 ) -> str:
     """Report an agent's sign-in state and methods, or sign it in with ``method`` as a background job.
 
-    Without ``method``: opens a session (no prompt). Already signed in -> ``status=authenticated``. Not signed
+    Without ``method``: opens a session (no prompt). A session opens -> ``status=authenticated``, meaning no ACP
+    sign-in is needed (a turn can still need a provider key, which ``doctor`` checks). Not signed
     in -> ``status=method_required`` with the advertised ``methods``. With ``method`` on an ``agent``-kind
     method: starts ``authenticate`` in a background job, waits up to ``wait_s`` for the agent to print a
     sign-in link or finish, and returns ``status=pending`` (``job_id`` + ``signin_urls``) or the finished
-    outcome. ``timeout_s`` bounds the whole sign-in. ``env_var`` / ``terminal`` methods return what the user
-    has to set or run instead (``status=configure_env`` / ``run_in_terminal``).
+    outcome. ``timeout_s`` bounds the ``authenticate`` step (the wait on the person signing in); the launch and
+    the confirming ``session/new`` keep the agent's own handshake budget. While a sign-in is running for an
+    agent, a further ``login`` for it returns that job as ``pending`` rather than starting a second one.
+    ``env_var`` / ``terminal`` methods return what the user has to set or run instead
+    (``status=configure_env`` / ``run_in_terminal``).
     """
     ensure_known_agent(app.descriptors, agent)
     if not 0 <= wait_s <= _MAX_WAIT_S:
         raise RutherfordError(ErrorCode.INVALID_INPUT, f"wait_s must be between 0 and {_MAX_WAIT_S:g}")
     if not 0 < timeout_s <= _MAX_TIMEOUT_S:
         raise RutherfordError(ErrorCode.INVALID_INPUT, f"timeout_s must be above 0 and at most {_MAX_TIMEOUT_S:g}")
-    descriptor = app.descriptors.get(agent)
+    # A sign-in already running for this agent is joined, not duplicated: a caller that retries after a
+    # `pending` answer must not open a second consent screen racing the first to write the credential cache.
+    # The lock spans the check, the state check, and the submit, so concurrent calls serialize on it; the wait
+    # for the link happens after it is released, so a joining caller is answered without waiting on that.
+    async with _agent_lock(app, agent):
+        active = await _active_signin(app, agent)
+        if active is None:
+            outcome: str | _ActiveSignin = await _decide(app, agent, method, timeout_s=timeout_s)
+        elif method is not None and method != active.method:
+            raise RutherfordError(
+                ErrorCode.INVALID_INPUT,
+                f"a sign-in to {agent} with {active.method!r} is already running (job {active.job_id}); "
+                f"finish or cancel_job it before signing in with {method!r}",
+            )
+        else:
+            outcome = active
+    if isinstance(outcome, str):
+        return outcome
+    # A joining caller gets the same bounded wait for the link as the one that started the sign-in.
+    return await _await_link(app, agent, outcome, wait_s=wait_s, joined=outcome is active)
 
+
+async def _decide(app: AppContext, agent: str, method: str | None, *, timeout_s: float) -> str | _ActiveSignin:
+    """Check the agent's state and either answer now (an envelope) or submit the sign-in job (its entry)."""
+    descriptor = app.descriptors.get(agent)
     state, methods, detail = await _current_state(descriptor)
     if state != "auth_required":
         # Signed in already, not installed, or broken in a way a sign-in cannot fix: report it and stop. A
@@ -105,7 +137,7 @@ async def login_tool(
         return tool_success(_env_var_answer(agent, chosen))
     if chosen.kind == "terminal":
         return tool_success(_terminal_answer(agent, descriptor, chosen))
-    return await _start_signin(app, descriptor, chosen, wait_s=wait_s, timeout_s=timeout_s)
+    return await _submit_signin(app, descriptor, chosen, timeout_s=timeout_s)
 
 
 async def _current_state(descriptor: AgentDescriptor) -> tuple[str, list[AuthMethodInfo], str]:
@@ -126,7 +158,19 @@ async def _current_state(descriptor: AgentDescriptor) -> tuple[str, list[AuthMet
             return "handshake_failed", session.auth_methods, exc.message
         with contextlib.suppress(Exception):
             await session.close()
-    return "authenticated", session.auth_methods, f"{descriptor.id} is already signed in (a session opened)"
+    return (
+        "authenticated",
+        session.auth_methods,
+        f"a session with {descriptor.id} opens, so it needs no ACP sign-in; a turn may still need a provider key "
+        f"or entitlement of its own (run doctor agent={descriptor.id} to check a full turn)",
+    )
+
+
+#: Labels a ``run_in_terminal`` answer: its arguments and environment are the agent's, not Rutherford's.
+_COMMAND_NOTE = (
+    "the launch command is this agent's configured command; terminal_args and env were advertised by the agent "
+    "and not checked by Rutherford. Review them before running the command."
+)
 
 
 def _env_var_answer(agent: str, method: AuthMethodInfo) -> dict[str, Any]:
@@ -143,6 +187,9 @@ def _env_var_answer(agent: str, method: AuthMethodInfo) -> dict[str, Any]:
     }
     if method.link:
         answer["link"] = method.link
+        answer["link_note"] = (
+            "the link was advertised by the agent and passed Rutherford's https-only check; Rutherford did not open it"
+        )
     return answer
 
 
@@ -155,32 +202,135 @@ def _terminal_answer(agent: str, descriptor: AgentDescriptor, method: AuthMethod
         "method": method.as_payload(),
         "command": argv,
         "env": method.terminal_env,
+        "command_note": _COMMAND_NOTE,
         "next": f"run the command in an interactive terminal, finish the sign-in, then re-run doctor agent={agent}",
     }
 
 
-async def _start_signin(
-    app: AppContext, descriptor: AgentDescriptor, method: AuthMethodInfo, *, wait_s: float, timeout_s: float
-) -> str:
-    """Run ``authenticate`` + a confirming ``session/new`` as a job; return its link, or its result if quick."""
-    cwd = tempfile.mkdtemp(prefix="rutherford-acp-login-")
+@dataclass(frozen=True, slots=True)
+class _ActiveSignin:
+    """A sign-in job in flight for one agent, so a retried ``login`` joins it instead of starting another."""
+
+    job_id: str
+    method: str
+    timeout_s: float
+    session: ACPSession
+    #: Set once the job's agent has been killed and reaped (not merely once ``close`` returned), whatever way the
+    #: job ended.
+    torn_down: asyncio.Event
+
+
+#: The sign-in in flight per agent, per job store. Keyed weakly on the store so a discarded app context (every
+#: test builds its own) takes its entries with it.
+_ACTIVE: weakref.WeakKeyDictionary[JobStore, dict[str, _ActiveSignin]] = weakref.WeakKeyDictionary()
+#: One lock per agent, per job store. A ``login`` holds it from the in-flight check through the state check and
+#: the job submit, so two concurrent calls cannot both see "nothing running" and each launch a sign-in.
+_LOCKS: weakref.WeakKeyDictionary[JobStore, dict[str, asyncio.Lock]] = weakref.WeakKeyDictionary()
+#: How long a new ``login`` waits for a just-finished (e.g. cancelled) sign-in to tear its agent down before it
+#: launches another. Above the session close budget, so a normal teardown always fits.
+_TEARDOWN_WAIT_S = 20.0
+
+
+async def _job_or_none(app: AppContext, job_id: str) -> JobRecord | None:
+    """The job record, or ``None`` once the store no longer holds it (evicted after its TTL)."""
+    try:
+        return await app.jobs.get(job_id)
+    except RutherfordError:
+        return None
+
+
+def _agent_lock(app: AppContext, agent: str) -> asyncio.Lock:
+    return _LOCKS.setdefault(app.jobs, {}).setdefault(agent, asyncio.Lock())
+
+
+async def _active_signin(app: AppContext, agent: str) -> _ActiveSignin | None:
+    """The unfinished sign-in job for ``agent``, or ``None``. Call with the agent's lock held.
+
+    A finished entry is dropped, but only after its job has finished tearing down -- a sign-in cancelled a
+    moment ago may still be closing its agent, and launching another then would put two sign-ins in flight.
+    """
+    active = _ACTIVE.get(app.jobs, {})
+    entry = active.get(agent)
+    if entry is None:
+        return None
+    record = await _job_or_none(app, entry.job_id)
+    if record is not None and not record.is_finished:
+        return entry
+    if record is not None and record.started_at is not None:  # it ran, so its teardown is pending or done
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(entry.torn_down.wait(), timeout=_TEARDOWN_WAIT_S)
+    active.pop(agent, None)
+    return None
+
+
+def _pending(agent: str, entry: _ActiveSignin, *, wait_s: float, joined: bool) -> str:
+    """The ``pending`` envelope for an in-flight sign-in, with the links the agent has printed so far.
+
+    ``joined`` marks a caller that attached to a sign-in another call started, whose ``method`` and
+    ``timeout_s`` (reported here) are the ones in effect.
+    """
+    urls = entry.session.signin_urls
+    return tool_success(
+        {
+            "agent": agent,
+            "status": "pending",
+            "method": entry.method,
+            "job_id": entry.job_id,
+            "joined": joined,
+            "signin_urls": urls,
+            "timeout_s": entry.timeout_s,
+            "note": _URL_NOTE
+            if urls
+            else (
+                f"the agent printed no sign-in link within {wait_s:g}s; it may have opened a browser itself. Poll "
+                "job_status / job_result with this job_id for the outcome."
+            ),
+        }
+    )
+
+
+async def _submit_signin(
+    app: AppContext, descriptor: AgentDescriptor, method: AuthMethodInfo, *, timeout_s: float
+) -> _ActiveSignin:
+    """Submit ``authenticate`` + a confirming ``session/new`` as a job and register it as the agent's sign-in.
+
+    Called with the agent's lock held, so registration is atomic with the in-flight check that preceded it.
+    """
+    # Named here, CREATED inside the job: a job that never runs (a full job store, or a cancel while it is still
+    # queued) then leaves no directory behind. ACPSession only resolves the path, so it need not exist yet.
+    cwd = Path(tempfile.gettempdir()) / f"rutherford-acp-login-{uuid.uuid4().hex[:12]}"
     session = ACPSession(
         descriptor,
         policy=PermissionPolicy(SafetyMode.READ_ONLY),
-        cwd=cwd,
+        cwd=str(cwd),
         auth_method=method.id,
         auth_timeout_s=timeout_s,
     )
 
     async def _signin(_on_activity: object) -> str:
         try:
+            cwd.mkdir(parents=True, exist_ok=True)
             await session.open()  # authenticate, then session/new proves the credential actually works
         except ACPHandshakeError as exc:
+            if exc.code is ErrorCode.AUTH_REQUIRED:
+                # authenticate returned, yet the agent still refused a session: the sign-in did not take.
+                raise RutherfordError(
+                    ErrorCode.AUTH_FAILED,
+                    f"signing in to {descriptor.id} with {method.id!r} completed, but the agent still refused a "
+                    f"session: {exc.message}",
+                ) from exc
             raise RutherfordError(exc.code, exc.message) from exc
         finally:
-            with contextlib.suppress(Exception):
-                await session.close()
-            shutil.rmtree(cwd, ignore_errors=True)
+            try:
+                with contextlib.suppress(Exception):
+                    await session.close()
+                shutil.rmtree(cwd, ignore_errors=True)
+            finally:
+                # Set when the agent is really gone, not when close() returned: close() stops waiting after its
+                # own budget while the kill and reap carry on, and a second sign-in must not start before then.
+                session.when_closed(torn_down.set)
+        # A seat benched for being signed out would otherwise sit out panels until its bench timed out.
+        app.delegation.clear_cooldown(descriptor.id)
         return tool_success(
             {
                 "agent": descriptor.id,
@@ -190,39 +340,37 @@ async def _start_signin(
             }
         )
 
+    torn_down = asyncio.Event()
     job_id = await app.jobs.submit(
         "login", _signin, summary=make_summary("login", target=f"{descriptor.id} ({method.id})")
     )
+    entry = _ActiveSignin(job_id=job_id, method=method.id, timeout_s=timeout_s, session=session, torn_down=torn_down)
+    _ACTIVE.setdefault(app.jobs, {})[descriptor.id] = entry
+    return entry
+
+
+async def _await_link(app: AppContext, agent: str, entry: _ActiveSignin, *, wait_s: float, joined: bool = False) -> str:
+    """Wait up to ``wait_s`` for the sign-in's link or its finish; return ``pending`` or the finished outcome."""
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        record = await app.jobs.get(job_id)
-        if record.is_finished or session.signin_urls:
+        record = await _job_or_none(app, entry.job_id)
+        if record is None or record.is_finished or entry.session.signin_urls:
             break
         await asyncio.sleep(_POLL_INTERVAL_S)
 
-    record = await app.jobs.get(job_id)
+    record = await _job_or_none(app, entry.job_id)
+    if record is None:
+        raise RutherfordError(
+            ErrorCode.JOB_NOT_FOUND,
+            f"the sign-in job {entry.job_id} for {agent} is no longer tracked (job store reset or evicted); run "
+            f"login agent={agent} again to check its state",
+        )
     if record.is_finished:
         if record.result is not None:
             return record.result  # signed in before the wait ran out (e.g. the agent had a cached credential)
         error = record.error
         raise RutherfordError(
             error.code if error is not None else ErrorCode.INTERNAL,
-            error.message if error is not None else f"signing in to {descriptor.id} did not complete",
+            error.message if error is not None else f"signing in to {agent} did not complete",
         )
-    urls = session.signin_urls
-    return tool_success(
-        {
-            "agent": descriptor.id,
-            "status": "pending",
-            "method": method.id,
-            "job_id": job_id,
-            "signin_urls": urls,
-            "timeout_s": timeout_s,
-            "note": _URL_NOTE
-            if urls
-            else (
-                f"the agent printed no sign-in link within {wait_s:g}s; it may have opened a browser itself. Poll "
-                "job_status / job_result with this job_id for the outcome."
-            ),
-        }
-    )
+    return _pending(agent, entry, wait_s=wait_s, joined=joined)

@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [3.3.0] - 2026-10-26
 
 ### Added
 
@@ -17,17 +17,31 @@ All notable changes to this project are documented in this file. The format is b
   after that the server caches its credential and Rutherford's sessions open without further prompts.
 - **New tool: `login`** signs an agent in once through ACP `authenticate`, for agents that open no session
   until a client has done so. Called with only `agent`, it is read-only and lists the sign-in methods the
-  agent advertises. With `method`, it starts the sign-in as a background job and returns the sign-in link the
-  agent printed, plus a `job_id` to poll; the job finishes `authenticated` once a session opens with the new
-  credential, or `AUTH_FAILED` if the sign-in is declined or times out. `env_var` and `terminal` methods are
-  answered with the variables to set or the command to run, and Rutherford never handles a credential value.
-  No other call signs in, so a delegation never opens a browser as a side effect.
+  agent advertises. With `method`, it starts the sign-in as a background job and returns a `job_id` to poll,
+  plus the sign-in link when the agent prints one; the job finishes `authenticated` once a session opens with the new
+  credential (lifting any cooldown bench the seat picked up while signed out), or fails `AUTH_FAILED` if the
+  sign-in is declined, times out, or does not take; a confirming session that fails for another reason
+  reports that handshake error instead. The link is taken only
+  from a sign-in prompt line, so other URLs the agent logs are not mistaken for it, and a repeated `login`
+  while a sign-in is running joins that job instead of opening a second consent screen. `env_var` and
+  `terminal` methods are answered with the variables to set or the command to run (plus the agent's
+  credential-page link, if it passes the same https check), and Rutherford never asks for, reads, or stores
+  the secret itself. No other call signs in, so a delegation never opens a browser as a side effect.
 
 ### Changed
 
-- An agent that refuses `session/new` with ACP's "Authentication required" now fails with `AUTH_REQUIRED`
-  instead of `ACP_HANDSHAKE_FAILED`, naming the sign-in methods it offers. `doctor` reports it as
+- An agent that refuses `session/new` or `session/load` with ACP's "Authentication required" now fails with
+  `AUTH_REQUIRED` instead of `ACP_HANDSHAKE_FAILED` / `RESUME_FAILED`, naming the sign-in methods it offers. `doctor` reports it as
   `auth_required` with a pointer to `login`, rather than as a broken handshake.
+
+### Security
+
+- The `fastmcp` floor is raised to 3.4.10, the first 3.x release patched for GHSA-7xgj-8392-5q4r, in which
+  post-transform component authorization was skipped on direct calls. A fresh install can no longer resolve
+  an affected release.
+- The locked dependency set CI tests against moves to patched releases of PyJWT (2.15.1), anyio (4.14.2),
+  mcp (1.30.0), certifi (2026.10.19), and opentelemetry-api (1.45.1), clearing the open advisories against
+  each.
 
 ## [3.2.0] - 2026-09-05
 

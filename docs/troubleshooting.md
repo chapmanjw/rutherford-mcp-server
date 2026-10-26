@@ -46,7 +46,8 @@ failure surfacing at session creation, or a slow setup that blew the handshake b
 
 ### `auth_required` in doctor / `AUTH_REQUIRED`
 
-The agent spawned and answered `initialize`, then refused `session/new` with ACP's "Authentication required":
+The agent spawned and answered `initialize`, then refused `session/new` (or `session/load`, on a resume) with
+ACP's "Authentication required":
 it holds no credential yet. Some agents (Google Antigravity is one) only sign in through ACP `authenticate`,
 which no ordinary Rutherford call makes, so this is a one-time setup step rather than a broken install.
 
@@ -54,8 +55,12 @@ which no ordinary Rutherford call makes, so this is a one-time setup step rather
 - Run `login agent=<id> method=<id>` with a method of kind `agent`. It returns `status=pending`, a `job_id`,
   and `signin_urls`. Open the first link and finish the sign-in in the browser (the agent may also open one
   itself), then poll `job_status` / `job_result`. The job ends `authenticated` once a session opens with the
-  new credential, or fails `AUTH_FAILED` if the sign-in was declined or did not finish within `timeout_s`
-  (300 seconds by default). `cancel_job` stops it.
+  new credential (and lifts any cooldown bench the seat picked up while signed out), fails with the agent's
+  own handshake error if that confirming session fails for an unrelated reason, or fails `AUTH_FAILED` if
+  the sign-in was declined, did not take, or did not finish within
+  `timeout_s` (300 seconds by default, applied to the `authenticate` step). `cancel_job` stops it. Calling
+  `login` again while it runs returns the same job (`joined=true`); asking for a different method then is
+  refused until that job finishes or is cancelled.
 - An `env_var` method answers with the variables to set (`[agents.<id>.env]` or the server's environment),
   and a `terminal` method answers with the command to run yourself. Rutherford never asks for or stores a
   credential value.

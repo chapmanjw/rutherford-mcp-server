@@ -19,7 +19,7 @@ import os
 import re
 import subprocess
 import time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, TypeVar
@@ -44,7 +44,14 @@ from ..domain.enums import Effort, ReexecutionSafety
 from ..domain.error_codes import ErrorCode
 from ..domain.models import Cost, DelegationResult, ErrorInfo, Provenance, Target
 from ..runtime.depth import child_env
-from .auth import AuthMethodInfo, auth_methods_of, describe_methods, extract_urls, is_auth_required
+from .auth import (
+    MAX_SIGNIN_URLS,
+    AuthMethodInfo,
+    auth_methods_of,
+    describe_methods,
+    extract_urls,
+    is_auth_required,
+)
 from .client import RutherfordACPClient
 from .descriptors import AgentDescriptor
 from .effort import (
@@ -96,9 +103,10 @@ _DIRECT_PROCESS_KILL_WAIT_S = 2.0
 #: The default budget for an ACP ``authenticate`` call. It waits on a person completing a browser sign-in, so
 #: it is minutes rather than a handshake step's seconds.
 _AUTH_TIMEOUT_S = 300.0
-#: The longest incomplete stderr line carried between chunks for the sign-in link scan. A line longer than
-#: this is not a sign-in prompt, so it is dropped rather than buffered without bound.
+#: The longest incomplete stderr line carried between chunks for the sign-in link scan. Past it, only the
+#: last ``_URL_CARRY_KEEP`` bytes are kept, so memory stays bounded while a prompt at the line's end survives.
 _URL_CARRY_CAP = 16 * 1024
+_URL_CARRY_KEEP = 4 * 1024
 #: The transport runs only after Rutherford has hard-killed its direct child, so this bounds connection cleanup.
 _TRANSPORT_CLOSE_TIMEOUT_S = 5.0
 #: ``close`` returns after this caller budget while its instance-owned teardown task continues in the background.
@@ -537,12 +545,12 @@ class ACPSession:
             except (OSError, ValueError):  # pragma: no cover - a torn-down transport races EOF
                 return
             if not chunk:
-                if self._auth_method is not None and self._url_carry:
+                if self._auth_method is not None and self._url_carry and len(self._signin_urls) < MAX_SIGNIN_URLS:
                     self._scan_signin_urls(self._url_carry)
                     self._url_carry = b""
                 return
-            if self._auth_method is not None:
-                self._scan_chunk_for_urls(chunk)
+            if self._auth_method is not None and len(self._signin_urls) < MAX_SIGNIN_URLS:
+                self._scan_chunk_for_urls(chunk)  # stops once the cap is reached: no regex work past it
             room = _STDERR_CAPTURE_CAP - len(self._stderr_buffer)
             if room <= 0:
                 self._stderr_truncated = True
@@ -559,14 +567,28 @@ class ACPSession:
         head, newline, tail = data.rpartition(b"\n")
         if newline:
             self._scan_signin_urls(head)
-        # An over-long partial line is not a sign-in prompt; drop it rather than buffer it without bound.
-        self._url_carry = tail if len(tail) <= _URL_CARRY_CAP else b""
+        # An over-long partial line keeps only its END, bounded, rather than being buffered without limit or
+        # dropped: a prompt appended to a long log line ("<16 KiB of noise> Open ... https://...") still reaches
+        # the scan once its newline arrives, because the wording and link sit at the end.
+        self._url_carry = tail if len(tail) <= _URL_CARRY_CAP else tail[-_URL_CARRY_KEEP:]
 
     def _scan_signin_urls(self, raw: bytes) -> None:
-        """Record the https links in ``raw`` after the same neutralization a failure detail gets."""
+        """Record the sign-in links in ``raw`` after the same neutralization a failure detail gets.
+
+        Capped across the whole session, not per chunk, so an agent logging links for five minutes cannot grow
+        the list without bound.
+        """
+        if len(self._signin_urls) >= MAX_SIGNIN_URLS:
+            return
         for url in extract_urls(_neutralize_stderr(raw)):
+            # Credential masking can land inside a link (a JWT ``id_token_hint=``, a ``key=AIza...``); a masked
+            # link no longer works, so it is dropped rather than handed over broken.
+            if _REDACTED.rstrip("]") in url:  # the closing bracket may be trimmed off as trailing punctuation
+                continue
             if url not in self._signin_urls:
                 self._signin_urls.append(url)
+                if len(self._signin_urls) >= MAX_SIGNIN_URLS:
+                    return
 
     @property
     def auth_methods(self) -> list[AuthMethodInfo]:
@@ -750,20 +772,25 @@ class ACPSession:
         except Exception as exc:
             await self.close()
             if is_auth_required(exc):
-                # The agent is installed and speaking ACP but holds no credential. Distinct from a broken
-                # handshake because the fix is a one-time sign-in, not a reinstall or a config change.
-                raise self._handshake_failure(
-                    ErrorCode.AUTH_REQUIRED,
-                    f"{self._descriptor.id} needs a one-time sign-in before it can open a session "
-                    f"({_fault_reason(exc)}); {describe_methods(self._auth_methods)}. Sign in with "
-                    f"`login agent={self._descriptor.id}`",
-                ) from exc
+                raise self._auth_required_failure(exc) from exc
             raise self._handshake_failure(
                 ErrorCode.ACP_HANDSHAKE_FAILED,
                 f"ACP handshake with {self._descriptor.id} failed: {_fault_reason(exc)}",
             ) from exc
         self._session_id = session.session_id
         return session
+
+    def _auth_required_failure(self, exc: BaseException) -> ACPHandshakeError:
+        """The ``AUTH_REQUIRED`` failure for a session/new or session/load the agent refused for lack of sign-in.
+
+        Distinct from a broken handshake because the fix is a one-time sign-in, not a reinstall or a config
+        change, so the message names the methods on offer and the tool that uses them.
+        """
+        return self._handshake_failure(
+            ErrorCode.AUTH_REQUIRED,
+            f"{self._descriptor.id} needs a one-time sign-in before it can open a session ({_fault_reason(exc)}); "
+            f"{describe_methods(self._auth_methods)}. Sign in with `login agent={self._descriptor.id}`",
+        )
 
     async def _read_auth_and_sign_in(self, conn: ClientSideConnection, init: InitializeResponse) -> None:
         """Record the advertised sign-in methods, then call ACP ``authenticate`` when this session was asked to.
@@ -844,6 +871,8 @@ class ACPSession:
             )
         except Exception as exc:
             await self.close()
+            if is_auth_required(exc):
+                raise self._auth_required_failure(exc) from exc
             raise self._handshake_failure(
                 ErrorCode.RESUME_FAILED,
                 f"resuming session {resume_id!r} on {self._descriptor.id} failed: {_fault_reason(exc)}",
@@ -1314,6 +1343,20 @@ class ACPSession:
         done, _ = await asyncio.wait({self._close_task}, timeout=_SESSION_CLOSE_WAIT_S)
         if self._close_task in done:
             consume_task_result(self._close_task)
+
+    def when_closed(self, callback: Callable[[], None]) -> None:
+        """Run ``callback`` once this session's teardown has really finished -- the agent killed and reaped.
+
+        :meth:`close` returns after its caller budget even while that teardown continues in the background, so
+        "close returned" is not "the agent is gone". A caller that must not start a second agent until the
+        first is gone waits on this instead. Runs at once when no teardown was ever started (nothing was
+        spawned, or :meth:`close` was never called) or it has already finished.
+        """
+        task = self._close_task
+        if task is None or task.done():
+            callback()
+        else:
+            task.add_done_callback(lambda _task: callback())
 
     async def _close_body(self) -> None:
         """Snapshot the live tree, kill its spawning parent, reap descendants, then close the ACP transport.

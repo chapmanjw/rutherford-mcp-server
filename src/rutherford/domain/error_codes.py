@@ -18,7 +18,8 @@ class ErrorCode(StrEnum):
 
     #: The target CLI's binary is not installed or not on PATH.
     BINARY_NOT_FOUND = "BINARY_NOT_FOUND"
-    #: The agent is installed and speaks ACP but refused ``session/new`` with ACP's "Authentication required":
+    #: The agent is installed and speaks ACP but refused ``session/new`` (or ``session/load``) with ACP's
+    #: "Authentication required":
     #: it holds no credential yet. Pre-prompt, so re-execution-safe. Fixed by a one-time sign-in with the
     #: ``login`` tool (or the agent's own login), not by a reinstall.
     AUTH_REQUIRED = "AUTH_REQUIRED"
