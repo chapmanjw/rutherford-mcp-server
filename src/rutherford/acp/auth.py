@@ -106,6 +106,8 @@ def auth_methods_of(init: object) -> list[AuthMethodInfo]:
         method = _method_from(entry)
         if method is not None:
             methods.append(method)
+            if len(methods) >= _MAX_METHODS:
+                break  # an agent offers a handful; more is noise that would only bloat every error and answer
     return methods
 
 
@@ -113,8 +115,12 @@ def auth_methods_of(init: object) -> list[AuthMethodInfo]:
 #: classes the stderr sanitizer removes, so a ``name`` or ``description`` cannot reorder or hide text in a client.
 _ANSI = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|\x1b\[[0-?]*[ -/]*[@-~]")
 _CONTROLS = re.compile("[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
-#: The longest advertised method string kept; a method name or argument has no use for more.
+#: The longest advertised method string kept; a method name or argument has no use for more. A string that must
+#: be exact (an id, a variable name, a terminal argument) and is longer is dropped rather than truncated, since
+#: :func:`_clean` caps it and so no longer compares equal.
 _MAX_FIELD = 512
+#: The most sign-in methods read from one agent. Real agents advertise one to four.
+_MAX_METHODS = 16
 
 
 def _clean(value: object) -> str | None:

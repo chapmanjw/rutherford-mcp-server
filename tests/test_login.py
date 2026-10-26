@@ -332,6 +332,20 @@ async def test_signin_links_are_capped_across_the_whole_session(tmp_path: Path) 
     assert session.signin_urls == [_SIGNIN_URL, "https://extra0.test/oauth", "https://extra1.test/oauth"]
 
 
+def test_advertised_methods_are_bounded_in_size_and_count() -> None:
+    class Oversized:
+        auth_methods: ClassVar[list[object]] = [
+            {"id": "a" * 600, "name": "dropped: its id is over the field cap"},
+            {"id": "t", "type": "terminal", "args": ["x" * 600]},  # an exact field over the cap: dropped too
+            *({"id": f"m{n}", "name": f"M{n}"} for n in range(40)),
+        ]
+
+    methods = auth_methods_of(Oversized())
+    assert len(methods) == 16 and methods[0].id == "m0"
+    assert max(len(m.id) for m in methods) <= 512
+    assert len(describe_methods(methods)) < 2000  # what an AUTH_REQUIRED message embeds stays bounded
+
+
 def test_advertised_method_strings_are_stripped_of_controls() -> None:
     class Advertised:
         auth_methods: ClassVar[list[object]] = [
