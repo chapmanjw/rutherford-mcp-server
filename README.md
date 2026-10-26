@@ -255,8 +255,8 @@ not installed onto PATH, so add its directory to PATH or set `[agents.antigravit
 Until it has been signed in once, `doctor` reports it as `auth_required`: run `login agent=antigravity
 method=oauth-personal`, open the returned sign-in link (Antigravity prints one; if `signin_urls` is empty
 the agent may have opened a browser itself), and poll `job_status` / `job_result` with the returned
-`job_id`. The server caches the credential under `~/.gemini/antigravity-acp/`, so later sessions open
-without it. It has been verified on Windows; the macOS and Linux launch commands (including the
+`job_id`. The server caches the credential under `~/.gemini/antigravity-acp/` (`$GEMINI_HOME` relocates
+it), so later sessions open without it. It has been verified on Windows; the macOS and Linux launch commands (including the
 `--uid=` argument Linux gets) come from the registry entry and are not yet verified. If it fails to launch
 on Linux, try `[agents.antigravity] command = ["agy_acp_server.par"]` to drop that argument.
 

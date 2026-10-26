@@ -22,7 +22,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from acp import RequestError
 
@@ -177,7 +177,9 @@ def _method_from(entry: object) -> AuthMethodInfo | None:
         kind=kind,
         description=description,
         env_vars=tuple(env_vars),
-        link=link if isinstance(link, str) and is_safe_link(link) else None,
+        # A credential page link reaches the caller verbatim (it never passes through the stderr masking), so
+        # one that carries a credential itself is dropped rather than echoed into a result or a log.
+        link=link if isinstance(link, str) and is_safe_link(link) and not carries_credential(link) else None,
         terminal_args=terminal_args,
         terminal_env=terminal_env,
     )
@@ -228,6 +230,43 @@ def describe_methods(methods: list[AuthMethodInfo]) -> str:
     if not methods:
         return "it advertises no sign-in methods"
     return "it advertises: " + ", ".join(f"{method.id} ({method.name})" for method in methods)
+
+
+#: Query parameters that carry a credential, and credential shapes that can sit anywhere in a URL. A link holding
+#: one would put a live secret into a tool result (and any log or persisted job that keeps it), so it is dropped.
+#: Mirrors what the stderr sanitizer masks, for links that reach the caller without passing through it.
+_CREDENTIAL_QUERY_KEYS = frozenset(
+    {
+        "access_token",
+        "id_token",
+        "refresh_token",
+        "token",
+        "sig",
+        "signature",
+        "x-amz-signature",
+        "x-goog-signature",
+        "client_secret",
+        "api_key",
+        "apikey",
+        "key",
+        "password",
+    }
+)
+_CREDENTIAL_SHAPE = re.compile(
+    r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{35}|sk-[A-Za-z0-9_-]{16,}"
+    r"|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}"
+)
+
+
+def carries_credential(url: str) -> bool:
+    """Whether ``url`` carries a credential: a credential-named query parameter, or a known credential shape."""
+    try:
+        query = urlsplit(url).query
+    except ValueError:
+        return True  # unparseable: never surfaced anyway, and refusing is the safe answer
+    if any(name.lower() in _CREDENTIAL_QUERY_KEYS for name, _value in parse_qsl(query, keep_blank_values=True)):
+        return True
+    return _CREDENTIAL_SHAPE.search(url) is not None
 
 
 def is_safe_link(url: str) -> bool:

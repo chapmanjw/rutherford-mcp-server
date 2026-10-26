@@ -25,6 +25,7 @@ from rutherford import server
 from rutherford.acp.auth import (
     AuthMethodInfo,
     auth_methods_of,
+    carries_credential,
     describe_methods,
     extract_urls,
     is_auth_required,
@@ -119,6 +120,13 @@ def test_auth_methods_of_reads_every_kind_and_salvaged_dicts() -> None:
         "https://[bad/",
         "https://",
         "https://keys.test/a b",
+        # A credential page link carrying a credential would put a live secret into the tool result.
+        "https://keys.test/cb?access_token=abc123def456",
+        "https://keys.test/cb?TOKEN=abc",
+        "https://keys.test/file?sig=abc",
+        "https://bucket.test/o?X-Amz-Signature=deadbeef&X-Amz-Expires=60",
+        "https://keys.test/cb?state=s&client_secret=xyz",
+        "https://keys.test/cb#id_token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlc2ln",
     ],
 )
 def test_env_var_link_must_be_a_safe_https_url(link: str) -> None:
@@ -135,6 +143,12 @@ def test_env_var_link_keeps_a_plain_https_url() -> None:
         ]
 
     assert auth_methods_of(Advertised())[0].link == "https://keys.test/new?x=1"
+
+
+def test_carries_credential_spots_named_parameters_and_shapes() -> None:
+    assert carries_credential("https://k.test/?Signature=abc")  # case-insensitive name
+    assert carries_credential("https://k.test/path/AKIAABCDEFGHIJKLMNOP")  # a shape outside the query
+    assert not carries_credential("https://k.test/settings/api-keys?tab=new&state=s")  # mentions keys, holds none
 
 
 def test_method_payload_only_carries_fields_its_kind_uses() -> None:
@@ -530,6 +544,61 @@ async def test_a_successful_login_lifts_the_seats_bench(tmp_path: Path) -> None:
     assert app.delegation.is_benched("fake")  # signed out -> benched
     assert decode(await login_tool(app, agent="fake", method="fake-oauth"))["status"] == "authenticated"
     assert not app.delegation.is_benched("fake")
+
+
+async def test_a_read_only_login_that_finds_the_agent_signed_in_lifts_its_bench(tmp_path: Path) -> None:
+    marker = tmp_path / "marker"
+    app = build_app_context(
+        config=RutherfordConfig(cooldown_threshold=1, cooldown_duration_s=600.0),
+        descriptors=DescriptorRegistry([_descriptor(marker)]),
+    )
+    await delegate_tool(app, cli="fake", prompt="hi", working_dir=str(tmp_path))
+    assert app.delegation.is_benched("fake")
+    marker.write_text("signed-in", encoding="utf-8")  # signed in some other way, e.g. the agent's own CLI
+    assert decode(await login_tool(app, agent="fake"))["status"] == "authenticated"
+    assert not app.delegation.is_benched("fake")
+
+
+async def test_when_closed_fires_only_once_the_teardown_task_finishes(tmp_path: Path) -> None:
+    session = _session(_descriptor(tmp_path / "marker"), tmp_path)
+    calls: list[str] = []
+    session.when_closed(lambda: calls.append("never-opened"))  # no teardown was ever started: runs at once
+    assert calls == ["never-opened"]
+
+    release = asyncio.Event()
+
+    async def _slow_teardown() -> None:
+        await release.wait()
+
+    session._close_task = asyncio.create_task(_slow_teardown())
+    session.when_closed(lambda: calls.append("after-teardown"))
+    await asyncio.sleep(0.05)
+    assert calls == ["never-opened"]  # close() may have returned, but the agent is not gone yet
+    release.set()
+    await session._close_task
+    await asyncio.sleep(0)  # done callbacks run on the next loop iteration
+    assert calls == ["never-opened", "after-teardown"]
+    session.when_closed(lambda: calls.append("already-done"))  # a finished teardown: runs at once
+    assert calls == ["never-opened", "after-teardown", "already-done"]
+
+
+async def test_the_signin_dir_is_removed_only_after_the_agent_is_gone(tmp_path: Path) -> None:
+    cwd, torn_down = tmp_path / "login-dir", asyncio.Event()
+    cwd.mkdir()
+    session = _session(_descriptor(tmp_path / "marker"), tmp_path)
+    release = asyncio.Event()
+
+    async def _slow_teardown() -> None:
+        await release.wait()
+
+    session._close_task = asyncio.create_task(_slow_teardown())
+    session.when_closed(lambda: login_module._finish_teardown(cwd, torn_down))
+    await asyncio.sleep(0.05)
+    assert cwd.exists() and not torn_down.is_set()
+    release.set()
+    await session._close_task
+    await asyncio.sleep(0)
+    assert not cwd.exists() and torn_down.is_set()
 
 
 async def test_a_signin_job_evicted_mid_wait_is_a_clean_job_not_found(

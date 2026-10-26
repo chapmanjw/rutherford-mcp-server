@@ -109,6 +109,10 @@ async def _decide(app: AppContext, agent: str, method: str | None, *, timeout_s:
     """Check the agent's state and either answer now (an envelope) or submit the sign-in job (its entry)."""
     descriptor = app.descriptors.get(agent)
     state, methods, detail = await _current_state(descriptor)
+    if state == "authenticated":
+        # An explicit check found the agent opening sessions (perhaps signed in through its own CLI): lift a bench
+        # it picked up while signed out, the same decision a successful sign-in job makes.
+        app.delegation.clear_cooldown(agent)
     if state != "auth_required":
         # Signed in already, not installed, or broken in a way a sign-in cannot fix: report it and stop. A
         # method passed here is ignored on purpose -- there is nothing to sign in to, and an already-signed-in
@@ -289,6 +293,14 @@ def _pending(agent: str, entry: _ActiveSignin, *, wait_s: float, joined: bool) -
     )
 
 
+def _finish_teardown(cwd: Path, torn_down: asyncio.Event) -> None:
+    """Remove the sign-in's working directory, then mark the sign-in torn down (once its agent is gone)."""
+    try:
+        shutil.rmtree(cwd, ignore_errors=True)
+    finally:
+        torn_down.set()
+
+
 async def _submit_signin(
     app: AppContext, descriptor: AgentDescriptor, method: AuthMethodInfo, *, timeout_s: float
 ) -> _ActiveSignin:
@@ -324,11 +336,12 @@ async def _submit_signin(
             try:
                 with contextlib.suppress(Exception):
                     await session.close()
-                shutil.rmtree(cwd, ignore_errors=True)
             finally:
-                # Set when the agent is really gone, not when close() returned: close() stops waiting after its
-                # own budget while the kill and reap carry on, and a second sign-in must not start before then.
-                session.when_closed(torn_down.set)
+                # Both run when the agent is really gone, not when close() returned: close() stops waiting after
+                # its own budget while the kill and reap carry on. Before that, Windows refuses to delete a live
+                # process's working directory, and a second sign-in must not start. Registered in a `finally`, so
+                # a second cancel landing inside close() cannot skip them.
+                session.when_closed(lambda: _finish_teardown(cwd, torn_down))
         # A seat benched for being signed out would otherwise sit out panels until its bench timed out.
         app.delegation.clear_cooldown(descriptor.id)
         return tool_success(
