@@ -173,6 +173,35 @@ def test_carries_credential_spots_named_parameters_and_shapes() -> None:
     assert not carries_credential("https://k.test/docs#getting-a-key")  # an ordinary page anchor
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://x.test/?authorization=opaque",
+        "https://x.test/?credential=opaque",
+        "https://x.test/?secret=opaque",
+        "https://x.test/?private_key=opaque",
+        "https://x.test/?client_assertion=opaque",
+        "https://x.test/?X-Goog-Credential=opaque",
+        "https://x.test/?sessionid=opaque",
+        "https://x.test/?auth=opaque",
+        "https://x.test/#refreshToken=opaque",
+        # A JWT under an innocent name, percent-encoded so the raw URL matches no shape.
+        "https://x.test/?hint=" + "%65" + _FAKE_JWT[1:],
+    ],
+)
+def test_carries_credential_catches_name_variants_and_decoded_values(url: str) -> None:
+    assert carries_credential(url)
+
+
+def test_carries_credential_keeps_an_oauth_authorization_request() -> None:
+    url = (
+        "https://accounts.example.com/o/oauth2/v2/auth?response_type=code&client_id=abc.apps.example.com"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A50684%2F&scope=openid+email+https%3A%2F%2Fwww.example.com%2Fauth%2Fx"
+        "&state=PAsZ&code_challenge=QI2p&code_challenge_method=S256&access_type=offline&prompt=consent&keyword=k"
+    )
+    assert not carries_credential(url)
+
+
 def test_method_payload_only_carries_fields_its_kind_uses() -> None:
     agent = AuthMethodInfo(id="o", name="O", description="browser").as_payload()
     assert agent == {"id": "o", "name": "O", "kind": "agent", "description": "browser"}

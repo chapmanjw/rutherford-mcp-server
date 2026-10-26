@@ -22,7 +22,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from acp import RequestError
 
@@ -232,45 +232,60 @@ def describe_methods(methods: list[AuthMethodInfo]) -> str:
     return "it advertises: " + ", ".join(f"{method.id} ({method.name})" for method in methods)
 
 
-#: Query parameters that carry a credential, and credential shapes that can sit anywhere in a URL. A link holding
-#: one would put a live secret into a tool result (and any log or persisted job that keeps it), so it is dropped.
-#: Mirrors what the stderr sanitizer masks, for links that reach the caller without passing through it.
-_CREDENTIAL_QUERY_KEYS = frozenset(
-    {
-        "access_token",
-        "id_token",
-        "refresh_token",
-        "token",
-        "sig",
-        "signature",
-        "x-amz-signature",
-        "x-goog-signature",
-        "client_secret",
-        "api_key",
-        "apikey",
-        "key",
-        "password",
-    }
+#: Credential-bearing parameter NAMES, matched as a fragment of the lower-cased, separator-stripped name
+#: (``X-Amz-Signature`` -> ``xamzsignature`` contains ``signature``), so a vendor's variant of a known name is
+#: caught without listing every spelling. A link holding one would put a live secret into a tool result (and any
+#: log or persisted job that keeps it), so it is dropped.
+#:
+#: Deliberately NOT here: ``code`` (an authorization request carries ``code_challenge``, and a returned code is
+#: single-use and bound to a PKCE verifier only the agent holds), ``state`` and ``nonce`` (anti-forgery values),
+#: and ``client_id`` / ``redirect_uri`` / ``scope`` (public). Those are exactly what a real sign-in link has.
+_CREDENTIAL_NAME_PARTS = (
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "signature",
+    "apikey",
+    "privatekey",
+    "assertion",
+    "authorization",
+    "bearer",
+    "session",
+    "cookie",
 )
+#: Short names that are credentials only as the WHOLE name (as a fragment they would match ``keyword`` etc.).
+_CREDENTIAL_NAMES_EXACT = frozenset({"key", "sig", "auth", "pwd", "jwt"})
 _CREDENTIAL_SHAPE = re.compile(
     r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{35}|sk-[A-Za-z0-9_-]{16,}"
     r"|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}"
 )
 
 
+def _credential_name(name: str) -> bool:
+    """Whether a URL parameter name says it holds a credential (see :data:`_CREDENTIAL_NAME_PARTS`)."""
+    folded = re.sub(r"[^a-z0-9]", "", name.lower())
+    return folded in _CREDENTIAL_NAMES_EXACT or any(part in folded for part in _CREDENTIAL_NAME_PARTS)
+
+
 def carries_credential(url: str) -> bool:
-    """Whether ``url`` carries a credential: a credential-named query parameter, or a known credential shape."""
+    """Whether ``url`` carries a credential, judged on the percent-DECODED URL.
+
+    A query or fragment parameter whose name says it holds a credential, or a known credential shape (JWT, a
+    vendor key prefix) anywhere -- in a path segment or in any parameter's value, whatever its name. Decoding
+    first is what stops ``%65yJ...`` slipping past the shape match. The fragment is read too: implicit-style
+    flows put the token there (``#access_token=...``).
+    """
     try:
         parts = urlsplit(url)
     except ValueError:
         return True  # unparseable: never surfaced anyway, and refusing is the safe answer
-    # The fragment too: OAuth implicit-style flows put the token there (``#access_token=...``), and an opaque
-    # value there matches no credential shape, so only its parameter name gives it away.
     for component in (parts.query, parts.fragment):
-        params = parse_qsl(component, keep_blank_values=True)
-        if any(name.lower() in _CREDENTIAL_QUERY_KEYS for name, _value in params):
-            return True
-    return _CREDENTIAL_SHAPE.search(url) is not None
+        for name, value in parse_qsl(component, keep_blank_values=True):  # parse_qsl percent-decodes both
+            if _credential_name(name) or _CREDENTIAL_SHAPE.search(value):
+                return True
+    return _CREDENTIAL_SHAPE.search(unquote(url)) is not None
 
 
 def is_safe_link(url: str) -> bool:
