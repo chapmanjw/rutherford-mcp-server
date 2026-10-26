@@ -187,6 +187,9 @@ def test_carries_credential_spots_named_parameters_and_shapes() -> None:
         "https://x.test/#refreshToken=opaque",
         # A JWT under an innocent name, percent-encoded so the raw URL matches no shape.
         "https://x.test/?hint=" + "%65" + _FAKE_JWT[1:],
+        # Vendor token shapes the stderr masker knows, in a value and in a path segment (built, not literal).
+        "https://x.test/cb?ref=" + "xox" + "b-1234567890-abcdefghij",
+        "https://x.test/" + "glp" + "at-ABCDEFGHIJKLMNOPQRST" + "/cb",
     ],
 )
 def test_carries_credential_catches_name_variants_and_decoded_values(url: str) -> None:
@@ -428,12 +431,12 @@ def test_a_pkce_value_the_stderr_masker_would_mangle_keeps_its_link(tmp_path: Pa
     assert session.signin_urls == [link]
 
 
-def test_a_link_mangled_by_credential_masking_is_dropped(tmp_path: Path) -> None:
+def test_a_signin_link_carrying_a_jwt_is_dropped(tmp_path: Path) -> None:
     session = _session(_descriptor(tmp_path / "marker"), tmp_path, auth_method="fake-oauth")
     jwt = _FAKE_JWT
     session._scan_chunk_for_urls(f"Open this link to sign in: https://login.test/oauth?id_token_hint={jwt}\n".encode())
     session._scan_chunk_for_urls(f"Or sign in at https://login.test/o?hint={jwt}&state=s\n".encode())
-    assert session.signin_urls == []  # handed over masked, the link would not work
+    assert session.signin_urls == []  # carries_credential spots the JWT in the decoded value
 
 
 def test_an_over_long_partial_line_keeps_its_end_for_the_link_scan(tmp_path: Path) -> None:

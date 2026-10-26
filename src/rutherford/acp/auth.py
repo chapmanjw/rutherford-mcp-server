@@ -270,8 +270,11 @@ _CREDENTIAL_SHAPE = re.compile(
     r"(?<![A-Za-z0-9_-])(?:"
     r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{35}|sk-[A-Za-z0-9_-]{16,}"
     r"|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}"
+    r"|xox[abposr]-[A-Za-z0-9-]{10,}|glpat-[A-Za-z0-9_-]{16,}"
     r")"
 )
+#: Every vendor-prefixed shape the stderr masker in ``session.py`` redacts is listed above too. The sign-in link
+#: scan reads stderr UNMASKED, so this pattern is the only shape check those links get; keep the two in step.
 
 
 def _credential_name(name: str) -> bool:
@@ -333,8 +336,7 @@ def extract_urls(text: str) -> list[str]:
             continue  # the wording must be outside the URL, or every query string saying "auth" would pass
         for match in _HTTPS_URL.finditer(line):
             url = match.group(0).rstrip(_URL_TRAILERS)
-            # The same two checks every agent-supplied link gets: safe to hand over, and carrying no credential
-            # (stderr masking only catches some shapes; an opaque ``#access_token=`` passes it).
+            # The same two checks every agent-supplied link gets: safe to hand over, and carrying no credential.
             if is_safe_link(url) and not carries_credential(url) and url not in urls:
                 urls.append(url)
                 if len(urls) >= MAX_SIGNIN_URLS:
