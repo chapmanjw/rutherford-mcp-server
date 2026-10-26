@@ -1408,7 +1408,9 @@ class ACPSession:
                 # returns, the body never reaches the kill below, and the `finally` never runs either --
                 # a `finally` only fires when its block exits. The adapter would then outlive the server
                 # process, which is the exact leak this teardown path exists to prevent.
-                descendants = await snapshot_within_deadline(pid, timeout_s=_SNAPSHOT_TIMEOUT_S, source="session")
+                descendants = await snapshot_within_deadline(
+                    pid, timeout_s=_SNAPSHOT_TIMEOUT_S, source="session", owner=self._teardown_tasks
+                )
             # * Kill the spawning adapter immediately after its tree snapshot so it cannot create replacements.
             await self._kill_direct_process(process)
             # * Brokered commands retain their own shared kill tasks if this bounded aggregate is still running.

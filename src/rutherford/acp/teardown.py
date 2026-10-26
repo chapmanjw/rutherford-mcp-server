@@ -168,7 +168,9 @@ async def await_without_cancelling(
         return default
 
 
-async def snapshot_within_deadline(pid: int, *, timeout_s: float, source: str) -> list[psutil.Process]:
+async def snapshot_within_deadline(
+    pid: int, *, timeout_s: float, source: str, owner: set[asyncio.Task[Any]] | None = None
+) -> list[psutil.Process]:
     """Enumerate ``pid``'s descendants under a deadline, reaping a late result instead of discarding it.
 
     Shared by every pre-kill snapshot on purpose. Each caller runs this BEFORE hard-killing the process it
@@ -184,9 +186,16 @@ async def snapshot_within_deadline(pid: int, *, timeout_s: float, source: str) -
     ``source`` labels the log events. Retention is this function's own business, not a caller-supplied
     hook: an argument only one of two call sites passed is a difference between the paths waiting to become
     a divergence, and the shared owner already keeps a late snapshot alive until it can be reaped.
+
+    ``owner`` is OBSERVATION, not retention: when given, it also tracks the snapshot and, on a timeout, the
+    late reap as a task, so a caller can learn when the whole tree is really gone (``ACPSession.when_closed``).
+    The reap itself is the same either way.
     """
     task = asyncio.create_task(snapshot_descendants_eagerly(pid), name=f"rutherford-snapshot-{source}")
     register_pending_cleanup(task)
+    if owner is not None:
+        owner.add(task)
+        task.add_done_callback(owner.discard)
     done, _ = await asyncio.wait({task}, timeout=timeout_s)
     if task in done:
         try:
@@ -196,8 +205,29 @@ async def snapshot_within_deadline(pid: int, *, timeout_s: float, source: str) -
             return []
     # * Not an empty tree -- an unknown one. Say so, then let the late result reap itself.
     log_event("acp_teardown_snapshot_timeout", level=logging.WARNING, source=source, pid=pid, timeout_s=timeout_s)
-    task.add_done_callback(functools.partial(_reap_late_snapshot, source=source))
+    if owner is None:
+        task.add_done_callback(functools.partial(_reap_late_snapshot, source=source))
+    else:
+        # The same late reap, as a tracked task instead of a fire-and-forget thread, so the owner sees it end.
+        late_reap = asyncio.create_task(_reap_late_tracked(task, source=source), name=f"rutherford-late-reap-{source}")
+        register_pending_cleanup(late_reap)
+        owner.add(late_reap)
+        late_reap.add_done_callback(owner.discard)
     return []
+
+
+async def _reap_late_tracked(snapshot: asyncio.Task[list[psutil.Process]], *, source: str) -> None:
+    """Await a snapshot that missed its deadline, then reap what it found -- the observable twin of
+    :func:`_reap_late_snapshot`, for a caller that must know when the tree is gone. Never raises."""
+    try:
+        late = await asyncio.shield(snapshot)
+    except (Exception, asyncio.CancelledError):
+        return
+    if not late:
+        return
+    log_event("acp_teardown_late_snapshot_scheduled", level=logging.WARNING, source=source, descendants=len(late))
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(reap, late)
 
 
 def _reap_late_snapshot(task: asyncio.Task[list[psutil.Process]], *, source: str) -> None:

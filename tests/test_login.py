@@ -674,6 +674,32 @@ async def test_a_signin_still_closing_past_the_bound_keeps_the_slot(
         await drain_async_job(app.jobs, after["job_id"])
 
 
+async def test_a_late_descendant_snapshot_and_its_reap_are_tracked(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The snapshot misses its deadline; until the late result is reaped, the owner (a session's teardown set,
+    # which when_closed waits on) must still hold a task -- or a login slot could be freed with the tree alive.
+    from rutherford.acp import teardown
+
+    release, reaped = asyncio.Event(), asyncio.Event()
+
+    async def _slow_snapshot(_pid: int) -> list[Any]:
+        await release.wait()
+        return ["fake-descendant"]
+
+    def _reap(procs: list[Any], **_kwargs: Any) -> None:
+        assert procs == ["fake-descendant"]
+
+    monkeypatch.setattr(teardown, "snapshot_descendants_eagerly", _slow_snapshot)
+    monkeypatch.setattr(teardown, "reap", _reap)
+    owner: set[asyncio.Task[Any]] = set()
+    assert await teardown.snapshot_within_deadline(1234, timeout_s=0.05, source="test", owner=owner) == []
+    assert owner  # the snapshot and the late reap are both tracked
+    release.set()
+    pending = set(owner)
+    await asyncio.wait(pending, timeout=5.0)
+    reaped.set()
+    assert all(task.done() for task in pending) and not owner
+
+
 async def test_when_closed_also_waits_for_stages_that_outlived_the_close_task(tmp_path: Path) -> None:
     session = _session(_descriptor(tmp_path / "marker"), tmp_path)
     release = asyncio.Event()
