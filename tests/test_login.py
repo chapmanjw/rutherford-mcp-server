@@ -126,7 +126,7 @@ def test_auth_methods_of_reads_every_kind_and_salvaged_dicts() -> None:
         "https://keys.test/file?sig=abc",
         "https://bucket.test/o?X-Amz-Signature=deadbeef&X-Amz-Expires=60",
         "https://keys.test/cb?state=s&client_secret=xyz",
-        "https://keys.test/cb#id_token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlc2ln",
+        "https://keys.test/cb#id_token=" + _FAKE_JWT,
     ],
 )
 def test_env_var_link_must_be_a_safe_https_url(link: str) -> None:
@@ -147,7 +147,8 @@ def test_env_var_link_keeps_a_plain_https_url() -> None:
 
 def test_carries_credential_spots_named_parameters_and_shapes() -> None:
     assert carries_credential("https://k.test/?Signature=abc")  # case-insensitive name
-    assert carries_credential("https://k.test/path/AKIAABCDEFGHIJKLMNOP")  # a shape outside the query
+    fake_key_id = "AKIA" + "ABCDEFGHIJKLMNOP"  # assembled so a secret scanner never sees a key-shaped literal
+    assert carries_credential(f"https://k.test/path/{fake_key_id}")  # a shape outside the query
     assert not carries_credential("https://k.test/settings/api-keys?tab=new&state=s")  # mentions keys, holds none
 
 
@@ -327,7 +328,7 @@ async def test_a_prompt_with_no_trailing_newline_is_scanned_at_eof(tmp_path: Pat
 
 def test_a_link_mangled_by_credential_masking_is_dropped(tmp_path: Path) -> None:
     session = _session(_descriptor(tmp_path / "marker"), tmp_path, auth_method="fake-oauth")
-    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlc2lnbmF0dXJl"
+    jwt = _FAKE_JWT
     session._scan_chunk_for_urls(f"Open this link to sign in: https://login.test/oauth?id_token_hint={jwt}\n".encode())
     session._scan_chunk_for_urls(f"Or sign in at https://login.test/o?hint={jwt}&state=s\n".encode())
     assert session.signin_urls == []  # handed over masked, the link would not work
