@@ -83,7 +83,7 @@ def test_descriptor_registry() -> None:
     registry = default_registry()
     assert registry.has("goose") and "goose" in registry.ids()
     assert registry.get("goose").command == ("goose", "acp")
-    assert len(registry) == 20
+    assert len(registry) == 21
     with pytest.raises(KeyError):
         registry.get("nope")
     with pytest.raises(ValueError, match="duplicate"):

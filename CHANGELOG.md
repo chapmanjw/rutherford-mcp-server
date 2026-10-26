@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **New built-in agent: `antigravity`** (Google Antigravity's ACP server), bringing the built-in roster to 21.
+  Google now sends individual Gemini accounts to Antigravity, and Gemini CLI's `--acp` mode refuses them with
+  "no longer supported for Gemini Code Assist for individuals". The server is a standalone Google-signed binary
+  from the ACP registry (`agy_acp_server.exe` on Windows, `agy_acp_server.par` on macOS and Linux), separate
+  from the `agy` CLI, and it is not installed onto PATH: add its directory to PATH or set
+  `[agents.antigravity] command` to the full path. It needs one Google sign-in through ACP `authenticate`;
+  after that the server caches its token and Rutherford's sessions open without further prompts.
+
 ## [3.2.0] - 2026-09-05
 
 ### Added

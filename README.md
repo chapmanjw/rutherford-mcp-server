@@ -233,6 +233,7 @@ they work with zero config:
 | `qoder` | Qoder | `qodercli --acp` | Qoder login |
 | `grok` | Grok | `grok agent stdio` | xAI login + SuperGrok subscription |
 | `fast_agent` | fast-agent | `uvx fast-agent-acp==0.8.3` | provider API key (env or `fast-agent.secrets.yaml`) |
+| `antigravity` | Google Antigravity | `agy_acp_server` (`.par` on macOS / Linux) | Google login, once, through ACP `authenticate` |
 
 `codex` and `claude_code` launch through the official Zed adapters (`codex-acp` and
 `claude-agent-acp`, npm `@agentclientprotocol/*`), which front the Codex and Claude Code CLIs as ACP
@@ -245,7 +246,13 @@ than on PATH — add that directory to PATH, point `[agents.qoder] command` at t
 `discover` find it. `grok` (xAI) is ACP-native and connects cleanly, but a completed turn needs a SuperGrok
 subscription — without it the model call returns `403`; run `doctor connect_only=true` to confirm Rutherford
 can reach and configure it (it reports `reachable` and the advertised models) independent of the
-entitlement. Not every agent drives cleanly on every machine — run `doctor` to see which actually answer
+entitlement. `antigravity` is Google Antigravity's ACP server, which Google now points individual Gemini
+accounts to (Gemini CLI refuses them). It is a standalone binary from the
+[ACP registry](https://agentclientprotocol.com/get-started/registry), separate from the `agy` CLI, and is
+not installed onto PATH, so add its directory to PATH or set `[agents.antigravity] command` to the full path.
+Until it has been signed in once through ACP `authenticate` (for example from an ACP editor that offers the
+Google login), `doctor` reports `Authentication required`; the server caches the token under
+`~/.gemini/antigravity-acp/` and later sessions open without it. Not every agent drives cleanly on every machine — run `doctor` to see which actually answer
 here.
 
 **Config-driven agents.** Under ACP an agent is just how to launch it plus a few quirks, so the roster
