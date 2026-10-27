@@ -242,15 +242,29 @@ _URL_START = re.compile(r"(?i)[a-z][a-z0-9+.-]*://")
 #: What separates a flag's name from an inline value: ``--token=v`` and ``--token:v``.
 _FLAG_VALUE_SPLIT = re.compile(r"[=:]")
 #: What separates a bare argument's name from its value: ``api_key=v``, or a header's ``Authorization: v``.
-#: A colon with no space after it is not one, so a ``topic:command`` subcommand (``auth:login``) passes.
 _ASSIGNMENT_SPLIT = re.compile(r"=|:\s")
+
+
+def _bare_colon_credential(arg: str) -> bool:
+    """Whether a bare ``name:value`` argument is a credential header written with no space after the colon
+    (``Authorization:Bearer v``, ``X-Api-Key:v``).
+
+    Matched on :data:`_CREDENTIAL_NAME_PARTS` minus ``session``, and never on the short exact names, so
+    ``topic:command`` subcommands such as ``auth:login`` and ``session:start`` pass.
+    """
+    name, colon, value = arg.partition(":")
+    if not colon or not value or "=" in name:
+        return False
+    folded = re.sub(r"[^a-z0-9]", "", name.lower())
+    return any(part in folded for part in _CREDENTIAL_NAME_PARTS if part != "session")
 
 
 def _args_carry_credential(args: list[str]) -> bool:
     """Whether a terminal method's argv passes a credential value.
 
     Caught: a known credential shape anywhere, a URL anywhere in an argument (nested ones included) that
-    :func:`carries_credential`, a bare ``api_key=v`` assignment, and a flag whose name says it holds a
+    :func:`carries_credential`, a bare ``api_key=v`` assignment or credential header (``Authorization: v``,
+    ``Authorization:v``), and a flag whose name says it holds a
     credential (``--token``, ``--api-key``) given a value, inline (``--token=v``, ``--token:v``) or as the next
     argument (``--api-key v``). Such a flag with no value is a switch and passes. Name matching is broad on
     purpose (``--token-file path`` is refused too): refusing a harmless method costs a sign-in path, passing a
@@ -261,14 +275,16 @@ def _args_carry_credential(args: list[str]) -> bool:
         # one later in a comma list) gets its own check instead of reading as an opaque value.
         if _CREDENTIAL_SHAPE.search(arg) or any(carries_credential(arg[m.start() :]) for m in _URL_START.finditer(arg)):
             return True
-        # A flag's value follows `=` or `:`; a bare argument is an assignment only with `=`, since `auth:login`
-        # is an ordinary `topic:command` subcommand.
+        # A flag's value follows `=` or `:`. A bare argument's follows `=` or a colon and whitespace; a bare colon
+        # with no space counts only after a header-style credential name (see `_bare_colon_credential`).
         is_flag = arg.startswith("-")
         name, *inline = (_FLAG_VALUE_SPLIT if is_flag else _ASSIGNMENT_SPLIT).split(arg.lstrip("-"), maxsplit=1)
+        if not is_flag and _bare_colon_credential(arg):
+            return True
         if not _credential_name(name):
             continue
         if inline:
-            return True  # `--token=v`, `--token:v`, or a bare `api_key=v`
+            return True  # `--token=v`, `--token:v`, a bare `api_key=v`, or `Authorization: v`
         if not is_flag:
             continue
         following = args[index + 1] if index + 1 < len(args) else None

@@ -232,6 +232,8 @@ def test_carries_credential_follows_an_encoded_redirect_url() -> None:
         ["--open", "https://login.test/?next=https%3A%2F%2Fopaqueuser%40git.test%2Frepo"],  # ...in a nested URL
         ["--open", "https://login.test/?next=https%253A%252F%252Fb.test%252F%253Faccess_token%253Dx"],  # 2x encoded
         ["-H", "Authorization: Bearer opaquevalue123"],  # a header as a bare argument
+        ["-H", "Authorization:Bearer opaquevalue123"],  # ...with no space after the colon
+        ["-H", "X-Api-Key:opaquevalue123"],
     ],
 )
 def test_a_terminal_method_whose_arguments_pass_a_credential_is_not_offered(
