@@ -56,8 +56,9 @@ which no ordinary Rutherford call makes, so this is a one-time setup step rather
 - Run `login agent=<id> method=<id>` with a method of kind `agent`. It usually returns `status=pending`, a
   `job_id`, and `signin_urls`; a sign-in that finishes within `wait_s` returns its outcome directly, and one
   cancelled while the call waits returns `status=cancelled`. Open the first link and finish the sign-in in
-  the browser (the agent may also open one itself), then poll `job_status` / `job_result`. The job ends `authenticated` once a session opens with the
-  new credential (and lifts any cooldown bench the seat picked up while signed out), fails with the agent's
+  the browser (the agent may also open one itself), then poll `job_status` / `job_result`. The job ends
+  `authenticated` once a session opens with the new credential (and lifts any cooldown bench the seat
+  picked up while signed out), fails with the agent's
   own handshake error if that confirming session fails for an unrelated reason, or fails `AUTH_FAILED` if
   the sign-in was declined, did not take, or did not finish within
   `timeout_s` (300 seconds by default, applied to the `authenticate` step). `cancel_job` stops it. Calling

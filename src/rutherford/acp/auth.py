@@ -56,7 +56,7 @@ _AUTH_WORDING = re.compile(
     r"|\b(?:sign|log)[\s-]?in\s+(?:is\s+)?required"
     r"|\bplease\s+(?:sign|log)[\s-]?in"
     r"|\b(?:not|un)[\s-]?(?:authenticated|authori[sz]ed|signed[\s-]?in|logged[\s-]?in)"
-    r"|\b(?:invalid|expired)\s+(?:access\s+|auth\s+)?token"
+    r"|\b(?:invalid|expired)\s+(?:access|auth|bearer|api|refresh|id)\s+token\b"
     r"|\bno\s+(?:valid\s+)?credentials?\b|\bcredentials?\s+(?:are\s+|is\s+)?(?:required|missing|expired|not\s+found)"
     r"|\bno\s+authentication\s+method"
 )
