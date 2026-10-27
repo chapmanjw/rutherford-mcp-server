@@ -30,15 +30,18 @@ All notable changes to this project are documented in this file. The format is b
   A `terminal` method whose arguments pass a credential (`--token=...`, `--api-key ...`, a bare
   `api_key=...`, an `Authorization: ...` header, bare or as `--header=...`, a known key shape, or a URL
   carrying one, including in its userinfo or in an encoded redirect nested inside it) is not offered at
-  all; flag-name matching is
-  broad, so `--token-file path` is refused too, and the server log records `auth_method_refused` with the
-  method id. No other call signs in, so a delegation never opens a browser as a side effect.
+  all; flag-name matching is broad, so `--token-file path` is refused too, and the server log records
+  `auth_method_refused` with the method id. No other call signs in, so a delegation never opens a browser
+  as a side effect.
 
 ### Changed
 
 - An agent that refuses `session/new` or `session/load` with ACP's "Authentication required" now fails with
   `AUTH_REQUIRED` instead of `ACP_HANDSHAKE_FAILED` / `RESUME_FAILED`, naming the sign-in methods it offers.
-  `doctor` reports it as `auth_required` with a pointer to `login`, rather than as a broken handshake.
+  `doctor` reports it as `auth_required` with a pointer to `login`, rather than as a broken handshake. The
+  `-32000` code alone is not enough, since JSON-RPC also uses it for generic server errors: the error must
+  say a sign-in is missing ("authentication required", "not signed in", "credentials expired"), so a
+  failing auth backend stays `ACP_HANDSHAKE_FAILED`.
 
 ### Security
 

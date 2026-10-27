@@ -34,6 +34,9 @@ AUTH_REQUIRED_CODE = -32000
 
 AuthKind = Literal["agent", "env_var", "terminal"]
 
+#: How much of a -32000 error's message and data is searched for sign-in wording.
+_MAX_AUTH_TEXT = 4096
+
 #: An https URL in agent-authored text. Deliberately https-only: a sign-in link is the one URL worth surfacing,
 #: and refusing every other scheme keeps a ``file:`` / ``javascript:`` string out of what a caller may open.
 _HTTPS_URL = re.compile(r"https://[^\s\"'<>`]+")
@@ -46,7 +49,16 @@ MAX_SIGNIN_URLS = 3
 _SIGNIN_WORDING = re.compile(r"(?i)\b(?:auth\w*|sign[\s-]?in|log[\s-]?in|oauth|consent|verif\w*|open)\b")
 #: Wording that marks an ACP -32000 error as an authentication refusal. JSON-RPC uses -32000 as the start of
 #: the generic server-error range, so the code alone does not mean "sign in first".
-_AUTH_WORDING = re.compile(r"(?i)auth|sign[\s-]?in|log[\s-]?in|credential")
+#: It must say a sign-in is MISSING, not merely mention auth: "Authentication service unavailable" is a backend
+#: failure that signing in cannot fix, and is left a handshake failure.
+_AUTH_WORDING = re.compile(
+    r"(?i)\bauth(?:entication|orization)?\s+(?:is\s+)?required"
+    r"|\b(?:sign|log)[\s-]?in\s+(?:is\s+)?required"
+    r"|\bplease\s+(?:sign|log)[\s-]?in"
+    r"|\b(?:not|un)[\s-]?(?:authenticated|signed[\s-]?in|logged[\s-]?in)"
+    r"|\bno\s+(?:valid\s+)?credentials?\b|\bcredentials?\s+(?:are\s+|is\s+)?(?:required|missing|expired|not\s+found)"
+    r"|\bno\s+authentication\s+method"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,9 +322,11 @@ def is_auth_required(exc: BaseException) -> bool:
     message must say so too. An agent whose ``session/new`` fails for an unrelated reason keeps reporting a
     plain handshake failure instead of being sent to ``login``.
     """
-    return (
-        isinstance(exc, RequestError) and exc.code == AUTH_REQUIRED_CODE and _AUTH_WORDING.search(str(exc)) is not None
-    )
+    if not (isinstance(exc, RequestError) and exc.code == AUTH_REQUIRED_CODE):
+        return False
+    # The SDK's own refusal says "Authentication required"; an agent may put its wording in `data` instead.
+    text = f"{exc} {exc.data if exc.data is not None else ''}"[:_MAX_AUTH_TEXT]
+    return _AUTH_WORDING.search(text) is not None
 
 
 def describe_methods(methods: list[AuthMethodInfo]) -> str:
