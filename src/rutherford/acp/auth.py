@@ -19,12 +19,15 @@ Pure and dependency-light so every branch is unit-testable without a subprocess.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from acp import RequestError
+
+from ..runtime.logging import log_event
 
 #: The JSON-RPC error code ACP reserves for "Authentication required" (``RequestError.auth_required``).
 AUTH_REQUIRED_CODE = -32000
@@ -107,7 +110,9 @@ def auth_methods_of(init: object) -> list[AuthMethodInfo]:
         # anything unreadable about one method drops that method and nothing else.
         try:
             method = _method_from(entry)
-        except Exception:
+        except Exception as exc:
+            # The entry's contents are agent-authored and never logged; its position and the error type are.
+            log_event("auth_method_unreadable", level=logging.WARNING, index=len(methods), error=type(exc).__name__)
             method = None
         if method is not None:
             methods.append(method)

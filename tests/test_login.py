@@ -359,27 +359,56 @@ def test_malformed_method_metadata_never_breaks_parsing() -> None:
     assert methods["bad-var"].env_vars == () and methods["ok"].name == "OK"
 
 
-async def test_a_signed_in_agent_with_malformed_auth_metadata_still_opens(tmp_path: Path) -> None:
+async def test_a_signed_in_agent_with_malformed_auth_metadata_still_opens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # Parsing runs on every initialize; one bad advertised method must not turn into ACP_HANDSHAKE_FAILED.
-    session = _session(AgentDescriptor("fake", "Fake", _FAKE_CMD), tmp_path)
+    # The fake advertises its three methods (sign-in simulation on) but is already signed in, so the session
+    # opens -- while every method's parse is forced to throw.
+    marker = tmp_path / "marker"
+    marker.write_text("signed-in", encoding="utf-8")
+    session = _session(_descriptor(marker), tmp_path)
+    calls: list[object] = []
+    logged: list[str] = []
 
-    def _boom(_entry: object) -> None:
+    def _boom(entry: object) -> None:
+        calls.append(entry)
         raise TypeError("'int' object is not iterable")
 
     import rutherford.acp.auth as auth_module
 
-    original = auth_module._method_from
-    auth_module._method_from = _boom  # type: ignore[assignment]
+    monkeypatch.setattr(auth_module, "_method_from", _boom)
+    monkeypatch.setattr(auth_module, "log_event", lambda event, **_fields: logged.append(event))
     try:
-        assert (
-            auth_methods_of(InitializeResponse(protocol_version=1, auth_methods=[AuthMethodAgent(id="x", name="X")]))
-            == []
-        )
         await session.open()
         assert session.session_id == "fake-session-1"
+        assert len(calls) == 3 and session.auth_methods == []  # each method was read, failed, and was dropped
+        assert logged == ["auth_method_unreadable"] * 3
     finally:
-        auth_module._method_from = original
         await session.close()
+
+
+async def test_a_cancel_and_a_snapshot_landing_together_reap_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The tracker is cancelled with its snapshot already finished: its cancel handler and the snapshot's
+    # fallback callback both see a finished tracker. The one-shot claim lets only one of them reap.
+    from rutherford.acp import teardown
+
+    reaps: list[Any] = []
+    monkeypatch.setattr(teardown, "_reap_late_snapshot", lambda task, *, source: reaps.append(task.result()))
+    loop = asyncio.get_running_loop()
+    snapshot: asyncio.Future[list[Any]] = loop.create_future()
+    claim = teardown._ReapClaim()
+    tracker = asyncio.create_task(
+        teardown._reap_late_tracked(snapshot, source="test", claim=claim)  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)  # the tracker is now parked on the snapshot
+    snapshot.set_result(["fake-descendant"])
+    tracker.cancel()  # in the same tick as the snapshot's completion
+    with pytest.raises(asyncio.CancelledError):
+        await tracker
+    if claim.take():  # what the fallback callback does once it sees the tracker finished
+        reaps.append(["fallback"])
+    assert reaps == [["fake-descendant"]]  # exactly one reap, by the cancel handler
 
 
 async def test_a_late_reap_cancelled_while_waiting_for_its_snapshot_reaps_once(

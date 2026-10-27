@@ -209,7 +209,12 @@ async def snapshot_within_deadline(
         task.add_done_callback(functools.partial(_reap_late_snapshot, source=source))
     else:
         # The same late reap, as a tracked task instead of a fire-and-forget thread, so the owner sees it end.
-        late_reap = asyncio.create_task(_reap_late_tracked(task, source=source), name=f"rutherford-late-reap-{source}")
+        # One-shot: whichever path reaps first (the tracker's normal path, its cancel handler, or the fallback
+        # below) claims the tree, and the others do nothing -- so the same tree is never reaped twice.
+        claim = _ReapClaim()
+        late_reap = asyncio.create_task(
+            _reap_late_tracked(task, source=source, claim=claim), name=f"rutherford-late-reap-{source}"
+        )
         register_pending_cleanup(late_reap)
         owner.add(late_reap)
         late_reap.add_done_callback(owner.discard)
@@ -218,7 +223,7 @@ async def snapshot_within_deadline(
             # A late_reap that is already over when the snapshot lands was cancelled -- possibly before it ever
             # ran, so its own handler never saw the result. Reap untracked then, so the tree is never left alive.
             # A late_reap still pending will take the result itself (or reap in its cancel handler).
-            if late_reap.done():
+            if late_reap.done() and claim.take():
                 _reap_late_snapshot(snapshot, source=source)
 
         task.add_done_callback(_fallback)
@@ -257,24 +262,51 @@ async def _reap_on_own_thread(procs: list[psutil.Process], *, source: str) -> No
     await finished
 
 
-async def _reap_late_tracked(snapshot: asyncio.Task[list[psutil.Process]], *, source: str) -> None:
+class _ReapClaim:
+    """A one-shot claim on a late snapshot's tree, shared by every path that might reap it.
+
+    All claimants run on the event loop thread, so a plain flag is enough: no two can interleave inside
+    :meth:`take`.
+    """
+
+    __slots__ = ("_taken",)
+
+    def __init__(self) -> None:
+        self._taken = False
+
+    def take(self) -> bool:
+        """Claim the tree; ``True`` only for the first caller."""
+        if self._taken:
+            return False
+        self._taken = True
+        return True
+
+
+async def _reap_late_tracked(
+    snapshot: asyncio.Task[list[psutil.Process]], *, source: str, claim: _ReapClaim | None = None
+) -> None:
     """Await a snapshot that missed its deadline, then reap what it found -- the observable twin of
     :func:`_reap_late_snapshot`, for a caller that must know when the tree is gone. Never raises."""
+    claim = claim if claim is not None else _ReapClaim()
     try:
         late = await asyncio.shield(snapshot)
     except Exception:
         return  # the snapshot itself failed: there is no tree to reap
     except asyncio.CancelledError:
         # The snapshot is shielded and keeps running; only the tracking (for when_closed) ends here. If it has
-        # already finished, nothing else will reap its tree, so do it now. If it has not, the fallback callback
+        # already finished, reap it now unless another path already has. If it has not, the fallback callback
         # `snapshot_within_deadline` put on it sees this task done and reaps when the result arrives.
-        if snapshot.done():
+        landed = snapshot.done()
+        if landed and claim.take():
             _reap_late_snapshot(snapshot, source=source)
         log_event(
-            "acp_teardown_late_reap_detached", level=logging.WARNING, source=source, reason="cancelled_before_snapshot"
+            "acp_teardown_late_reap_detached",
+            level=logging.WARNING,
+            source=source,
+            reason="cancelled_after_snapshot" if landed else "cancelled_before_snapshot",
         )
         raise
-    if not late:
+    if not late or not claim.take():
         return
     log_event("acp_teardown_late_snapshot_scheduled", level=logging.WARNING, source=source, descendants=len(late))
     try:
