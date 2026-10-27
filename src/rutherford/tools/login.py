@@ -196,8 +196,9 @@ async def _current_state(descriptor: AgentDescriptor) -> tuple[str, list[AuthMet
 
 #: Labels a ``run_in_terminal`` answer: its arguments and environment are the agent's, not Rutherford's.
 _COMMAND_NOTE = (
-    "the launch command is this agent's configured command; terminal_args and env were advertised by the agent "
-    "and not checked by Rutherford. Review them before running the command."
+    "the launch command is this agent's configured command; its extra arguments and env_names were advertised "
+    "by the agent and not checked by Rutherford. env_names lists the variables the agent wants set; their values "
+    "are not shown. Review the command before running it."
 )
 
 
@@ -230,7 +231,9 @@ def _terminal_answer(agent: str, descriptor: AgentDescriptor, method: AuthMethod
         "status": "run_in_terminal",
         "method": method.as_payload(),
         "command": argv,
-        "env": method.terminal_env,
+        # Names only, never values: an agent could advertise a credential it holds as a "value to set", and a
+        # tool result is logged and persisted. The user sets the variables themselves.
+        "env_names": sorted(method.terminal_env),
         "command_note": _COMMAND_NOTE,
         "next": f"run the command in an interactive terminal, finish the sign-in, then re-run doctor agent={agent}",
     }

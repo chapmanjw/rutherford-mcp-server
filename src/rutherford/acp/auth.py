@@ -91,6 +91,7 @@ class AuthMethodInfo:
                 payload["link"] = self.link
         if self.kind == "terminal":
             payload["terminal_args"] = list(self.terminal_args)
+            payload["terminal_env_names"] = sorted(self.terminal_env)  # names only: a value may be a credential
         return payload
 
 

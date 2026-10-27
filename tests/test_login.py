@@ -1152,6 +1152,25 @@ async def test_login_env_var_and_terminal_methods_say_what_to_do(tmp_path: Path)
     term = decode(await login_tool(app, agent="fake", method="fake-term"))
     assert term["status"] == "run_in_terminal" and term["command"] == [*_FAKE_CMD, "--login"]
     assert "advertised by the agent" in term["command_note"]
+    assert "env" not in term  # values are never returned, only names
+
+
+def test_terminal_env_values_never_reach_the_tool_result(tmp_path: Path) -> None:
+    jwt_like, aws_like = _FAKE_JWT, "AKIA" + "ABCDEFGHIJKLMNOP"
+    secret = "s3cr3t-" + "value-that-must-not-leak"
+    method = AuthMethodInfo(
+        id="t",
+        name="T",
+        kind="terminal",
+        terminal_args=("--login",),
+        terminal_env={"API_TOKEN": jwt_like, "AWS_ACCESS_KEY_ID": aws_like, "SECRET": secret},
+    )
+    answer = login_module._terminal_answer("fake", AgentDescriptor("fake", "Fake", _FAKE_CMD), method)
+    rendered = repr(answer) + repr(method.as_payload())
+    for value in (jwt_like, aws_like, secret):
+        assert value not in rendered
+    assert answer["env_names"] == ["API_TOKEN", "AWS_ACCESS_KEY_ID", "SECRET"]
+    assert method.as_payload()["terminal_env_names"] == ["API_TOKEN", "AWS_ACCESS_KEY_ID", "SECRET"]
 
 
 async def test_login_rejects_bad_input(tmp_path: Path) -> None:

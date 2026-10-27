@@ -24,7 +24,8 @@ All notable changes to this project are documented in this file. The format is b
   reports that handshake error instead. The link is taken only
   from a sign-in prompt line, so other URLs the agent logs are not mistaken for it, and a repeated `login`
   while a sign-in is running joins that job instead of opening a second consent screen. `env_var` and
-  `terminal` methods are answered with the variables to set or the command to run (plus the agent's
+  `terminal` methods are answered with the variables to set or the command to run (names only, never an
+  agent-supplied value; plus the agent's
   credential-page link, if it passes the same https and no-credential checks every agent-supplied link gets), and Rutherford never asks for, reads, or stores
   the secret itself. No other call signs in, so a delegation never opens a browser as a side effect.
 
