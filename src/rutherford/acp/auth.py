@@ -241,19 +241,9 @@ def _exact_terminal(args: object, env: object) -> tuple[tuple[str, ...], dict[st
 _URL_START = re.compile(r"(?i)[a-z][a-z0-9+.-]*://")
 #: What separates a flag's name from an inline value: ``--token=v`` and ``--token:v``.
 _FLAG_VALUE_SPLIT = re.compile(r"[=:]")
-#: What separates a bare argument's name from its value: ``api_key=v`` only.
-_ASSIGNMENT_SPLIT = re.compile(r"=")
-
-
-def _url_arg_carries_credential(url: str) -> bool:
-    """:func:`carries_credential`, plus any userinfo at all: in a terminal argument (unlike a link, which
-    :func:`is_safe_link` refuses for any ``@``), ``https://<token>@host/`` is the usual git / PAT form."""
-    try:
-        if urlsplit(url).username:
-            return True
-    except ValueError:
-        return True
-    return carries_credential(url)
+#: What separates a bare argument's name from its value: ``api_key=v``, or a header's ``Authorization: v``.
+#: A colon with no space after it is not one, so a ``topic:command`` subcommand (``auth:login``) passes.
+_ASSIGNMENT_SPLIT = re.compile(r"=|:\s")
 
 
 def _args_carry_credential(args: list[str]) -> bool:
@@ -269,9 +259,7 @@ def _args_carry_credential(args: list[str]) -> bool:
     for index, arg in enumerate(args):
         # Each scheme start is checked from there to the end, so a URL nested in another's query (or a second
         # one later in a comma list) gets its own check instead of reading as an opaque value.
-        if _CREDENTIAL_SHAPE.search(arg) or any(
-            _url_arg_carries_credential(arg[m.start() :]) for m in _URL_START.finditer(arg)
-        ):
+        if _CREDENTIAL_SHAPE.search(arg) or any(carries_credential(arg[m.start() :]) for m in _URL_START.finditer(arg)):
             return True
         # A flag's value follows `=` or `:`; a bare argument is an assignment only with `=`, since `auth:login`
         # is an ordinary `topic:command` subcommand.
@@ -367,8 +355,10 @@ def carries_credential(url: str, *, _depth: int = 0) -> bool:
     """
     try:
         parts = urlsplit(url)
-        if parts.password:
-            return True  # `https://user:secret@host/` (a link also fails is_safe_link; a terminal argument would not)
+        if parts.username or parts.password:
+            # Any userinfo: `https://user:secret@host/`, or a token as the username (the git / PAT form). A top-level
+            # link already fails is_safe_link for it; this covers terminal arguments and nested URLs.
+            return True
     except ValueError:
         return True  # unparseable: never surfaced anyway, and refusing is the safe answer
     for component in (parts.query, parts.fragment):
@@ -379,8 +369,11 @@ def carries_credential(url: str, *, _depth: int = 0) -> bool:
                 return True
             # A percent-encoded redirect (`?next=https%3A%2F%2F...`) decodes to a URL of its own: check it too,
             # a few levels deep at most.
-            if _depth < _MAX_NESTED_URL_DEPTH and "://" in value and carries_credential(value, _depth=_depth + 1):
-                return True
+            if _depth < _MAX_NESTED_URL_DEPTH:
+                # A double-encoded redirect still holds `%3A%2F%2F` after one decode; decode once more to see it.
+                nested = value if "://" in value else unquote(value)
+                if "://" in nested and carries_credential(nested, _depth=_depth + 1):
+                    return True
     return _CREDENTIAL_SHAPE.search(unquote(url)) is not None
 
 

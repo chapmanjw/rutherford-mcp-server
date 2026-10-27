@@ -28,7 +28,8 @@ All notable changes to this project are documented in this file. The format is b
   agent-supplied value (plus the agent's credential-page link, if it passes the same https and no-credential
   checks every agent-supplied link gets), and Rutherford never asks for, reads, or stores the secret itself.
   A `terminal` method whose arguments pass a credential (`--token=...`, `--api-key ...`, a bare
-  `api_key=...`, a known key shape, or a URL carrying one) is not offered at all; flag-name matching is
+  `api_key=...`, an `Authorization: ...` header, a known key shape, or a URL carrying one, including in its
+  userinfo or in an encoded redirect nested inside it) is not offered at all; flag-name matching is
   broad, so `--token-file path` is refused too, and the server log records `auth_method_refused` with the
   method id. No other call signs in, so a delegation never opens a browser as a side effect.
 
