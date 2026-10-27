@@ -55,7 +55,8 @@ _AUTH_WORDING = re.compile(
     r"(?i)\bauth(?:entication|orization)?\s+(?:is\s+)?required"
     r"|\b(?:sign|log)[\s-]?in\s+(?:is\s+)?required"
     r"|\bplease\s+(?:sign|log)[\s-]?in"
-    r"|\b(?:not|un)[\s-]?(?:authenticated|signed[\s-]?in|logged[\s-]?in)"
+    r"|\b(?:not|un)[\s-]?(?:authenticated|authori[sz]ed|signed[\s-]?in|logged[\s-]?in)"
+    r"|\b(?:invalid|expired)\s+(?:access\s+|auth\s+)?token"
     r"|\bno\s+(?:valid\s+)?credentials?\b|\bcredentials?\s+(?:are\s+|is\s+)?(?:required|missing|expired|not\s+found)"
     r"|\bno\s+authentication\s+method"
 )
@@ -319,8 +320,9 @@ def is_auth_required(exc: BaseException) -> bool:
     """Whether ``exc`` is the agent's ACP "Authentication required" refusal.
 
     ACP reserves ``-32000`` for it, but JSON-RPC also uses that code for any generic server error, so the
-    message must say so too. An agent whose ``session/new`` fails for an unrelated reason keeps reporting a
-    plain handshake failure instead of being sent to ``login``.
+    message or ``data`` must also say a sign-in is missing (:data:`_AUTH_WORDING`). An agent whose
+    ``session/new`` fails for an unrelated reason keeps reporting a plain handshake failure instead of being
+    sent to ``login``.
     """
     if not (isinstance(exc, RequestError) and exc.code == AUTH_REQUIRED_CODE):
         return False

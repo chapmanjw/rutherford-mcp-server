@@ -326,7 +326,8 @@ def test_is_auth_required_needs_the_reserved_code_and_auth_wording() -> None:
     # Mentioning auth is not enough: a broken auth backend is not something signing in fixes.
     for message in ("Authentication service unavailable", "auth backend timed out", "Login server error"):
         assert not is_auth_required(RequestError(-32000, message))
-    for message in ("Not signed in", "Unauthenticated", "Credentials expired", "Sign-in required"):
+    signed_out = ("Not signed in", "Unauthenticated", "Credentials expired", "Sign-in required", "Unauthorized")
+    for message in (*signed_out, "Not authorized", "Invalid token", "Expired access token"):
         assert is_auth_required(RequestError(-32000, message))
     # The agent's wording may sit in `data` under a generic message.
     assert is_auth_required(RequestError(-32000, "Server error", {"message": "No authentication method selected."}))
