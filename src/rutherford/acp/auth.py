@@ -187,7 +187,11 @@ def _method_from(entry: object) -> AuthMethodInfo | None:
         terminal = _exact_terminal(_read(entry, "args"), _read(entry, "env"))
         # The argv is returned verbatim in a tool result, which is logged and persisted. It cannot be masked
         # without presenting a command the agent did not send, so a method passing a credential is refused.
-        if terminal is None or _args_carry_credential(list(terminal[0])):
+        if terminal is None:
+            return None
+        if _args_carry_credential(list(terminal[0])):
+            # Logged by id and reason only, so an operator can see why `login` lists fewer methods than offered.
+            log_event("auth_method_refused", level=logging.WARNING, method=method_id, reason="credential_in_args")
             return None
         terminal_args, terminal_env = terminal
     link = _read(entry, "link") if kind == "env_var" else None
@@ -233,22 +237,30 @@ def _exact_terminal(args: object, env: object) -> tuple[tuple[str, ...], dict[st
     return tuple(exact_args), exact_env
 
 
+#: A URL of any scheme, in any case, anywhere in an argument (``--open=HTTPS://...`` included).
+_ANY_URL = re.compile(r"(?i)[a-z][a-z0-9+.-]*://\S+")
+#: What separates a flag's name from an inline value: ``--token=v`` and ``--token:v``.
+_FLAG_VALUE_SPLIT = re.compile(r"[=:]")
+
+
 def _args_carry_credential(args: list[str]) -> bool:
     """Whether a terminal method's argv passes a credential value.
 
-    Caught: a known credential shape anywhere, an https argument that :func:`carries_credential`, and a flag
-    whose name says it holds a credential (``--token``, ``--api-key``) given a value, either inline
-    (``--token=v``) or as the next argument (``--api-key v``). Such a flag with no value is a switch and passes.
+    Caught: a known credential shape anywhere, a URL anywhere in an argument that :func:`carries_credential`,
+    and a flag whose name says it holds a credential (``--token``, ``--api-key``) given a value, inline
+    (``--token=v``, ``--token:v``) or as the next argument (``--api-key v``). Such a flag with no value is a
+    switch and passes. Name matching is broad on purpose (``--token-file path`` is refused too): refusing a
+    harmless method costs a sign-in path, passing a credential leaks it.
     """
     for index, arg in enumerate(args):
-        if _CREDENTIAL_SHAPE.search(arg) or (arg.startswith("https://") and carries_credential(arg)):
+        if _CREDENTIAL_SHAPE.search(arg) or any(carries_credential(url) for url in _ANY_URL.findall(arg)):
             return True
         if not arg.startswith("-"):
             continue
-        name, has_inline, _ = arg.lstrip("-").partition("=")
+        name, *inline = _FLAG_VALUE_SPLIT.split(arg.lstrip("-"), maxsplit=1)
         if not _credential_name(name):
             continue
-        if has_inline:
+        if inline:
             return True
         following = args[index + 1] if index + 1 < len(args) else None
         if following is not None and not following.startswith("-"):

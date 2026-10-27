@@ -65,7 +65,8 @@ which no ordinary Rutherford call makes, so this is a one-time setup step rather
 - An `env_var` method answers with the variables to set (`[agents.<id>.env]` or the server's environment),
   and a `terminal` method answers with the command to run yourself and the names of any variables to set
   for it (take their values from the agent's documentation). Rutherford never asks for or stores a
-  credential value, and a `terminal` method whose arguments pass one is not offered.
+  credential value, and a `terminal` method whose arguments pass one is not offered (the server log records
+  `auth_method_refused` with the method id, never the arguments).
 - The agent caches the credential in its own store, so later sessions open without signing in again.
 
 ### `no_answer` in doctor / `ACP_REFUSED` / `ACP_EMPTY_ANSWER`

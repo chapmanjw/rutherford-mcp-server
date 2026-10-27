@@ -213,13 +213,28 @@ def test_an_encoded_semicolon_inside_a_value_is_not_a_separator() -> None:
         ["login", "--client-secret", "opaque", "--verbose"],
         ["--hint", "sk-" + "AbCdEfGhIjKlMnOpQr"],
         ["--open", "https://login.test/#access_token=opaque"],
+        ["--open=https://login.test/#access_token=opaque"],
+        ["--open", "HTTPS://login.test/#access_token=opaque"],
+        ["--token:opaque"],
+        ["--token-file", "/path"],  # broad on purpose: a credential-named flag with a value is refused
     ],
 )
-def test_a_terminal_method_whose_arguments_pass_a_credential_is_not_offered(args: list[str]) -> None:
+def test_a_terminal_method_whose_arguments_pass_a_credential_is_not_offered(
+    args: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import rutherford.acp.auth as auth_module
+
     class Advertised:
         auth_methods: ClassVar[list[object]] = [{"id": "t", "type": "terminal", "args": args}, {"id": "ok"}]
 
+    logged: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(auth_module, "log_event", lambda event, **fields: logged.append((event, fields)))
     assert [method.id for method in auth_methods_of(Advertised())] == ["ok"]
+    # The refusal is visible to an operator, by id and reason only: no argument text reaches the log.
+    assert [(event, fields["method"], fields["reason"]) for event, fields in logged] == [
+        ("auth_method_refused", "t", "credential_in_args")
+    ]
+    assert all(arg not in repr(logged) for arg in args)
 
 
 def test_a_terminal_credential_flag_without_a_value_is_a_switch() -> None:
