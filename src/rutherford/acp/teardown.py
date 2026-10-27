@@ -213,6 +213,15 @@ async def snapshot_within_deadline(
         register_pending_cleanup(late_reap)
         owner.add(late_reap)
         late_reap.add_done_callback(owner.discard)
+
+        def _fallback(snapshot: asyncio.Task[list[psutil.Process]]) -> None:
+            # A late_reap that is already over when the snapshot lands was cancelled -- possibly before it ever
+            # ran, so its own handler never saw the result. Reap untracked then, so the tree is never left alive.
+            # A late_reap still pending will take the result itself (or reap in its cancel handler).
+            if late_reap.done():
+                _reap_late_snapshot(snapshot, source=source)
+
+        task.add_done_callback(_fallback)
     return []
 
 
@@ -256,7 +265,14 @@ async def _reap_late_tracked(snapshot: asyncio.Task[list[psutil.Process]], *, so
     except Exception:
         return  # the snapshot itself failed: there is no tree to reap
     except asyncio.CancelledError:
-        log_event("acp_teardown_late_snapshot_dropped", level=logging.WARNING, source=source, reason="cancelled")
+        # The snapshot is shielded and keeps running; only the tracking (for when_closed) ends here. If it has
+        # already finished, nothing else will reap its tree, so do it now. If it has not, the fallback callback
+        # `snapshot_within_deadline` put on it sees this task done and reaps when the result arrives.
+        if snapshot.done():
+            _reap_late_snapshot(snapshot, source=source)
+        log_event(
+            "acp_teardown_late_reap_detached", level=logging.WARNING, source=source, reason="cancelled_before_snapshot"
+        )
         raise
     if not late:
         return

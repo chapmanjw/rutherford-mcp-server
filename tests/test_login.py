@@ -345,6 +345,100 @@ async def test_signin_links_are_capped_across_the_whole_session(tmp_path: Path) 
     assert session.signin_urls == [_SIGNIN_URL, "https://extra0.test/oauth", "https://extra1.test/oauth"]
 
 
+def test_malformed_method_metadata_never_breaks_parsing() -> None:
+    class Salvaged:  # what ACP 0.12 can hand back for an entry it could not parse
+        auth_methods: ClassVar[list[object]] = [
+            {"id": "scalar-vars", "type": "env_var", "vars": 42},
+            {"id": "dict-vars", "type": "env_var", "vars": {"NAME": "x"}},
+            {"id": "bad-var", "type": "env_var", "vars": [42, None, {"name": 7}]},
+            {"id": "ok", "name": "OK"},
+        ]
+
+    methods = {m.id: m for m in auth_methods_of(Salvaged())}
+    assert methods["scalar-vars"].env_vars == () and methods["dict-vars"].env_vars == ()
+    assert methods["bad-var"].env_vars == () and methods["ok"].name == "OK"
+
+
+async def test_a_signed_in_agent_with_malformed_auth_metadata_still_opens(tmp_path: Path) -> None:
+    # Parsing runs on every initialize; one bad advertised method must not turn into ACP_HANDSHAKE_FAILED.
+    session = _session(AgentDescriptor("fake", "Fake", _FAKE_CMD), tmp_path)
+
+    def _boom(_entry: object) -> None:
+        raise TypeError("'int' object is not iterable")
+
+    import rutherford.acp.auth as auth_module
+
+    original = auth_module._method_from
+    auth_module._method_from = _boom  # type: ignore[assignment]
+    try:
+        assert (
+            auth_methods_of(InitializeResponse(protocol_version=1, auth_methods=[AuthMethodAgent(id="x", name="X")]))
+            == []
+        )
+        await session.open()
+        assert session.session_id == "fake-session-1"
+    finally:
+        auth_module._method_from = original
+        await session.close()
+
+
+async def test_a_late_reap_cancelled_while_waiting_for_its_snapshot_reaps_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rutherford.acp import teardown
+
+    release = asyncio.Event()
+    reaps: list[list[Any]] = []
+
+    async def _slow_snapshot(_pid: int) -> list[Any]:
+        await release.wait()
+        return ["fake-descendant"]
+
+    monkeypatch.setattr(teardown, "snapshot_descendants_eagerly", _slow_snapshot)
+    monkeypatch.setattr(teardown, "reap", lambda procs, **_kw: reaps.append(procs))
+    owner: set[asyncio.Task[Any]] = set()
+    await teardown.snapshot_within_deadline(1234, timeout_s=0.05, source="test", owner=owner)
+    late_reap = next(task for task in owner if task.get_name() == "rutherford-late-reap-test")
+    await asyncio.sleep(0.05)  # it is now running, parked on the snapshot
+    late_reap.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await late_reap
+    release.set()
+    for _ in range(100):
+        if reaps:
+            break
+        await asyncio.sleep(0.02)
+    await asyncio.sleep(0.2)  # room for a second, duplicate reap to show up
+    assert reaps == [["fake-descendant"]]  # reaped exactly once
+
+
+async def test_a_late_reap_cancelled_before_its_snapshot_arrives_still_reaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rutherford.acp import teardown
+
+    release = asyncio.Event()
+    reaped = threading.Event()
+
+    async def _slow_snapshot(_pid: int) -> list[Any]:
+        await release.wait()
+        return ["fake-descendant"]
+
+    def _reap(procs: list[Any], **_kwargs: Any) -> None:
+        reaped.set()
+
+    monkeypatch.setattr(teardown, "snapshot_descendants_eagerly", _slow_snapshot)
+    monkeypatch.setattr(teardown, "reap", _reap)
+    owner: set[asyncio.Task[Any]] = set()
+    await teardown.snapshot_within_deadline(1234, timeout_s=0.05, source="test", owner=owner)
+    late_reap = next(task for task in owner if task.get_name() == "rutherford-late-reap-test")
+    late_reap.cancel()  # cancelled before the snapshot lands (here even before the task first runs)
+    with pytest.raises(asyncio.CancelledError):
+        await late_reap
+    release.set()  # the snapshot arrives afterwards ...
+    assert await asyncio.to_thread(reaped.wait, 5.0)  # ... and its tree is still reaped
+
+
 def test_advertised_methods_are_bounded_in_size_and_count() -> None:
     class Oversized:
         auth_methods: ClassVar[list[object]] = [

@@ -103,7 +103,12 @@ def auth_methods_of(init: object) -> list[AuthMethodInfo]:
         return []
     methods: list[AuthMethodInfo] = []
     for entry in raw:
-        method = _method_from(entry)
+        # This runs after EVERY initialize, signing in or not, so a malformed entry must never fail the session:
+        # anything unreadable about one method drops that method and nothing else.
+        try:
+            method = _method_from(entry)
+        except Exception:
+            method = None
         if method is not None:
             methods.append(method)
             if len(methods) >= _MAX_METHODS:
@@ -157,7 +162,8 @@ def _method_from(entry: object) -> AuthMethodInfo | None:
     kind: AuthKind = kind_raw if kind_raw in ("env_var", "terminal") else "agent"
     env_vars: list[AuthEnvVarInfo] = []
     if kind == "env_var":
-        for var in _read(entry, "vars") or []:
+        raw_vars = _read(entry, "vars")
+        for var in raw_vars if isinstance(raw_vars, list) else []:
             var_name = _read(var, "name")
             if isinstance(var_name, str) and var_name and _clean(var_name) == var_name:
                 label = _clean(_read(var, "label"))
