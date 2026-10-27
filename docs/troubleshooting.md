@@ -4,8 +4,9 @@
 
 Run `doctor` before investigating further. It drives each agent with a real read-only ACP round trip
 — the only trustworthy health signal — and reports `ok`, `no_answer`, `model_unavailable`,
-`auth_required` (sign in with `login`), `handshake_failed`, `not_installed`, or `error` per agent. `capabilities` is the cheaper read (the
-static registry: launch command, `default_model`, `model_selection`, `effort_capable`; no spawn).
+`auth_required` (sign in with `login`), `handshake_failed`, `not_installed`, or `error` per agent.
+`capabilities` is the cheaper read (the static registry: launch command, `default_model`,
+`model_selection`, `effort_capable`; no spawn).
 For live advertised model ids use `doctor(agent=<id>, connect_only=true)`.
 
 ---

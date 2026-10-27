@@ -271,10 +271,11 @@ def _args_carry_credential(args: list[str]) -> bool:
 
     Caught: a known credential shape anywhere, a URL anywhere in an argument (nested ones included) that
     :func:`carries_credential`, a bare ``api_key=v`` assignment or credential header (``Authorization: v``,
-    ``Authorization:v``), and a flag whose name says it holds a
-    credential (``--token``, ``--api-key``) given a value, inline (``--token=v``, ``--token:v``) or as the next
-    argument (``--api-key v``). Such a flag with no value is a switch and passes. Name matching is broad on
-    purpose (``--token-file path`` is refused too): refusing a harmless method costs a sign-in path, passing a
+    ``Authorization:v``), a flag whose name says it holds a credential (``--token``, ``--api-key``) given a
+    value, inline (``--token=v``, ``--token:v``) or as the next argument (``--api-key v``), and a flag of any
+    name whose inline value is itself a credential header or assignment (``--header=Authorization: Bearer v``).
+    A credential-named flag with no value is a switch and passes. Name matching is broad on purpose
+    (``--token-file path`` is refused too): refusing a harmless method costs a sign-in path, passing a
     credential leaks it.
     """
     for index, arg in enumerate(args):
