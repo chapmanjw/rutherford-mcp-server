@@ -245,12 +245,19 @@ _FLAG_VALUE_SPLIT = re.compile(r"[=:]")
 _ASSIGNMENT_SPLIT = re.compile(r"=|:\s")
 
 
+def _value_is_credential_header(value: str) -> bool:
+    """Whether a flag's inline value is itself a credential header or assignment, checked as a bare argument."""
+    name, *rest = _ASSIGNMENT_SPLIT.split(value, maxsplit=1)
+    return _bare_colon_credential(value) or (bool(rest) and _credential_name(name))
+
+
 def _bare_colon_credential(arg: str) -> bool:
     """Whether a bare ``name:value`` argument is a credential header written with no space after the colon
     (``Authorization:Bearer v``, ``X-Api-Key:v``).
 
     Matched on :data:`_CREDENTIAL_NAME_PARTS` minus ``session``, and never on the short exact names, so
-    ``topic:command`` subcommands such as ``auth:login`` and ``session:start`` pass.
+    ``topic:command`` subcommands such as ``auth:login`` and ``session:start`` pass. Broad like the rest:
+    ``secrets:list`` or ``tokens:refresh`` is refused.
     """
     name, colon, value = arg.partition(":")
     if not colon or not value or "=" in name:
@@ -281,6 +288,8 @@ def _args_carry_credential(args: list[str]) -> bool:
         name, *inline = (_FLAG_VALUE_SPLIT if is_flag else _ASSIGNMENT_SPLIT).split(arg.lstrip("-"), maxsplit=1)
         if not is_flag and _bare_colon_credential(arg):
             return True
+        if is_flag and inline and _value_is_credential_header(inline[0]):
+            return True  # `--header=Authorization: Bearer v`: the value is a header of its own
         if not _credential_name(name):
             continue
         if inline:

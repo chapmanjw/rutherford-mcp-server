@@ -4,7 +4,7 @@
 
 Run `doctor` before investigating further. It drives each agent with a real read-only ACP round trip
 — the only trustworthy health signal — and reports `ok`, `no_answer`, `model_unavailable`,
-`handshake_failed`, `not_installed`, or `error` per agent. `capabilities` is the cheaper read (the
+`auth_required` (sign in with `login`), `handshake_failed`, `not_installed`, or `error` per agent. `capabilities` is the cheaper read (the
 static registry: launch command, `default_model`, `model_selection`, `effort_capable`; no spawn).
 For live advertised model ids use `doctor(agent=<id>, connect_only=true)`.
 
@@ -252,6 +252,7 @@ reported as a `ConfigError`, not a raw decode error.
 | --- | --- |
 | `ACP_SPAWN_FAILED` | Run `doctor`; install the agent (and its ACP shim); confirm it is on PATH. |
 | `ACP_HANDSHAKE_FAILED` | Confirm the ACP launch command; raise `handshake_timeout_s`; check the agent's auth. On Codex with `model` + `effort`, this can mean the bare model was advertised but `reasoning_effort` was not confirmed (Codex ACP 1.8); it is not `MODEL_UNAVAILABLE`. |
+| `AUTH_REQUIRED` / `auth_required` (doctor) | The agent needs an ACP sign-in; run `login agent=<id>` to list its methods, then `login agent=<id> method=<method>`. See [`auth_required` in doctor](#auth_required-in-doctor--auth_required). |
 | `ACP_REFUSED` / `ACP_EMPTY_ANSWER` | The agent answered nothing; check auth, or a local model's tool-calling support. |
 | `model_unavailable` (doctor) | The provider rejected the model id; on Bedrock/Vertex/an enterprise wrapper pin one via `[agents.claude_code.env]` — see [bedrock.md](bedrock.md). |
 | `ACP_TURN_TIMEOUT` | Raise `timeout_s` or `default_timeout_s`; use `mode="async"` for long tasks. |

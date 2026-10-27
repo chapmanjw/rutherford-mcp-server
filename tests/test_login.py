@@ -234,6 +234,8 @@ def test_carries_credential_follows_an_encoded_redirect_url() -> None:
         ["-H", "Authorization: Bearer opaquevalue123"],  # a header as a bare argument
         ["-H", "Authorization:Bearer opaquevalue123"],  # ...with no space after the colon
         ["-H", "X-Api-Key:opaquevalue123"],
+        ["--header=Authorization: Bearer opaquevalue123"],  # a header as a flag's inline value
+        ["--header=Authorization:Bearer opaquevalue123"],
     ],
 )
 def test_a_terminal_method_whose_arguments_pass_a_credential_is_not_offered(
