@@ -106,14 +106,14 @@ def auth_methods_of(init: object) -> list[AuthMethodInfo]:
     if not isinstance(raw, list):
         return []
     methods: list[AuthMethodInfo] = []
-    for entry in raw:
+    for position, entry in enumerate(raw):
         # This runs after EVERY initialize, signing in or not, so a malformed entry must never fail the session:
         # anything unreadable about one method drops that method and nothing else.
         try:
             method = _method_from(entry)
         except Exception as exc:
             # The entry's contents are agent-authored and never logged; its position and the error type are.
-            log_event("auth_method_unreadable", level=logging.WARNING, index=len(methods), error=type(exc).__name__)
+            log_event("auth_method_unreadable", level=logging.WARNING, index=position, error=type(exc).__name__)
             method = None
         if method is not None:
             methods.append(method)
@@ -185,7 +185,9 @@ def _method_from(entry: object) -> AuthMethodInfo | None:
     terminal_env: dict[str, str] = {}
     if kind == "terminal":
         terminal = _exact_terminal(_read(entry, "args"), _read(entry, "env"))
-        if terminal is None:
+        # The argv is returned verbatim in a tool result, which is logged and persisted. It cannot be masked
+        # without presenting a command the agent did not send, so a method passing a credential is refused.
+        if terminal is None or _args_carry_credential(list(terminal[0])):
             return None
         terminal_args, terminal_env = terminal
     link = _read(entry, "link") if kind == "env_var" else None
@@ -229,6 +231,29 @@ def _exact_terminal(args: object, env: object) -> tuple[tuple[str, ...], dict[st
                 return None
             exact_env[key] = value
     return tuple(exact_args), exact_env
+
+
+def _args_carry_credential(args: list[str]) -> bool:
+    """Whether a terminal method's argv passes a credential value.
+
+    Caught: a known credential shape anywhere, an https argument that :func:`carries_credential`, and a flag
+    whose name says it holds a credential (``--token``, ``--api-key``) given a value, either inline
+    (``--token=v``) or as the next argument (``--api-key v``). Such a flag with no value is a switch and passes.
+    """
+    for index, arg in enumerate(args):
+        if _CREDENTIAL_SHAPE.search(arg) or (arg.startswith("https://") and carries_credential(arg)):
+            return True
+        if not arg.startswith("-"):
+            continue
+        name, has_inline, _ = arg.lstrip("-").partition("=")
+        if not _credential_name(name):
+            continue
+        if has_inline:
+            return True
+        following = args[index + 1] if index + 1 < len(args) else None
+        if following is not None and not following.startswith("-"):
+            return True
+    return False
 
 
 def is_auth_required(exc: BaseException) -> bool:
@@ -308,7 +333,9 @@ def carries_credential(url: str) -> bool:
     except ValueError:
         return True  # unparseable: never surfaced anyway, and refusing is the safe answer
     for component in (parts.query, parts.fragment):
-        for name, value in parse_qsl(component, keep_blank_values=True):  # parse_qsl percent-decodes both
+        # `;` is a parameter separator too (``#state=x;access_token=...``), and parse_qsl splits only on `&`. The
+        # swap happens before decoding, so an encoded ``%3B`` inside a value is left alone.
+        for name, value in parse_qsl(component.replace(";", "&"), keep_blank_values=True):  # decodes both
             if _credential_name(name) or _CREDENTIAL_SHAPE.search(value):
                 return True
     return _CREDENTIAL_SHAPE.search(unquote(url)) is not None

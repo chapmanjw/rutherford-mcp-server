@@ -26,7 +26,9 @@ All notable changes to this project are documented in this file. The format is b
   while a sign-in is running joins that job instead of opening a second consent screen. `env_var` and
   `terminal` methods are answered with the variable names to set or the command to run, never an
   agent-supplied value (plus the agent's credential-page link, if it passes the same https and no-credential
-  checks every agent-supplied link gets), and Rutherford never asks for, reads, or stores the secret itself. No other call signs in, so a delegation never opens a browser as a side effect.
+  checks every agent-supplied link gets), and Rutherford never asks for, reads, or stores the secret itself.
+  A `terminal` method whose arguments pass a credential (`--token=...`, `--api-key ...`, a known key shape)
+  is not offered at all. No other call signs in, so a delegation never opens a browser as a side effect.
 
 ### Changed
 

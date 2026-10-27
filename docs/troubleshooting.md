@@ -63,8 +63,9 @@ which no ordinary Rutherford call makes, so this is a one-time setup step rather
   `login` again while it runs returns the same job (`joined=true`); asking for a different method then is
   refused until that job finishes or is cancelled.
 - An `env_var` method answers with the variables to set (`[agents.<id>.env]` or the server's environment),
-  and a `terminal` method answers with the command to run yourself. Rutherford never asks for or stores a
-  credential value.
+  and a `terminal` method answers with the command to run yourself and the names of any variables to set
+  for it (take their values from the agent's documentation). Rutherford never asks for or stores a
+  credential value, and a `terminal` method whose arguments pass one is not offered.
 - The agent caches the credential in its own store, so later sessions open without signing in again.
 
 ### `no_answer` in doctor / `ACP_REFUSED` / `ACP_EMPTY_ANSWER`

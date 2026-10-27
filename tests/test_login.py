@@ -192,10 +192,63 @@ def test_carries_credential_spots_named_parameters_and_shapes() -> None:
         # Vendor token shapes the stderr masker knows, in a value and in a path segment (built, not literal).
         "https://x.test/cb?ref=" + "xox" + "b-1234567890-abcdefghij",
         "https://x.test/" + "glp" + "at-ABCDEFGHIJKLMNOPQRST" + "/cb",
+        # `;` separates parameters as well as `&`, in a fragment and in a query.
+        "https://login.test/#state=x;access_token=opaque",
+        "https://login.test/cb?state=x;access_token=opaque",
     ],
 )
 def test_carries_credential_catches_name_variants_and_decoded_values(url: str) -> None:
     assert carries_credential(url)
+
+
+def test_an_encoded_semicolon_inside_a_value_is_not_a_separator() -> None:
+    assert not carries_credential("https://login.test/cb?state=x%3Baccess_token%3Dopaque")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--token=opaque"],
+        ["--api-key", "opaque"],
+        ["login", "--client-secret", "opaque", "--verbose"],
+        ["--hint", "sk-" + "AbCdEfGhIjKlMnOpQr"],
+        ["--open", "https://login.test/#access_token=opaque"],
+    ],
+)
+def test_a_terminal_method_whose_arguments_pass_a_credential_is_not_offered(args: list[str]) -> None:
+    class Advertised:
+        auth_methods: ClassVar[list[object]] = [{"id": "t", "type": "terminal", "args": args}, {"id": "ok"}]
+
+    assert [method.id for method in auth_methods_of(Advertised())] == ["ok"]
+
+
+def test_a_terminal_credential_flag_without_a_value_is_a_switch() -> None:
+    class Advertised:
+        auth_methods: ClassVar[list[object]] = [
+            {"id": "t", "type": "terminal", "args": ["--login", "--token", "--device-code"]}
+        ]
+
+    assert auth_methods_of(Advertised())[0].terminal_args == ("--login", "--token", "--device-code")
+
+
+def test_an_unreadable_method_logs_its_own_position(monkeypatch: pytest.MonkeyPatch) -> None:
+    import rutherford.acp.auth as auth_module
+
+    class Advertised:
+        auth_methods: ClassVar[list[object]] = [{"id": "bad0"}, {"id": "bad1"}, {"id": "ok"}]
+
+    real = auth_module._method_from
+    indexes: list[object] = []
+
+    def _fail_bad(entry: object) -> AuthMethodInfo | None:
+        if isinstance(entry, dict) and str(entry["id"]).startswith("bad"):
+            raise TypeError("unreadable")
+        return real(entry)
+
+    monkeypatch.setattr(auth_module, "_method_from", _fail_bad)
+    monkeypatch.setattr(auth_module, "log_event", lambda _event, **fields: indexes.append(fields["index"]))
+    assert [method.id for method in auth_methods_of(Advertised())] == ["ok"]
+    assert indexes == [0, 1]
 
 
 def test_a_random_pkce_value_containing_a_key_like_run_is_not_a_credential() -> None:
@@ -389,25 +442,29 @@ async def test_a_signed_in_agent_with_malformed_auth_metadata_still_opens(
 
 
 async def test_a_cancel_and_a_snapshot_landing_together_reap_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The tracker is cancelled with its snapshot already finished: its cancel handler and the snapshot's
+    # The late reap is cancelled in the same tick its snapshot lands: its cancel handler and the snapshot's real
     # fallback callback both see a finished tracker. The one-shot claim lets only one of them reap.
     from rutherford.acp import teardown
 
+    release = asyncio.Event()
     reaps: list[Any] = []
+
+    async def _slow_snapshot(_pid: int) -> list[Any]:
+        await release.wait()
+        return ["fake-descendant"]
+
+    monkeypatch.setattr(teardown, "snapshot_descendants_eagerly", _slow_snapshot)
     monkeypatch.setattr(teardown, "_reap_late_snapshot", lambda task, *, source: reaps.append(task.result()))
-    loop = asyncio.get_running_loop()
-    snapshot: asyncio.Future[list[Any]] = loop.create_future()
-    claim = teardown._ReapClaim()
-    tracker = asyncio.create_task(
-        teardown._reap_late_tracked(snapshot, source="test", claim=claim)  # type: ignore[arg-type]
-    )
+    owner: set[asyncio.Task[Any]] = set()
+    await teardown.snapshot_within_deadline(1234, timeout_s=0.05, source="test", owner=owner)
+    late_reap = next(task for task in owner if task.get_name() == "rutherford-late-reap-test")
     await asyncio.sleep(0)  # the tracker is now parked on the snapshot
-    snapshot.set_result(["fake-descendant"])
-    tracker.cancel()  # in the same tick as the snapshot's completion
+    release.set()  # the snapshot finishes on the next tick...
+    late_reap.cancel()  # ...and the tracker is cancelled in that same tick
     with pytest.raises(asyncio.CancelledError):
-        await tracker
-    if claim.take():  # what the fallback callback does once it sees the tracker finished
-        reaps.append(["fallback"])
+        await late_reap
+    for _ in range(5):
+        await asyncio.sleep(0)  # let the snapshot's done callbacks, the fallback among them, run
     assert reaps == [["fake-descendant"]]  # exactly one reap, by the cancel handler
 
 
