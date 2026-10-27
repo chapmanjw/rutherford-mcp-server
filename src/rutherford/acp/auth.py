@@ -237,8 +237,8 @@ def _exact_terminal(args: object, env: object) -> tuple[tuple[str, ...], dict[st
     return tuple(exact_args), exact_env
 
 
-#: A URL of any scheme, in any case, anywhere in an argument (``--open=HTTPS://...`` included).
-_ANY_URL = re.compile(r"(?i)[a-z][a-z0-9+.-]*://\S+")
+#: Where a URL of any scheme, in any case, starts inside an argument (``--open=HTTPS://...`` included).
+_URL_START = re.compile(r"(?i)[a-z][a-z0-9+.-]*://")
 #: What separates a flag's name from an inline value: ``--token=v`` and ``--token:v``.
 _FLAG_VALUE_SPLIT = re.compile(r"[=:]")
 
@@ -246,22 +246,25 @@ _FLAG_VALUE_SPLIT = re.compile(r"[=:]")
 def _args_carry_credential(args: list[str]) -> bool:
     """Whether a terminal method's argv passes a credential value.
 
-    Caught: a known credential shape anywhere, a URL anywhere in an argument that :func:`carries_credential`,
-    and a flag whose name says it holds a credential (``--token``, ``--api-key``) given a value, inline
-    (``--token=v``, ``--token:v``) or as the next argument (``--api-key v``). Such a flag with no value is a
-    switch and passes. Name matching is broad on purpose (``--token-file path`` is refused too): refusing a
-    harmless method costs a sign-in path, passing a credential leaks it.
+    Caught: a known credential shape anywhere, a URL anywhere in an argument (nested ones included) that
+    :func:`carries_credential`, a bare ``api_key=v`` assignment, and a flag whose name says it holds a
+    credential (``--token``, ``--api-key``) given a value, inline (``--token=v``, ``--token:v``) or as the next
+    argument (``--api-key v``). Such a flag with no value is a switch and passes. Name matching is broad on
+    purpose (``--token-file path`` is refused too): refusing a harmless method costs a sign-in path, passing a
+    credential leaks it.
     """
     for index, arg in enumerate(args):
-        if _CREDENTIAL_SHAPE.search(arg) or any(carries_credential(url) for url in _ANY_URL.findall(arg)):
+        # Each scheme start is checked from there to the end, so a URL nested in another's query (or a second
+        # one later in a comma list) gets its own check instead of reading as an opaque value.
+        if _CREDENTIAL_SHAPE.search(arg) or any(carries_credential(arg[m.start() :]) for m in _URL_START.finditer(arg)):
             return True
-        if not arg.startswith("-"):
-            continue
         name, *inline = _FLAG_VALUE_SPLIT.split(arg.lstrip("-"), maxsplit=1)
         if not _credential_name(name):
             continue
         if inline:
-            return True
+            return True  # `--token=v`, `--token:v`, or a bare `api_key=v`
+        if not arg.startswith("-"):
+            continue
         following = args[index + 1] if index + 1 < len(args) else None
         if following is not None and not following.startswith("-"):
             return True
@@ -342,6 +345,8 @@ def carries_credential(url: str) -> bool:
     """
     try:
         parts = urlsplit(url)
+        if parts.password:
+            return True  # `https://user:secret@host/` (a link also fails is_safe_link; a terminal argument would not)
     except ValueError:
         return True  # unparseable: never surfaced anyway, and refusing is the safe answer
     for component in (parts.query, parts.fragment):

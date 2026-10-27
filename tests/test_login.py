@@ -217,6 +217,10 @@ def test_an_encoded_semicolon_inside_a_value_is_not_a_separator() -> None:
         ["--open", "HTTPS://login.test/#access_token=opaque"],
         ["--token:opaque"],
         ["--token-file", "/path"],  # broad on purpose: a credential-named flag with a value is refused
+        ["--open=https://a.test/?next=https://b.test/?access_token=opaque"],  # a URL nested in another's query
+        ["--urls=https://a.test/?x=1,https://b.test/?access_token=opaque"],
+        ["--open", "https://admin:hunter2opaque@login.test/"],  # a password in userinfo
+        ["login", "api_key=opaque"],  # a bare assignment, no leading dash
     ],
 )
 def test_a_terminal_method_whose_arguments_pass_a_credential_is_not_offered(
