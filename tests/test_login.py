@@ -329,7 +329,11 @@ def test_is_auth_required_needs_the_reserved_code_and_auth_wording() -> None:
     for message in (*not_signin, "invalid token at line 3 column 5", "Invalid tokenizer configuration"):
         assert not is_auth_required(RequestError(-32000, message))
     signed_out = ("Not signed in", "Unauthenticated", "Credentials expired", "Sign-in required", "Unauthorized")
-    for message in (*signed_out, "Not authorized", "Invalid auth token", "Expired access token"):
+    tokens = [
+        *("Invalid auth token", "Expired access token", "Expired refresh token", "Invalid bearer token"),
+        *("invalid access-token", "error=invalid_token", "Token expired", "Your token has expired"),
+    ]
+    for message in (*signed_out, "Not authorized", *tokens):
         assert is_auth_required(RequestError(-32000, message))
     # The agent's wording may sit in `data` under a generic message.
     assert is_auth_required(RequestError(-32000, "Server error", {"message": "No authentication method selected."}))
