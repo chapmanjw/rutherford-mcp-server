@@ -241,6 +241,19 @@ def _exact_terminal(args: object, env: object) -> tuple[tuple[str, ...], dict[st
 _URL_START = re.compile(r"(?i)[a-z][a-z0-9+.-]*://")
 #: What separates a flag's name from an inline value: ``--token=v`` and ``--token:v``.
 _FLAG_VALUE_SPLIT = re.compile(r"[=:]")
+#: What separates a bare argument's name from its value: ``api_key=v`` only.
+_ASSIGNMENT_SPLIT = re.compile(r"=")
+
+
+def _url_arg_carries_credential(url: str) -> bool:
+    """:func:`carries_credential`, plus any userinfo at all: in a terminal argument (unlike a link, which
+    :func:`is_safe_link` refuses for any ``@``), ``https://<token>@host/`` is the usual git / PAT form."""
+    try:
+        if urlsplit(url).username:
+            return True
+    except ValueError:
+        return True
+    return carries_credential(url)
 
 
 def _args_carry_credential(args: list[str]) -> bool:
@@ -256,14 +269,19 @@ def _args_carry_credential(args: list[str]) -> bool:
     for index, arg in enumerate(args):
         # Each scheme start is checked from there to the end, so a URL nested in another's query (or a second
         # one later in a comma list) gets its own check instead of reading as an opaque value.
-        if _CREDENTIAL_SHAPE.search(arg) or any(carries_credential(arg[m.start() :]) for m in _URL_START.finditer(arg)):
+        if _CREDENTIAL_SHAPE.search(arg) or any(
+            _url_arg_carries_credential(arg[m.start() :]) for m in _URL_START.finditer(arg)
+        ):
             return True
-        name, *inline = _FLAG_VALUE_SPLIT.split(arg.lstrip("-"), maxsplit=1)
+        # A flag's value follows `=` or `:`; a bare argument is an assignment only with `=`, since `auth:login`
+        # is an ordinary `topic:command` subcommand.
+        is_flag = arg.startswith("-")
+        name, *inline = (_FLAG_VALUE_SPLIT if is_flag else _ASSIGNMENT_SPLIT).split(arg.lstrip("-"), maxsplit=1)
         if not _credential_name(name):
             continue
         if inline:
             return True  # `--token=v`, `--token:v`, or a bare `api_key=v`
-        if not arg.startswith("-"):
+        if not is_flag:
             continue
         following = args[index + 1] if index + 1 < len(args) else None
         if following is not None and not following.startswith("-"):
@@ -335,7 +353,11 @@ def _credential_name(name: str) -> bool:
     return folded in _CREDENTIAL_NAMES_EXACT or any(part in folded for part in _CREDENTIAL_NAME_PARTS)
 
 
-def carries_credential(url: str) -> bool:
+#: How many levels of URL-inside-a-parameter :func:`carries_credential` follows.
+_MAX_NESTED_URL_DEPTH = 3
+
+
+def carries_credential(url: str, *, _depth: int = 0) -> bool:
     """Whether ``url`` carries a credential, judged on the percent-DECODED URL.
 
     A query or fragment parameter whose name says it holds a credential, or a known credential shape (JWT, a
@@ -354,6 +376,10 @@ def carries_credential(url: str) -> bool:
         # swap happens before decoding, so an encoded ``%3B`` inside a value is left alone.
         for name, value in parse_qsl(component.replace(";", "&"), keep_blank_values=True):  # decodes both
             if _credential_name(name) or _CREDENTIAL_SHAPE.search(value):
+                return True
+            # A percent-encoded redirect (`?next=https%3A%2F%2F...`) decodes to a URL of its own: check it too,
+            # a few levels deep at most.
+            if _depth < _MAX_NESTED_URL_DEPTH and "://" in value and carries_credential(value, _depth=_depth + 1):
                 return True
     return _CREDENTIAL_SHAPE.search(unquote(url)) is not None
 

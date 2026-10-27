@@ -18,24 +18,25 @@ All notable changes to this project are documented in this file. The format is b
 - **New tool: `login`** signs an agent in once through ACP `authenticate`, for agents that open no session
   until a client has done so. Called with only `agent`, it is read-only and lists the sign-in methods the
   agent advertises. With `method`, it starts the sign-in as a background job and returns a `job_id` to poll,
-  plus the sign-in link when the agent prints one; the job finishes `authenticated` once a session opens with the new
-  credential (lifting any cooldown bench the seat picked up while signed out), or fails `AUTH_FAILED` if the
-  sign-in is declined, times out, or does not take; a confirming session that fails for another reason
-  reports that handshake error instead. The link is taken only
-  from a sign-in prompt line, so other URLs the agent logs are not mistaken for it, and a repeated `login`
-  while a sign-in is running joins that job instead of opening a second consent screen. `env_var` and
+  plus the sign-in link when the agent prints one; the job finishes `authenticated` once a session opens
+  with the new credential (lifting any cooldown bench the seat picked up while signed out), or fails
+  `AUTH_FAILED` if the sign-in is declined, times out, or does not take; a confirming session that fails for
+  another reason reports that handshake error instead. The link is taken only from a sign-in prompt line, so
+  other URLs the agent logs are not mistaken for it, and a repeated `login` while a sign-in is running joins
+  that job instead of opening a second consent screen. `env_var` and
   `terminal` methods are answered with the variable names to set or the command to run, never an
   agent-supplied value (plus the agent's credential-page link, if it passes the same https and no-credential
   checks every agent-supplied link gets), and Rutherford never asks for, reads, or stores the secret itself.
-  A `terminal` method whose arguments pass a credential (`--token=...`, `--api-key ...`, a known key shape,
-  or a URL carrying one) is not offered at all; flag-name matching is broad, so `--token-file path` is
-  refused too, and the server log records `auth_method_refused` with the method id. No other call signs in, so a delegation never opens a browser as a side effect.
+  A `terminal` method whose arguments pass a credential (`--token=...`, `--api-key ...`, a bare
+  `api_key=...`, a known key shape, or a URL carrying one) is not offered at all; flag-name matching is
+  broad, so `--token-file path` is refused too, and the server log records `auth_method_refused` with the
+  method id. No other call signs in, so a delegation never opens a browser as a side effect.
 
 ### Changed
 
 - An agent that refuses `session/new` or `session/load` with ACP's "Authentication required" now fails with
-  `AUTH_REQUIRED` instead of `ACP_HANDSHAKE_FAILED` / `RESUME_FAILED`, naming the sign-in methods it offers. `doctor` reports it as
-  `auth_required` with a pointer to `login`, rather than as a broken handshake.
+  `AUTH_REQUIRED` instead of `ACP_HANDSHAKE_FAILED` / `RESUME_FAILED`, naming the sign-in methods it offers.
+  `doctor` reports it as `auth_required` with a pointer to `login`, rather than as a broken handshake.
 
 ### Security
 

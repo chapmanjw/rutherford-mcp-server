@@ -205,6 +205,11 @@ def test_an_encoded_semicolon_inside_a_value_is_not_a_separator() -> None:
     assert not carries_credential("https://login.test/cb?state=x%3Baccess_token%3Dopaque")
 
 
+def test_carries_credential_follows_an_encoded_redirect_url() -> None:
+    assert carries_credential("https://login.test/?next=https%3A%2F%2Fb.test%2F%3Faccess_token%3Dopaque")
+    assert not carries_credential("https://login.test/?redirect_uri=https%3A%2F%2Fb.test%2Fcb%3Fstate%3Ds")
+
+
 @pytest.mark.parametrize(
     "args",
     [
@@ -221,6 +226,9 @@ def test_an_encoded_semicolon_inside_a_value_is_not_a_separator() -> None:
         ["--urls=https://a.test/?x=1,https://b.test/?access_token=opaque"],
         ["--open", "https://admin:hunter2opaque@login.test/"],  # a password in userinfo
         ["login", "api_key=opaque"],  # a bare assignment, no leading dash
+        # A percent-encoded redirect is a nested URL too.
+        ["--open", "https://login.test/?next=https%3A%2F%2Fb.test%2F%3Faccess_token%3Dopaque"],
+        ["--open", "https://opaquetoken@git.test/repo"],  # a token as the userinfo username
     ],
 )
 def test_a_terminal_method_whose_arguments_pass_a_credential_is_not_offered(
@@ -244,10 +252,14 @@ def test_a_terminal_method_whose_arguments_pass_a_credential_is_not_offered(
 def test_a_terminal_credential_flag_without_a_value_is_a_switch() -> None:
     class Advertised:
         auth_methods: ClassVar[list[object]] = [
-            {"id": "t", "type": "terminal", "args": ["--login", "--token", "--device-code"]}
+            {"id": "t", "type": "terminal", "args": ["--login", "--token", "--device-code"]},
+            # A `topic:command` subcommand and a bare non-credential assignment are ordinary arguments.
+            {"id": "sub", "type": "terminal", "args": ["auth:login", "session:start", "mode=interactive"]},
         ]
 
-    assert auth_methods_of(Advertised())[0].terminal_args == ("--login", "--token", "--device-code")
+    methods = auth_methods_of(Advertised())
+    assert methods[0].terminal_args == ("--login", "--token", "--device-code")
+    assert methods[1].terminal_args == ("auth:login", "session:start", "mode=interactive")
 
 
 def test_an_unreadable_method_logs_its_own_position(monkeypatch: pytest.MonkeyPatch) -> None:
