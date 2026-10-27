@@ -575,8 +575,11 @@ class ACPSession:
     def _scan_chunk_for_urls(self, chunk: bytes) -> None:
         """Scan the COMPLETE stderr lines in ``chunk`` (plus the carried partial line) for a sign-in link."""
         data = self._url_carry + chunk
-        head, newline, tail = data.rpartition(b"\n")
-        if newline:
+        # A bare `\r` ends a line too, as in `_strip_stderr_controls`: an agent that prints its prompt with a
+        # carriage return and then waits for the browser must still have the link scanned now, not at exit.
+        end = max(data.rfind(b"\n"), data.rfind(b"\r"))
+        head, tail = (data[:end], data[end + 1 :]) if end >= 0 else (b"", data)
+        if end >= 0:
             self._scan_signin_urls(head)
         # An over-long partial line keeps only its END, bounded, rather than being buffered without limit or
         # dropped: a prompt appended to a long log line ("<16 KiB of noise> Open ... https://...") still reaches

@@ -332,6 +332,7 @@ def test_is_auth_required_needs_the_reserved_code_and_auth_wording() -> None:
     tokens = [
         *("Invalid auth token", "Expired access token", "Expired refresh token", "Invalid bearer token"),
         *("invalid access-token", "error=invalid_token", "Token expired", "Your token has expired"),
+        *("invalid access  token", "token is expired", "access token is expired"),
     ]
     for message in (*signed_out, "Not authorized", *tokens):
         assert is_auth_required(RequestError(-32000, message))
@@ -663,6 +664,20 @@ def test_a_pkce_value_the_stderr_masker_would_mangle_keeps_its_link(tmp_path: Pa
     link = "https://login.test/auth?response_type=code&code_challenge=QI2p-sk-AbCdEfGhIjKlMnOpQr&state=s"
     session._scan_chunk_for_urls(f"Open this link to sign in: {link}\n".encode())
     assert session.signin_urls == [link]
+
+
+def test_a_prompt_ended_by_a_bare_carriage_return_is_scanned_at_once(tmp_path: Path) -> None:
+    # An agent that prints its prompt with `\r` and then waits for the browser must not hold the link back
+    # until it writes more or exits.
+    session = _session(_descriptor(tmp_path / "marker"), tmp_path, auth_method="fake-oauth")
+    session._scan_chunk_for_urls(b"Open this link to sign in: https://login.test/oauth?state=s\r")
+    assert session.signin_urls == ["https://login.test/oauth?state=s"]
+    assert session._url_carry == b""
+    # A CRLF split across reads still yields one line, not a stray empty one with the link lost.
+    other = _session(_descriptor(tmp_path / "marker2"), tmp_path, auth_method="fake-oauth")
+    other._scan_chunk_for_urls(b"Open this link to sign in: https://login.test/b\r")
+    other._scan_chunk_for_urls(b"\nI0001 waiting\n")
+    assert other.signin_urls == ["https://login.test/b"]
 
 
 def test_a_signin_link_carrying_a_jwt_is_dropped(tmp_path: Path) -> None:
