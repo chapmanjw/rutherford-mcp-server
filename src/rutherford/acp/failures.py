@@ -38,6 +38,9 @@ _UNHEALTHY: frozenset[ErrorCode] = frozenset(
         ErrorCode.ACP_TURN_ERROR,
         ErrorCode.RATE_LIMITED,
         ErrorCode.AUTH_FAILED,
+        # A seat with no credential cannot answer anything until someone signs in, so it benches the same way
+        # the handshake failure it used to be reported as did.
+        ErrorCode.AUTH_REQUIRED,
     }
 )
 

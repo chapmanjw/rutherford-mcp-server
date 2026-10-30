@@ -48,6 +48,7 @@ from .tools.debate import debate_tool
 from .tools.delegate import delegate_tool
 from .tools.discover import discover_tool
 from .tools.jobs import activity_tool, cancel_job_tool, job_result_tool, job_status_tool, list_jobs_tool
+from .tools.login import login_tool
 from .tools.panels import reload_panels_tool
 from .tools.plan import plan_tool
 from .tools.review import review_tool
@@ -83,7 +84,8 @@ mcp: FastMCP = FastMCP(
         "(mode=async), enumerated with `list_jobs`, polled with `job_status` / `job_result`, and cancelled "
         "with `cancel_job`; `activity` is the focused snapshot of just the jobs in flight right now. First "
         "time here? `setup` shows where config lives and scaffolds a starter config.toml, and `discover` "
-        "finds ACP agents you already have installed (via the community registry) and proposes config for them."
+        "finds ACP agents you already have installed (via the community registry) and proposes config for them. "
+        "An agent `doctor` reports as `auth_required` is signed in once with `login`."
     ),
 )
 
@@ -618,14 +620,14 @@ async def doctor(agent: str | None = None, timeout_s: float = 60.0, connect_only
     """Probe each agent (or one named `agent`) with a real read-only ACP round trip and report conformance.
 
     The trustworthy health check for ACP agents: whether each spawns, handshakes, and answers. Each report
-    is ok / no_answer / model_unavailable / handshake_failed / not_installed / error. `model_unavailable`
-    means spawn + handshake succeeded (the agent is reachable) but the harness/provider rejected the model on
-    the turn (a model/provider config issue, e.g. a Claude Code on AWS Bedrock / Vertex), so it is NOT reported
-    as a broken agent. Slower
-    than `capabilities` (it makes a real call per agent); run it to see which of the roster actually drive on
-    this machine. `connect_only`
-    runs the lighter handshake-only check (spawn + handshake, no prompt) and reports reachable /
-    handshake_failed / not_installed plus each agent's advertised models -- it shows whether Rutherford can
+    is ok / no_answer / model_unavailable / handshake_failed / auth_required / not_installed / error.
+    `auth_required` means the agent is installed but holds no credential yet; sign it in once with `login`.
+    `model_unavailable` means spawn + handshake succeeded (the agent is reachable) but the harness/provider
+    rejected the model on the turn (a model/provider config issue, e.g. a Claude Code on AWS Bedrock / Vertex),
+    so it is NOT reported as a broken agent. Slower than `capabilities` (it makes a real call per agent); run it
+    to see which of the roster actually drive on this machine. `connect_only` runs the lighter handshake-only
+    check (spawn + handshake, no prompt) and reports reachable / handshake_failed / auth_required /
+    not_installed plus each agent's advertised models -- it shows whether Rutherford can
     talk to and configure an agent even when a model call would fail for a reason outside ACP (an auth /
     entitlement / quota issue, e.g. Grok without a SuperGrok subscription).
 
@@ -635,6 +637,33 @@ async def doctor(agent: str | None = None, timeout_s: float = 60.0, connect_only
     `setup install_adapters=true`, to set the adapter up.
     """
     return await _guarded(doctor_tool(get_app(), agent=agent, timeout_s=timeout_s, connect_only=connect_only))
+
+
+@mcp.tool
+async def login(agent: str, method: str | None = None, wait_s: float = 20.0, timeout_s: float = 300.0) -> str:
+    """Sign an ACP agent in once, for an agent that `doctor` reports as `auth_required`.
+
+    Some agents open no session until a client has called ACP `authenticate`, then cache the credential
+    themselves (Google Antigravity is one). No other Rutherford call signs in; this is the explicit place.
+
+    Without `method` it is read-only: `status=authenticated` if a session already opens, else
+    `status=method_required` with the agent's advertised `methods` (`id`, `name`, `kind`). With `method` (an
+    `agent`-kind id) it starts the sign-in as a background job, waits up to `wait_s` for the agent to print its
+    sign-in link, and returns `status=pending` with `job_id` and `signin_urls` -- give the first link to the
+    user, who completes the sign-in in a browser, then poll `job_status` / `job_result`. The job finishes
+    `authenticated` once a session opens with the new credential (lifting any cooldown bench), fails with
+    `AUTH_FAILED` (declined, the agent still refused a session afterwards, or no sign-in within `timeout_s`,
+    which bounds the authenticate step), or with the agent's own handshake error if the confirming session
+    fails for another reason. `status=authenticated` without `method` means a session opens and no ACP
+    sign-in is needed; a turn may still need a provider key, which `doctor` checks. A repeated `login` while
+    one is running returns that job (`joined=true`) instead of starting another (and `status=cancelled` if
+    `cancel_job` ends it while the call waits); a different `method` then is
+    refused with `INVALID_INPUT` until it finishes or is cancelled. The links are agent-authored, taken only
+    from sign-in prompt lines, and never opened by Rutherford. An `env_var`
+    method returns the variables to set (`status=configure_env`) and a `terminal` method returns the command to
+    run (`status=run_in_terminal`); Rutherford never asks for or stores a credential value.
+    """
+    return await _guarded(login_tool(get_app(), agent=agent, method=method, wait_s=wait_s, timeout_s=timeout_s))
 
 
 @mcp.tool

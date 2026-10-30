@@ -76,6 +76,15 @@ class CooldownTracker:
             return
         self._failures.pop(agent_id, None)
 
+    def clear(self, agent_id: str) -> None:
+        """Lift ``agent_id``'s bench and drop its failure streak at once.
+
+        For a fix the operator made explicitly -- a successful ``login`` on a seat benched for being signed
+        out -- where waiting out the time-based bench would only keep a now-working agent out of panels.
+        """
+        self._failures.pop(agent_id, None)
+        self._benched_until.pop(agent_id, None)
+
     def is_benched(self, agent_id: str) -> bool:
         """Whether ``agent_id`` is currently benched (its bench has not yet lifted)."""
         if not self.enabled:

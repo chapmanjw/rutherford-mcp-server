@@ -4,6 +4,54 @@ All notable changes to this project are documented in this file. The format is b
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [3.3.0] - 2026-10-26
+
+### Added
+
+- **New built-in agent: `antigravity`** (Google Antigravity's ACP server), bringing the built-in roster to 21.
+  Google now sends individual Gemini accounts to Antigravity, and Gemini CLI's `--acp` mode refuses them with
+  "no longer supported for Gemini Code Assist for individuals". The server is a standalone Google-signed binary
+  from the ACP registry (`agy_acp_server.exe` on Windows, `agy_acp_server.par` on macOS and Linux), separate
+  from the `agy` CLI, and it is not installed onto PATH: add its directory to PATH or set
+  `[agents.antigravity] command` to the full path. It needs one Google sign-in with the new `login` tool;
+  after that the server caches its credential and Rutherford's sessions open without further prompts.
+- **New tool: `login`** signs an agent in once through ACP `authenticate`, for agents that open no session
+  until a client has done so. Called with only `agent`, it is read-only and lists the sign-in methods the
+  agent advertises. With `method`, it starts the sign-in as a background job and returns a `job_id` to poll,
+  plus the sign-in link when the agent prints one; the job finishes `authenticated` once a session opens
+  with the new credential (lifting any cooldown bench the seat picked up while signed out), or fails
+  `AUTH_FAILED` if the sign-in is declined, times out, or does not take; a confirming session that fails for
+  another reason reports that handshake error instead. The link is taken only from a sign-in prompt line, so
+  other URLs the agent logs are not mistaken for it, and a repeated `login` while a sign-in is running joins
+  that job instead of opening a second consent screen. `env_var` and
+  `terminal` methods are answered with the variable names to set or the command to run, never an
+  agent-supplied value (plus the agent's credential-page link, if it passes the same https and no-credential
+  checks every agent-supplied link gets), and Rutherford never asks for, reads, or stores the secret itself.
+  A `terminal` method whose arguments pass a credential (`--token=...`, `--api-key ...`, a bare
+  `api_key=...`, an `Authorization: ...` header, bare or as `--header=...`, a known key shape, or a URL
+  carrying one, including in its userinfo or in an encoded redirect nested inside it) is not offered at
+  all; flag-name matching is broad, so `--token-file path` is refused too, and the server log records
+  `auth_method_refused` with the method id. No other call signs in, so a delegation never opens a browser
+  as a side effect.
+
+### Changed
+
+- An agent that refuses `session/new` or `session/load` with ACP's "Authentication required" now fails with
+  `AUTH_REQUIRED` instead of `ACP_HANDSHAKE_FAILED` / `RESUME_FAILED`, naming the sign-in methods it offers.
+  `doctor` reports it as `auth_required` with a pointer to `login`, rather than as a broken handshake. The
+  `-32000` code alone is not enough, since JSON-RPC also uses it for generic server errors: the error must
+  say a sign-in is missing ("authentication required", "not signed in", "credentials expired"), so a
+  failing auth backend stays `ACP_HANDSHAKE_FAILED`.
+
+### Security
+
+- The `fastmcp` floor is raised to 3.4.10, the first 3.x release patched for GHSA-7xgj-8392-5q4r, in which
+  post-transform component authorization was skipped on direct calls. A fresh install can no longer resolve
+  an affected release.
+- The locked dependency set CI tests against moves to patched releases of PyJWT (2.15.1), anyio (4.14.2),
+  mcp (1.30.0), certifi (2026.10.19), and opentelemetry-api (1.45.1), clearing the open advisories against
+  each.
+
 ## [3.2.0] - 2026-09-05
 
 ### Added

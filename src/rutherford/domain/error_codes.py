@@ -18,9 +18,10 @@ class ErrorCode(StrEnum):
 
     #: The target CLI's binary is not installed or not on PATH.
     BINARY_NOT_FOUND = "BINARY_NOT_FOUND"
-    #: The target CLI is installed but not authenticated, and cannot log in non-interactively.
-    #: Reserved (not currently raised): auth failures surface pre-run as panel skip reasons or
-    #: mid-run as AUTH_FAILED, but the code stays in the documented contract.
+    #: The agent is installed and speaks ACP but refused ``session/new`` (or ``session/load``) with ACP's
+    #: "Authentication required":
+    #: it holds no credential yet. Pre-prompt, so re-execution-safe. Fixed by a one-time sign-in with the
+    #: ``login`` tool (or the agent's own login), not by a reinstall.
     AUTH_REQUIRED = "AUTH_REQUIRED"
     #: A write or yolo delegation targeted a workspace that is not on the trusted allowlist.
     WORKSPACE_NOT_TRUSTED = "WORKSPACE_NOT_TRUSTED"
@@ -38,8 +39,8 @@ class ErrorCode(StrEnum):
     #: on a different target (a refinement of a non-zero exit).
     RATE_LIMITED = "RATE_LIMITED"
     #: The CLI was authenticated enough to start but the call was rejected for auth (a 401/403,
-    #: an expired or invalid credential) -- distinct from BINARY_NOT_FOUND/AUTH_REQUIRED, which are
-    #: pre-run. A different target may still answer.
+    #: an expired or invalid credential), or an ACP ``authenticate`` sign-in did not complete --
+    #: distinct from BINARY_NOT_FOUND/AUTH_REQUIRED, which are pre-run. A different target may still answer.
     AUTH_FAILED = "AUTH_FAILED"
     #: The prompt plus context exceeded the model's window. A different target with a larger window
     #: may still answer (a refinement of a non-zero exit).

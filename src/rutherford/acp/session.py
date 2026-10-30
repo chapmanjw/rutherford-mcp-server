@@ -19,7 +19,7 @@ import os
 import re
 import subprocess
 import time
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, TypeVar
@@ -44,6 +44,14 @@ from ..domain.enums import Effort, ReexecutionSafety
 from ..domain.error_codes import ErrorCode
 from ..domain.models import Cost, DelegationResult, ErrorInfo, Provenance, Target
 from ..runtime.depth import child_env
+from .auth import (
+    MAX_SIGNIN_URLS,
+    AuthMethodInfo,
+    auth_methods_of,
+    describe_methods,
+    extract_urls,
+    is_auth_required,
+)
 from .client import RutherfordACPClient
 from .descriptors import AgentDescriptor
 from .effort import (
@@ -92,6 +100,13 @@ _SNAPSHOT_TIMEOUT_S = 3.0
 _TERMINAL_SHUTDOWN_TIMEOUT_S = 4.0
 _DESCENDANT_REAP_TIMEOUT_S = 3.0
 _DIRECT_PROCESS_KILL_WAIT_S = 2.0
+#: The default budget for an ACP ``authenticate`` call. It waits on a person completing a browser sign-in, so
+#: it is minutes rather than a handshake step's seconds.
+_AUTH_TIMEOUT_S = 300.0
+#: The longest incomplete stderr line carried between chunks for the sign-in link scan. Past it, only the
+#: last ``_URL_CARRY_KEEP`` bytes are kept, so memory stays bounded while a prompt at the line's end survives.
+_URL_CARRY_CAP = 16 * 1024
+_URL_CARRY_KEEP = 4 * 1024
 #: The transport runs only after Rutherford has hard-killed its direct child, so this bounds connection cleanup.
 _TRANSPORT_CLOSE_TIMEOUT_S = 5.0
 #: ``close`` returns after this caller budget while its instance-owned teardown task continues in the background.
@@ -230,34 +245,50 @@ def _fault_reason(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
 
-def _sanitize_stderr(raw: bytes) -> str:
-    """Decode and neutralize captured agent stderr for inclusion in a failure detail.
+def _strip_stderr_controls(raw: bytes) -> str:
+    """Decode agent stderr and strip escape sequences and controls -- stage 1 of :func:`_neutralize_stderr`.
+
+    Line endings are normalized BEFORE the control strip, not after. `\\r` is itself a control character, so
+    stripping first deleted it and made the normalization dead code -- and worse, silently joined the two
+    halves of a progress line ("Downloading...\\rDone" became "Downloading...Done") instead of separating
+    them. A lone CR is a line break here because that is how a progress writer uses it.
+    """
+    text = _ANSI_ESCAPE.sub("", raw.decode("utf-8", errors="replace"))
+    return _CONTROL_CHARS.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+
+
+def _neutralize_stderr(raw: bytes) -> str:
+    """Decode agent stderr, strip escapes and controls, and mask credential shapes -- with NO length cap.
 
     The bytes are produced by a spawned agent, so they are untrusted in the terminal-rendering sense even
-    though Rutherford chose the binary: strip escape sequences and controls, mask credential shapes, then cap
-    lines and bytes. This is a DIAGNOSTIC breadcrumb, not a log sink, and it is fenced by the caller so the
-    boundary of agent-authored text is unambiguous to whoever (or whatever) reads the error.
+    though Rutherford chose the binary. This is the shared front half of :func:`_sanitize_stderr` (which then
+    caps the text for a failure detail) and of the sign-in link scan, which must see every chunk rather than
+    a capped head. The output is a DIAGNOSTIC breadcrumb, not a log sink, and callers fence it so the boundary
+    of agent-authored text is unambiguous to whoever (or whatever) reads it.
 
-    The three stages are ORDERED, and the order carries weight:
+    The stages are ORDERED, and the order carries weight:
 
     1. Escapes and controls go first, so a credential cannot be split by an embedded escape sequence to slip
        past the masking below -- stripping after redaction would let ``sk-\\x1b[0mABC...`` evade the pattern
        and then reassemble on screen.
-    2. Masking runs on the full text, BEFORE the caps, so a secret is never half-clipped into an unmatched
+    2. Masking runs on the full text, BEFORE any cap, so a secret is never half-clipped into an unmatched
        fragment that the patterns no longer recognize.
-    3. The caps are last, bounding what a blob can do to an error envelope.
     """
-    # Line endings are normalized BEFORE the control strip, not after. `\r` is itself a control character, so
-    # stripping first deleted it and made the normalization dead code -- and worse, silently joined the two
-    # halves of a progress line ("Downloading...\rDone" became "Downloading...Done") instead of separating
-    # them. A lone CR is a line break here because that is how a progress writer uses it.
-    text = _ANSI_ESCAPE.sub("", raw.decode("utf-8", errors="replace"))
-    text = _CONTROL_CHARS.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+    text = _strip_stderr_controls(raw)
     for pattern in _SECRET_PATTERNS:
         # Group 1, where a pattern has one, is the NAME half (the header, the variable, the query key). Keeping
         # it is the difference between "a token leaked here" and an unreadable line -- the diagnostic survives
         # while the value does not.
         text = pattern.sub(lambda m: f"{m.group(1)}{_REDACTED}" if m.lastindex else _REDACTED, text)
+    return text
+
+
+def _sanitize_stderr(raw: bytes) -> str:
+    """Neutralize captured agent stderr (:func:`_neutralize_stderr`), then cap it for a failure detail.
+
+    The caps are last, bounding what a blob can do to an error envelope.
+    """
+    text = _neutralize_stderr(raw)
     lines = [line.rstrip() for line in text.split("\n") if line.strip()]
     if not lines:
         return ""
@@ -306,9 +337,27 @@ class ACPSession:
         sandbox_root: str | None = None,
         resume_session_id: str | None = None,
         handshake_timeout_s: float | None = None,
+        auth_method: str | None = None,
+        auth_timeout_s: float = _AUTH_TIMEOUT_S,
     ) -> None:
         self._descriptor = descriptor
         self._policy = policy
+        # Sign in with this ACP auth method between initialize and session/new (the ``login`` tool's path). The
+        # agent runs its own flow -- typically a browser OAuth round trip that waits on the user -- so the call
+        # gets its own, much longer budget than a handshake step. ``None`` (every ordinary session) never calls
+        # authenticate: a delegation must not pop a browser on the user's machine as a side effect.
+        self._auth_method = auth_method
+        self._auth_timeout = auth_timeout_s
+        #: The sign-in methods the agent advertised at initialize, read whether or not this session signs in, so
+        #: an AUTH_REQUIRED failure can name them and ``login`` can offer them. ``[]`` before initialize.
+        self._auth_methods: list[AuthMethodInfo] = []
+        #: The https links the agent printed on stderr during a sign-in (the URL to open), collected from EVERY
+        #: stderr line rather than the capped head, because a chatty agent can log far more than the cap
+        #: before it reaches the link. Only populated when ``auth_method`` is set.
+        self._signin_urls: list[str] = []
+        #: The incomplete trailing stderr line carried between chunks for that scan, so a link split across two
+        #: reads is matched whole instead of as a truncated prefix.
+        self._url_carry = b""
         # The per-step budget for each handshake call (initialize / new_session / load_session / set_model):
         # the descriptor's default, unless a caller overrides it. A handshake-only connection probe passes its
         # own budget here so a generous local-model floor actually reaches the handshake (descriptor's fixed
@@ -388,6 +437,10 @@ class ACPSession:
         self._pid: int | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._close_task: asyncio.Task[None] | None = None
+        #: Teardown stages still running for this session -- the direct-process wait, terminal shutdown,
+        #: descendant reap, transport close. Each is bounded only in how long the close body WAITS for it, so
+        #: one can outlive the close task; :meth:`when_closed` waits for these too.
+        self._teardown_tasks: set[asyncio.Task[Any]] = set()
         #: Head-bounded capture of the agent's own stderr, for a failure detail. An agent that dies at launch
         #: often explains itself there and nowhere else -- a launcher stub handed a name it does not
         #: recognize prints one exact line and exits, which ACP can otherwise only report as "Connection lost".
@@ -503,7 +556,12 @@ class ACPSession:
             except (OSError, ValueError):  # pragma: no cover - a torn-down transport races EOF
                 return
             if not chunk:
+                if self._auth_method is not None and self._url_carry and len(self._signin_urls) < MAX_SIGNIN_URLS:
+                    self._scan_signin_urls(self._url_carry)
+                    self._url_carry = b""
                 return
+            if self._auth_method is not None and len(self._signin_urls) < MAX_SIGNIN_URLS:
+                self._scan_chunk_for_urls(chunk)  # stops once the cap is reached: no regex work past it
             room = _STDERR_CAPTURE_CAP - len(self._stderr_buffer)
             if room <= 0:
                 self._stderr_truncated = True
@@ -513,6 +571,49 @@ class ACPSession:
                 self._stderr_truncated = True
             else:
                 self._stderr_buffer.extend(chunk)
+
+    def _scan_chunk_for_urls(self, chunk: bytes) -> None:
+        """Scan the COMPLETE stderr lines in ``chunk`` (plus the carried partial line) for a sign-in link."""
+        data = self._url_carry + chunk
+        # A bare `\r` ends a line too, as in `_strip_stderr_controls`: an agent that prints its prompt with a
+        # carriage return and then waits for the browser must still have the link scanned now, not at exit.
+        end = max(data.rfind(b"\n"), data.rfind(b"\r"))
+        head, tail = (data[:end], data[end + 1 :]) if end >= 0 else (b"", data)
+        if end >= 0:
+            self._scan_signin_urls(head)
+        # An over-long partial line keeps only its END, bounded, rather than being buffered without limit or
+        # dropped: a prompt appended to a long log line ("<16 KiB of noise> Open ... https://...") still reaches
+        # the scan once its newline arrives, because the wording and link sit at the end.
+        self._url_carry = tail if len(tail) <= _URL_CARRY_CAP else tail[-_URL_CARRY_KEEP:]
+
+    def _scan_signin_urls(self, raw: bytes) -> None:
+        """Record the sign-in links in ``raw`` after the same neutralization a failure detail gets.
+
+        Capped across the whole session, not per chunk, so an agent logging links for five minutes cannot grow
+        the list without bound.
+        """
+        if len(self._signin_urls) >= MAX_SIGNIN_URLS:
+            return
+        # Scanned with escapes and controls stripped but WITHOUT the credential masking: masking is shaped for
+        # free-form log text and can mangle a link (a random PKCE value that merely contains ``-sk-...``), and
+        # a mangled link would be dropped for no reason. Every link that comes out has already passed
+        # ``carries_credential`` inside ``extract_urls``, which is the check that decides whether a link may
+        # be surfaced; one carrying a credential (a JWT ``id_token_hint=``, a ``key=AIza...``) is dropped there.
+        for url in extract_urls(_strip_stderr_controls(raw)):
+            if url not in self._signin_urls:
+                self._signin_urls.append(url)
+                if len(self._signin_urls) >= MAX_SIGNIN_URLS:
+                    return
+
+    @property
+    def auth_methods(self) -> list[AuthMethodInfo]:
+        """The sign-in methods the agent advertised at initialize; ``[]`` before it, or when it offered none."""
+        return list(self._auth_methods)
+
+    @property
+    def signin_urls(self) -> list[str]:
+        """The https links the agent has printed so far during a sign-in, oldest first. Agent-authored text."""
+        return list(self._signin_urls)
 
     def _stderr_detail(self) -> str:
         """The captured stderr as a fenced clause to append to a failure message, or ``""`` when there is none.
@@ -645,6 +746,7 @@ class ACPSession:
             # capability blob the ACP SDK had salvaged into a raw dict AttributeError straight out of open()
             # with the adapter still running.
             try:
+                await self._read_auth_and_sign_in(conn, init)
                 # Resume a prior session (session/load) when asked, else create a fresh one (session/new). The
                 # resume path is gated on the agent's advertised loadSession capability and fails RESUME_FAILED
                 # if unsupported.
@@ -684,12 +786,64 @@ class ACPSession:
             )
         except Exception as exc:
             await self.close()
+            if is_auth_required(exc):
+                raise self._auth_required_failure(exc) from exc
             raise self._handshake_failure(
                 ErrorCode.ACP_HANDSHAKE_FAILED,
                 f"ACP handshake with {self._descriptor.id} failed: {_fault_reason(exc)}",
             ) from exc
         self._session_id = session.session_id
         return session
+
+    def _auth_required_failure(self, exc: BaseException) -> ACPHandshakeError:
+        """The ``AUTH_REQUIRED`` failure for a session/new or session/load the agent refused for lack of sign-in.
+
+        Distinct from a broken handshake because the fix is a one-time sign-in, not a reinstall or a config
+        change, so the message names the methods on offer and the tool that uses them.
+        """
+        return self._handshake_failure(
+            ErrorCode.AUTH_REQUIRED,
+            f"{self._descriptor.id} needs a one-time sign-in before it can open a session ({_fault_reason(exc)}); "
+            f"{describe_methods(self._auth_methods)}. Sign in with `login agent={self._descriptor.id}`",
+        )
+
+    async def _read_auth_and_sign_in(self, conn: ClientSideConnection, init: InitializeResponse) -> None:
+        """Record the advertised sign-in methods, then call ACP ``authenticate`` when this session was asked to.
+
+        Raises ``AUTH_FAILED`` / ``INVALID_INPUT``; a no-op beyond the read for an ordinary session. The method
+        must be one the agent advertised: calling an id it never offered is a caller mistake, and the agent's
+        own error for it is rarely as clear as naming the ones it does offer. A non-``agent`` method
+        (``env_var`` / ``terminal``) is refused here too, because ``authenticate`` is not how those complete.
+        """
+        self._auth_methods = auth_methods_of(init)
+        if self._auth_method is None:
+            return
+        method = next((m for m in self._auth_methods if m.id == self._auth_method), None)
+        if method is None:
+            raise ACPHandshakeError(
+                ErrorCode.INVALID_INPUT,
+                f"{self._descriptor.id} does not offer sign-in method {self._auth_method!r}; "
+                f"{describe_methods(self._auth_methods)}",
+                ReexecutionSafety.SAFE,
+            )
+        if method.kind != "agent":
+            raise ACPHandshakeError(
+                ErrorCode.INVALID_INPUT,
+                f"sign-in method {method.id!r} on {self._descriptor.id} is a {method.kind} method, which is "
+                "completed by the client rather than by an ACP authenticate call",
+                ReexecutionSafety.SAFE,
+            )
+        try:
+            await asyncio.wait_for(conn.authenticate(method_id=method.id), timeout=self._auth_timeout)
+        except Exception as exc:
+            reason = (
+                f"no sign-in completed within {self._auth_timeout:g}s"
+                if isinstance(exc, TimeoutError)
+                else _fault_reason(exc)
+            )
+            raise self._handshake_failure(
+                ErrorCode.AUTH_FAILED, f"signing in to {self._descriptor.id} with {method.id!r} failed: {reason}"
+            ) from exc
 
     async def _resume(self, conn: ClientSideConnection, init: InitializeResponse) -> LoadSessionResponse:
         """Resume the prior session via ACP ``session/load`` instead of ``session/new``.
@@ -732,6 +886,8 @@ class ACPSession:
             )
         except Exception as exc:
             await self.close()
+            if is_auth_required(exc):
+                raise self._auth_required_failure(exc) from exc
             raise self._handshake_failure(
                 ErrorCode.RESUME_FAILED,
                 f"resuming session {resume_id!r} on {self._descriptor.id} failed: {_fault_reason(exc)}",
@@ -1133,9 +1289,13 @@ class ACPSession:
         busy teardown could drop exactly the work this deadline promised to let finish.
         """
         if not cancel_on_timeout:
-            return await await_without_cancelling(coro, timeout_s=timeout_s, task_name=task_name, default=default)
+            return await await_without_cancelling(
+                coro, timeout_s=timeout_s, task_name=task_name, default=default, owner=self._teardown_tasks
+            )
         task = asyncio.create_task(coro, name=task_name)
         register_pending_cleanup(task)
+        self._teardown_tasks.add(task)
+        task.add_done_callback(self._teardown_tasks.discard)
         try:
             done, _ = await asyncio.wait({task}, timeout=timeout_s)
         except asyncio.CancelledError:
@@ -1176,6 +1336,7 @@ class ACPSession:
             timeout_s=_DIRECT_PROCESS_KILL_WAIT_S,
             task_name="rutherford-acp-direct-process-wait",
             default=None,
+            owner=self._teardown_tasks,
         )
 
     async def cancel(self) -> None:
@@ -1203,6 +1364,35 @@ class ACPSession:
         if self._close_task in done:
             consume_task_result(self._close_task)
 
+    def when_closed(self, callback: Callable[[], None]) -> None:
+        """Run ``callback`` once this session's teardown has really finished -- the agent killed and reaped.
+
+        :meth:`close` returns after its caller budget even while that teardown continues in the background, so
+        "close returned" is not "the agent is gone". Nor is "the close task finished": it bounds how long it
+        waits for each stage (process wait, terminal shutdown, descendant reap, transport close), and a stage
+        past its deadline keeps running. This fires only once the close task AND every such stage are done. A
+        caller that must not start a second agent until the first is gone waits on this instead.
+
+        Call it only after :meth:`close` (or after :meth:`open` raised, which closes the session itself): it
+        runs at once when no teardown task exists, which on a session that is still open would mean "now",
+        with the agent alive. It also runs at once when the teardown has already finished.
+        """
+        close_task = self._close_task
+        if (close_task is None or close_task.done()) and all(task.done() for task in self._teardown_tasks):
+            callback()
+            return
+
+        async def _after_teardown() -> None:
+            if close_task is not None:
+                await asyncio.wait({close_task})
+            # The close body bounds how long it WAITS for each stage, not the stage: a reap or transport close
+            # that outran its deadline is still running here, so wait for every stage this session started.
+            while pending := {task for task in self._teardown_tasks if not task.done()}:
+                await asyncio.wait(pending)
+            callback()
+
+        register_pending_cleanup(asyncio.create_task(_after_teardown(), name="rutherford-acp-when-closed"))
+
     async def _close_body(self) -> None:
         """Snapshot the live tree, kill its spawning parent, reap descendants, then close the ACP transport.
 
@@ -1221,7 +1411,9 @@ class ACPSession:
                 # returns, the body never reaches the kill below, and the `finally` never runs either --
                 # a `finally` only fires when its block exits. The adapter would then outlive the server
                 # process, which is the exact leak this teardown path exists to prevent.
-                descendants = await snapshot_within_deadline(pid, timeout_s=_SNAPSHOT_TIMEOUT_S, source="session")
+                descendants = await snapshot_within_deadline(
+                    pid, timeout_s=_SNAPSHOT_TIMEOUT_S, source="session", owner=self._teardown_tasks
+                )
             # * Kill the spawning adapter immediately after its tree snapshot so it cannot create replacements.
             await self._kill_direct_process(process)
             # * Brokered commands retain their own shared kill tasks if this bounded aggregate is still running.

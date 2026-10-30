@@ -168,7 +168,8 @@ confirm the crew actually drives before your first real task:
 
 `doctor` probes each agent with a real read-only ACP round trip — the only trustworthy health signal,
 since there is no cheap non-interactive auth check. Each report is `ok`, `no_answer`,
-`handshake_failed`, `not_installed`, or `error`. Two or more `ok` agents means you are ready.
+`model_unavailable`, `handshake_failed`, `auth_required`, `not_installed`, or `error`. An `auth_required` agent is installed but
+not yet signed in; sign it in once with `login`. Two or more `ok` agents means you are ready.
 
 **No paid agent subscription?** Run your first consensus for free against a local model. With
 [Ollama](https://ollama.com) or [LM Studio](https://lmstudio.ai) running, Rutherford auto-detects
@@ -191,6 +192,7 @@ read-only.
 | `analyze` | Run an offline report over the kept run corpus (e.g. `historical_agreement` cross-lineage agreement). |
 | `capabilities` | List the registered agents (id, display name, launch command, provider) — the cheap snapshot. |
 | `doctor` | Probe each agent with a real read-only ACP round trip and report conformance. |
+| `login` | Sign an agent in once through ACP `authenticate`, for one `doctor` reports as `auth_required`; returns a job to poll, plus the sign-in link when the agent prints one. |
 | `discover` | Detect installed ACP agents from the community registry and propose reviewable config blocks. |
 | `list_roles` | List the role personas you can pass as `role="<id>"`. |
 | `setup` | Show where config lives, scaffold a starter `config.toml`, and install missing npm ACP adapter shims; the first-run helper. |
@@ -207,7 +209,7 @@ scope), `safety_mode`, `timeout_s`, `role`, and `mode` (`sync` or `async`). `del
 
 ## The agent roster
 
-Rutherford ships **20 built-in agents** with curated launch commands and quirks (the Windows npm-shim
+Rutherford ships **21 built-in agents** with curated launch commands and quirks (the Windows npm-shim
 resolution, per-agent handshake budgets, a fixed provider) that a bare `acp.json` cannot express, so
 they work with zero config:
 
@@ -233,6 +235,7 @@ they work with zero config:
 | `qoder` | Qoder | `qodercli --acp` | Qoder login |
 | `grok` | Grok | `grok agent stdio` | xAI login + SuperGrok subscription |
 | `fast_agent` | fast-agent | `uvx fast-agent-acp==0.8.3` | provider API key (env or `fast-agent.secrets.yaml`) |
+| `antigravity` | Google Antigravity | `agy_acp_server` (macOS: `agy_acp_server.par`; Linux: `agy_acp_server.par --uid=`) | Google sign-in, once, with the `login` tool |
 
 `codex` and `claude_code` launch through the official Zed adapters (`codex-acp` and
 `claude-agent-acp`, npm `@agentclientprotocol/*`), which front the Codex and Claude Code CLIs as ACP
@@ -245,8 +248,19 @@ than on PATH — add that directory to PATH, point `[agents.qoder] command` at t
 `discover` find it. `grok` (xAI) is ACP-native and connects cleanly, but a completed turn needs a SuperGrok
 subscription — without it the model call returns `403`; run `doctor connect_only=true` to confirm Rutherford
 can reach and configure it (it reports `reachable` and the advertised models) independent of the
-entitlement. Not every agent drives cleanly on every machine — run `doctor` to see which actually answer
-here.
+entitlement. `antigravity` is Google Antigravity's ACP server, which Google now points individual Gemini
+accounts to (Gemini CLI refuses them). It is a standalone binary from the
+[ACP registry](https://agentclientprotocol.com/get-started/registry), separate from the `agy` CLI, and is
+not installed onto PATH, so add its directory to PATH or set `[agents.antigravity] command` to the full path.
+Until it has been signed in once, `doctor` reports it as `auth_required`: run `login agent=antigravity
+method=oauth-personal`, open the returned sign-in link (Antigravity prints one; if `signin_urls` is empty
+the agent may have opened a browser itself), and poll `job_status` / `job_result` with the returned
+`job_id`. The server caches the credential under `~/.gemini/antigravity-acp/` (`$GEMINI_HOME` relocates
+it), so later sessions open without it. It has been verified on Windows; the macOS and Linux launch commands (including the
+`--uid=` argument Linux gets) come from the registry entry and are not yet verified. If it fails to launch
+on Linux, try `[agents.antigravity] command = ["agy_acp_server.par"]` to drop that argument.
+
+Not every agent drives cleanly on every machine — run `doctor` to see which actually answer here.
 
 **Config-driven agents.** Under ACP an agent is just how to launch it plus a few quirks, so the roster
 is config-driven. An `[agents.<id>]` section overrides a built-in's command / env / provider / model,

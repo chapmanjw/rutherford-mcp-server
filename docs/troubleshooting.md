@@ -4,8 +4,9 @@
 
 Run `doctor` before investigating further. It drives each agent with a real read-only ACP round trip
 — the only trustworthy health signal — and reports `ok`, `no_answer`, `model_unavailable`,
-`handshake_failed`, `not_installed`, or `error` per agent. `capabilities` is the cheaper read (the
-static registry: launch command, `default_model`, `model_selection`, `effort_capable`; no spawn).
+`auth_required` (sign in with `login`), `handshake_failed`, `not_installed`, or `error` per agent.
+`capabilities` is the cheaper read (the static registry: launch command, `default_model`,
+`model_selection`, `effort_capable`; no spawn).
 For live advertised model ids use `doctor(agent=<id>, connect_only=true)`.
 
 ---
@@ -43,6 +44,32 @@ failure surfacing at session creation, or a slow setup that blew the handshake b
 - Some agents drive over ACP only with their own service auth. `cline`, for instance, returns an empty
   handshake/turn when configured for a ChatGPT subscription or OpenRouter in the desktop app — its
   headless `--acp` path needs Cline's own service auth.
+
+### `auth_required` in doctor / `AUTH_REQUIRED`
+
+The agent spawned and answered `initialize`, then refused `session/new` (or `session/load`, on a resume) with
+ACP's "Authentication required":
+it holds no credential yet. Some agents (Google Antigravity is one) only sign in through ACP `authenticate`,
+which no ordinary Rutherford call makes, so this is a one-time setup step rather than a broken install.
+
+- Run `login agent=<id>` to see the sign-in methods the agent offers. It changes nothing.
+- Run `login agent=<id> method=<id>` with a method of kind `agent`. It usually returns `status=pending`, a
+  `job_id`, and `signin_urls`; a sign-in that finishes within `wait_s` returns its outcome directly, and one
+  cancelled while the call waits returns `status=cancelled`. Open the first link and finish the sign-in in
+  the browser (the agent may also open one itself), then poll `job_status` / `job_result`. The job ends
+  `authenticated` once a session opens with the new credential (and lifts any cooldown bench the seat
+  picked up while signed out), fails with the agent's
+  own handshake error if that confirming session fails for an unrelated reason, or fails `AUTH_FAILED` if
+  the sign-in was declined, did not take, or did not finish within
+  `timeout_s` (300 seconds by default, applied to the `authenticate` step). `cancel_job` stops it. Calling
+  `login` again while it runs returns the same job (`joined=true`); asking for a different method then is
+  refused until that job finishes or is cancelled.
+- An `env_var` method answers with the variables to set (`[agents.<id>.env]` or the server's environment),
+  and a `terminal` method answers with the command to run yourself and the names of any variables to set
+  for it (take their values from the agent's documentation). Rutherford never asks for or stores a
+  credential value, and a `terminal` method whose arguments pass one is not offered (the server log records
+  `auth_method_refused` with the method id, never the arguments).
+- The agent caches the credential in its own store, so later sessions open without signing in again.
 
 ### `no_answer` in doctor / `ACP_REFUSED` / `ACP_EMPTY_ANSWER`
 
@@ -166,8 +193,9 @@ closed mapping; an unknown id fails with `UNKNOWN_TARGET` and lists the known id
 
 - Run `capabilities` to see every registered agent id. The built-in ids are `goose`, `opencode`,
   `vibe`, `cline`, `junie`, `kimi`, `openhands`, `codex`, `claude_code`, `copilot`, `qwen`, `droid`,
-  `cursor`, `kiro`, `pi`, `hermes`, `gemini`, `qoder`, `grok`, plus any you added in config and any
-  auto-detected local model (`ollama-<model>` / `lmstudio-<model>`). The id is case-sensitive.
+  `cursor`, `kiro`, `pi`, `hermes`, `gemini`, `qoder`, `grok`, `fast_agent`, `antigravity`, plus any you
+  added in config and any auto-detected local model (`ollama-<model>` / `lmstudio-<model>`). The id is
+  case-sensitive.
 
 ### `TOO_MANY_TARGETS` — panel fan-out exceeds the cap
 
@@ -226,6 +254,7 @@ reported as a `ConfigError`, not a raw decode error.
 | --- | --- |
 | `ACP_SPAWN_FAILED` | Run `doctor`; install the agent (and its ACP shim); confirm it is on PATH. |
 | `ACP_HANDSHAKE_FAILED` | Confirm the ACP launch command; raise `handshake_timeout_s`; check the agent's auth. On Codex with `model` + `effort`, this can mean the bare model was advertised but `reasoning_effort` was not confirmed (Codex ACP 1.8); it is not `MODEL_UNAVAILABLE`. |
+| `AUTH_REQUIRED` / `auth_required` (doctor) | The agent needs an ACP sign-in; run `login agent=<id>` to list its methods, then `login agent=<id> method=<method>`. See [`auth_required` in doctor](#auth_required-in-doctor--auth_required). |
 | `ACP_REFUSED` / `ACP_EMPTY_ANSWER` | The agent answered nothing; check auth, or a local model's tool-calling support. |
 | `model_unavailable` (doctor) | The provider rejected the model id; on Bedrock/Vertex/an enterprise wrapper pin one via `[agents.claude_code.env]` — see [bedrock.md](bedrock.md). |
 | `ACP_TURN_TIMEOUT` | Raise `timeout_s` or `default_timeout_s`; use `mode="async"` for long tasks. |

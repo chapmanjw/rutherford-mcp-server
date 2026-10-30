@@ -309,7 +309,8 @@ class DiscoveredAgent:
     found_at: str
     #: Whether an agent with this id is already in the live roster (a built-in / configured agent).
     already_in_roster: bool
-    #: The probe result: ``ok`` | ``no_answer`` | ``handshake_failed`` | ``not_installed`` | ``error``, or
+    #: The probe result: ``ok`` | ``no_answer`` | ``model_unavailable`` | ``handshake_failed`` |
+    #: ``auth_required`` | ``not_installed`` | ``error``, or
     #: ``None`` when probing was skipped.
     status: str | None
     detail: str

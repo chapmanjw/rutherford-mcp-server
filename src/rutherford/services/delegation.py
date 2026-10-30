@@ -166,6 +166,10 @@ class DelegationService:
         """Whether ``agent_id`` is currently on cooldown (F7), so the consensus auto-panel can skip it."""
         return self._cooldown.is_benched(agent_id)
 
+    def clear_cooldown(self, agent_id: str) -> None:
+        """Lift ``agent_id``'s bench now -- after an explicit fix such as a successful ``login``."""
+        self._cooldown.clear(agent_id)
+
     def cooldown_remaining_s(self, agent_id: str) -> float:
         """Seconds until ``agent_id``'s cooldown bench lifts (``0.0`` when not benched), for the skip reason."""
         return self._cooldown.remaining_s(agent_id)

@@ -71,6 +71,7 @@ EXPECTED_TOOLS = frozenset(
         "job_status",
         "list_jobs",
         "list_roles",
+        "login",
         "plan",
         "reload_panels",
         "review",

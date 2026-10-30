@@ -48,6 +48,10 @@ from acp import PROTOCOL_VERSION, RequestError, run_agent  # noqa: E402
 from acp.helpers import update_agent_message_text, update_agent_thought_text  # noqa: E402
 from acp.schema import (  # noqa: E402
     AgentCapabilities,
+    AuthenticateResponse,
+    AuthEnvVar,
+    AuthMethodAgent,
+    EnvVarAuthMethod,
     InitializeResponse,
     LoadSessionResponse,
     NewSessionResponse,
@@ -56,7 +60,69 @@ from acp.schema import (  # noqa: E402
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
     SetSessionConfigOptionResponse,
+    TerminalAuthMethod,
 )
+
+#: Sign-in simulation. ``RUTHERFORD_FAKE_AUTH_MARKER=<path>`` makes the fake require ACP authentication: it
+#: advertises one method of each kind, refuses ``session/new`` with "Authentication required" until the marker
+#: file exists, and ``authenticate`` with the agent-kind method prints a sign-in link to stderr and creates the
+#: marker. ``RUTHERFORD_FAKE_AUTH_DELAY`` (seconds) holds ``authenticate`` open like a user mid-sign-in,
+#: ``RUTHERFORD_FAKE_AUTH_NOISE`` (bytes) logs that much stderr BEFORE the link, and ``RUTHERFORD_FAKE_AUTH_FAIL=1``
+#: makes the sign-in fail the way a declined or timed-out browser flow does. ``RUTHERFORD_FAKE_AUTH_SILENT=1``
+#: signs in without printing a link, like an agent reusing a credential it already has;
+#: ``RUTHERFORD_FAKE_AUTH_DECOY=1`` logs unrelated URLs before the prompt; ``RUTHERFORD_FAKE_AUTH_NOSTICK=1``
+#: reports success without keeping the credential; ``RUTHERFORD_FAKE_AUTH_LONG_PREFIX`` (bytes) puts the prompt
+#: at the end of one very long line; ``RUTHERFORD_FAKE_GENERIC_32000=1`` fails ``session/new``
+#: with a -32000 that is NOT an auth refusal; ``RUTHERFORD_FAKE_PID_FILE=<path>`` appends each launched
+#: agent's PID as a line.
+_FAKE_SIGNIN_URL = "https://example.test/oauth?state=abc&code_challenge=xyz"
+
+
+def _auth_marker() -> Path | None:
+    raw = os.environ.get("RUTHERFORD_FAKE_AUTH_MARKER")
+    return Path(raw) if raw else None
+
+
+async def _write_pre_prompt_stderr() -> None:
+    """Write whatever stderr the sign-in simulation is configured to log BEFORE the prompt line."""
+    noise = int(os.environ.get("RUTHERFORD_FAKE_AUTH_NOISE", "0"))
+    if noise:
+        sys.stderr.write(("I0000 harness log line padding the head of stderr\n" * (noise // 50 + 1))[:noise])
+    long_prefix = int(os.environ.get("RUTHERFORD_FAKE_AUTH_LONG_PREFIX", "0"))
+    if long_prefix:  # one very long line whose END is the prompt, written in pieces like a slow logger
+        for _ in range(long_prefix // 4096):
+            sys.stderr.write("x" * 4096)
+            sys.stderr.flush()
+            await asyncio.sleep(0.01)
+        sys.stderr.write(" ")
+    if os.environ.get("RUTHERFORD_FAKE_AUTH_DECOY") == "1":
+        # URLs logged for another reason, ahead of the real prompt; none may be reported as the sign-in link.
+        for n in range(5):
+            sys.stderr.write(f"I0000 connecting to https://decoy{n}.test/api?auth=1\n")
+
+
+def _require_signin() -> None:
+    """Refuse a session with ACP's "Authentication required" until the sign-in marker exists."""
+    marker = _auth_marker()
+    if marker is not None and not marker.exists():
+        raise RequestError.auth_required({"message": "No authentication method selected."})
+
+
+def _advertised_auth_methods() -> list[Any]:
+    if _auth_marker() is None:
+        return []
+    return [
+        AuthMethodAgent(id="fake-oauth", name="Log in with Fake", description="Browser sign-in"),
+        EnvVarAuthMethod(
+            id="fake-key",
+            name="Fake API key",
+            type="env_var",
+            vars=[AuthEnvVar(name="FAKE_API_KEY", label="Fake key")],
+            link="https://example.test/keys",
+        ),
+        TerminalAuthMethod(id="fake-term", name="Terminal login", type="terminal", args=["--login"]),
+    ]
+
 
 # * Legacy SessionModelState / ModelInfo exist only on ACP 0.10.x; 0.11+ removes them. Never copy protocol
 # classes -- optional getattr keeps this module importable on both SDKs.
@@ -368,21 +434,55 @@ class FakeAgent:
         # Advertise the loadSession capability so the resume (session/load) path is exercisable. A test that
         # needs an agent which CANNOT resume sets RUTHERFORD_FAKE_NO_LOADSESSION=1 (then a resume -> RESUME_FAILED).
         supports_load = os.environ.get("RUTHERFORD_FAKE_NO_LOADSESSION") != "1"
+        pid_file = os.environ.get("RUTHERFORD_FAKE_PID_FILE")
+        if pid_file:
+            with open(pid_file, "a", encoding="utf-8") as fh:  # noqa: ASYNC230, PTH123 - a tiny fixture write
+                fh.write(f"{os.getpid()}\n")  # one line per launch, so a test can count agent processes
         return InitializeResponse(
             protocol_version=PROTOCOL_VERSION,
             agent_capabilities=AgentCapabilities(load_session=supports_load),
+            auth_methods=_advertised_auth_methods(),
         )
 
     async def new_session(
         self, cwd: str, additional_directories: Any = None, mcp_servers: Any = None, **kwargs: Any
     ) -> NewSessionResponse:
+        if os.environ.get("RUTHERFORD_FAKE_GENERIC_32000") == "1":
+            # -32000 is also JSON-RPC's generic server error: this must NOT be read as "sign in first".
+            raise RequestError(-32000, "Internal backend crashed")
+        _require_signin()
         return _new_session_response(session_id="fake-session-1")
+
+    async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse:
+        marker = _auth_marker()
+        if marker is None or method_id != "fake-oauth":
+            raise RequestError.invalid_params({"method_id": method_id})
+        await _write_pre_prompt_stderr()
+        if os.environ.get("RUTHERFORD_FAKE_AUTH_SILENT") != "1":  # silent = signs in with no link to open
+            sys.stderr.write("Open the following link to authenticate the ACP server: ")
+            if os.environ.get("RUTHERFORD_FAKE_AUTH_LONG_PREFIX"):
+                # Flush the wording on its own, so it is still a partial (over-long) line when the URL arrives.
+                sys.stderr.flush()
+                await asyncio.sleep(0.2)
+            sys.stderr.write(f"{_FAKE_SIGNIN_URL}\n")
+            sys.stderr.flush()
+        for n in range(int(os.environ.get("RUTHERFORD_FAKE_AUTH_EXTRA_LINKS", "0"))):
+            await asyncio.sleep(0.05)  # separate flushes, so the links arrive in separate stderr reads
+            sys.stderr.write(f"Or sign in here: https://extra{n}.test/oauth\n")
+            sys.stderr.flush()
+        await asyncio.sleep(float(os.environ.get("RUTHERFORD_FAKE_AUTH_DELAY", "0")))
+        if os.environ.get("RUTHERFORD_FAKE_AUTH_FAIL") == "1":
+            raise RequestError(-32000, "Onboarding failed: Timed out waiting for the authentication flow.")
+        if os.environ.get("RUTHERFORD_FAKE_AUTH_NOSTICK") != "1":  # nostick = reports success, keeps nothing
+            marker.write_text("signed-in", encoding="utf-8")
+        return AuthenticateResponse()
 
     async def load_session(
         self, cwd: str, session_id: str, additional_directories: Any = None, mcp_servers: Any = None, **kwargs: Any
     ) -> LoadSessionResponse:
         # Resume: the agent reloads the named conversation. session/load keeps the requested id (no new one is
         # minted), so the client runs the next prompt under ``session_id``. Recorded so WHOAMI can confirm it.
+        _require_signin()
         self._loaded_session = session_id
         return _load_session_response()
 

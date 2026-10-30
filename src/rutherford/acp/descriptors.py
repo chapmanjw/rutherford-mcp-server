@@ -9,6 +9,7 @@ a closed mapping that fails fast on an unknown id, mirroring the old adapter reg
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -160,6 +161,30 @@ class DescriptorRegistry:
 #: handshake, and reach a turn that cleanly reports ``Authentication required`` with no provider key -- so,
 #: like ``kimi`` / ``openhands`` (and ``grok``'s entitlement gate), it is a conformance-verified seat whose
 #: full answering turn is gated on the user's own provider key, not confirmed on the maintainer's machine.
+#:
+#: ``antigravity`` is Google Antigravity's ACP server, a standalone Google-signed binary distributed as a
+#: per-platform archive (``agy_acp_server.exe`` on Windows, ``agy_acp_server.par`` on macOS and Linux) and
+#: separate from the ``agy`` CLI, which has no ACP mode. It is Google's replacement for ``gemini`` on
+#: individual accounts: Gemini CLI now refuses those with "no longer supported for Gemini Code Assist for
+#: individuals". The archive is not installed onto PATH, so add its directory to PATH or point
+#: ``[agents.antigravity] command`` at the full path. Auth is one-time: the server advertises
+#: ``oauth-personal`` / ``oauth-business`` / ``gemini-api-key`` / ``agent-platform`` (all agent-kind) and,
+#: until a client has called ACP ``authenticate`` once, ``session/new`` fails with ``Authentication
+#: required`` -- surfaced as ``AUTH_REQUIRED`` and fixed with the ``login`` tool. After one sign-in the server
+#: caches its credential under ``~/.gemini/antigravity-acp/`` (``$GEMINI_HOME`` relocates it) and every
+#: later session opens without it.
+#: Live-verified on Windows 2026-10-25 with 1.4.3: handshake, session, a read-only turn (status=ok), and, from
+#: a signed-out ``GEMINI_HOME``, ``auth_required`` -> ``login`` returning the Google sign-in link. The
+#: Linux ``--uid=`` argument is copied from the registry entry and is not verified here.
+def antigravity_command(platform: str) -> tuple[str, ...]:
+    """The Antigravity ACP server's launch argv for ``platform`` (a :data:`sys.platform` value)."""
+    if platform == "win32":
+        return ("agy_acp_server",)  # resolves agy_acp_server.exe through PATHEXT
+    if platform.startswith("linux"):
+        return ("agy_acp_server.par", "--uid=")
+    return ("agy_acp_server.par",)
+
+
 HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("goose", "Goose", ("goose", "acp")),
     AgentDescriptor("opencode", "OpenCode", ("opencode", "acp")),
@@ -195,6 +220,7 @@ HIGH_FIDELITY: tuple[AgentDescriptor, ...] = (
     AgentDescriptor("qoder", "Qoder", ("qodercli", "--acp"), provider="qoder"),
     AgentDescriptor("grok", "Grok", ("grok", "agent", "stdio"), provider="xai"),
     AgentDescriptor("fast_agent", "fast-agent", ("uvx", "fast-agent-acp==0.8.3")),
+    AgentDescriptor("antigravity", "Google Antigravity", antigravity_command(sys.platform), provider="google"),
 )
 
 

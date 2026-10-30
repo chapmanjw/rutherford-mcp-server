@@ -81,8 +81,9 @@ async def doctor_tool(
     """Probe each agent (or one named ``agent``) with a real read-only ACP round trip and report conformance.
 
     The only trustworthy health signal for an ACP agent: whether it spawns, handshakes, and answers. Probes
-    run in parallel; each report says ok / no_answer / model_unavailable / handshake_failed / not_installed /
-    error. ``model_unavailable`` means spawn + handshake succeeded (the ACP transport is reachable) but the
+    run in parallel; each report says ok / no_answer / model_unavailable / handshake_failed / auth_required /
+    not_installed / error. ``auth_required`` means the agent is installed but not yet signed in (``login``).
+    ``model_unavailable`` means spawn + handshake succeeded (the ACP transport is reachable) but the
     harness/provider rejected the model on the turn -- a model/provider config issue (e.g. a Claude Code
     pointed at AWS Bedrock / Vertex), not a broken agent -- so a recognizable model rejection is not reported
     as a generic failure.
@@ -90,7 +91,8 @@ async def doctor_tool(
     it, because a cold local model loads on its first prompt and the cloud default would false-flag it.
 
     ``connect_only`` runs the LIGHTER handshake-only check instead: it opens a session (spawn + handshake, no
-    prompt) and reports ``reachable`` / ``handshake_failed`` / ``not_installed`` plus the agent's advertised
+    prompt) and reports ``reachable`` / ``handshake_failed`` / ``auth_required`` / ``not_installed`` plus the
+    agent's advertised
     models -- proving Rutherford can talk to and configure the agent without a model call. Useful for an agent
     that connects but cannot complete a turn for a reason outside ACP (an auth / entitlement / quota issue,
     e.g. Grok without a SuperGrok subscription), which the full probe would report as a turn ``error``.

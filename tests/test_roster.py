@@ -5,11 +5,12 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 from pydantic import ValidationError
 
-from rutherford.acp.descriptors import HIGH_FIDELITY
+from rutherford.acp.descriptors import HIGH_FIDELITY, antigravity_command
 from rutherford.acp.roster import build_registry
 from rutherford.config.schema import AgentConfig, RutherfordConfig
 from rutherford.domain.errors import ConfigError
@@ -18,12 +19,32 @@ from rutherford.domain.errors import ConfigError
 def test_no_config_is_the_builtin_roster() -> None:
     # auto_detect_local_models off so the count is deterministic regardless of a running local backend.
     registry = build_registry(RutherfordConfig(auto_detect_local_models=False))
-    assert len(registry) == len(HIGH_FIDELITY) == 20
+    assert len(registry) == len(HIGH_FIDELITY) == 21
     assert registry.get("goose").command == ("goose", "acp")
     assert registry.get("gemini").command == ("gemini", "--acp")
     assert registry.get("qoder").command == ("qodercli", "--acp")
     assert registry.get("grok").command == ("grok", "agent", "stdio")
     assert registry.get("fast_agent").command == ("uvx", "fast-agent-acp==0.8.3")
+    antigravity = registry.get("antigravity")
+    assert antigravity.provider == "google"
+    assert antigravity.underlying_cli is None  # the server binary is its own ACP agent, not a shim
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [
+        ("win32", ("agy_acp_server",)),
+        ("darwin", ("agy_acp_server.par",)),
+        ("linux", ("agy_acp_server.par", "--uid=")),
+    ],
+)
+def test_antigravity_launch_command_follows_the_registry_per_platform(platform: str, expected: tuple[str, ...]) -> None:
+    # The registry ships a different binary per platform (.exe on Windows, .par elsewhere, plus --uid= on Linux).
+    assert antigravity_command(platform) == expected
+
+
+def test_antigravity_builtin_uses_this_platforms_command() -> None:
+    assert build_registry(RutherfordConfig()).get("antigravity").command == antigravity_command(sys.platform)
 
 
 def test_override_a_builtin_agent() -> None:
