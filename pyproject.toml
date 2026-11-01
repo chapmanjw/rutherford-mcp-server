@@ -56,7 +56,7 @@ dependencies = [
     # The floor is 3.4.10, the first 3.x release patched for GHSA-7xgj-8392-5q4r ("post-transform component
     # authorization is skipped on direct calls"); the lock is not shipped, so only this string keeps a user's
     # fresh resolve off the affected releases.
-    "fastmcp>=3.4.10,<4",
+    "fastmcp>=3.4.10,<5",
     "pydantic>=2.13",
     "psutil>=7",
     "python-toon>=0.1.3",
